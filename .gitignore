@@ -1,0 +1,45 @@
+# NVIDIA's property — never committed, never redistributed. See notes/CLAUDE.md "Rules".
+/ref/
+/work/
+/dist/
+*.dll
+*.exe
+*.7z
+
+# Derived from the DLL: the weight container and everything carved out of it.
+weights_ht.bin
+*.ptx
+*.cubin
+*.fatbin
+*.safetensors
+*.npy
+*.npz
+*.bin
+
+.venv/
+__pycache__/
+*.pyc
+
+# Third-party game frames: test material, not code, and somebody else's copyright. A
+# single one was staged once and is still a loose object in this clone — see
+# `src/tools/publish_check.py --history`, which is what found it.
+/pngs/
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.bmp
+*.gif
+*.mp4
+*.webm
+
+# Build output and archives, none of which belongs in a source tree.
+*.so
+*.spv
+*.7z
+*.zip
+*.zst
+
+# The daemon's own log, written beside the tree.
+nr_daemon.log
+*.obj
