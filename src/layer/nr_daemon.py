@@ -24,13 +24,16 @@ import json
 import math
 import os
 import pathlib
+import queue
 import re
 import socket
 import stat
 import struct
 import subprocess
 import sys
+import threading
 import time
+import types
 
 import numpy as np
 
@@ -130,6 +133,34 @@ def encode(image, raw, vk_format):
 _INBOX = {}
 
 
+# Scratch the frame's own arithmetic wants, kept from frame to frame. `np.abs(a - b)` builds
+# two arrays the size of its operands and drops them; writing the difference into one array
+# that is already there computes exactly the same number. Alone, against two cold 1920x1080
+# frames, that is 2.99 ms to 0.58 ms; inside the frame, where the same arrays have just been
+# written by the composition, the two changes this enabled together measured 1.70 ms a frame
+# of host time (work/cpu_cost_probe.py, alternating frames, 35 of each spelling) — of which
+# 0.42 ms is on the game's own wait and the rest is behind a game already gone back to
+# drawing. One shape a key, remade when the shape moves: one stage reaches each of these, so
+# no two frames write one at once.
+_SCRATCH = {}
+
+
+def _scratch(key, shape, dtype=np.float32):
+    out = _SCRATCH.get(key)
+    if out is None or out.shape != shape:
+        out = np.empty(shape, dtype)
+        _SCRATCH[key] = out
+    return out
+
+
+def mean_change(fresh, was, key):
+    """Mean absolute difference between two images, into `key`'s kept scratch."""
+    difference = _scratch(key, fresh.shape)
+    np.subtract(fresh, was, out=difference)
+    np.abs(difference, out=difference)
+    return float(difference.mean())
+
+
 def receive(connection, count, probe_ok=False, keep=None):
     # Straight into one buffer where the socket allows it: collecting the chunks and
     # joining them copied the whole frame once more, 0.3 ms at 1280x720.
@@ -176,7 +207,7 @@ class Settings:
     """
 
     KNOBS = ("profile", "intensity", "detail_strength", "colour_strength", "render_scale",
-             "temporal", "cut_limit", "hold", "release", "min_extent")
+             "temporal", "cut_limit", "hold", "release", "min_extent", "int8")
 
     def __init__(self, args):
         self.path = args.settings
@@ -457,6 +488,10 @@ class History:
         self.inner = None       # `output` at the network's input extent, taken ahead
         self.frames = 0
         self.cut = 0.0
+        # The cut's difference, written into rather than made: `np.abs(source - self.source)`
+        # builds two arrays the size of the network's frame every frame and drops them.
+        # 2.2 ms of the frame before, 1.2 after, at 1920x1080 with the network at 768x448.
+        self._difference = None
 
     def take(self, key, source, limit):
         """History for this frame: at the network's extent, at the output's, and the
@@ -466,7 +501,12 @@ class History:
             self.key, self.output, self.source, self.pixels, self.frames = key, None, None, None, 0
             self.inner = None
             return None, None, None
-        self.cut = float(np.abs(source - self.source).mean())
+        difference = self._difference
+        if difference is None or difference.shape != source.shape:
+            difference = self._difference = np.empty(source.shape, np.float32)
+        np.subtract(source, self.source, out=difference)
+        np.abs(difference, out=difference)
+        self.cut = float(difference.mean())
         if self.cut > limit:
             # A round transition, a replay cut or a menu. The gate rejects wrong history
             # per pixel, but it was characterised at full scale on a pan (phase12); a
@@ -564,6 +604,139 @@ def explain(error):
     return FAILURES.get(int(code.group(1)), "") if code else ""
 
 
+class Pipeline:
+    """The three stages on three threads: prepare, network, finish.
+
+    Serial, a frame is 13 ms of host work, 46 ms on the device and 13 ms more of host
+    work, and the device is idle through 26 of the 72. Here each stage hands its frame to
+    the next and goes straight back for another, so the network of frame N overlaps the
+    host work of N+1 and N-1 and a frame costs the slowest stage instead of the sum.
+
+    The queues are two deep, which is what lets prepare run exactly one frame ahead: any
+    more and the picture would be several frames behind the game's own input.
+
+    `history` is shared: `take` runs in prepare, `keep` in finish. They hold
+    `args.history_lock` so neither sees a half-written state; as the class above says, a
+    frame may read the history one frame back, which is the trade this makes.
+    """
+
+    def __init__(self, backend, args, depth=2):
+        self.backend = backend
+        self.args = args
+        self.to_network = queue.Queue(depth)
+        self.to_finish = queue.Queue(depth)
+        self.lock = threading.Lock()
+        self.failure = None
+        # The history is a chain: a frame reads what the frame before it wrote. Letting
+        # prepare run ahead of finish breaks that chain — a frame is then steadied against
+        # a prediction two or three frames back, from a picture the camera has already
+        # left, and what comes out jumps between frames instead of holding. That is the
+        # flicker, and it is what a depth of four looked like.
+        #
+        # Waiting for the frame before costs more than it is worth, and is off by default
+        # for that reason: 15.68 fps against 11.94 measured, a quarter of the frame rate,
+        # to move `held` from 80-85% to 86-87% at a depth of two, where the history is only
+        # one frame behind. `finish` blocks in `sendall` until the layer reads, so the wait
+        # drags that in as well — which is why it costs 84 ms rather than the 64 the stages
+        # add up to. Kept because a deeper pipeline, or a game that moves faster than this
+        # one, may want the chain back: NR_DAEMON_HISTORY_SYNC=1.
+        self.history_sync = os.environ.get(
+            "NR_DAEMON_HISTORY_SYNC", "0") not in ("0", "", "off")
+        self.history_gate = threading.Event()
+        self.history_gate.set()     # nothing to wait for before the first frame
+        self.threads = [threading.Thread(target=self._network, name="nr-network",
+                                         daemon=True),
+                        threading.Thread(target=self._finish, name="nr-finish",
+                                         daemon=True)]
+        for thread in self.threads:
+            thread.start()
+
+    def _fail(self, error):
+        with self.lock:
+            if self.failure is None:
+                self.failure = error
+
+    def _network(self):
+        # How much of the frame is the device working and how much is it waiting for the
+        # next frame to be ready: the whole point of the pipeline is that the second is
+        # nothing, and until it was measured it was not known which of the two the 18 ms
+        # between a 46 ms network and a 64 ms frame was.
+        report = os.environ.get("NR_DAEMON_TIMELINE", "0") not in ("0", "", "off")
+        previous_end = None
+        busy = idle = 0.0
+        runs = 0
+        while True:
+            frame = self.to_network.get()
+            if frame is None:
+                self.to_finish.put(None)
+                return
+            started = time.perf_counter()
+            try:
+                stage_network(frame, self.backend)
+            except BaseException as error:      # noqa: BLE001 - reported in the accept loop
+                self._fail(error)
+                frame = None
+            ended = time.perf_counter()
+            if previous_end is not None:
+                idle += started - previous_end
+            previous_end = ended
+            busy += ended - started
+            runs += 1
+            if report and runs % 20 == 0:
+                print(f"timeline: {runs} runs — device busy {1000 * busy / runs:.1f} ms, "
+                      f"waiting for the next frame {1000 * idle / (runs - 1):.1f} ms, "
+                      f"frame {1000 * (busy + idle) / runs:.1f} ms", flush=True)
+            self.to_finish.put(frame)
+
+    def _finish(self):
+        while True:
+            frame = self.to_finish.get()
+            if frame is None:
+                return
+            try:
+                stage_finish(frame, self.backend, self.args)
+            except (EOFError, OSError, ValueError, RuntimeError) as error:
+                print(f"frame rejected/failed; game keeps original: {error}{explain(error)}",
+                      flush=True)
+            except BaseException as error:      # noqa: BLE001 - DeviceLost reaches the loop
+                self._fail(error)
+            finally:
+                # Set even when the frame failed: whatever happened, this frame's history
+                # is as written as it is going to get, and a gate left closed would stop
+                # every frame after it at the wait below.
+                self.release_history()
+                frame.connection.close()
+
+    def release_history(self):
+        """Let the next frame's `take` go ahead. See `history_gate` above."""
+        if self.history_sync:
+            self.history_gate.set()
+
+    def check(self):
+        """Re-raise a stage's failure where `serve` already knows how to handle it."""
+        with self.lock:
+            failure = self.failure
+        if failure is None:
+            return
+        if isinstance(failure, DeviceLost):
+            raise failure
+        raise failure
+
+    def close(self):
+        self.to_network.put(None)
+        for thread in self.threads:
+            thread.join()
+
+
+def process_connection(connection, backend, args):
+    """One request, all three stages in turn — the path with the pipeline off."""
+    frame = stage_prepare(connection, backend, args)
+    if frame is None:
+        return
+    stage_network(frame, backend)
+    stage_finish(frame, backend, args)
+
+
 def serve(server, backend, args):
     """Answer frames until interrupted, or until the GPU is gone.
 
@@ -582,11 +755,47 @@ def serve(server, backend, args):
     if keeping:
         print("keeping NumPy's large blocks from frame to frame (NR_KEEP_BLOCKS=0 to stop)",
               flush=True)
+    # A number is how many frames may be inside the pipeline at once, which is what lets
+    # the layer's own depth be matched: a layer sending three frames into a two-deep
+    # pipeline simply waits for room, and the third frame buys nothing. Anything else
+    # that is not "0" is the old two.
+    given = os.environ.get("NR_DAEMON_PIPELINE", "0")
+    depth = 0
+    if given not in ("0", "", "off"):
+        try:
+            depth = int(given)
+        except ValueError:
+            depth = 2
+        depth = max(2, min(depth, 8))
+    pipeline = Pipeline(backend, args, depth=depth) if depth else None
+    if pipeline is not None:
+        print(f"pipeline on: prepare, network and finish overlap across frames, "
+              f"{depth} deep (NR_DAEMON_PIPELINE=0 for the old one frame at a time)",
+              flush=True)
+        if pipeline.history_sync:
+            print("history in frame order: a frame is steadied against the one before "
+                  "it, not one several back; only the device work overlaps "
+                  "(NR_DAEMON_HISTORY_SYNC=0 to let prepare run ahead)", flush=True)
     while True:
         connection, _ = server.accept()
         try:
             connection.settimeout(args.timeout)
-            process_connection(connection, backend, args)
+            if pipeline is None:
+                process_connection(connection, backend, args)
+            else:
+                try:
+                    frame = stage_prepare(connection, backend, args, pipeline)
+                except BaseException:
+                    # The gate was closed for this frame and it will never reach finish;
+                    # open it or the next frame waits for something that is not coming.
+                    pipeline.release_history()
+                    raise
+                if frame is not None:
+                    pipeline.to_network.put(frame)
+                else:
+                    connection.close()
+                    pipeline.release_history()   # a refused frame keeps no history either
+                pipeline.check()
         except DeviceLost as error:
             print(DEVICE_LOST.format(error=error), flush=True)
             raise SystemExit(1) from error
@@ -594,15 +803,59 @@ def serve(server, backend, args):
             print(f"frame rejected/failed; game keeps original: {error}{explain(error)}",
                   flush=True)
         finally:
-            connection.close()
+            if pipeline is None:
+                connection.close()
             if keeping:
                 keeping.frame_done()
 
 
-def process_connection(connection, backend, args):
-    """One request. Reject invalid extents before allocating/receiving the body.
+def _knobs(live):
+    """A frozen copy of the settings as they were read for this frame.
 
-    Closing a rejected exchange makes the Vulkan layer retain its original frame.
+    `Settings.refresh` rewrites the object in place whenever the file changes, and a
+    later frame's prepare would otherwise move a knob under a frame that is still being
+    composed.
+    """
+    return types.SimpleNamespace(**{knob: getattr(live, knob) for knob in Settings.KNOBS})
+
+
+class Frame:
+    """One request's state, carried from the stage that produces it to the next.
+
+    The daemon used to run a request end to end on one thread: about 13 ms of host work
+    before the network, 46 ms on the device, 13 ms after, all strictly in turn, so the
+    device sat idle through two thirds of a frame. Split into stages, each stage is a
+    thread and the three overlap across consecutive frames, which is what
+    `NR_DAEMON_PIPELINE` turns on.
+
+    The one thing that does not overlap is the history: `History.keep` is handed this
+    frame's network output and the next frame's `History.take` reads it, so frames are a
+    chain just as the network's own blocks are. Rather than wait, the pipeline lets a
+    frame read the history as it stood one frame back — the same one-frame shift the
+    layer's async present already introduces at the other end. `notes/` has the
+    measurement; the knob is off until it is on.
+    """
+
+    __slots__ = ("connection", "payload", "interface", "width", "height", "vk_format",
+                 "clock", "live", "top", "bottom", "left", "right", "boxed", "whole",
+                 "colour", "active_height", "active_width", "inner", "geometry", "shot",
+                 "history_inner", "history_full", "history_pixels", "features",
+                 "channels", "grade", "neural", "control", "held", "previous", "kind",
+                 "head", "split")
+
+    def __init__(self, **fields):
+        for name in self.__slots__:
+            setattr(self, name, fields.pop(name, None))
+        if fields:
+            raise TypeError(f"Frame got unknown field(s): {sorted(fields)}")
+
+
+def stage_prepare(connection, backend, args, pipeline=None):
+    """The request up to the network: decode it, resample it, build its features.
+
+    Nothing here touches the device, which is the point: it can run while the network is
+    busy with the frame before. Returns None when the frame was rejected or answered
+    outright and needs no further stage.
     """
     header = receive(connection, 16, probe_ok=True)
     if header is None:
@@ -623,6 +876,12 @@ def process_connection(connection, backend, args):
 
     live = args.live
     live.refresh()
+    # The one knob that is not post-network: it changes which kernels the graph is made
+    # of, so the weights and the captured frames have to go. `set_int8` only does that
+    # when the value actually moved, so this costs a compare on every other frame.
+    if backend.set_int8(live.int8):
+        print(f"settings: integer projections "
+              f"{'on' if live.int8 else 'off'}; rebuilding the graph", flush=True)
     clock = time.perf_counter()
     whole = decode(payload, width, height, vk_format)
     # A letterboxed game — DoA5's smallest window is 1024x768 with 16:9 inside it — leaves
@@ -653,8 +912,15 @@ def process_connection(connection, backend, args):
     # frame's cut test, and aliasing the decode buffer through it has caused two bugs in
     # this function already.
     shot = (width, height, vk_format, top, bottom, left, right, live.profile)
-    history_inner, history_full, history_pixels = args.history.take(
-        shot, inner, live.cut_limit if live.temporal > 0 else -1.0)
+    if pipeline is not None and pipeline.history_sync:
+        # Wait for the frame before this one to have written its history, then close the
+        # gate for the frame after. Only here: everything before — the receive, the
+        # decode, the resample — has already run alongside that frame's device work.
+        pipeline.history_gate.wait()
+        pipeline.history_gate.clear()
+    with args.history_lock:
+        history_inner, history_full, history_pixels = args.history.take(
+            shot, inner, live.cut_limit if live.temporal > 0 else -1.0)
     # Built in the graph's own mapped input where the backend offers it, so nothing is
     # copied on the way in — on Linux that is measured and clean (test_input_fp16.py).
     #
@@ -676,7 +942,6 @@ def process_connection(connection, backend, args):
         inner, geometry=geometry, history=history_inner,
         out=input_view(geometry.network_height, geometry.network_width) if input_view else None,
         **nr_frame.PROFILES[live.profile])
-    head = geometry.crop(backend.run_features(features))
     # The fourth channel is the temporal gate. Without history it reaches nothing —
     # carrying it through the upscale would be a quarter of that pass for nothing
     # (notes/phase48) — and with history it is what decides the blend, per pixel.
@@ -727,6 +992,52 @@ def process_connection(connection, backend, args):
     # written into the request's own buffer when nothing needs the request's bytes
     # afterwards — the interface restore does.
     kind = FORMATS[vk_format][0]
+    return Frame(connection=connection, payload=payload, interface=interface,
+                 width=width, height=height, vk_format=vk_format, clock=clock,
+                 live=_knobs(live), top=top, bottom=bottom, left=left, right=right,
+                 boxed=boxed, whole=whole, colour=colour, active_height=active_height,
+                 active_width=active_width, inner=inner, geometry=geometry, shot=shot,
+                 history_inner=history_inner, history_full=history_full,
+                 history_pixels=history_pixels, features=features, channels=channels,
+                 grade=grade, neural=neural, control=control, held=held,
+                 previous=previous, kind=kind, head=None, split=None)
+
+
+def stage_network(frame, backend):
+    """The graph, and only the graph: the part that holds the device.
+
+    `backend.split` is a single set of scalars on the backend, so a later frame's run
+    would overwrite it before this one's log line is written. It is copied out here,
+    while it is still this frame's.
+    """
+    frame.head = frame.geometry.crop(backend.run_features(frame.features))
+    frame.split = tuple(getattr(backend, "split", (0.0, 0.0, 0.0)))
+
+
+def stage_finish(frame, backend, args):
+    """What follows the network: compose it into the game's frame, answer, keep history."""
+    connection = frame.connection
+    payload = frame.payload
+    width, height, vk_format = frame.width, frame.height, frame.vk_format
+    clock = frame.clock
+    live = frame.live
+    top, bottom, left, right = frame.top, frame.bottom, frame.left, frame.right
+    boxed = frame.boxed
+    whole = frame.whole
+    colour = frame.colour
+    active_height, active_width = frame.active_height, frame.active_width
+    inner = frame.inner
+    geometry = frame.geometry
+    shot = frame.shot
+    history_full = frame.history_full
+    channels = frame.channels
+    grade = frame.grade
+    neural = frame.neural
+    control = frame.control
+    held = frame.held
+    previous = frame.previous
+    kind = frame.kind
+    head = frame.head
     fused = None
     if (kind in ("bgra8", "rgba8") and live.detail_strength == 1 and live.colour_strength == 1
             and head.shape[0] <= active_height and head.shape[1] <= active_width):
@@ -769,11 +1080,14 @@ def process_connection(connection, backend, args):
     # figures: the whole frame took 5 ms of a 1080p frame for a number printed to five
     # places, and a quarter of the rows moves it by about a part in five hundred. Taken
     # after the answer has gone where nothing writes into `composed` before then.
+    # The rows are taken once and handed to `mean_change` twice below: it writes its
+    # difference into a buffer kept for the shape, and both calls want the same shape.
+    rows = slice(None, None, 4)
     changed = None
     if held is not None:
         if full is None:
             # the restore below writes into the composition itself
-            changed = float(np.abs(composed[::4] - colour[::4]).mean())
+            changed = mean_change(composed[rows], colour[rows], "change")
         # The control mask reaches `compose_head`, but `compose_detail` runs *after* it
         # and re-weights the whole frame: with either strength away from 1 it moved 89.6%
         # of the masked pixels, so the interface protection silently stopped working the
@@ -794,7 +1108,7 @@ def process_connection(connection, backend, args):
         (full[top:bottom, left:right] if full is not None else composed)[held] = colour[held]
     connection.sendall(encoded)
     if changed is None:
-        changed = float(np.abs(composed[::4] - colour[::4]).mean())
+        changed = mean_change(composed[rows], colour[rows], "change")
     # What the game was handed at the active region, for the dump below.
     active = full[top:bottom, left:right] if full is not None else composed
     if live.temporal > 0:
@@ -805,7 +1119,8 @@ def process_connection(connection, backend, args):
         # hand back fresh arrays, nothing writes them from here on, and History only reads
         # what it holds. Three frame copies a frame were 0.4 ms at 640x360 and 2-3 at
         # 1280x720.
-        args.history.keep(shot, neural, inner, colour)
+        with args.history_lock:
+            args.history.keep(shot, neural, inner, colour)
     if args.dump:
         import image_io
         try:
@@ -989,6 +1304,18 @@ def main():
     parser.add_argument("--release", type=float, default=24.0,
                         help="levels of 255 of change in the game's own pixel by which none "
                              "of the model's history gate survives there, 0-255; 0 is off")
+    parser.add_argument("--int8", type=int,
+                        default=int(os.environ.get("NR_INT8_PROJECT", "0") != "0"),
+                        help="the projections on the integer path: 1 runs the bottleneck's "
+                             "two and every window block's feed-forward down and attention "
+                             "out in configuration 4, worth 4.8 ms of a 46 ms frame and "
+                             "costing 14.5 % of the network's own effect against the float "
+                             "path; 0 keeps the float path. `NR_INT8_WINDOW=0` and "
+                             "NR_INT8_WINDOW_OUT=0 keep the bottleneck's alone. Switchable "
+                             "while the game runs with tools/nr_int8_on.bat and "
+                             "tools/nr_int8_off.bat, which set \"int8\" in nr_settings.json; "
+                             "the daemon sees it on the next frame and rebuilds the graph, "
+                             "which costs one slow frame, so it A/Bs in place")
     parser.add_argument("--min-extent", type=float, default=320.0,
                         help="the smallest side the network's frame is padded to, 128-4096; "
                              "320 is what NVIDIA's own driver does, the graph runs down to 128")
@@ -1017,6 +1344,9 @@ def main():
         parser.error("--min-extent must be between 128 and 4096")
     args.live = Settings(args)
     args.history = History()
+    # Guards the history across the pipeline's threads: `take` runs in the prepare stage,
+    # `keep` in the finish stage, and a frame may be composed while the next is prepared.
+    args.history_lock = threading.Lock()
     args.letterbox = Letterbox()
     args.meter = Meter() if args.meter else None
 
@@ -1053,7 +1383,8 @@ def main():
             ("NR_FUSE_MERGE_FFN", "fuse_merge_ffn"), ("NR_FUSE_STEM_FFN", "fuse_stem_ffn"),
             ("NR_FUSE_POOL", "fuse_pool"), ("NR_FUSE_WINDOW_BLOCK", "fuse_window_block"),
             ("NR_FUSE_HEAD", "fuse_head"),
-            ("NR_FUSE_GLOBAL_ATTENTION", "fuse_global_attention"))),
+            ("NR_FUSE_GLOBAL_ATTENTION", "fuse_global_attention"),
+            ("NR_INT8_PROJECT", "int8_project"))),
           flush=True)
 
     if os.name == "nt":
@@ -1061,7 +1392,13 @@ def main():
         # named pipe instead. nr_pipe gives the same accept/recv/sendall shape a
         # socket has, so serve() below does not care which one it got.
         import nr_pipe
-        server = nr_pipe.NamedPipeServer(args.socket, backlog=4, timeout=None)
+        # `backlog` is nMaxInstances, a hard ceiling on how many instances of this pipe
+        # name exist at once, and one instance is spent on every frame still on its way
+        # plus one waiting to be connected to. With three frames in flight and a backlog
+        # of four the ceiling was reached, the instance that should have been listening
+        # could not be created, and the layer's next CreateFile found no pipe to open.
+        # The headroom costs nothing — an instance is a handle until someone connects.
+        server = nr_pipe.NamedPipeServer(args.socket, backlog=16, timeout=None)
         print(f"listening on {args.socket}", flush=True)
         try:
             serve(server, backend, args)

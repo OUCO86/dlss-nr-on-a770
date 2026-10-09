@@ -12,6 +12,9 @@
 #include <string.h>
 #include <vulkan/vulkan.h>
 
+#include "gpu_pick.h"
+#include "xmx_shape.h"
+
 #define VKOK(x) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
     fprintf(stderr, "%s:%d: %s -> %d\n", __FILE__, __LINE__, #x, _r); exit(1); } } while (0)
 
@@ -76,9 +79,10 @@ int main(int argc, char **argv)
 
 	uint32_t nd = 0;
 	vkEnumeratePhysicalDevices(inst, &nd, NULL);
-	VkPhysicalDevice *pds = calloc(nd, sizeof *pds);
-	vkEnumeratePhysicalDevices(inst, &nd, pds);
-	VkPhysicalDevice pd = pds[0];
+	if (!nd) { fprintf(stderr, "no physical device\n"); return 1; }
+	/* Not pds[0]: this machine enumerates the AMD card first and the Arc second. */
+	VkPhysicalDevice pd = xmx_pick_device(inst, "gemm_runner", NULL);
+	if (pd == VK_NULL_HANDLE) { fprintf(stderr, "no physical device\n"); return 1; }
 	VkPhysicalDeviceProperties props;
 	vkGetPhysicalDeviceProperties(pd, &props);
 	fprintf(stderr, "device: %s\n", props.deviceName);
@@ -202,7 +206,9 @@ int main(int argc, char **argv)
 	vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, playout, 0, 1, &set, 0, NULL);
 	uint32_t pcv[3] = { M, N, K };
 	vkCmdPushConstants(cb, playout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, pcv);
-	vkCmdDispatch(cb, N / 16, M / 8, 1);
+	/* The grid follows the kernel's shape, not a literal: with N halved on Xe-HPG
+	 * a hardcoded N/16 covers half the columns and leaves the rest as zero. */
+	vkCmdDispatch(cb, XMX_DIV_UP(N, XMX_TN), XMX_DIV_UP(M, XMX_TM), 1);
 	VKOK(vkEndCommandBuffer(cb));
 
 	VkFenceCreateInfo fi = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };

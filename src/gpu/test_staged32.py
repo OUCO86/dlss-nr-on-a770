@@ -69,6 +69,11 @@ def main():
                 for small in (0, 1):
                     if rt.lib.xmx_staged32(small) != 0:
                         raise X.failure(rt.lib, "xmx_staged32")
+                    # Every M here is below 32, so the 32-row builds this file is
+                    # about are reached through the partial-row routing; ask for it
+                    # rather than depending on what the default happens to be.
+                    if rt.lib.xmx_staged_partial(1) != 0:
+                        raise X.failure(rt.lib, "xmx_staged_partial")
                     for mask in (0, 7):
                         rt.specialize(mask)
                         out = alloc(total + GUARD, dtype)

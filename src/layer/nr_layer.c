@@ -96,6 +96,19 @@ typedef pthread_mutex_t nr_mutex_t;
 #define MAX_SWAPCHAINS 8
 #define MAX_IMAGES 8
 
+/* How many frames may be on their way to the daemon at once. The depth asked for in the
+ * environment is clamped to this rather than trusted.
+ *
+ * Three used to fail, and for two reasons that were never the transport's real ceiling:
+ * the daemon's pipe allowed four instances in total, which three frames in flight plus
+ * the one listening used up exactly, so the listening one could not be made and the next
+ * frame found no pipe to open; and a connect that met an instance being closed came back
+ * with ERROR_NO_DATA, which the layer treated as a dead daemon instead of a pipe that is
+ * busy for a moment. Both are fixed where they are — the instance count in nr_daemon, the
+ * retry in nr_link_connect. This is now only a bound on the arrays and on how far behind
+ * the picture may fall. */
+#define NR_INFLIGHT_MAX 4
+
 /* Capture and writeback consume the game's waits once, complete on private
  * fences, then present with no remaining waits. Legacy NR_LAYER_SYNC values are
  * accepted for launcher compatibility; both use this single verified path. */
@@ -131,11 +144,14 @@ struct device_data {
 	int have_earlier;
 	unsigned char *outgoing;        /* colour followed by the mask, for one send */
 	VkDeviceSize outgoing_size;
-	/* NR_LAYER_ASYNC: the frame sent on the last processed present, whose answer is read
-	 * on the next one. Zero-initialised devices must not read fd 0 as a request. */
-	int inflight;
-	int inflight_fd;
-	VkDeviceSize inflight_size;
+	/* NR_LAYER_ASYNC: the frames sent on the last processed presents, whose answers are
+	 * read on the next ones, oldest first. How many are allowed to be on their way at
+	 * once is `async_depth`, and the queue is NR_INFLIGHT_MAX deep so a larger depth in
+	 * the environment cannot write past the arrays. Zero-initialised devices must not
+	 * read fd 0 as a request. */
+	int inflight_count;
+	int inflight_fd[NR_INFLIGHT_MAX];
+	VkDeviceSize inflight_size[NR_INFLIGHT_MAX];
 	PFN_vkGetDeviceProcAddr get_device_proc;
 	PFN_vkQueuePresentKHR present;
 	PFN_vkCreateSwapchainKHR create_swapchain;
@@ -165,6 +181,9 @@ static const char *capture_path;
 static long capture_every;
 static long live_every;
 static int async_live;
+/* How many frames process_frame_async lets out before it starts collecting answers:
+ * 1 is the original one behind, 2 lets the daemon's stages overlap across frames. */
+static int async_depth = 1;
 static const char *socket_path;
 static const char *trigger_path;
 static int ui_mask;
@@ -215,23 +234,39 @@ static int exchange(const void *header, size_t header_size, const void *payload,
 	return fd < 0 ? -1 : exchange_receive(fd, reply, reply_size);
 }
 
+/* Takes the oldest frame off the queue and returns its link, or leaves the queue alone. */
+static int take_inflight(struct device_data *data, VkDeviceSize *size)
+{
+	if (data->inflight_count <= 0) return -1;
+	int fd = data->inflight_fd[0];
+	*size = data->inflight_size[0];
+	for (int i = 1; i < data->inflight_count; i++) {
+		data->inflight_fd[i - 1] = data->inflight_fd[i];
+		data->inflight_size[i - 1] = data->inflight_size[i];
+	}
+	data->inflight_count--;
+	return fd;
+}
+
 /* An answer still on its way is read to the end and thrown away rather than cut off: the
  * daemon is single-file and would log a broken pipe for it, and the panel reads that log.
  * It costs at most one frame of the daemon's, and only when the effect is switched off,
- * the swapchain changes or the device goes. */
+ * the swapchain changes or the device goes. With two frames allowed out at once this can
+ * be two of the daemon's, which is still only on the way out. */
 static void drop_inflight(struct device_data *data)
 {
-	if (!data->inflight) return;
-	data->inflight = 0;
-	nr_link link = nr_link_from_handle(data->inflight_fd);
-	unsigned char sink[65536];
-	for (VkDeviceSize got = 0; got < data->inflight_size; ) {
-		size_t want = data->inflight_size - got < sizeof sink
-			      ? (size_t)(data->inflight_size - got) : sizeof sink;
-		if (nr_link_read(&link, sink, want) != 0) break;
-		got += want;
+	VkDeviceSize size = 0;
+	int fd;
+	while ((fd = take_inflight(data, &size)) >= 0) {
+		nr_link link = nr_link_from_handle(fd);
+		unsigned char sink[65536];
+		for (VkDeviceSize got = 0; got < size; ) {
+			size_t want = size - got < sizeof sink ? (size_t)(size - got) : sizeof sink;
+			if (nr_link_read(&link, sink, want) != 0) break;
+			got += want;
+		}
+		nr_link_close(&link);
 	}
-	nr_link_close(&link);
 }
 
 static struct device_data *find_device(VkDevice device)
@@ -767,10 +802,24 @@ VKAPI_ATTR VkResult VKAPI_CALL nr_CreateInstance(const VkInstanceCreateInfo *inf
 		live_every = live ? strtol(live, NULL, 10) : 0;
 		if (live_every < 0) live_every = 0;
 		const char *pipelined = getenv("NR_LAYER_ASYNC");
-		async_live = live_every > 0 && pipelined && strcmp(pipelined, "0") != 0;
+		/* A number is the depth, "2" being the one that lets the daemon overlap;
+		 * anything else that is not "0" keeps the single frame behind it, so the
+		 * words this used to accept still mean what they meant. */
+		async_depth = 0;
+		if (pipelined) {
+			long asked = strtol(pipelined, NULL, 10);
+			if (asked > 0)
+				async_depth = asked > NR_INFLIGHT_MAX ? NR_INFLIGHT_MAX : (int)asked;
+			else if (strcmp(pipelined, "0") != 0)
+				async_depth = 1;
+		}
+		if (live_every <= 0) async_depth = 0;
+		async_live = async_depth > 0;
 		if (async_live)
-			fprintf(stderr, "[nr_layer] async: each processed present shows the answer "
-				"for the one before it, and the daemon works while the game draws\n");
+			fprintf(stderr, "[nr_layer] async: %d frame%s on its way to the daemon at "
+				"once, so a processed present shows the answer that far back and the "
+				"daemon works while the game draws\n",
+				async_depth, async_depth == 1 ? "" : "s");
 		if (live_every > 0)
 			fprintf(stderr, "[nr_layer] live: every %ld%s present goes through the "
 				"network, the frames between hold the last result\n",
@@ -1284,12 +1333,21 @@ static int process_frame(struct device_data *data, struct swapchain_data *chain,
 	return 0;
 }
 
-/* NR_LAYER_ASYNC: the frame goes out and the answer for the one before it comes back, so
- * the daemon works while the game draws its next frame instead of the game waiting for the
- * daemon; what is on screen is one processed present behind. The old answer is read before
- * the new frame is sent. The other order deadlocks: an answer is larger than a socket's
- * buffer, and the daemon, which takes one connection at a time, cannot accept the new frame
- * until the old answer has been read. */
+/* NR_LAYER_ASYNC: the frame goes out and an answer comes back, so the daemon works while
+ * the game draws its next frame instead of the game waiting for the daemon; what is on
+ * screen is however many frames behind `async_depth` says.
+ *
+ * The old answer is read before the new frame is sent. The other order deadlocks: an
+ * answer is larger than a socket's buffer, and the daemon cannot take the new frame until
+ * the old answer has been read out of the one it is still writing.
+ *
+ * With a depth of two the answer read on a present is not the one for the frame before
+ * it but the one before that, and there are always two frames inside the daemon: while
+ * one is on the device the next is being decoded and the one before is being written
+ * back, which is the only way the device is ever asked for two things at once. The cost
+ * is the extra frame of lag, and it buys nothing unless the daemon is running its stages
+ * on separate threads (NR_DAEMON_PIPELINE=1): one after the other there, two frames out
+ * here is two frames waiting in line. */
 static int process_frame_async(struct device_data *data, struct swapchain_data *chain,
 			       VkQueue queue, uint32_t index)
 {
@@ -1299,22 +1357,41 @@ static int process_frame_async(struct device_data *data, struct swapchain_data *
 		return -1;
 	}
 	int answered = 0;
-	if (data->inflight && data->inflight_size == needed) {
-		data->inflight = 0;
-		answered = exchange_receive(data->inflight_fd, data->result, (size_t)needed) == 0;
+	/* Only collect once the queue is full. Until then the daemon is being filled, and
+	 * reading the answer that is furthest along would empty the pipe again. */
+	while (data->inflight_count >= async_depth) {
+		VkDeviceSize size = 0;
+		int fd = take_inflight(data, &size);
+		if (fd < 0) break;
+		if (size != needed) {
+			/* The extent changed under it: it fits nothing on screen now. */
+			nr_link link = nr_link_from_handle(fd);
+			unsigned char sink[65536];
+			for (VkDeviceSize got = 0; got < size; ) {
+				size_t want = size - got < sizeof sink
+					      ? (size_t)(size - got) : sizeof sink;
+				if (nr_link_read(&link, sink, want) != 0) break;
+				got += want;
+			}
+			nr_link_close(&link);
+			continue;
+		}
+		answered = exchange_receive(fd, data->result, (size_t)needed) == 0;
 		if (!answered)
 			fprintf(stderr, "[nr_layer] the daemon did not answer; frame unchanged\n");
-	} else {
-		drop_inflight(data);          /* the extent changed under it: it fits nothing */
+		break;
 	}
 	if (socket_path) {
 		uint32_t header[4] = { 0x304E524Eu, chain->extent.width, chain->extent.height,
 				       (uint32_t)chain->format };
 		int fd = exchange_send(header, sizeof header, data->mapped, (size_t)needed);
-		if (fd >= 0) {
-			data->inflight = 1;
-			data->inflight_fd = fd;
-			data->inflight_size = needed;
+		if (fd >= 0 && data->inflight_count < NR_INFLIGHT_MAX) {
+			data->inflight_fd[data->inflight_count] = fd;
+			data->inflight_size[data->inflight_count] = needed;
+			data->inflight_count++;
+		} else if (fd >= 0) {
+			nr_link link = nr_link_from_handle(fd);
+			nr_link_close(&link);   /* never happens: the queue drains every present */
 		}
 	}
 	if (!answered) return -1;

@@ -16,13 +16,20 @@
  *
  * The includer provides `stage` (the raw accumulator block, row-major, BN wide) and its
  * element type as `QKV_STAGE`, BM and BN, `qkv_barrier()`, and a push block with `n`, `c`,
- * `d`, `residual_cos`, `qkv_scale`, `image_h` and `image_w`. The operands, which have no other use in this mode:
+ * `d`, `residual_cos`, `qkv_scale`, `image_h` and `image_w`. The integer GEMM keeps the
+ * block as int32 and writes the dequantised float's bits back over it, so it also defines
+ * `QKV_READ(i)` — a float out of element `i` — which defaults to reading the block as it
+ * is. The operands, which have no other use in this mode:
  *   c    Q target        d    K target        residual_cos    V target
  *   qkv_scale   the query's per-head scale (float32)
  *   image_h     tokens per window             image_w         heads
  * Flag 0x2000 is the ViT's normalisation (`vit_reciprocal`), whose query takes half(sqrt(32))
  * and then its learned scale, two half multiplies (notes/opendlss-reference.md).
  */
+
+#ifndef QKV_READ
+#define QKV_READ(i) float(stage[i])
+#endif
 
 /* No shared memory of its own, and that is load-bearing. Workgroup shared memory is
  * allocated in powers of two on this hardware: the tiled block's `stage` is exactly 2 KB,
@@ -40,7 +47,7 @@ void qkv_epilogue(uint row, uint col, uint lane, uint lanes) {
         float scale = part == 0u ? half_round(FloatBuf(pc.qkv_scale).v[head]) : 1.0;
         for (uint r = lane; r < BM; r += lanes) {
             float h[32];
-            for (uint i = 0u; i < 32u; i++) h[i] = half_round(float(stage[r * BN + i]));
+            for (uint i = 0u; i < 32u; i++) h[i] = half_round(QKV_READ(r * BN + i));
             float reciprocal = vit ? vit_reciprocal(h) : cosine_reciprocal(h);
             for (uint i = 0u; i < 32u; i++) {
                 float value = hmul(h[i], reciprocal);
@@ -60,7 +67,7 @@ void qkv_epilogue(uint row, uint col, uint lane, uint lanes) {
         if (r >= pc.m) continue;                 // a partial last block's rows past M
         uint at = ((window * heads + head) * tokens + token) * 32u + e % BN;
         vec4 out4;
-        for (uint i = 0u; i < 4u; i++) out4[i] = e4m3(float(stage[e + i]));
+        for (uint i = 0u; i < 4u; i++) out4[i] = e4m3(QKV_READ(e + i));
         if (wide) {
             Half4Buf(target).v4[at >> 2] = f16vec4(out4);
         } else {

@@ -100,9 +100,9 @@ void main() {
     uint blocks = (rows + 63u) / 64u;                       // the tokens' 64-blocks too
     float total = 0.0;                                      // lane r < 8: row r's sum
     float column[8];                                        // and its block's columns
-    coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator> context[2];
-    for (uint j = 0u; j < 2u; j++)
-        context[j] = coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> context[4];
+    for (uint j = 0u; j < 4u; j++)
+        context[j] = coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0.0);
 
     for (uint block = 0u; block < blocks; block++) {
         uint first = block * 64u, keys = min(64u, rows - first);
@@ -124,16 +124,20 @@ void main() {
             /* Sixteen keys' logits in; the weights back in their place, two neighbours a
              * lane, for each row's lane to add in the tree's order, and the published
              * weights beside them as the PV's A. */
-            coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator> acc =
-                coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>(0.0);
+            coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> acc[2];
+            for (uint j = 0u; j < 2u; j++)
+                acc[j] = coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0.0);
             if (start < rows)
-                for (uint c = 0u; c < 2u; c++) {
-                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> key;
-                    coopMatLoad(key, h16, chunk * 16u * 32u + c * 16u, 32u,
-                                gl_CooperativeMatrixLayoutColumnMajor);
-                    acc = coopMatMulAdd(query[c], key, acc);
-                }
-            coopMatStore(acc, f32, scratch, 16u, gl_CooperativeMatrixLayoutRowMajor);
+                for (uint c = 0u; c < 2u; c++)
+                    for (uint j = 0u; j < 2u; j++) {
+                        coopmat<float16_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseB> key;
+                        coopMatLoad(key, h16, chunk * 16u * 32u + j * 8u * 32u + c * 16u, 32u,
+                                    gl_CooperativeMatrixLayoutColumnMajor);
+                        acc[j] = coopMatMulAdd(query[c], key, acc[j]);
+                    }
+            for (uint j = 0u; j < 2u; j++)
+                coopMatStore(acc[j], f32, scratch + j * 8u, 16u,
+                             gl_CooperativeMatrixLayoutRowMajor);
             subgroupMemoryBarrierShared();
             subgroupBarrier();
             for (uint t = 0u; t < 2u; t++) {
@@ -159,9 +163,9 @@ void main() {
             if (start < rows) {
                 coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseA> p;
                 coopMatLoad(p, h16, (scratch + 128u) * 2u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-                for (uint j = 0u; j < 2u; j++) {
-                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> v;
-                    coopMatLoad(v, h16, VALUES + chunk * 16u * 32u + j * 16u, 32u,
+                for (uint j = 0u; j < 4u; j++) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseB> v;
+                    coopMatLoad(v, h16, VALUES + chunk * 16u * 32u + j * 8u, 32u,
                                 gl_CooperativeMatrixLayoutRowMajor);
                     context[j] = coopMatMulAdd(p, v, context[j]);
                 }
@@ -186,8 +190,8 @@ void main() {
 
     /* The head merge's store, the value sum rounded to half times its row's reciprocal,
      * published: (rows, heads * 32), this head's 32 columns. */
-    for (uint j = 0u; j < 2u; j++)
-        coopMatStore(context[j], f32, scratch + j * 16u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+    for (uint j = 0u; j < 4u; j++)
+        coopMatStore(context[j], f32, scratch + j * 8u, 32u, gl_CooperativeMatrixLayoutRowMajor);
     subgroupMemoryBarrierShared();
     subgroupBarrier();
     uint channels = heads * 32u;

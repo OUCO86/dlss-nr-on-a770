@@ -28,7 +28,8 @@
 
 #include "publish.glsl"
 
-const uint TM = 8, TN = 16, TK = 16;
+/* A770 / Xe-HPG: fp16 cooperative matrix is 8x8x16 (config 0), not Xe2's 8x16x16. */
+const uint TM = 8, TN = 8, TK = 16;
 const uint WARPS = 4;
 /* STAGED_BK: the K step. 32 everywhere by default; the deep variant (gemm_staged_deep.spv)
  * takes a longer one for small-M, deep-K GEMMs, whose time is the number of trips round

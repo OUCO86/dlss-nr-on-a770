@@ -58,7 +58,13 @@ layout(push_constant, scalar) uniform Push {
 #include "specialize.glsl"
 #include "residual_epilogue.glsl"   /* needs operation_flags() from above */
 
-const uint TM = 8, TN = 16, TK = 16;
+/* A770 / Xe-HPG: fp16 cooperative matrix is 8x8x16 (config 0), not Xe2's 8x16x16.
+ *
+ * XMX_TN repeats the N extent as a macro because GLSL `const` is invisible to `#if`,
+ * and two blocks below — the QKV epilogue's definition and its call — are decided on
+ * the *block's* width, which is the preprocessor's TN * RN, not the const's. */
+#define XMX_TN 8
+const uint TM = 8, TN = XMX_TN, TK = 16;
 
 /* The accumulator's type. Config 1 (`fp16 x fp16 -> fp32`) is what this project has
  * always used and is 400-800x more accurate than the original; config 0
@@ -76,12 +82,31 @@ const uint TM = 8, TN = 16, TK = 16;
  * compiled twice: RM = RN = 1 for shapes whose extents are not a whole tile block, and
  * RM = 2, RN = 2 otherwise. Every K step then loads RM fragments of A and RN of B to
  * feed RM*RN multiply-accumulates, so the loads per unit of arithmetic fall by
- * RM*RN/(RM+RN) — from 0.5 to 1 — and the workgroup count falls fourfold with it. */
+ * RM*RN/(RM+RN) — from 0.5 to 1 — and the workgroup count falls fourfold with it.
+ *
+ * RN on Xe-HPG is set by what the epilogues need a workgroup to see, not by the
+ * block Xe2 happened to have. Two of them read the whole block at once:
+ *
+ *   - the compact head (0x10000) is restricted to N = 16, ldc = 4, and writes
+ *     `stage[(e / 4) * BN + e % 4]` — a workgroup has to hold all sixteen columns
+ *     before it can keep four. With TN = 8 that needs RN = 2, so the plain build
+ *     is RN = 2 here where Xe2's TN = 16 let it be RN = 1.
+ *   - the QKV epilogue (0x100000) normalises a head inside one workgroup and so
+ *     needs a block 32 wide, which is RN = 4 here and was RN = 2 on Xe2.
+ *
+ * Both are the model's geometry — a head is 32 channels, the compact head's
+ * output is 4 — so they are the same requirement on any part. Only the RN that
+ * satisfies them changes. Verified rather than assumed: building the plain
+ * kernel with RN = 1 leaves the compact head's second workgroup overwriting the
+ * first's four columns with columns 8-11, and test_joint_qkv.py fails on it.
+ *
+ * The register cost is the same either way: eight 8x8 fp32 accumulators are the
+ * 16 GRF that four 8x16 ones were (notes/phase26-the-register-ceiling.md). */
 #ifndef RM
 #define RM 1
 #endif
 #ifndef RN
-#define RN 1
+#define RN 2          /* the compact head's sixteen columns, see above */
 #endif
 const uint BM = TM * RM, BN = TN * RN;
 
@@ -94,8 +119,10 @@ const uint BM = TM * RM, BN = TN * RN;
 shared ACC stage[BM * BN];
 
 /* The QKV projection's epilogue needs a column block of exactly one head, 32 wide, so it
- * exists in the register-tiled build only; libxmx never routes it anywhere else. */
-#if RN == 2
+ * exists in the register-tiled build only; libxmx never routes it anywhere else.
+ * Tested on the block rather than on RN: Xe-HPG reaches BN = 32 with RN = 4, where Xe2
+ * reached it with RN = 2, and the requirement is the width, not the tile count. */
+#if XMX_TN * RN == 32
 void qkv_barrier() { subgroupMemoryBarrierShared(); subgroupBarrier(); }
 #define QKV_STAGE ACC
 #include "cosine_tree.glsl"
@@ -165,7 +192,7 @@ void main() {
      * through shared memory and every element is finished on its own. Bits 0x20000
      * (residual), 0x40000 (half skip) and 0x80000 (window layout) are clear of
      * compact_head's 0x10000. */
-#if RN == 2
+#if XMX_TN * RN == 32
     /* Bit 0x100000: Q and K normalised and V published here, straight into the three
      * (window, head, token, 32) targets (qkv_epilogue.glsl). */
     if ((operation_flags() & 0x100000u) != 0u) {

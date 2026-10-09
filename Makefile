@@ -9,13 +9,16 @@ CFLAGS  := -O2 -fPIC -Wall -Wextra -Wno-unused-parameter -Iwork/vulkan-headers/i
 # each is a call into libgcc, and a frame was 5-13 % slower. On Lunar Lake v3 is as fast as
 # -march=native and byte-identical. CMakeLists.txt uses the same floor (build_check.py).
 NR_IMAGE_ARCH ?= -march=x86-64-v3
-SHADERS := work/gemm_resident.spv work/gemm_tiled.spv work/gemm_staged.spv \
+SHADERS := work/gemm_resident.spv work/gemm_tiled.spv work/gemm_tiled32.spv \
+           work/gemm_tiled8.spv \
+           work/gemm_staged.spv \
            work/gemm_staged32.spv work/gemm_staged32_deep.spv work/attention_rows.spv \
            work/resident.spv work/attention.spv \
            work/history.spv work/gemm_coopmat.spv work/gemm_batched.spv \
            work/gemm_f16acc.spv work/gemm_coopmat_int8.spv work/gemm_staged_int8.spv \
+           work/gemm_staged_int8_fused.spv \
            work/window_attention.spv work/window_block.spv work/global_attention.spv \
-           work/ffn_fused.spv
+           work/ffn_fused.spv work/quantize_row.spv
 
 # half_probe.spv is built by `all` because the daemon needs it: check_half_rounding()
 # runs it at start-up and refuses to run the graph if the driver's float16 conversion is
@@ -89,9 +92,20 @@ GEMM_GLSL := src/gpu/publish.glsl src/gpu/specialize.glsl src/gpu/residual_epilo
              src/gpu/cosine_tree.glsl src/gpu/qkv_epilogue.glsl
 work/gemm_resident.spv: src/gpu/gemm_resident.comp $(GEMM_GLSL)
 	$(GLSL) -o $@ $<
-# the same source, with a 16x32 block of the output held in one subgroup's registers
+# the same source, with a block of the output held in one subgroup's registers.
+# RN is 4, not Xe2's 2: the block is TM*RM x TN*RN and TN is 8 on Xe-HPG, so it takes
+# four tiles to reach the 32 columns the QKV epilogue needs (xmx_shape.h).
 work/gemm_tiled.spv: src/gpu/gemm_resident.comp $(GEMM_GLSL) Makefile
-	$(GLSL) -DRM=2 -DRN=2 -o $@ $<
+	$(GLSL) -DRM=2 -DRN=4 -o $@ $<
+# and the 32x32 build: quicker where the shape is a whole block of it, which not every
+# live shape is, so it is a second pipeline rather than a replacement (libxmx routes).
+work/gemm_tiled32.spv: src/gpu/gemm_resident.comp $(GEMM_GLSL) Makefile
+	$(GLSL) -DRM=4 -DRN=4 -o $@ $<
+# and the 8x32 build: half the 16x32's rows, twice the workgroups. Measured slower
+# over a whole frame (47.2 against 44.0 ms), so it ships as a build the routing can
+# take with XMX_TILED8=1 rather than as the default.
+work/gemm_tiled8.spv: src/gpu/gemm_resident.comp $(GEMM_GLSL) Makefile
+	$(GLSL) -DRM=1 -DRN=4 -o $@ $<
 work/gemm_staged.spv: src/gpu/gemm_staged.comp $(GEMM_GLSL)
 	$(GLSL) -o $@ $<
 # 32-row blocks for a bottleneck of 32 tokens or fewer, with a 32- and a 64-deep K step
@@ -118,6 +132,12 @@ work/history.spv: src/gpu/history.comp
 work/gemm_coopmat_int8.spv: src/gpu/gemm_coopmat_int8.comp
 	$(GLSL) -o $@ $<
 work/gemm_staged_int8.spv: src/gpu/gemm_staged_int8.comp
+	$(GLSL) -o $@ $<
+# The same kernel quantising its own activations, so there is no quantise pass to run.
+work/gemm_staged_int8_fused.spv: src/gpu/gemm_staged_int8_fused.comp
+	$(GLSL) -o $@ $<
+# The integer path's other half: the activations onto its grid, one scale per row.
+work/quantize_row.spv: src/gpu/quantize_row.comp
 	$(GLSL) -o $@ $<
 work/window_block.spv: src/gpu/window_block.comp src/gpu/publish.glsl src/gpu/specialize.glsl \
                        src/gpu/cosine_tree.glsl
@@ -174,6 +194,7 @@ test: all work/attention_ab.spv work/test_exchange work/test_settled work/test_p
 	python3 src/bench/frame_profile.py --tables
 	python3 src/gpu/test_gemm_int8.py
 	python3 src/gpu/test_gemm_int8_staged.py
+	python3 src/gpu/test_quantize_row.py
 	python3 src/gpu/test_window_block.py
 	python3 src/gpu/test_global_attention.py
 	python3 src/gpu/test_int8_quant.py

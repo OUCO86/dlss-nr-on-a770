@@ -34,7 +34,8 @@ LIBRARIES = ("libxmx.dll", "libnr_image.dll", "libnr_alloc.dll")
 SHADERS = frozenset((
     "attention.spv", "attention_rows.spv", "ffn_fused.spv", "gemm_batched.spv",
     "gemm_coopmat.spv", "gemm_resident.spv", "gemm_staged.spv", "gemm_staged32.spv",
-    "gemm_staged32_deep.spv", "gemm_staged_int8.spv", "gemm_tiled.spv",
+    "gemm_staged32_deep.spv", "gemm_staged_int8.spv", "gemm_staged_int8_fused.spv", "gemm_tiled.spv",
+    "gemm_tiled32.spv",
     "global_attention.spv", "half_probe.spv", "history.spv", "resident.spv",
     "window_attention.spv", "window_block.spv",
 ))

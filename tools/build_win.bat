@@ -83,7 +83,8 @@ call :shader gemm_coopmat_batched
 call :shader gemm_coopmat_f16acc
 call :shader_def gemm_batched gemm_coopmat_batched ""
 call :shader_def gemm_f16acc  gemm_coopmat_f16acc  ""
-call :shader_def gemm_tiled   gemm_resident        "-DRM=2 -DRN=2"
+call :shader_def gemm_tiled   gemm_resident        "-DRM=2 -DRN=4"
+call :shader_def gemm_tiled32 gemm_resident        "-DRM=4 -DRN=4"
 call :shader_def gemm_staged32      gemm_staged "-DSTAGED_BM=32"
 call :shader_def gemm_staged32_deep gemm_staged "-DSTAGED_BM=32" "-DSTAGED_BK=64"
 call :shader_def attention_rows     attention   "-DROW_LANES=256"

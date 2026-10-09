@@ -36,7 +36,8 @@ layout(binding = 2) writeonly buffer Cbuf { int32_t C[]; };
 
 layout(push_constant) uniform Push { uint M, N, K; } pc;
 
-const uint TM = 8, TN = 16, TK = 32;
+/* A770 / Xe-HPG: int8 cooperative matrix is 8x8x32 (configs 1,2), not Xe2's 8x16x32. */
+const uint TM = 8, TN = 8, TK = 32;
 
 void main() {
     uint row = gl_WorkGroupID.y * TM;

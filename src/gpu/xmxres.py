@@ -101,6 +101,10 @@ def _load():
             ("xmx_staged32_calls", []),
             ("xmx_staged32_init", [ctypes.c_char_p, ctypes.c_char_p]),
             ("xmx_rows_init", [ctypes.c_char_p]),
+            ("xmx_tiled32_init", [ctypes.c_char_p]),
+            ("xmx_tiled8_init", [ctypes.c_char_p]),
+            ("xmx_tiled32", [ctypes.c_uint]),
+            ("xmx_tiled32_calls", []),
             ("xmx_specialized_count", []),
             ("xmx_specialization", []),
             ("xmx_graph_capture", []),
@@ -126,6 +130,10 @@ def _load():
             ("xmx_rec_global_attention", [ctypes.c_int] * 4 + [ctypes.c_uint] * 3),
             ("xmx_int8_init", [ctypes.c_char_p]),
             ("xmx_rec_gemm_int8", [ctypes.c_int] * 5 + [ctypes.c_uint] * 4),
+            ("xmx_int8_fused_init", [ctypes.c_char_p]),
+            ("xmx_rec_gemm_int8_fused", [ctypes.c_int] * 5 + [ctypes.c_uint] * 4),
+            ("xmx_quant_init", [ctypes.c_char_p]),
+            ("xmx_rec_quant", [ctypes.c_int] * 3 + [ctypes.c_uint] * 2),
             ("xmx_rec_unary2", [ctypes.c_uint] + [ctypes.c_int] * 5
              + [ctypes.c_uint, ctypes.c_uint, ctypes.c_float] + [ctypes.c_uint] * 5),
             ("xmx_rec_window_attention", [ctypes.c_int] * 5 + [ctypes.c_uint] * 3),
@@ -139,6 +147,13 @@ def _load():
             ("xmx_device_lost", [])):
         getattr(lib, name).argtypes = args
         getattr(lib, name).restype = ctypes.c_int
+    # The integer QKV projection's recorder is newer than the native build the daemon holds
+    # open, and `NR_LIBXMX` exists to let one tree run against either. Where it is missing
+    # the switch that would call it stays off (`Runtime.int8_qkv`) rather than every
+    # runtime in the tree failing to load.
+    if hasattr(lib, "xmx_rec_gemm_int8_qkv"):
+        lib.xmx_rec_gemm_int8_qkv.argtypes = [ctypes.c_int] * 8 + [ctypes.c_uint] * 5
+        lib.xmx_rec_gemm_int8_qkv.restype = ctypes.c_int
     lib.xmx_buf_ptr.argtypes = [ctypes.c_int]
     lib.xmx_buf_ptr.restype = ctypes.c_void_p
     lib.xmx_buf_bytes.argtypes = [ctypes.c_int]
@@ -176,6 +191,15 @@ def _load():
     rows = os.environ.get("XMX_ROWS_SPV") or str(ROOT / "work" / "attention_rows.spv")
     if lib.xmx_rows_init(rows.encode()) != 0:
         raise failure(lib, "xmx_rows_init")
+    # The 32x32 register block, alongside the 16x32 one res_init loaded. Optional by
+    # design: a tree built without it routes every shape to the 16x32 kernel and runs
+    # exactly as it did, so an older shader set is not a hard failure here.
+    wide = os.environ.get("XMX_TILED32_SPV") or str(ROOT / "work" / "gemm_tiled32.spv")
+    if pathlib.Path(wide).exists() and lib.xmx_tiled32_init(wide.encode()) != 0:
+        raise failure(lib, "xmx_tiled32_init")
+    short = os.environ.get("XMX_TILED8_SPV") or str(ROOT / "work" / "gemm_tiled8.spv")
+    if pathlib.Path(short).exists() and lib.xmx_tiled8_init(short.encode()) != 0:
+        raise failure(lib, "xmx_tiled8_init")
     _lib = lib
     return lib
 
@@ -627,6 +651,20 @@ class Runtime:
         self.fuse_head = os.environ.get("NR_FUSE_HEAD", "1") != "0"
         # A bottleneck block's QK^T, softmax, PV and head merge in one pass, no score stored.
         self.fuse_global_attention = os.environ.get("NR_FUSE_GLOBAL_ATTENTION", "1") != "0"
+        # The projections on the integer path: the activations quantised per row, the
+        # weights once at load, the residual as its own pass because the integer kernel
+        # has no epilogue. Off until its accuracy bill is paid for at this extent.
+        self.int8_project = os.environ.get("NR_INT8_PROJECT", "0") != "0"
+        # The QKV projection on the integer path as well: 120 of a frame's GEMMs, 6.5 ms of
+        # its 43 at 768x448 (`work/qkv_frame_probe.py`), the largest single group left, and
+        # 1.9 ms of that back for 2.8 points of the network's own effect — a better trade
+        # than the window blocks' down and out projections already make at +4.25 points for
+        # 2.6 ms. Measured in notes/improve-int8-a770.md; `NR_INT8_QKV=0` takes it back.
+        # Like the rest of the integer path's switches, it only means anything where that
+        # path is on at all: `NR_INT8_PROJECT=0` leaves every projection on the float one,
+        # QKV's included, and off outright on a native build that predates the kernel.
+        self.int8_qkv = (self.int8_project and os.environ.get("NR_INT8_QKV", "1") != "0"
+                         and hasattr(self.lib, "xmx_rec_gemm_int8_qkv"))
 
     def graph_key(self):
         return (self.lib.xmx_specialization() | (int(self.fuse_qk) << 3)
@@ -650,7 +688,8 @@ class Runtime:
                 | (int(self.fuse_pool) << 20)
                 | (int(self.fuse_window_block) << 21)
                 | (int(self.fuse_head) << 22)
-                | (int(self.fuse_global_attention) << 23))
+                | (int(self.fuse_global_attention) << 23)
+                | (int(self.int8_project) << 24) | (int(self.int8_qkv) << 25))
 
     def scratch_key(self):
         """What decides which scratch a frame's recording touches: the switches, not the
@@ -894,15 +933,20 @@ class Runtime:
         self.recorded += 1
         return self
 
-    def gemm_int8(self, a, b, c, a_scale, b_scale, rows, cols, inner):
+    def gemm_int8(self, a, b, c, a_scale, b_scale, rows, cols, inner, *,
+                  epilogue=0, narrow=False):
         """C = (A @ B^T) * a_scale[row] * b_scale[column] on the integer path.
 
         `a` is int8 rows x inner, `b` the weights transposed, int8 cols x inner, the scales
-        float32 (`int8_quant.quantise`), `c` float32 (gemm_staged_int8.comp).
+        float32 (`int8_quant.quantise`), `c` float32 — or float16 when `narrow`, which is
+        how the expansion takes it: the gate epilogue and the publish happen in the
+        kernel's write-back, so the quadratic gate needs no pass of its own
+        (gemm_staged_int8.comp).
         """
         if rows <= 0 or cols <= 0 or cols % 32 or inner <= 0 or inner % 64:
             raise ValueError("the integer GEMM needs cols a multiple of 32 and inner of 64")
-        for buf, needed in ((a, rows * inner), (b, cols * inner), (c, rows * cols * 4),
+        for buf, needed in ((a, rows * inner), (b, cols * inner),
+                            (c, rows * cols * (2 if narrow else 4)),
                             (a_scale, rows * 4), (b_scale, cols * 4)):
             if buf.nbytes < needed:
                 raise ValueError("integer GEMM buffer is too small")
@@ -910,8 +954,98 @@ class Runtime:
         if self.lib.xmx_int8_init(path.encode()) != 0:
             raise RuntimeError("integer GEMM pipeline: " + self.lib.xmx_error().decode())
         if self.lib.xmx_rec_gemm_int8(a.id, b.id, c.id, a_scale.id, b_scale.id,
-                                      rows, cols, inner, 0) != 0:
+                                      rows, cols, inner, _publish(epilogue, narrow)) != 0:
             raise RuntimeError("xmx_rec_gemm_int8: " + self.lib.xmx_error().decode())
+        self.recorded += 1
+        return self
+
+    def gemm_int8_qkv(self, a, b, q, k, v, a_scale, b_scale, qkv_scale,
+                      rows, channels, heads, tokens, *, vit=False):
+        """The QKV projection on the integer path, finished in its own epilogue.
+
+        The same three outputs as `gemm_qkv` — Q and K cosine-normalised, V published, all
+        as E4M3 halves in (window, head, token, 32) order — from int8 operands: `a` is
+        int8 rows x channels, `b` the quantised projection, int8 3*channels x channels,
+        and the two scale vectors are the ones `int8_quant.quantise` and `quantize_row`
+        compute, one per row of A and one per column of B. The weight's scale is per
+        column as it is everywhere else on this path: it leaves a head's direction off by
+        at most half a degree against the half product, where one scale per head of 32
+        would leave it off by twice as much (`work/qkv_scale_spread.py`).
+
+        There is no window-gathering variant: the rows must already be in window order, so
+        a window block's projection partitions first, as it did before the epilogue folded
+        the gather into the float kernel.
+        """
+        if (min(rows, channels, heads, tokens) <= 0 or channels != heads * 32
+                or rows % tokens or channels % 64):
+            raise ValueError("the integer QKV projection needs channels a multiple of 64, "
+                             "32 a head and whole windows")
+        if len({q.id, k.id, v.id}) != 3 or {q.id, k.id, v.id} & {a.id, b.id, a_scale.id,
+                                                                 b_scale.id, qkv_scale.id}:
+            raise ValueError("QKV targets must be distinct from each other and the inputs")
+        for buf, needed in ((a, rows * channels), (b, 3 * channels * channels),
+                            (q, rows * channels * 2), (k, rows * channels * 2),
+                            (v, rows * channels * 2), (a_scale, rows * 4),
+                            (b_scale, 3 * channels * 4), (qkv_scale, heads * 4)):
+            if buf.nbytes < needed:
+                raise ValueError("integer QKV projection buffer is too small")
+        path = os.environ.get("XMX_INT8_SPV") or str(ROOT / "work" / "gemm_staged_int8.spv")
+        if self.lib.xmx_int8_init(path.encode()) != 0:
+            raise RuntimeError("integer GEMM pipeline: " + self.lib.xmx_error().decode())
+        if self.lib.xmx_rec_gemm_int8_qkv(a.id, b.id, q.id, k.id, v.id, a_scale.id,
+                                          b_scale.id, qkv_scale.id, rows, channels, heads,
+                                          tokens, 0x2000 if vit else 0) != 0:
+            raise RuntimeError("xmx_rec_gemm_int8_qkv: " + self.lib.xmx_error().decode())
+        self.recorded += 1
+        return self
+
+    def gemm_int8_fused(self, a, b, c, a_scale, b_scale, rows, cols, inner):
+        """C = (A @ B^T) * a_scale[row] * b_scale[column], quantising A as it is loaded.
+
+        The same product as `gemm_int8`, from the same scales, but `a` is float16 and
+        goes onto the integer grid inside the kernel: there is no packed int8 copy of the
+        activations to write and then read back, which is what `quantize_row` spends most
+        of its time doing. `a_scale` is the row scale `quantize_row` computes — one per
+        row, unchanged — so the two kernels agree, and this one is a drop-in for the pair
+        of them (gemm_staged_int8_fused.comp).
+        """
+        if rows <= 0 or cols <= 0 or cols % 32 or inner <= 0 or inner % 64:
+            raise ValueError("the integer GEMM needs cols a multiple of 32 and inner of 64")
+        for buf, needed in ((a, rows * inner * 2), (b, cols * inner), (c, rows * cols * 4),
+                            (a_scale, rows * 4), (b_scale, cols * 4)):
+            if buf.nbytes < needed:
+                raise ValueError("integer GEMM buffer is too small")
+        path = os.environ.get("XMX_INT8_FUSED_SPV") or str(
+            ROOT / "work" / "gemm_staged_int8_fused.spv")
+        if self.lib.xmx_int8_fused_init(path.encode()) != 0:
+            raise RuntimeError("fused integer GEMM pipeline: " + self.lib.xmx_error().decode())
+        if self.lib.xmx_rec_gemm_int8_fused(a.id, b.id, c.id, a_scale.id, b_scale.id,
+                                            rows, cols, inner, 0) != 0:
+            raise RuntimeError("xmx_rec_gemm_int8_fused: " + self.lib.xmx_error().decode())
+        self.recorded += 1
+        return self
+
+    def quantize_row(self, source, packed, scale, rows, inner):
+        """packed = roundEven(source / s), one s per row, s = max|row| / 127.
+
+        The integer path's other half: configuration 4 takes `sint8 x sint8`, so the
+        activations go on its grid too, and a grid per row rather than per tensor is what
+        keeps that from rounding a fifth of a level's values away
+        (`notes/phase23-integer-weights.md`). `source` float16 rows x inner, `packed`
+        int8 rows x inner, `scale` float32 rows (quantize_row.comp). Matches
+        `int8_quant.quantise(a, axis=1)` on the host, rounding included.
+        """
+        if rows <= 0 or inner <= 0 or inner % 16:
+            raise ValueError("the quantiser needs a positive extent and inner a multiple of 16")
+        for buf, needed in ((source, rows * inner * 2), (packed, rows * inner),
+                            (scale, rows * 4)):
+            if buf.nbytes < needed:
+                raise ValueError("quantiser buffer is too small")
+        path = os.environ.get("XMX_QUANT_SPV") or str(ROOT / "work" / "quantize_row.spv")
+        if self.lib.xmx_quant_init(path.encode()) != 0:
+            raise RuntimeError("quantiser pipeline: " + self.lib.xmx_error().decode())
+        if self.lib.xmx_rec_quant(source.id, packed.id, scale.id, rows, inner) != 0:
+            raise RuntimeError("xmx_rec_quant: " + self.lib.xmx_error().decode())
         self.recorded += 1
         return self
 

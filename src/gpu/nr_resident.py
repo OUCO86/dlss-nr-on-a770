@@ -14,6 +14,7 @@ concatenation, no strided elementwise kernel.
 """
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
 
@@ -23,8 +24,37 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "ref"))
 
+import int8_quant  # noqa: E402
 import nr_model  # noqa: E402
 import xmxres  # noqa: E402
+
+
+def quantise_weight(runtime, array):
+    """A weight matrix on the integer path, or None if the shape will not go.
+
+    `array` is (K, N), the layout the recovered weights are in. The kernel wants B as
+    (N, K), because it loads a B fragment by column (`gemm_staged_int8.comp`), and it
+    scales after the accumulator, so a scale per output channel costs nothing
+    (`src/gpu/int8_quant.py`). Quantised once, here, because weights do not change
+    between frames.
+    """
+    inner, cols = array.shape
+    if cols % 32 or inner % 64:
+        return None
+    packed, scale = int8_quant.quantise(array, 0)
+    return (runtime.buffer_from(np.ascontiguousarray(packed.T), np.int8),
+            runtime.buffer_from(scale, np.float32))
+
+
+def integer_pair(w, s):
+    """A block's quantised down projection with this scratch's row grid, or None.
+
+    The four things `record_project_residual`'s integer branch wants. `None` is a block
+    that has no integer copy — one the switch is off for, or one whose weight failed the
+    tile gate — and sends the call down the float path unchanged.
+    """
+    pair = getattr(w, "int8_ffn", None)
+    return None if pair is None else (pair[0], pair[1], s.aq, s.ascale)
 
 
 class SplitBlockWeights:
@@ -54,6 +84,20 @@ class SplitBlockWeights:
         self.attn_cos = runtime.buffer_from(weights[f"block{index}.layer3.attn_cos_skip"])
         self.branched = False
         self.split = True
+        # the split family's down projection is `weight3`; its out projection is the
+        # window attention's, as any window block's is (`work/int8_levels.py`: the levels
+        # these live on tolerate a per-row int8 grid as well as the bottleneck does)
+        self.int8_ffn = self.int8_out = None
+        if runtime.int8_project:
+            if os.environ.get("NR_INT8_WINDOW", "1") != "0":
+                self.int8_ffn = quantise_weight(runtime,
+                                                weights[f"block{index}.layer1.weight3"])
+            if os.environ.get("NR_INT8_WINDOW_OUT", "1") != "0":
+                self.int8_out = quantise_weight(runtime, self.projection)
+        # the projection the integer path could not take at all until its epilogue could
+        # be carried: Q, K and V, whose Q and K are normalised after the scales land
+        self.int8_qkv = (quantise_weight(runtime, weights[f"block{index}.layer2.qkv_weight"])
+                         if runtime.int8_qkv else None)
 
 
 class BlockWeights:
@@ -95,6 +139,32 @@ class BlockWeights:
             self.branch = take("weight2")
             self.ffn_out = None
 
+        # The integer path's copies, made once. Two projections can take it: the
+        # feed-forward's down — `ffn_out` where the block is branched, `weight2` where it
+        # is not — and the attention's out. Neither the expansion, whose epilogue is the
+        # quadratic gate and the integer kernel has none, nor the QKV projection, which
+        # has no integer kernel at all. `quantise_weight` returns None for a shape the
+        # (N % 32, K % 64) tile will not carry, which is every 32-channel block's out
+        # projection and nothing else in this graph (`work/int8_gate.py`).
+        # Both follow `NR_INT8_PROJECT` now, and `NR_INT8_WINDOW=0` or
+        # `NR_INT8_WINDOW_OUT=0` takes one of them back. They were off while the out
+        # projection's residual was being given the window row count instead of the
+        # image's, which cost the device; `record_project_residual` derives the count
+        # from `reverse` and it no longer does. What they are worth together, and what
+        # they cost, is measured in `work/int8_frame_cost.py` and `work/int8_quality.py`:
+        # 2.6 ms of a 46 ms frame, and the frame's own error against the float path
+        # from 10.1 % of the network's effect to 14.5 %.
+        self.int8_ffn = self.int8_out = None
+        if runtime.int8_project:
+            if os.environ.get("NR_INT8_WINDOW", "1") != "0":
+                self.int8_ffn = quantise_weight(
+                    runtime, weights[f"{prefix}.ffn_output_projection_weight"
+                                     if self.branched else f"{prefix}.weight2"])
+            if os.environ.get("NR_INT8_WINDOW_OUT", "1") != "0":
+                self.int8_out = quantise_weight(runtime, self.projection)
+        self.int8_qkv = (quantise_weight(runtime, weights[f"{prefix}.qkv_weight"])
+                         if runtime.int8_qkv else None)
+
 
 class GlobalBlockWeights:
     """A bottleneck block (31-38): every token attends to every other, 32 heads, C=1024."""
@@ -113,6 +183,28 @@ class GlobalBlockWeights:
         self.scale = runtime.buffer_from(weights[f"block{index}.layer2.attn_scale"])
         self.out = runtime.buffer_from(self.projection, np.float16)
         self.attn_cos = runtime.buffer_from(weights[f"block{index}.layer4.attn_cos_skip"])
+        # The three projections the integer path can take: the feed-forward's expansion and
+        # down, and the attention's out. The expansion used to be excluded because its
+        # epilogue is the quadratic gate and the integer kernel had none, so it would have
+        # paid a whole pass to publish; gemm_staged_int8 now applies the publish in its
+        # write-back, so it takes the gate like any other.
+        #
+        # Measured on the frame the network actually runs (`work/int8_quality.py`,
+        # the capture at 768x448): 43.70 ms -> 43.12 ms on `work/int8_frame_cost.py
+        # 768 448`, three alternating runs, every "on" run under every "off" one; and
+        # the picture 0.7512 -> 0.7423 of 255 against the float path, 14.52 % ->
+        # 14.35 % of the network's own effect. It is faster and slightly cleaner, and
+        # `NR_INT8_EXPAND=0` takes it back.
+        self.int8_ffn = self.int8_out = self.int8_expand = None
+        if runtime.int8_project:
+            self.int8_ffn = quantise_weight(runtime, weights[f"block{index}.layer1.weight"])
+            if os.environ.get("NR_INT8_OUT", "1") != "0":
+                self.int8_out = quantise_weight(runtime, self.projection)
+            if os.environ.get("NR_INT8_EXPAND", "1") != "0":
+                self.int8_expand = quantise_weight(
+                    runtime, weights[f"block{index}.layer0.weight"])
+        self.int8_qkv = (quantise_weight(runtime, weights[f"block{index}.layer2.qkv_weight"])
+                         if runtime.int8_qkv else None)
 
 
 class GlobalScratch:
@@ -163,6 +255,10 @@ class GlobalScratch:
         self.context16 = make("context16", padded * channels, np.float16)
         self.attention = make("attention", padded * channels)
         self.out = make("global.out", padded * channels)
+        # The integer path's operands: the activations on a grid a row, one pass per
+        # GEMM, and the row's scale beside it. Sized for the deepest K any of them has.
+        self.aq = make("global.aq", padded * max(hidden, channels), np.int8)
+        self.ascale = make("global.ascale", padded)
 
     def free(self):
         for name in dir(self):
@@ -219,8 +315,27 @@ def record_qkv_projection(runtime, a, w, s, windows, tokens, channels, heads, *,
     live, so the partition is recorded here as it always was. `publish_image` says the
     projection reads the image published — a 32-channel block's raw feed-forward output.
     `vit`: the ViT's normalisation and query scale, wherever Q and K are made.
+
+    On the integer path (`runtime.int8_qkv`, `NR_INT8_QKV`) the same epilogue runs on
+    `gemm_staged_int8`, which has no window gather: a window block partitions first, as it
+    did before the gather was folded into the float GEMM, and then quantises the partition
+    a row at a time. Two passes the float path does not pay, against a product whose K
+    loop covers twice the depth per multiply-add.
     """
     rows = windows * tokens
+    qkv8 = getattr(w, "int8_qkv", None)
+    if runtime.int8_qkv and qkv8 is not None and channels % 64 == 0:
+        weight8, column_scale = qkv8
+        if window is not None:
+            height, width, origin = window
+            runtime.partition(a, s.win16, height, width, channels, origin=origin,
+                              narrow=True, a_half=image_half,
+                              epilogue=xmxres.EPI_E4M3 if publish_image else 0)
+            a = s.win16
+        runtime.quantize_row(a, s.aq, s.ascale, rows, channels)
+        runtime.gemm_int8_qkv(s.aq, weight8, s.q16, s.key16, s.v16, s.ascale, column_scale,
+                              w.scale, rows, channels, heads, tokens, vit=vit)
+        return s.key16
     if window is not None:
         if runtime.qkv_epilogue and rows % 64 == 0:
             runtime.gemm_qkv(a, w.qkv, s.q16, s.key16, s.v16, w.scale, rows, channels, heads,
@@ -245,21 +360,67 @@ def record_qkv_projection(runtime, a, w, s, windows, tokens, channels, heads, *,
 
 def record_project_residual(runtime, a, weight, branch, skip, cosine, target,
                             rows, channels, inner, *, epilogue=0, skip_half=False,
-                            narrow=False):
+                            narrow=False, integer=None, reverse=None):
     """A projection and its residual: `target = a @ weight + skip * cosine`.
 
     Fused, the residual is the GEMM's own epilogue and the float32 branch never goes
     to memory (ProjectsCodex's phase38, `notes/improve-fusions.md`). Unfused it is the
     two passes this graph always had, kept for paired comparison and as the reference
     the fused path is bit-identical to. `NR_FUSE_RESIDUAL=0` selects them.
+
+    `integer` is `(weight8, column_scale, packed, row_scale)` — the weight quantised
+    per output channel and the activation's row grid — and takes the third path: the
+    kernel has no epilogue, so the residual is a pass of its own after it, and there
+    is one more pass than there was. What that buys is the instruction, not the bytes:
+    configuration 4 covers twice the K of the float one per multiply-add, and these
+    are the passes that wait on their K loop (`notes/improve-int8-a770.md`).
+
+    That is also why it is not offered everywhere, and where the line falls has moved
+    once. The row grid is a pass over M x K that reads two bytes a value and writes one,
+    and while that pass cost ten times the GEMM it feeds it cost more than the GEMM
+    saved on any shape where the GEMM was waiting on memory rather than on its K loop:
+    on the frame's own shapes (`work/int8_ab.py`) `21504 x 32 x 128` paid 4.1x and
+    `384 x 64 x 256` paid 0.72x, and the line was drawn at M at or under 1536 with K at
+    or above 256.
+
+    Then `quantize_row` was rewritten — a warp per row, whole words per thread, the row
+    maximum four shuffles instead of a shared-memory tree behind eight barriers — and
+    the pass went from 189 us to about 9 us on `21504 x 128 x 64`, twenty-one times
+    quicker for the same bytes (`notes/improve-int8-a770.md`). Measured again on every
+    shape the frame asks for (`work/int8_cover.py`) the integer path now wins on
+    twenty-four of thirty-six, including every one of the large-M shapes the old line
+    excluded, and loses on one: `384 x 256 x 64`, by 12 %. The line is that shape.
+
+    `reverse=(height, width, window, origin)` is the window blocks' out projection: its
+    skip is the image in image order and the residual gathers its window rows out of it,
+    which is the residual's own gather and costs nothing extra on either path.
     """
+    if integer is not None and rows <= 512 and inner <= 64:
+        integer = None
+    # The residual's own length. Without `reverse` it is the projection's rows; with it
+    # the residual writes the image and reads the branch through the window reverse, and
+    # its linear index is an image index — `rest / width` in resident.comp — so the count
+    # is the image's, which the padded window count is not: a shifted origin has more
+    # window rows than there are pixels, and passing those cost the device.
+    count = (rows if reverse is None else reverse[0] * reverse[1]) * channels
+    if integer is not None:
+        weight8, column_scale, packed, row_scale = integer
+        runtime.quantize_row(a, packed, row_scale, rows, inner)
+        runtime.gemm_int8(packed, weight8, branch, row_scale, column_scale,
+                          rows, channels, inner)
+        runtime.residual(branch, skip, cosine, target, count, channels,
+                         epilogue=epilogue, b_half=skip_half, narrow=narrow,
+                         reverse=reverse)
+        return
     if runtime.fuse_residual:
         runtime.gemm_residual(a, weight, skip, cosine, target, rows, channels, inner,
-                              epilogue=epilogue, skip_half=skip_half, narrow=narrow)
+                              epilogue=epilogue, skip_half=skip_half, narrow=narrow,
+                              reverse=reverse)
     else:
         runtime.gemm(a, weight, branch, rows, channels, inner)
-        runtime.residual(branch, skip, cosine, target, rows * channels, channels,
-                         epilogue=epilogue, b_half=skip_half, narrow=narrow)
+        runtime.residual(branch, skip, cosine, target, count, channels,
+                         epilogue=epilogue, b_half=skip_half, narrow=narrow,
+                         reverse=reverse)
 
 
 def record_global_block(runtime, w, s, source=None, target=None, *, chain=False):
@@ -285,13 +446,26 @@ def record_global_block(runtime, w, s, source=None, target=None, *, chain=False)
         value16 = s.value16
         runtime.to_half(source, value16, padded * channels)
     target = s.io16 if chain else (target or s.out)
-    runtime.gemm(value16, w.expand, s.hidden16, padded, w.hidden_width, channels,
-                 epilogue=xmxres.EPI_GATE_E4M3, narrow=True)
+    # The expansion on the integer path: the same row grid the down projection uses,
+    # quantised once here, and the gate applied in the kernel's write-back. The shapes
+    # line up with the scratch's deepest K, which this GEMM is: K = channels.
+    expand8 = getattr(w, "int8_expand", None)
+    if expand8 is not None:
+        runtime.quantize_row(value16, s.aq, s.ascale, padded, channels)
+        runtime.gemm_int8(s.aq, expand8[0], s.hidden16, s.ascale, expand8[1],
+                          padded, w.hidden_width, channels,
+                          epilogue=xmxres.EPI_GATE_E4M3, narrow=True)
+    else:
+        runtime.gemm(value16, w.expand, s.hidden16, padded, w.hidden_width, channels,
+                     epilogue=xmxres.EPI_GATE_E4M3, narrow=True)
     # Published, as half, in `ffn` — the residual role, live until the attention's residual
     # has read it: `ffn16`'s role is K's too, which the projection's passes write.
+    ffn8 = getattr(w, "int8_ffn", None)
     record_project_residual(runtime, s.hidden16, w.ffn_proj, s.branch, source, w.ffn_cos,
                             s.ffn, padded, channels, w.hidden_width, skip_half=chain,
-                            epilogue=xmxres.EPI_E4M3, narrow=True)
+                            epilogue=xmxres.EPI_E4M3, narrow=True,
+                            integer=None if ffn8 is None else
+                            (ffn8[0], ffn8[1], s.aq, s.ascale))
 
     key = record_qkv_projection(runtime, s.ffn, w, s, 1, padded, channels, heads, vit=True)
     if runtime.fuse_global_attention:
@@ -308,13 +482,17 @@ def record_global_block(runtime, w, s, source=None, target=None, *, chain=False)
                      strides=(padded * padded, padded * 32, padded * 32))
         runtime.merge_heads(s.context, merged, 1, padded, channels, heads,
                             epilogue=xmxres.EPI_E4M3, narrow=True, scale=s.reciprocal)
+    out8 = getattr(w, "int8_out", None)
+    integer = None if out8 is None else (out8[0], out8[1], s.aq, s.ascale)
     if chain:
         record_project_residual(runtime, merged, w.out, s.attention, s.ffn, w.attn_cos,
                                 target, s.tokens, channels, channels,
-                                epilogue=xmxres.EPI_E4M3, narrow=True, skip_half=True)
+                                epilogue=xmxres.EPI_E4M3, narrow=True, skip_half=True,
+                                integer=integer)
     else:
         record_project_residual(runtime, merged, w.out, s.attention, s.ffn, w.attn_cos,
-                                target, padded, channels, channels, skip_half=True)
+                                target, padded, channels, channels, skip_half=True,
+                                integer=integer)
 
 
 def run_global_block(runtime, w, s, value):
@@ -369,6 +547,12 @@ class BlockScratch:
         # the fused attention's merged output: scores' and context's role, unused by then
         self.context16 = make("context16", windowed, np.float16)
         self.attended = make("attended", windowed)
+        # The integer path's operands. Rows is the worse of the image and the padded
+        # window count, because the out projection runs over windows and a shifted origin
+        # has more of them than there are pixels; K is the deeper of the two projections.
+        rows = max(pixels, self.windows * self.tokens)
+        self.aq = make("aq", rows * max(hidden, channels), np.int8)
+        self.ascale = make("ascale", rows)
         self.out = make("out", pixels * channels)
         self.core16 = (make("core16", pixels * channels, np.float16)
                        if getattr(weights, "split", False) else None)
@@ -472,7 +656,7 @@ def record_feed_forward(runtime, w, s, source, source_half=False, source16=None,
         record_project_residual(runtime, s.heads16, w.ffn_out, s.branch, source, w.ffn_cos,
                                 s.ffn, pixels, channels, channels,
                                 epilogue=xmxres.EPI_E4M3, skip_half=source_half,
-                                narrow=True)
+                                narrow=True, integer=integer_pair(w, s))
         return True
     elif (runtime.fuse_ffn and channels == 32 and s.hidden_width % 32 == 0
           and pixels % 16 == 0):
@@ -486,7 +670,7 @@ def record_feed_forward(runtime, w, s, source, source_half=False, source16=None,
                      epilogue=xmxres.EPI_GATE_E4M3, narrow=True)
         record_project_residual(runtime, s.hidden16, w.branch, s.branch, source, w.ffn_cos,
                                 s.ffn, pixels, channels, s.hidden_width,
-                                skip_half=source_half)
+                                skip_half=source_half, integer=integer_pair(w, s))
         return False
 
 
@@ -514,7 +698,7 @@ def record_split_feed_forward(runtime, w, s, source, source_half=False):
                 strides=(256, 256 * 64, 64), epilogue=xmxres.EPI_E4M3)
     record_project_residual(runtime, s.core16, w.weight3, s.branch, source, w.ffn_cos,
                             s.ffn, pixels, channels, channels, skip_half=source_half,
-                            epilogue=xmxres.EPI_E4M3, narrow=True)
+                            epilogue=xmxres.EPI_E4M3, narrow=True, integer=integer_pair(w, s))
 
 
 def can_fuse_window_block(runtime, w, s):
@@ -603,10 +787,19 @@ def record_window_attention(runtime, w, s, source, target=None, publish=0,
                                    windows * tokens, channels,
                                    (s.height, s.width, 8, w.origin), skip_half=source_half)
     elif target is not None:
-        runtime.gemm_residual(attended, w.out, source, w.attn_cos, target,
-                              windows * tokens, channels, channels,
-                              reverse=(s.height, s.width, 8, w.origin),
-                              epilogue=publish, narrow=target_half, skip_half=source_half)
+        # Through the same helper the feed-forward uses, so the integer branch is one
+        # place. Its intermediate is `s.attended`, not `s.branch`: the projection runs
+        # over windows, and a shifted origin has more window rows than there are pixels,
+        # so the block's pixel-sized buffers are a row count short. `attended` is the
+        # window-sized one and this path leaves it unused.
+        out8 = getattr(w, "int8_out", None)
+        record_project_residual(runtime, attended, w.out, s.attended, source, w.attn_cos,
+                                target, windows * tokens, channels, channels,
+                                reverse=(s.height, s.width, 8, w.origin),
+                                epilogue=publish, narrow=target_half,
+                                skip_half=source_half,
+                                integer=None if out8 is None else
+                                (out8[0], out8[1], s.aq, s.ascale))
     else:
         runtime.gemm(attended, w.out, s.attended, windows * tokens, channels, channels)
 
@@ -678,9 +871,26 @@ class Transition:
     def __init__(self, runtime, weights, index, *, kind):
         self.kind = kind
         prefix = f"block{index}.layer0"
+        # The level change's own projection on the integer path. Both of them are a plain
+        # GEMM with a publish the integer kernel already has — the downsample's is E4M3
+        # into a half target, the upsample's is nothing at all into a float32 one — so
+        # unlike the QKV projection this needed no new kernel, only the weight here and
+        # the row grid where it is used.
+        #
+        # Both of the two level changes pass the tile gate (block14 K=128 N=256, block22
+        # K=256 N=512) and both are wired, but it buys nothing and so it is off: three
+        # alternating runs of `work/int8_frame_cost.py 768 448` give 43.15/43.12/42.93 ms
+        # without it and 42.96/42.97/43.19 ms with it — the same number either way, and
+        # the median the other way (43.31-43.37 against 43.36-43.71). K=128 is below
+        # where the integer path pays for its row grid at all, which is the same line
+        # `work/int8_cover.py` drew. Kept wired because it costs nothing to keep:
+        # `NR_INT8_TRANSITION=1` turns it on.
+        self.int8 = None
         if kind in ("down", "up"):
             self.weight0 = runtime.buffer_from(weights[f"{prefix}.weight0"], np.float16)
             self.out_channels = weights[f"{prefix}.weight0"].shape[1]
+            if runtime.int8_project and os.environ.get("NR_INT8_TRANSITION", "0") != "0":
+                self.int8 = quantise_weight(runtime, weights[f"{prefix}.weight0"])
         if kind == "up":
             self.sine = runtime.buffer_from(weights[f"{prefix}.sin"])
 
@@ -702,9 +912,16 @@ def record_downsample(runtime, transition, scratch, source, target, height, widt
     pixels = half_height * half_width
     runtime.pool2(source, scratch.pooled16, height, width, channels,
                   epilogue=xmxres.EPI_E4M3, narrow=True, a_half=source_half)
-    runtime.gemm(scratch.pooled16, transition.weight0, target, pixels,
-                 transition.out_channels, channels, epilogue=xmxres.EPI_E4M3,
-                 narrow=target_half)
+    grid = getattr(transition, "int8", None)
+    if grid is not None:
+        runtime.quantize_row(scratch.pooled16, scratch.aq, scratch.ascale, pixels, channels)
+        runtime.gemm_int8(scratch.aq, grid[0], target, scratch.ascale, grid[1],
+                          pixels, transition.out_channels, channels,
+                          epilogue=xmxres.EPI_E4M3, narrow=target_half)
+    else:
+        runtime.gemm(scratch.pooled16, transition.weight0, target, pixels,
+                     transition.out_channels, channels, epilogue=xmxres.EPI_E4M3,
+                     narrow=target_half)
     return half_height, half_width
 
 
@@ -724,8 +941,15 @@ def record_upsample_merge(runtime, transition, scratch, source, skip, target,
     projected16 = source if source_half else scratch.projected16
     if not source_half:
         runtime.to_half(source, scratch.projected16, source_pixels * channels)
-    runtime.gemm(projected16, transition.weight0, scratch.projected,
-                 source_pixels, out_channels, channels)
+    grid = getattr(transition, "int8", None)
+    if grid is not None:
+        runtime.quantize_row(projected16, scratch.aq, scratch.ascale,
+                             source_pixels, channels)
+        runtime.gemm_int8(scratch.aq, grid[0], scratch.projected, scratch.ascale,
+                          grid[1], source_pixels, out_channels, channels)
+    else:
+        runtime.gemm(projected16, transition.weight0, scratch.projected,
+                     source_pixels, out_channels, channels)
     if runtime.fuse_transition:
         # the upsample, the scaled skip and the add in one pass (resident.comp UPSAMPLE_ADD)
         runtime.upsample_add(scratch.projected, skip, transition.sine, target, height, width,
@@ -757,6 +981,10 @@ class TransitionScratch:
         self.projected16 = make("transition.projected16", elements, np.float16)
         self.upsampled = make("transition.upsampled", elements)
         self.scaled = make("transition.scaled", elements)
+        # the level changes' row grid: `aq` one byte a value for the widest level's
+        # pixels x channels, `ascale` one float a row.
+        self.aq = make("transition.aq", elements, np.int8)
+        self.ascale = make("transition.ascale", elements)
 
     def free(self):
         for name in dir(self):

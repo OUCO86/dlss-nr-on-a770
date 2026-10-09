@@ -489,6 +489,28 @@ class ResidentBackend:
         self._frames[key] = frame
         return frame
 
+    def set_int8(self, on):
+        """Move the projections between the float and the integer path while running.
+
+        Every other knob is post-network, or only moves the extent, and the weights
+        survive it. This one changes the graph's shape: the integer path needs the
+        weights quantised per output channel, which `DeviceWeights` does once when it
+        is built, so switching means dropping both it and every cached frame and paying
+        the upload again. That is a frame or two of hitch on the switch and nothing
+        after it. Returns whether anything actually changed.
+        """
+        on = bool(on)
+        if on == bool(getattr(self.runtime, "int8_project", False)):
+            return False
+        self.runtime.int8_project = on
+        for frame in self._frames.values():
+            frame.close()
+        self._frames.clear()
+        if self.device_weights is not None:
+            self.device_weights.close()
+            self.device_weights = None
+        return True
+
     def close(self):
         for frame in self._frames.values():
             frame.close()

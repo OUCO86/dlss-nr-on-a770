@@ -14,6 +14,9 @@
 #include <stddef.h>
 #include <vulkan/vulkan.h>
 
+#include "gpu_pick.h"
+#include "xmx_shape.h"
+
 /* A lost device is recorded as well as described: it is the one failure after which nothing
  * on this device can succeed again, so a caller has to be able to tell it from the rest
  * without reading the message. It stays set. */
@@ -39,14 +42,34 @@ static struct {
 	VkPipeline rint8;         /* the staged GEMM on the integer path, built on first use */
 	VkPipeline rblock;        /* a 32-channel window block's attention half, likewise */
 	VkPipeline rglobal;       /* a bottleneck block's attention in one pass, likewise */
-	char *rpaths[12];
+	VkPipeline rtiled32;      /* the 32x32 register block, built on first use */
+	VkPipeline rtiled8;       /* the 8x32 register block, likewise */
+	VkPipeline rquant;        /* the activation quantiser onto the integer path's grid */
+	VkPipeline rint8f;        /* the integer GEMM that quantises as it goes, built on first use */
+	unsigned tiled8;          /* it takes a shape the 16x32 one can, if asked */
+	unsigned tilem8, tilen8;
+	/* 12 is the 32x32 tiled build, 13 the 8x32 one, 14 the quantiser,
+	 * 15 the fused integer GEMM; see xmx_tiled32_init / xmx_tiled8_init /
+	 * xmx_quant_init / xmx_int8_fused_init */
+	char *rpaths[16];
 	unsigned specialize;
-	unsigned tiling, tilem, tilen;
+	unsigned tiling, tilem, tilen, tilem32, tilen32;
+	unsigned tiled32;         /* the 32x32 block may take a shape the 16x32 one can */
 	int syncing;
+	int barrier_mode;
+	/* A ceiling probe, not a setting: drop every Nth-but-one barrier regardless of
+	 * what the passes actually read. It computes the wrong frame. It exists to answer
+	 * one question — how much of the frame's boundary cost a correct dependency
+	 * analysis could ever recover — so that the work of `xmx_sync` is either
+	 * justified by the number or not started at all. */
+	unsigned barrier_every;
+	unsigned barrier_seen;
 	unsigned staging;
+	unsigned prefer_staged;   /* ask for the staged kernel on whole 64-row blocks anyway */
 	unsigned staged_partial;  /* the staged kernel takes M that is not whole 64-row blocks */
 	unsigned staged32;        /* M of 32 or fewer takes the 32-row staged build */
 	unsigned staged32_calls;  /* how many GEMMs it has recorded: tests check the routing */
+	unsigned tiled32_calls;   /* likewise for the 32x32 register block */
 	VkCommandBuffer rcb; VkFence rfence; int recording, recorded, rready;
 	/* transfers have their own command buffer: the weights are created while the
 	 * frame's graph is being recorded, so a staged upload cannot borrow `rcb` */
@@ -547,6 +570,56 @@ int xmx_rows_init(const char *path)
 	return build_pipeline(path, g.rpl, &g.rrows);
 }
 
+/* The 32x32 register block — gemm_resident.comp built RM = 4, RN = 4.
+ *
+ * Optional by design: it is a second build of the kernel the 16x32 pipeline already
+ * runs, not a capability anything else needs, so a runtime that does not supply it
+ * routes every shape to the build it does have and nothing changes. Only its
+ * presence turns the wider routing on, which is also what makes the A/B honest —
+ * XMX_TILED32=0 keeps the block off while the pipeline is still loaded.
+ *
+ * It gets a family of its own (12) because the specialised-pipeline cache is keyed
+ * on family and flags alone: sharing family 1 with the 16x32 build would hand one
+ * shape the other's pipeline, and the two differ only by the block their dispatch
+ * grid has to divide by. */
+int xmx_tiled32_init(const char *path)
+{
+	if (!g.rready) FAIL("resident runtime not initialised", 0);
+	if (g.rtiled32) return 0;
+	free(g.rpaths[12]);
+	if (!(g.rpaths[12] = strdup(path))) FAIL("pipeline path allocation", 0);
+	return build_pipeline(path, g.rpl, &g.rtiled32);
+}
+
+/* Whether the 32x32 block took a GEMM the 16x32 one would have. A routing test reads
+ * this the way `xmx_staged32_calls` reads the 32-row builds. */
+unsigned xmx_tiled32_calls(void) { return g.tiled32_calls; }
+
+/* The same switch as `xmx_staged32`, for the same reason: a test has to be able to
+ * run both blocks over the same shape in one process instead of inheriting whatever
+ * the environment's default is. The pipeline stays loaded either way. */
+int xmx_tiled32(unsigned on)
+{
+	if (g.recording) FAIL("cannot change the tiled routing during recording", 0);
+	g.tiled32 = on != 0;
+	return 0;
+}
+
+/* The 8x32 build: RM = 1 against the 16x32's 2, so a workgroup covers eight rows
+ * instead of sixteen and there are twice as many of them. Off unless XMX_TILED8 asks
+ * for it. It is here because the 32x32 block measured slower than the 16x32 one over a
+ * whole frame — 46.44 against 43.96 ms — and if halving the workgroup count costs more
+ * than the taller block wins, doubling it may pay. More arithmetic per operand fetched
+ * is the wrong thing to chase on these shapes; filling the machine is the right one. */
+int xmx_tiled8_init(const char *path)
+{
+	if (!g.rready) FAIL("resident runtime not initialised", 0);
+	if (g.rtiled8) return 0;
+	free(g.rpaths[13]);
+	if (!(g.rpaths[13] = strdup(path))) FAIL("pipeline path allocation", 0);
+	return build_pipeline(path, g.rpl, &g.rtiled8);
+}
+
 /* The 32-row staged builds, `shallow` with the default 32-deep K step and `deep` with 64. */
 int xmx_staged32_init(const char *shallow, const char *deep)
 {
@@ -626,10 +699,12 @@ int xmx_init(const char *spv_path)
 	uint32_t n = 0;
 	vkEnumeratePhysicalDevices(g.inst, &n, NULL);
 	if (!n) FAIL("no physical device", 0);
-	VkPhysicalDevice *pds = calloc(n, sizeof *pds);
-	vkEnumeratePhysicalDevices(g.inst, &n, pds);
-	g.pd = pds[0];
-	free(pds);
+	/* Not pds[0]. On a machine holding both an AMD card and an Arc, enumeration
+	 * offered the AMD card first, and every kernel here is written for Intel's
+	 * cooperative matrices — building them on the other card fails, or worse,
+	 * runs on a shape it was never tuned for. */
+	g.pd = xmx_pick_device(g.inst, "libxmx", NULL);
+	if (g.pd == VK_NULL_HANDLE) FAIL("no physical device", 0);
 	VkPhysicalDeviceProperties props;
 	vkGetPhysicalDeviceProperties(g.pd, &props);
 	snprintf(g.name, sizeof g.name, "%s", props.deviceName);
@@ -886,7 +961,8 @@ int xmx_gemm(unsigned M, unsigned N, unsigned K, const void *a, const void *b, v
 			       .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
 			       .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT };
 	for (unsigned i = 0; i < (iters ? iters : 1); i++) {
-		vkCmdDispatch(g.cb, N / 16, M / 8, 1);
+		/* One workgroup covers XMX_TM x XMX_TN: 8x8 here, 8x16 on Xe2. */
+		vkCmdDispatch(g.cb, N / XMX_TN, M / XMX_TM, 1);
 		if (i + 1 < iters)
 			vkCmdPipelineBarrier(g.cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 					     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
@@ -953,7 +1029,7 @@ int xmx_gemm_batched(unsigned M, unsigned N, unsigned K, unsigned batch,
 	vkCmdBindDescriptorSets(g.cb, VK_PIPELINE_BIND_POINT_COMPUTE, g.plb, 0, 1, &g.set, 0, NULL);
 	unsigned push[7] = { M, N, K, sa, sb, sc, bt };
 	vkCmdPushConstants(g.cb, g.plb, VK_SHADER_STAGE_COMPUTE_BIT, 0, 28, push);
-	vkCmdDispatch(g.cb, N / 16, M / 8, batch);
+	vkCmdDispatch(g.cb, N / XMX_TN, M / XMX_TM, batch);
 	vkEndCommandBuffer(g.cb);
 	vkResetFences(g.dev, 1, &g.fence);
 	VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &g.cb };
@@ -1000,17 +1076,55 @@ int xmx_res_init(const char *gemm_spv, const char *unary_spv, const char *row_sp
 		return -1;
 	const char *tile = getenv("XMX_TILE_K");
 	g.tiling = tile ? atoi(tile) : 1;
-	g.tilem = block_size("XMX_TILE_M", 16);
-	g.tilen = block_size("XMX_TILE_N", 32);
+	g.tilem = block_size("XMX_TILE_M", XMX_TILE_M);
+	g.tilen = block_size("XMX_TILE_N", XMX_TILE_N);
+	g.tilem32 = block_size("XMX_TILE32_M", XMX_TILE32_M);
+	g.tilen32 = block_size("XMX_TILE32_N", XMX_TILE32_N);
+	g.tilem8 = block_size("XMX_TILE8_M", XMX_TILE8_M);
+	g.tilen8 = block_size("XMX_TILE8_N", XMX_TILE8_N);
+	/* The 16x32 block is the default, and the 32x32 one is off until XMX_TILED32
+	 * asks for it. A block twice as tall is more arithmetic per operand fetched, and
+	 * measured on its own that is the quicker kernel (xmx_shape.h: 5565 against 5389
+	 * GF/s on the real shape set). Measured over a whole frame it is the slower one:
+	 * 1920x1080, gpu_run 46.44 ms with it against 43.96 without, bit-identical output
+	 * either way (bench/daemon_stages.py). Halving the workgroup count costs more in
+	 * parallelism than the block wins in efficiency, and a frame is thousands of
+	 * workgroups wide — the same reason walking several column blocks per workgroup
+	 * measured slower still (bench/ng_ab.sh). `xmx_tiled32_init` is what supplies the
+	 * build, so a runtime that never calls it keeps the 16x32 one regardless. */
+	const char *bm = getenv("XMX_BARRIER_MODE");
+	/* 1, not 0. The destination mask only has to cover what the next pass *reads*:
+	 * the stage mask already orders the writes that follow it, and access masks do not
+	 * carry a write-after-read hazard. Measured at 768x448 on the A770: 45 -> 44 ms with
+	 * int8 on, three runs of the same input bit-identical, and run_tests.sh PASS=31.
+	 * Mode 0 is kept because it is what every number before this was measured on. */
+	g.barrier_mode = bm ? atoi(bm) : 1;
+	if (g.barrier_mode < 0 || g.barrier_mode > 3) FAIL("XMX_BARRIER_MODE must be in 0..3", 0);
+	const char *be = getenv("XMX_BARRIER_EVERY");
+	g.barrier_every = be ? (unsigned)atoi(be) : 1;
+	if (g.barrier_every < 1) FAIL("XMX_BARRIER_EVERY must be at least 1", 0);
+	const char *t32 = getenv("XMX_TILED32");
+	g.tiled32 = t32 ? ((unsigned)atoi(t32) != 0) : 0;
+	const char *t8 = getenv("XMX_TILED8");
+	g.tiled8 = t8 ? ((unsigned)atoi(t8) != 0) : 0;
 	const char *sk = getenv("XMX_STAGE_K");
 	g.staging = sk ? (unsigned)atoi(sk) : 32;
-	/* On by default: the live extent's GEMMs whose M is not whole 64-row blocks — 144 or 400
-	 * rows at the deeper levels — ran on the tiled kernel at half the staged one's speed.
-	 * Live, 512x288 at scale 0.35: 42.7 -> 36.7 ms, bit-identical. It pays only where some
-	 * level's pixel count is not whole 64-row blocks: at 320x320 and 1920x1088, not at
-	 * 1280x768. 0 is the comparison. */
+	/* Off by default on Xe-HPG: see the measurement quoted above `staged` in
+	 * record_gemm. 1 restores upstream's behaviour for an A/B of the two kernels. */
+	const char *ps = getenv("XMX_PREFER_STAGED");
+	g.prefer_staged = ps ? (unsigned)atoi(ps) : 0;
+	/* Measured on Xe2/140V: the live extent's GEMMs whose M is not whole 64-row
+	 * blocks — 144 or 400 rows at the deeper levels — ran on the tiled kernel at half
+	 * the staged one's speed. Live, 512x288 at scale 0.35: 42.7 -> 36.7 ms,
+	 * bit-identical. It pays only where some level's pixel count is not whole 64-row
+	 * blocks: at 320x320 and 1920x1088, not at 1280x768. 0 is the comparison.
+	 * The default is now 0, for the same reason and with the same measurement behind it
+	 * (logs/bench-routing.txt: 4559 GF/s with the partial rule on, 5370 with it off, on
+	 * the real shape set). At 16 or 8 rows `small` was gated on this switch too, so
+	 * flipping it also had to stop being implicit: `src/gpu/test_staged32.py` asks for
+	 * the routing it needs instead of inheriting it. */
 	const char *sp = getenv("XMX_STAGED_PARTIAL");
-	g.staged_partial = sp ? (unsigned)atoi(sp) : 1;
+	g.staged_partial = sp ? (unsigned)atoi(sp) : 0;
 	/* the 32-row staged builds, once `xmx_staged32_init` has them; 0 is the comparison */
 	const char *s32 = getenv("XMX_STAGED32");
 	g.staged32 = s32 ? (unsigned)atoi(s32) : 1;
@@ -1294,13 +1408,40 @@ int xmx_abort(void)
  * so this is right by default; where a run of dispatches is known to be independent —
  * the per-head GEMMs of a branched feed-forward write disjoint slices, the three head
  * splits read one buffer and write three — `xmx_sync(0)` suppresses it and `xmx_sync(1)`
- * closes the run with a single barrier. */
+ * closes the run with a single barrier.
+ *
+ * XMX_BARRIER_MODE picks how wide that barrier is, because the default is wider than
+ * the graph needs. `VK_ACCESS_SHADER_READ_BIT` covers sampled images, uniform buffers
+ * and storage buffers alike, so the driver has to invalidate the sampler and constant
+ * caches at every one of the several hundred boundaries a frame crosses. Between two
+ * passes of this graph the only thing that moves is a storage buffer.
+ *
+ *   0  the default: src = SHADER_WRITE, dst = SHADER_READ | SHADER_WRITE.
+ *   1  drop dst SHADER_WRITE: the stage mask already orders the writes that follow.
+ *   2  drop src SHADER_WRITE as well, leaving only the invalidate half. Sound only if
+ *      every cache below the device coherence point is write-through, so that the
+ *      producer's stores are in L2 once the store counter drains; then the consumer
+ *      only has to be stopped from hitting a stale line. **Measured on the A770 and
+ *      rejected**: it is worth 3.2 ms of 46.4 (7%) but the graph stops being
+ *      deterministic — `capture_compare.py` runs the same input twice and the two
+ *      heads disagree, while mode 0 repeats bit for bit. RDNA4's caches are
+ *      write-through and Intel's are not, so the availability half is required here.
+ *      Left in as the measurement, not as an option to turn on.
+ *   3  no barrier at all. It computes the wrong frame; it exists to put a ceiling on
+ *      what any narrowing could buy. On the A770 that ceiling is 32.4 ms against
+ *      46.4: **the boundaries cost 14.0 ms, 30% of the frame**, of which only 3.2 is
+ *      cache and the remaining 10.8 is each dispatch's exposed tail. No barrier
+ *      width recovers the 10.8 — only fewer, larger dispatches can. */
 static void barrier(void)
 {
 	if (!g.syncing) return;
+	if (g.barrier_mode == 3) return;
+	if (g.barrier_every > 1 && ++g.barrier_seen % g.barrier_every) return;
+	VkAccessFlags dst = VK_ACCESS_SHADER_READ_BIT;
+	if (g.barrier_mode != 1) dst |= VK_ACCESS_SHADER_WRITE_BIT;
 	VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-			       .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-			       .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT };
+			       .srcAccessMask = g.barrier_mode == 2 ? 0u : VK_ACCESS_SHADER_WRITE_BIT,
+			       .dstAccessMask = dst };
 	vkCmdPipelineBarrier(g.rcb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 			     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
 }
@@ -1406,15 +1547,18 @@ static int record_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
 	 * support: A and B are half, and C is float unless the epilogue narrows it. */
 	p.a += (uint64_t)oa * 2; p.b += (uint64_t)ob * 2;
 	p.c += (uint64_t)oc * ((bt & 0x1000u) ? 2 : 4);
-	/* The register-tiled kernel keeps a 16x32 block of the output in one subgroup's
-	 * registers, which needs both extents to be a whole block; the 8x16 kernel takes
-	 * everything else. Slice writes make the N test exact rather than conservative —
-	 * a tile past the slice would land in the neighbouring one.
+	/* The register-tiled kernel keeps a block of the output in one subgroup's registers,
+	 * which needs both extents to be a whole block; the 8x16 kernel takes everything
+	 * else. Slice writes make the N test exact rather than conservative — a tile past
+	 * the slice would land in the neighbouring one.
 	 *
-	 * 16x32 and not larger: a 32x32 block halves the workgroup count again and is
-	 * *slower* in a frame, because the shapes here then stop having enough workgroups
-	 * to fill the machine. It still wins in isolation, which is why the two disagree.
-	 * The environment overrides exist so that trade can be re-measured. */
+	 * Two block sizes are built, 16x32 and 32x32, and the choice is per shape below.
+	 * Upstream's note that a 32x32 block is *slower* in a frame — fewer workgroups than
+	 * the machine has to fill — was written when the block was the only one there was,
+	 * so a shape that could not take it fell all the way back to the 8x16 kernel. That
+	 * fallback is what the measurement was really seeing. Kept as two builds, the wider
+	 * block takes the shapes that are whole multiples of it and everything else still
+	 * gets a tiled kernel, which is the comparison upstream never had. */
 	/* Operand staging pays only where there is reuse to amortise it. It wins up to
 	 * 24 % on a deep-K shape in isolation and loses half as much again on the shallow-K
 	 * ones that dominate this graph, where the output write is the cost and there is
@@ -1434,7 +1578,15 @@ static int record_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
 	 * 32-row build of the same kernel: its GEMMs wait on the K loop, so the pad was half of
 	 * every step's work for nothing. Where N is 1024 or less there are 32 blocks or fewer,
 	 * and a 64-deep step halves the trips round the loop. Bit-identical — a row's sums are
-	 * its own — and 0.7-1.2 ms of a 12-20 ms graph (notes/improve-b.md). */
+	 * its own — and 0.7-1.2 ms of a 12-20 ms graph (notes/improve-b.md).
+	 * `staged_partial` used to be part of this test as well, which made one routing
+	 * preference stand in for two unrelated things: whether a *plain* GEMM with an
+	 * awkward M prefers the staged kernel, and whether the 32-row builds may be used
+	 * at all. They are separate questions — the builds handle rows past M
+	 * `staged_partial` gates this as well as the plain case below: at 16 or 8 rows the
+	 * profiler's staged count is `small`'s alone, so `test_staged_partial` reads the two
+	 * as one routing and the default has to stay 1 for `test_staged32` to see its 32-row
+	 * build. Untangling them is a change to those tests, not to the port. */
 	int small = g.staged32 && g.rstaged32[0] && M <= 32 && !(bt & 0x400000u)
 		    && (M == 32 || g.staged_partial);
 	/* A bottleneck of 64 tokens — 320x320, the vendor's minimum — has two GEMMs with
@@ -1443,27 +1595,83 @@ static int record_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
 	if (g.staged32 && g.rstaged32[1] && M == 64 && N <= 1024 && K % 64 == 0 && K >= 1024
 	    && !(bt & 0x500000u))
 		small = 1;
-	int staged = (M % 64 == 0 || small || g.staged_partial)
-		     && N % 32 == 0 && K % 32 == 0 && K >= g.staging;
+	/* Staging is two different things and they have to be told apart. Three paths exist
+	 * in gemm_staged.comp and nowhere else — the window gather in its A loader
+	 * (0x400000), the pooled window residual in its epilogue (0x800000), and the
+	 * 32-row builds `small` selects — and for those it is a requirement. For a plain
+	 * GEMM it is only a preference, and on Xe-HPG the measurement says the preference
+	 * is wrong. At M = 61440, N = 128 the tiled kernel leads at every depth of K that
+	 * was tried, with no crossing point:
+	 *     K        32    128    512   2048   8192
+	 *     staged 1494   2848   3478   3685   3482   GF/s
+	 *     tiled  2135   5340   6811   6888   6850   GF/s
+	 * (logs/bench-overhead.txt, driver 101.9030.) Upstream's threshold of 32 came from
+	 * the same sweep on Xe2/140V, where staging did pay; here it costs about half the
+	 * GEMM throughput, so a whole 64-row block goes to the tiled kernel unless
+	 * XMX_PREFER_STAGED asks for the old routing back. A partial M is a different
+	 * question — it is `staged_partial`'s, it was not part of this sweep, and it keeps
+	 * upstream's answer.
+	 * The geometry is not a preference either: the staged block is
+	 * 64x32 and its grid is N / 32, so an N that is not whole 32-column blocks would
+	 * dispatch no workgroups at all and leave the output untouched. That includes
+	 * `small`, whose 32-row build has the same grid — keeping it inside this condition
+	 * is what stops a 16-column GEMM from being routed to a 32-column kernel. */
+	int staged;
+	if (bt & 0x200000u)
+		staged = 0;   /* the half copy is a plain-store path of the resident kernel */
+	else if (bt & 0x400000u)
+		staged = 1;   /* the window gather's geometry is asserted by the FAIL below */
+	else
+		staged = (small || (bt & 0x800000u)
+			  || (g.prefer_staged && M % 64 == 0)
+			  || (g.staged_partial && M % 64 != 0))
+			 && N % 32 == 0 && K % 32 == 0 && K >= g.staging;
 	/* the window gather lives in the staged kernel's A loader, at any depth of K */
 	if (bt & 0x400000u) {
 		if (!window_a || M % 64 || N % 32 || K % 32 || batch > 1 || (bt & 1u))
 			FAIL("a window-gathered A needs its geometry, whole blocks and one batch", 0);
 		staged = 1;
 	}
-	int tiled = M % g.tilem == 0 && N % g.tilen == 0 && K >= g.tiling;
+	/* Two register-tiled builds exist and the shape chooses between them, because the
+	 * block that is quicker — 32x32, RM = RN = 4 — is also the one that needs more of
+	 * the shape: M has to be a whole block of it, and the QKV epilogue's live rows are
+	 * not (a bottleneck's token count, 96 among them). 16x32 needs only M % 16 and is
+	 * what everything else runs on. The wider block is tried first and the narrower one
+	 * is the fallback, so a shape that cannot take the faster kernel still takes a
+	 * tiled one instead of dropping to the single-tile resident kernel.
+	 *
+	 * Both are the hardware's own 8x8 tiles; only how many a workgroup holds differs,
+	 * and that is a register-budget question, not a shape compromise. `g.rtiled32` is
+	 * absent until `xmx_tiled32_init` supplies the build, and then this is a no-op. */
+	int tiled16 = M % g.tilem == 0 && N % g.tilen == 0 && K >= g.tiling;
+	int tiled32 = g.tiled32 && g.rtiled32 && M % g.tilem32 == 0
+		      && N % g.tilen32 == 0 && K >= g.tiling;
+	int tiled = tiled16 || tiled32;
+	/* Only the tiled path runs this kernel. Where the shape is going to the staged one —
+	 * a window-gathered A (0x400000), a pooled window residual (0x800000) or a 32-row
+	 * build — the block that decides the grid is the staged block's, and handing that
+	 * dispatch the 32x32 pipeline would compute the wrong rows entirely. `tiled32` stays
+	 * true for the epilogue's column test below, which asks whether *some* tiled build
+	 * could take the shape. */
+	int tiled8 = g.tiled8 && g.rtiled8 && M % g.tilem8 == 0
+		     && N % g.tilen8 == 0 && K >= g.tiling;
+	int use8 = tiled8 && !staged && !small;
+	int use32 = tiled32 && !staged && !small && !use8;
 	if ((bt & 0x10000u) && (bt & 0x20000u))
 		FAIL("compact head and fused residual are exclusive", 0);
 	if (bt & 0x10000u) {
 		if (N != 16 || ldc != 4 || (bt & 0x1f00u))
 			FAIL("compact head requires N=16, ldc=4 and plain FP32 output", 0);
-		staged = tiled = 0;  /* its shared-memory scatter is one 8x16 tile */
+		staged = tiled = tiled16 = tiled32 = use32 = 0;  /* its scatter is one 8x16 tile */
 	}
 	/* The QKV epilogue normalises a head inside one workgroup, so the column block must
-	 * be one head exactly: 32 wide, which the staged block always is and the tiled one
-	 * is unless XMX_TILE_N moved it. The 8x16 kernel never qualifies. */
+	 * be one head exactly: 32 wide, which the staged block always is and either tiled
+	 * build is unless XMX_TILE_N / XMX_TILE32_N moved it. The 8x16 kernel never
+	 * qualifies. Both tiled builds are named because the shape decides which one runs,
+	 * and an epilogue that needs 32 columns has to accept the one that got them. */
 	if ((bt & 0x100000u) && !(qkv && (bt & ~0x40e000u) == 0x100000u
-				  && (staged || (tiled && g.tilen == 32))))
+				  && (staged || (tiled16 && g.tilen == 32)
+				      || (tiled32 && g.tilen32 == 32))))
 		FAIL("QKV epilogue needs its targets, no other flag, and a 32-column block", 0);
 	if ((bt & 0x4000u) && !(bt & 0x400000u))
 		FAIL("an A published on the way in is a window-gathered one", 0);
@@ -1477,19 +1685,36 @@ static int record_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
 	VkPipeline pipeline;
 	if (small) {
 		if (resident_pipeline(6 + deep, bt, g.rstaged32[deep], &pipeline)) return -1;
-	} else if (resident_pipeline(staged ? 2 : (tiled ? 1 : 0), bt,
-				     staged ? g.rstaged : (tiled ? g.rtiled : g.rgemm), &pipeline)) {
+	} else if (resident_pipeline(use8 ? 13 : (use32 ? 12 : (staged ? 2 : (tiled ? 1 : 0))),
+				     bt,
+				     use8 ? g.rtiled8
+					  : (use32 ? g.rtiled32
+						   : (staged ? g.rstaged
+							     : (tiled ? g.rtiled : g.rgemm))),
+				     &pipeline)) {
 		return -1;
 	}
 	vkCmdBindPipeline(g.rcb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
 	vkCmdPushConstants(g.rcb, g.rpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof p, &p);
 	g.staged32_calls += small;
+	g.tiled32_calls += use32;
+	if (use32 && getenv("XMX_DEBUG_TILE32"))
+		fprintf(stderr, "tile32: M=%u N=%u K=%u bt=0x%x lda=%u ldb=%u ldc=%u batch=%u\n",
+			M, N, K, bt, lda, ldb, ldc, batch);
 	if (staged) {
 		unsigned rows = small ? 32u : 64u;
 		vkCmdDispatch(g.rcb, N / 32, (M + rows - 1) / rows, batch ? batch : 1);
+	} else if (use8) {
+		vkCmdDispatch(g.rcb, N / g.tilen8, M / g.tilem8, batch ? batch : 1);
+	} else if (use32) {
+		/* the 32x32 block's own grid — the 16x32 one's N / tilen, M / tilem here would
+		 * dispatch four times the workgroups, each writing the block the *shader* has,
+		 * so the ones past the edge would run off the bottom of the output */
+		vkCmdDispatch(g.rcb, N / g.tilen32, M / g.tilem32, batch ? batch : 1);
 	} else {
 		if (tiled) vkCmdDispatch(g.rcb, N / g.tilen, M / g.tilem, batch ? batch : 1);
-		else       vkCmdDispatch(g.rcb, (N + 15) / 16, (M + 7) / 8, batch ? batch : 1);
+		else       vkCmdDispatch(g.rcb, XMX_DIV_UP(N, XMX_BLOCK_N),
+					 XMX_DIV_UP(M, XMX_BLOCK_M), batch ? batch : 1);
 	}
 	barrier();
 	stamp(staged ? PK_STAGED : (tiled ? PK_TILED : PK_GEMM), bt);
@@ -1840,6 +2065,48 @@ int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
 	return 0;
 }
 
+/* The integer path's other half. Configuration 4 needs both operands integer, so the
+ * activations have to be put on its grid before the GEMM, and a grid per row is what
+ * makes that survivable (`notes/phase23-integer-weights.md`,
+ * `notes/improve-int8-bottleneck.md`). `quantize_row.comp` does it in one pass:
+ * B = roundEven(A / s), s = max|A row| / 127, one s per row. */
+int xmx_quant_init(const char *path)
+{
+	if (!g.rready) FAIL("resident runtime not initialised", 0);
+	if (g.rquant) return 0;
+	free(g.rpaths[14]);
+	if (!(g.rpaths[14] = strdup(path))) FAIL("pipeline path allocation", 0);
+	return build_pipeline(path, g.rpl, &g.rquant);
+}
+
+/* packed = roundEven(source / scale[row]) with scale[row] = max|source row| / 127.
+ * `source` float16 M x K, `packed` int8 M x K, `scale` float32 M. */
+int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K)
+{
+	if (!g.recording || !g.rquant) FAIL("the quantiser is not ready for recording", 0);
+	if (!M || !K || K % 16u)
+		FAIL("the quantiser needs a positive extent and K a multiple of 16", 0);
+	struct push p = { .a = addr_of(source), .b = addr_of(packed), .c = addr_of(scale),
+			  .m = M, .k = K };
+	if (!p.a || !p.b || !p.c)
+		FAIL("quantiser operand is not a live buffer", 0);
+	vkCmdBindPipeline(g.rcb, VK_PIPELINE_BIND_POINT_COMPUTE, g.rquant);
+	vkCmdPushConstants(g.rcb, g.rpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof p, &p);
+	/* A warp a row, and where a row is shorter than a warp, several rows to a warp — the
+	 * same split `quantize_row.comp` makes, since it is what decides how many workgroups
+	 * there are. 65535 of them to a dispatch's x extent and the rest in y. */
+	unsigned words = K / 8u, per_row = 1u;
+	while (per_row < words && per_row < 32u) per_row <<= 1u;
+	unsigned per = 8u * (32u / per_row);
+	unsigned groups = (M + per - 1u) / per;
+	unsigned x = groups > 65535u ? 65535u : groups;
+	vkCmdDispatch(g.rcb, x, (groups + x - 1u) / x, 1);
+	barrier();
+	stamp(PK_UNARY, 12);
+	g.recorded++;
+	return 0;
+}
+
 int xmx_int8_init(const char *path)
 {
 	if (!g.rready) FAIL("resident runtime not initialised", 0);
@@ -1857,7 +2124,9 @@ int xmx_rec_gemm_int8(int a, int b, int c, int a_scale, int b_scale,
 	if (!g.recording || !g.rint8) FAIL("integer GEMM not ready for recording", 0);
 	if (!M || !N || N % 32u || !K || K % 64u)
 		FAIL("the integer GEMM needs N a multiple of 32 and K of 64", 0);
-	if (flags) FAIL("the integer GEMM takes no flags yet", 0);
+	/* flags carry the publish: bits 8-11 the epilogue, bit 0x1000 a half output,
+	 * the layout every kernel reads (_publish in xmxres.py). The fused variant
+	 * below still takes none. */
 	struct push p = { .a = addr_of(a), .b = addr_of(b), .c = addr_of(c), .d = addr_of(a_scale),
 			  .m = M, .n = N, .k = K, .batch = 1u, .flags = flags,
 			  .residual_cos = addr_of(b_scale) };
@@ -1865,7 +2134,83 @@ int xmx_rec_gemm_int8(int a, int b, int c, int a_scale, int b_scale,
 		FAIL("integer GEMM operand is not a live buffer", 0);
 	vkCmdBindPipeline(g.rcb, VK_PIPELINE_BIND_POINT_COMPUTE, g.rint8);
 	vkCmdPushConstants(g.rcb, g.rpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof p, &p);
-	vkCmdDispatch(g.rcb, N / 32u, (M + 63u) / 64u, 1);
+	/* gemm_staged_int8 computes a 64 x 32 block, the model's geometry: RN is
+	 * BN / TN, so the tile grid inside the block changes with the shape while
+	 * the block itself does not. */
+	vkCmdDispatch(g.rcb, N / XMX_STAGED_BN, XMX_DIV_UP(M, XMX_STAGED_BM), 1);
+	barrier();
+	stamp(PK_GEMM, 30);
+	g.recorded++;
+	return 0;
+}
+
+/* The QKV projection on configuration 4: A int8 M x channels, the weights int8
+ * 3*channels x channels, and the epilogue that normalises Q and K and publishes all three
+ * into `q`, `k` and `v` instead of writing a product (gemm_staged_int8.comp, bit
+ * 0x100000). What `xmx_rec_gemm_qkv` does on the float path, from integer operands.
+ *
+ * The epilogue needs both scale vectors, and `c`, `d` and `residual_cos` are the three
+ * targets by then, so they travel in the GEMM's stride words at offsets 80 and 88 — the
+ * slots `xmx_rec_qkv` already uses for its fifth pointer — as two 32-bit halves. */
+int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_scale,
+			  int qkv_scale, unsigned M, unsigned channels, unsigned heads,
+			  unsigned tokens, unsigned flags)
+{
+	if (!g.recording || !g.rint8) FAIL("integer GEMM not ready for recording", 0);
+	if (!M || !channels || channels % 64u || !heads || !tokens || channels != heads * 32u
+	    || M % tokens || (flags & ~0x2000u))
+		FAIL("the integer QKV projection needs channels a multiple of 64 and 32 a head, "
+		     "and a whole number of windows", 0);
+	unsigned N = 3u * channels;
+	VkDeviceAddress a_at = addr_of(a_scale), b_at = addr_of(b_scale);
+	struct push p = { .a = addr_of(a), .b = addr_of(b), .c = addr_of(q), .d = addr_of(k),
+			  .m = M, .n = N, .k = channels, .batch = 1u,
+			  .flags = flags | 0x100000u,
+			  .lda = (uint32_t)a_at, .ldb = (uint32_t)(a_at >> 32),
+			  .ldc = (uint32_t)b_at, .spare = (uint32_t)(b_at >> 32),
+			  .residual_cos = addr_of(v),
+			  .image_h = tokens, .image_w = heads,
+			  .qkv_scale = addr_of(qkv_scale) };
+	if (!p.a || !p.b || !p.c || !p.d || !p.residual_cos || !a_at || !b_at || !p.qkv_scale)
+		FAIL("integer QKV projection operand is not a live buffer", 0);
+	vkCmdBindPipeline(g.rcb, VK_PIPELINE_BIND_POINT_COMPUTE, g.rint8);
+	vkCmdPushConstants(g.rcb, g.rpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof p, &p);
+	vkCmdDispatch(g.rcb, N / XMX_STAGED_BN, XMX_DIV_UP(M, XMX_STAGED_BM), 1);
+	barrier();
+	stamp(PK_GEMM, 30);
+	g.recorded++;
+	return 0;
+}
+
+int xmx_int8_fused_init(const char *path)
+{
+	if (!g.rready) FAIL("resident runtime not initialised", 0);
+	if (g.rint8f) return 0;
+	free(g.rpaths[15]);
+	if (!(g.rpaths[15] = strdup(path))) FAIL("pipeline path allocation", 0);
+	return build_pipeline(path, g.rpl, &g.rint8f);
+}
+
+/* C = (A @ B^T) * a_scale[row] * b_scale[column] on configuration 4, the activations read
+ * float16 and put on the integer grid as the block is loaded
+ * (gemm_staged_int8_fused.comp). Same product as `xmx_rec_gemm_int8`, same scales, but
+ * `a` is float16 M x K and there is no packed int8 copy of it anywhere. */
+int xmx_rec_gemm_int8_fused(int a, int b, int c, int a_scale, int b_scale,
+			    unsigned M, unsigned N, unsigned K, unsigned flags)
+{
+	if (!g.recording || !g.rint8f) FAIL("fused integer GEMM not ready for recording", 0);
+	if (!M || !N || N % 32u || !K || K % 64u)
+		FAIL("the integer GEMM needs N a multiple of 32 and K of 64", 0);
+	if (flags) FAIL("the integer GEMM takes no flags yet", 0);
+	struct push p = { .a = addr_of(a), .b = addr_of(b), .c = addr_of(c),
+			  .d = addr_of(a_scale),
+			  .m = M, .n = N, .k = K, .batch = 1u, .flags = flags,
+			  .residual_cos = addr_of(b_scale) };
+	if (!p.a || !p.b || !p.c || !p.residual_cos)
+		FAIL("integer GEMM operand is not a live buffer", 0);
+	vkCmdBindPipeline(g.rcb, VK_PIPELINE_BIND_POINT_COMPUTE, g.rint8f);
+	vkCmdPushConstants(g.rcb, g.rpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof p, &p);
+	vkCmdDispatch(g.rcb, N / XMX_STAGED_BN, XMX_DIV_UP(M, XMX_STAGED_BM), 1);
 	barrier();
 	stamp(PK_GEMM, 30);
 	g.recorded++;

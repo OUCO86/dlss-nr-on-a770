@@ -108,8 +108,12 @@ def main():
             env = dict(os.environ)
             for name in ('XMX_STAGED_SPV', 'XMX_STAGED32_SPV', 'XMX_STAGED32_DEEP_SPV'):
                 env.pop(name, None)
+            # XMX_PREFER_STAGED: the staged kernel is no longer what a whole 64-row
+            # block takes by default (see record_gemm in libxmx.c — the tiled one is
+            # about twice as quick on Xe-HPG). This file is a test *of* the staged
+            # kernel, so it asks for that routing instead of inheriting it.
             env.update(XMX_STAGED_PACKED=str(mode), XMX_STAGE_K='32', XMX_STAGED32='1',
-                       XMX_STAGED_PARTIAL='1', PYTHONUTF8='1')
+                       XMX_STAGED_PARTIAL='1', XMX_PREFER_STAGED='1', PYTHONUTF8='1')
             subprocess.run([sys.executable, str(Path(__file__).resolve()), '--worker', str(archive)],
                            env=env, cwd=ROOT, check=True, timeout=120)
         with np.load(archives[0]) as old, np.load(archives[1]) as packed:

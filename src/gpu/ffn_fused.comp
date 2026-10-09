@@ -93,8 +93,18 @@ layout(push_constant, scalar) uniform Push {
 #include "specialize.glsl"
 #include "residual_epilogue.glsl"   /* needs operation_flags() from above */
 
-const uint TM = 8, TN = 16, TK = 16;
+/* A770 / Xe-HPG: fp16 cooperative matrix is 8x8x16 (config 0), not Xe2's 8x16x16. */
+const uint TM = 8, TN = 8, TK = 16;
 const uint ROWS = 16u, CHUNK = 32u, OUT = 32u, SUBGROUPS = 16u;
+/* The tile counts the literals below used to hard-code. RM is unchanged from Xe2
+ * (M is 16 rows on both); RN is not, because OUT is 32 columns and a tile is now
+ * 8 of them rather than 16. VEC_STEPS is the prologue's read of the stage: it
+ * steps 32 lanes x 4 floats at a time, and the stage holds ROWS*TN floats, which
+ * is half of what it was. */
+const uint RM = ROWS / TM;                       // 2
+const uint RN = OUT / TN;                        // 4  (Xe2: 2 at TN=16)
+const uint STAGE_ELEMS = ROWS * TN;              // 128 (Xe2: 256)
+const uint VEC_STEPS = STAGE_ELEMS / (32u * 4u); // 1   (Xe2: 2)
 const uint EPI_GATE_E4M3 = 3u;             // the expand GEMM's publish
 
 layout(buffer_reference, scalar, buffer_reference_align = 16) buffer Uvec4Buf { uvec4 u4[]; };
@@ -147,17 +157,17 @@ void main() {
     uint hidden = 8192u + 512u * sub;          // this subgroup's kilobyte, in halves
     uint stage = 4096u + 256u * sub;           // the same kilobyte, in floats
 
-    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> result[2][2];
-    for (uint i = 0; i < 2u; i++)
-        for (uint j = 0; j < 2u; j++)
+    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> result[RM][RN];
+    for (uint i = 0; i < RM; i++)
+        for (uint j = 0; j < RN; j++)
             result[i][j] = coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
 
     // an input made here: its sixteen rows, rounded to half, through the kilobyte into
     // the registers every chunk reads them from
-    coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> held[2][2];
-    coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> features[2];
+    coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> held[2][RM];
+    coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> features[RM];
     if (stemming()) {
-        for (uint i = 0; i < 2u; i++)
+        for (uint i = 0; i < RM; i++)
             coopMatLoad(features[i], pc.a.v, (row + i * TM) * 16u, 16u,
                         gl_CooperativeMatrixLayoutRowMajor);
     }
@@ -171,11 +181,11 @@ void main() {
                 h4[(hidden + r * 32u + c0 + q) >> 2] = f16vec4(merged);
             }
         } else {
-            for (uint j = 0; j < 2u; j++) {
+            for (uint j = 0; j < RN; j++) {
                 coopmat<float16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> adapter;
                 coopMatLoad(adapter, HalfBuf(pc.aux).v, j * TN, OUT,
                             gl_CooperativeMatrixLayoutRowMajor);
-                for (uint i = 0; i < 2u; i++) {
+                for (uint i = 0; i < RM; i++) {
                     coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> stem =
                         coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
                     stem = coopMatMulAdd(features[i], adapter, stem);
@@ -190,7 +200,7 @@ void main() {
         subgroupMemoryBarrierShared();
         subgroupBarrier();
         for (uint s = 0; s < 2u; s++)
-            for (uint i = 0; i < 2u; i++)
+            for (uint i = 0; i < RM; i++)
                 coopMatLoad(held[s][i], h16, hidden + i * TM * 32u + s * TK, 32u,
                             gl_CooperativeMatrixLayoutRowMajor);
         subgroupMemoryBarrierShared();          // the first chunk overwrites the kilobyte
@@ -199,25 +209,25 @@ void main() {
 
     for (uint chunk = 0u; chunk < width; chunk += CHUNK) {
         // the expand's 16x32 block for these hidden columns: K = 32 in two steps
-        coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> h[2][2];
-        for (uint i = 0; i < 2u; i++)
-            for (uint j = 0; j < 2u; j++)
+        coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> h[RM][RN];
+        for (uint i = 0; i < RM; i++)
+            for (uint j = 0; j < RN; j++)
                 h[i][j] = coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
         /* The input rows are read again for each chunk, from cache, rather than held
          * across all four: that is fewer registers for the same time. Narrower chunks
          * were measured too — 16 columns, no spills at all — and were 9 % slower: twice
          * the barriers and shared-memory round trips for the same arithmetic. */
         for (uint kk = 0; kk < cin; kk += TK) {
-            coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> x[2];
-            for (uint i = 0; i < 2u; i++) {
+            coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> x[RM];
+            for (uint i = 0; i < RM; i++) {
                 if (merging() || stemming())
                     x[i] = held[kk / TK][i];
                 else
                     coopMatLoad(x[i], pc.a.v, (row + i * TM) * cin + kk, cin,
                                 gl_CooperativeMatrixLayoutRowMajor);
             }
-            coopmat<float16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> w[2];
-            for (uint j = 0; j < 2u; j++) {
+            coopmat<float16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> w[RN];
+            for (uint j = 0; j < RN; j++) {
                 if (staged())
                     coopMatLoad(w[j], h16, kk * width + chunk + j * TN, width,
                                 gl_CooperativeMatrixLayoutRowMajor);
@@ -225,13 +235,13 @@ void main() {
                     coopMatLoad(w[j], pc.b.v, expand_base + kk * width + chunk + j * TN, width,
                                 gl_CooperativeMatrixLayoutRowMajor);
             }
-            for (uint i = 0; i < 2u; i++)
-                for (uint j = 0; j < 2u; j++)
+            for (uint i = 0; i < RM; i++)
+                for (uint j = 0; j < RN; j++)
                     h[i][j] = coopMatMulAdd(x[i], w[j], h[i][j]);
         }
         // its publish on the accumulator, then into shared memory as the projection's A
-        for (uint i = 0; i < 2u; i++)
-            for (uint j = 0; j < 2u; j++) {
+        for (uint i = 0; i < RM; i++)
+            for (uint j = 0; j < RN; j++) {
                 for (uint e = 0; e < h[i][j].length(); e++)
                     h[i][j][e] = publish(EPI_GATE_E4M3, h[i][j][e]);
                 coopmat<float16_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> narrow =
@@ -243,12 +253,12 @@ void main() {
         subgroupBarrier();
         // the projection over these 32 hidden rows, in two steps of 16
         for (uint kk = 0; kk < 2u; kk++) {
-            coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> g[2];
-            for (uint i = 0; i < 2u; i++)
+            coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> g[RM];
+            for (uint i = 0; i < RM; i++)
                 coopMatLoad(g[i], h16, hidden + i * TM * CHUNK + kk * TK, CHUNK,
                             gl_CooperativeMatrixLayoutRowMajor);
-            coopmat<float16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> p[2];
-            for (uint j = 0; j < 2u; j++) {
+            coopmat<float16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> p[RN];
+            for (uint j = 0; j < RN; j++) {
                 if (staged())
                     coopMatLoad(p[j], h16, PROJECTION + (chunk + kk * TK) * OUT + j * TN,
                                 OUT, gl_CooperativeMatrixLayoutRowMajor);
@@ -256,8 +266,8 @@ void main() {
                     coopMatLoad(p[j], projection.v, project_base + (chunk + kk * TK) * OUT + j * TN,
                                 OUT, gl_CooperativeMatrixLayoutRowMajor);
             }
-            for (uint i = 0; i < 2u; i++)
-                for (uint j = 0; j < 2u; j++)
+            for (uint i = 0; i < RM; i++)
+                for (uint j = 0; j < RN; j++)
                     result[i][j] = coopMatMulAdd(g[i], p[j], result[i][j]);
         }
         subgroupMemoryBarrierShared();          // the next chunk overwrites the hidden chunk
@@ -268,14 +278,14 @@ void main() {
     // as the projection GEMM's residual epilogue finishes each element.
     uint epilogue = (operation_flags() >> 8) & 0xFu;
     bool narrow_out = (operation_flags() & 0x1000u) != 0u;
-    for (uint j = 0; j < 2u; j++) {
+    for (uint j = 0; j < RN; j++) {
         // the stem's values under these sixteen columns, through the stage first
-        vec4 stem_at[2];
+        vec4 stem_at[VEC_STEPS];
         if (stemming()) {
             coopmat<float16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> adapter;
             coopMatLoad(adapter, HalfBuf(pc.aux).v, j * TN, OUT,
                         gl_CooperativeMatrixLayoutRowMajor);
-            for (uint i = 0; i < 2u; i++) {
+            for (uint i = 0; i < RM; i++) {
                 coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> stem =
                     coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
                 stem = coopMatMulAdd(features[i], adapter, stem);
@@ -284,7 +294,7 @@ void main() {
             }
             subgroupMemoryBarrierShared();
             subgroupBarrier();
-            for (uint n = 0; n < 2u; n++) {
+            for (uint n = 0; n < VEC_STEPS; n++) {
                 uint e = lane * 4u + n * 128u;
                 stem_at[n] = vec4(f32[stage + e], f32[stage + e + 1u], f32[stage + e + 2u],
                                   f32[stage + e + 3u]);
@@ -292,7 +302,7 @@ void main() {
             subgroupMemoryBarrierShared();      // the result overwrites the stage
             subgroupBarrier();
         }
-        for (uint i = 0; i < 2u; i++)
+        for (uint i = 0; i < RM; i++)
             coopMatStore(result[i][j], f32, stage + i * TM * TN, TN, gl_CooperativeMatrixLayoutRowMajor);
         subgroupMemoryBarrierShared();
         subgroupBarrier();

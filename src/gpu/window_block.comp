@@ -146,20 +146,20 @@ void main() {
     coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseA> query[2];
     uint keys[4], values[4];                     // this lane's K and V, two halves a word
     for (uint part = 0u; part < 3u; part++) {
-        coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator> acc[2];
-        for (uint j = 0u; j < 2u; j++)
-            acc[j] = coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>(0.0);
+        coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> acc[4];
+        for (uint j = 0u; j < 4u; j++)
+            acc[j] = coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0.0);
         for (uint kk = 0u; kk < 2u; kk++)
-            for (uint j = 0u; j < 2u; j++) {
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w;
-                coopMatLoad(w, h16, kk * 16u * 96u + part * 32u + j * 16u, 96u,
+            for (uint j = 0u; j < 4u; j++) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseB> w;
+                coopMatLoad(w, h16, kk * 16u * 96u + part * 32u + j * 8u, 96u,
                             gl_CooperativeMatrixLayoutRowMajor);
                 acc[j] = coopMatMulAdd(rows[kk], w, acc[j]);
             }
         subgroupMemoryBarrierShared();           // the row's halves are in registers
         subgroupBarrier();
-        for (uint j = 0u; j < 2u; j++)
-            coopMatStore(acc[j], f32, scratch + j * 16u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+        for (uint j = 0u; j < 4u; j++)
+            coopMatStore(acc[j], f32, scratch + j * 8u, 32u, gl_CooperativeMatrixLayoutRowMajor);
         subgroupMemoryBarrierShared();
         subgroupBarrier();
         /* Four lanes a row, eight channels a lane — 2l and 2l + 1 of each group of eight —
@@ -228,25 +228,25 @@ void main() {
     /* Window attention, as window_attention.comp computes it for one head, merged. */
     uint head_bias = row * 64u;
     {
-        coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator> acc[4];
-        for (uint j = 0u; j < 4u; j++)
-            acc[j] = coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>(0.0);
+        coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> acc[8];
+        for (uint j = 0u; j < 8u; j++)
+            acc[j] = coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0.0);
         for (uint c = 0u; c < 32u; c += 16u) {
-            for (uint j = 0u; j < 4u; j++) {
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> key;
-                coopMatLoad(key, h16, j * 16u * 32u + c, 32u, gl_CooperativeMatrixLayoutColumnMajor);
+            for (uint j = 0u; j < 8u; j++) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseB> key;
+                coopMatLoad(key, h16, j * 8u * 32u + c, 32u, gl_CooperativeMatrixLayoutColumnMajor);
                 acc[j] = coopMatMulAdd(query[c / 16u], key, acc[j]);
             }
         }
-        for (uint j = 0u; j < 4u; j++) {
-            coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator> b;
-            coopMatLoad(b, pc.d.v, head_bias + j * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+        for (uint j = 0u; j < 8u; j++) {
+            coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> b;
+            coopMatLoad(b, pc.d.v, head_bias + j * 8u, 64u, gl_CooperativeMatrixLayoutRowMajor);
             acc[j] = acc[j] + b;
         }
         uint kept[8];
         for (uint half_keys = 0u; half_keys < 2u; half_keys++) {
-            for (uint j = 0u; j < 2u; j++)
-                coopMatStore(acc[half_keys * 2u + j], f32, scratch + j * 16u, 32u,
+            for (uint j = 0u; j < 4u; j++)
+                coopMatStore(acc[half_keys * 4u + j], f32, scratch + j * 8u, 32u,
                              gl_CooperativeMatrixLayoutRowMajor);
             subgroupMemoryBarrierShared();
             subgroupBarrier();
@@ -297,23 +297,23 @@ void main() {
     }
     subgroupMemoryBarrierShared();
     subgroupBarrier();
-    coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator> context[2];
-    for (uint j = 0u; j < 2u; j++)
-        context[j] = coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> context[4];
+    for (uint j = 0u; j < 4u; j++)
+        context[j] = coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0.0);
     for (uint c = 0u; c < 64u; c += 16u) {
         coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseA> p;
         coopMatLoad(p, h16, scratch * 2u + c, 64u, gl_CooperativeMatrixLayoutRowMajor);
-        for (uint j = 0u; j < 2u; j++) {
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> v;
-            coopMatLoad(v, h16, VALUES + c * 32u + j * 16u, 32u,
+        for (uint j = 0u; j < 4u; j++) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseB> v;
+            coopMatLoad(v, h16, VALUES + c * 32u + j * 8u, 32u,
                         gl_CooperativeMatrixLayoutRowMajor);
             context[j] = coopMatMulAdd(p, v, context[j]);
         }
     }
     subgroupMemoryBarrierShared();
     subgroupBarrier();
-    for (uint j = 0u; j < 2u; j++)
-        coopMatStore(context[j], f32, scratch + j * 16u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+    for (uint j = 0u; j < 4u; j++)
+        coopMatStore(context[j], f32, scratch + j * 8u, 32u, gl_CooperativeMatrixLayoutRowMajor);
     subgroupMemoryBarrierShared();
     subgroupBarrier();
 
@@ -333,20 +333,20 @@ void main() {
     for (uint kk = 0u; kk < 2u; kk++)
         coopMatLoad(attended[kk], h16, scratch * 2u + kk * 16u, 32u,
                     gl_CooperativeMatrixLayoutRowMajor);
-    coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator> projected[2];
-    for (uint j = 0u; j < 2u; j++)
-        projected[j] = coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> projected[4];
+    for (uint j = 0u; j < 4u; j++)
+        projected[j] = coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0.0);
     for (uint kk = 0u; kk < 2u; kk++)
-        for (uint j = 0u; j < 2u; j++) {
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w;
-            coopMatLoad(w, h16, 512u + kk * 16u * 32u + j * 16u, 32u,
+        for (uint j = 0u; j < 4u; j++) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseB> w;
+            coopMatLoad(w, h16, 512u + kk * 16u * 32u + j * 8u, 32u,
                         gl_CooperativeMatrixLayoutRowMajor);
             projected[j] = coopMatMulAdd(attended[kk], w, projected[j]);
         }
     subgroupMemoryBarrierShared();
     subgroupBarrier();
-    for (uint j = 0u; j < 2u; j++)
-        coopMatStore(projected[j], f32, scratch + j * 16u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+    for (uint j = 0u; j < 4u; j++)
+        coopMatStore(projected[j], f32, scratch + j * 8u, 32u, gl_CooperativeMatrixLayoutRowMajor);
     subgroupMemoryBarrierShared();
     subgroupBarrier();
 
@@ -406,16 +406,21 @@ void main() {
         for (uint kk = 0u; kk < 2u; kk++)
             coopMatLoad(block_out[kk], h16, scratch * 2u + kk * 16u, 32u,
                         gl_CooperativeMatrixLayoutRowMajor);
-        coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator> head_acc =
-            coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>(0.0);
-        for (uint kk = 0u; kk < 2u; kk++) {
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w;
-            coopMatLoad(w, h16, 1536u + kk * 16u * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-            head_acc = coopMatMulAdd(block_out[kk], w, head_acc);
-        }
+        coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> head_acc[2];
+        for (uint j = 0u; j < 2u; j++)
+            head_acc[j] = coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0.0);
+        for (uint kk = 0u; kk < 2u; kk++)
+            for (uint j = 0u; j < 2u; j++) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseB> w;
+                coopMatLoad(w, h16, 1536u + kk * 16u * 16u + j * 8u, 16u,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                head_acc[j] = coopMatMulAdd(block_out[kk], w, head_acc[j]);
+            }
         subgroupMemoryBarrierShared();
         subgroupBarrier();
-        coopMatStore(head_acc, f32, scratch, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        for (uint j = 0u; j < 2u; j++)
+            coopMatStore(head_acc[j], f32, scratch + j * 8u, 16u,
+                         gl_CooperativeMatrixLayoutRowMajor);
         subgroupMemoryBarrierShared();
         subgroupBarrier();
         if ((operation_flags() & 0x2000000u) == 0u) {

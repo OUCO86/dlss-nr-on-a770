@@ -48,7 +48,14 @@ static int nr_link_connect(nr_link *link, const char *path)
 			return 0;
 		}
 		DWORD e = GetLastError();
-		if (e != ERROR_PIPE_BUSY && e != ERROR_FILE_NOT_FOUND) return -1;
+		/* ERROR_PIPE_BUSY is every instance spoken for, and ERROR_NO_DATA is an
+		 * instance caught in the middle of being closed by the daemon's last frame —
+		 * with several frames on their way at once one of the two is the normal state
+		 * of the pipe, not a failure, and both pass in the time it takes the daemon
+		 * to accept the frame before this one. Only a pipe that is not there at all
+		 * (ERROR_FILE_NOT_FOUND) belongs to the same wait: that is start-up. */
+		if (e != ERROR_PIPE_BUSY && e != ERROR_FILE_NOT_FOUND && e != ERROR_NO_DATA)
+			return -1;
 		Sleep(50);
 	}
 	return -1;

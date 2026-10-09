@@ -1,0 +1,135 @@
+#version 450
+/*
+ * quantize_row — a matrix's activations onto the integer path's grid, one scale per row.
+ *
+ * Configuration 4 is `sint8 x sint8 -> sint32`: both operands integer, so putting the
+ * weights on the integer path puts the activations there too, and `notes/phase23-integer-
+ * weights.md` is the note that measured why that matters. A single scale per tensor lays
+ * one absolute grid over values spanning 180 000x and rounds 21.5 % of level l1's
+ * non-zero values away entirely. One scale per row gives every token its own grid, and
+ * the range that matters becomes the range *within* a token, which is what
+ * `src/gpu/int8_quant.py` measured at 1.59 % relative error at the deepest level.
+ *
+ * So: C[row] = max|A[row]| / 127, and B[row][k] = roundEven(A[row][k] / C[row]). The
+ * rounding is `roundEven` and not `round` because the host reference is numpy's
+ * `np.round`, which is half-to-even, and this is the one place the two have to agree.
+ * The grid is reached by multiplying by 127 / peak rather than dividing by the scale:
+ * one division a row instead of one a value.
+ *
+ * A row that is all zeros keeps a scale of 1.0 rather than dividing by zero, and
+ * quantises to zeros, which is right — and which is also what the host reference does.
+ *
+ * How the work is laid out is most of what this pass costs. It used to be one workgroup
+ * of 256 threads per row, which on the model's shapes is 21504 workgroups each with
+ * three quarters of its threads idle: at K of 64 a row is 64 float16, so 64 of the 256
+ * threads had anything to do, and each read two bytes where it could have read sixteen.
+ * The row maximum was a tree reduction in shared memory behind eight barriers. Measured
+ * at 768x448 that pass cost 189 us on a shape whose GEMM costs 19 — ten times the thing
+ * it feeds, and the reason the integer path as a whole was slower than fp16
+ * (`work/int8_fused_out.txt`).
+ *
+ * So: a warp per row, and where a row is shorter than a warp, several rows to a warp.
+ * A thread reads whole 16-byte words, the row maximum is four shuffles inside the lanes
+ * that own the row, and there is no barrier anywhere. Rows past a dispatch's x extent go
+ * into y, as before.
+ */
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+const uint THREADS = 256u;
+const uint WARPS = THREADS / 32u;
+/* A dispatch's x extent is 65535 on every device this project runs on; workgroups past
+ * that go into y. */
+const uint GRID = 65535u;
+
+layout(local_size_x = THREADS) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) buffer HalfBuf  { float16_t v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 16) buffer Uvec4Buf { uvec4    v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 8)  buffer Uvec2Buf { uvec2    v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 16) buffer FloatBuf { float     v[]; };
+
+layout(push_constant, scalar) uniform Push {
+    HalfBuf a; Uvec4Buf b; FloatBuf c; FloatBuf d;
+    uint m, n, k, batch;
+    uint sa, sb, sc, flags;
+    float p0, p1, p2, p3;
+    uint lda, ldb, ldc, spare;
+    uint64_t residual_cos;
+    uint image_h, image_w, window_cols, window_pad;
+    uint64_t qkv_scale;
+} pc;
+
+/* Four int8 into one word, in the order the machine lays bytes out. */
+uint pack4(int x0, int x1, int x2, int x3)
+{
+    return (uint(x0) & 0xffu) | ((uint(x1) & 0xffu) << 8u)
+         | ((uint(x2) & 0xffu) << 16u) | ((uint(x3) & 0xffu) << 24u);
+}
+
+int grid(float v, float reciprocal)
+{
+    return clamp(int(roundEven(v * reciprocal)), -127, 127);
+}
+
+/* One word's eight float16 onto the grid, as eight bytes. */
+uvec2 quantise8(uvec4 w, float reciprocal)
+{
+    vec2 p0 = unpackHalf2x16(w.x), p1 = unpackHalf2x16(w.y);
+    vec2 p2 = unpackHalf2x16(w.z), p3 = unpackHalf2x16(w.w);
+    return uvec2(pack4(grid(p0.x, reciprocal), grid(p0.y, reciprocal),
+                       grid(p1.x, reciprocal), grid(p1.y, reciprocal)),
+                 pack4(grid(p2.x, reciprocal), grid(p2.y, reciprocal),
+                       grid(p3.x, reciprocal), grid(p3.y, reciprocal)));
+}
+
+float peak8(uvec4 w)
+{
+    vec2 p0 = unpackHalf2x16(w.x), p1 = unpackHalf2x16(w.y);
+    vec2 p2 = unpackHalf2x16(w.z), p3 = unpackHalf2x16(w.w);
+    return max(max(max(abs(p0.x), abs(p0.y)), max(abs(p1.x), abs(p1.y))),
+               max(max(abs(p2.x), abs(p2.y)), max(abs(p3.x), abs(p3.y))));
+}
+
+void main() {
+    uint words = pc.k / 8u;                     // a row, in 16-byte words
+    /* The lanes that share a row: as many as the row has words, up to a whole warp. A
+     * power of two, because the row's peak is found by shuffling within that group. */
+    uint per_row = words >= 32u ? 32u : 1u << (findMSB(words - 1u) + 1u);
+    uint rows_per_warp = 32u / per_row;
+    uint warp = gl_LocalInvocationID.x / 32u, lane = gl_LocalInvocationID.x % 32u;
+    uint which = lane / per_row, within = lane % per_row;
+    uint row = (gl_WorkGroupID.y * GRID + gl_WorkGroupID.x) * (WARPS * rows_per_warp)
+             + warp * rows_per_warp + which;
+    /* Rows past the end keep going, reading the last row instead of their own. A lane
+     * that drops out before a shuffle leaves the rest of its subgroup waiting on a lane
+     * that is never coming, and the row depends on the lane here, so it is the shuffle
+     * that has to be reached by all of them. Only the stores are guarded. */
+    uint held = min(row, pc.m - 1u);
+    Uvec4Buf source = Uvec4Buf(uint64_t(pc.a));
+    Uvec2Buf packed = Uvec2Buf(uint64_t(pc.b));
+    uint base = held * words;
+
+    float peak = 0.0;
+    for (uint w = within; w < words; w += per_row)
+        peak = max(peak, peak8(source.v[base + w]));
+    /* Every lane of the group ends up with the row's peak: four shuffles, no barrier. */
+    for (uint s = 1u; s < per_row; s <<= 1u)
+        peak = max(peak, subgroupShuffleXor(peak, s));
+    /* 1.0 for an empty row, so the packed values are zeros rather than NaN. */
+    float scale = peak == 0.0 ? 1.0 : peak / 127.0;
+    if (row >= pc.m) return;
+    if (within == 0u) pc.c.v[row] = scale;
+
+    float reciprocal = 1.0 / scale;
+    for (uint w = within; w < words; w += per_row)
+        packed.v[row * words + w] = quantise8(source.v[row * words + w], reciprocal);
+}

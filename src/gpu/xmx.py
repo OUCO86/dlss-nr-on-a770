@@ -36,6 +36,15 @@ def native_library(name):
     DLL's own dependencies only in the system folders and the ones added here: the build's
     `work/`, and `NR_DLL_PATH` for a toolchain's runtime — MinGW's libgomp and libwinpthread —
     wherever it is installed."""
+    override = os.environ.get("NR_LIBXMX")
+    if override and os.path.isfile(override):
+        # A second build alongside the resident one, so a tree can be rebuilt and timed
+        # while a game is holding work/libxmx.dll open.
+        if not _dll_directories:
+            for directory in [str(Path(override).parent), str(ROOT / "work")]:
+                if os.path.isdir(directory):
+                    _dll_directories.append(os.add_dll_directory(directory))
+        return ctypes.CDLL(override)
     folder = ROOT / "work"
     if os.name == "nt":
         if not _dll_directories:

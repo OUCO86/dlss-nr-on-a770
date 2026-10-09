@@ -250,7 +250,7 @@ if not exist "%MANIFEST%" (
 )
 rem Keep this shader inventory in step with scripts/build_release.py. Windows
 rem regression tests remove each runtime shader in turn to check completeness.
-set "RUNTIME_FILES=libxmx.dll libnr_image.dll libnr_alloc.dll attention.spv attention_rows.spv ffn_fused.spv gemm_batched.spv gemm_coopmat.spv gemm_resident.spv gemm_staged.spv gemm_staged32.spv gemm_staged32_deep.spv gemm_staged_int8.spv gemm_tiled.spv global_attention.spv half_probe.spv history.spv resident.spv window_attention.spv window_block.spv"
+set "RUNTIME_FILES=libxmx.dll libnr_image.dll libnr_alloc.dll attention.spv attention_rows.spv ffn_fused.spv gemm_batched.spv gemm_coopmat.spv gemm_resident.spv gemm_staged.spv gemm_staged32.spv gemm_staged32_deep.spv gemm_staged_int8.spv gemm_staged_int8_fused.spv gemm_tiled.spv gemm_tiled32.spv global_attention.spv half_probe.spv history.spv resident.spv window_attention.spv window_block.spv"
 rem A directory with a DLL/SPV filename is not a usable runtime file. IF EXIST
 rem alone accepts it, and COPY can also succeed while copying into a directory.
 for %%L in (%RUNTIME_FILES%) do (

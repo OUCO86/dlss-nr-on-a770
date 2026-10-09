@@ -97,7 +97,7 @@ def host_checks():
                 "fuse_attention_merge", "qkv_epilogue", "fuse_glue", "fuse_ffn",
                 "fuse_branched_ffn", "fuse_partition", "fuse_transition", "fuse_merge_ffn",
                 "fuse_stem_ffn", "fuse_pool", "fuse_window_block", "fuse_head",
-                "fuse_global_attention")
+                "fuse_global_attention", "int8_project")
     rt = object.__new__(xmxres.Runtime)
     seen = bytearray(1 << 22)
     walked = 0

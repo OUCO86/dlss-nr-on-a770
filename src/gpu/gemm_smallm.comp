@@ -45,8 +45,8 @@ layout(push_constant, scalar) uniform Push {
 } pc;
 
 #define A_TILE coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseA>
-#define B_TILE coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
-#define ACC    coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>
+#define B_TILE coopmat<float16_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseB>
+#define ACC    coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>
 
 /* ROWS: 16 or 32 rows a subgroup — two or four accumulators, spelled out rather than in
  * arrays: an array of cooperative matrices indexed in a loop compiled to something a third

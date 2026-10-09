@@ -78,25 +78,25 @@ void main() {
     uint scratch = 2048u + 256u * sub;   // this subgroup's kilobyte, in floats and words
     uint head_bias = (batch % pc.heads) * 4096u + row * 64u;
     {
-        coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator> acc[4];
-        for (uint j = 0u; j < 4u; j++)
-            acc[j] = coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>(0.0);
+        coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> acc[8];
+        for (uint j = 0u; j < 8u; j++)
+            acc[j] = coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0.0);
         for (uint c = 0u; c < 32u; c += 16u) {
             coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseA> q;
             coopMatLoad(q, pc.q.v, offset + row * 32u + c, 32u,
                         gl_CooperativeMatrixLayoutRowMajor);
-            for (uint j = 0u; j < 4u; j++) {
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> k;
-                coopMatLoad(k, h16, j * 16u * 32u + c, 32u, gl_CooperativeMatrixLayoutColumnMajor);
+            for (uint j = 0u; j < 8u; j++) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseB> k;
+                coopMatLoad(k, h16, j * 8u * 32u + c, 32u, gl_CooperativeMatrixLayoutColumnMajor);
                 acc[j] = coopMatMulAdd(q, k, acc[j]);
             }
         }
         /* The bias joins the logits a whole 8x16 tile at a time: the float32 add the
          * softmax used to make element by element, sixteen scattered loads a lane. */
         if (pc.flags != 0u) {
-            for (uint j = 0u; j < 4u; j++) {
-                coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator> b;
-                coopMatLoad(b, pc.bias.v, head_bias + j * 16u, 64u,
+            for (uint j = 0u; j < 8u; j++) {
+                coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> b;
+                coopMatLoad(b, pc.bias.v, head_bias + j * 8u, 64u,
                             gl_CooperativeMatrixLayoutRowMajor);
                 acc[j] = acc[j] + b;
             }
@@ -106,8 +106,8 @@ void main() {
          * straddle the halves, since both start on an even key. */
         uint kept[8];
         for (uint half_keys = 0u; half_keys < 2u; half_keys++) {
-            for (uint j = 0u; j < 2u; j++)
-                coopMatStore(acc[half_keys * 2u + j], f32, scratch + j * 16u, 32u,
+            for (uint j = 0u; j < 4u; j++)
+                coopMatStore(acc[half_keys * 4u + j], f32, scratch + j * 8u, 32u,
                              gl_CooperativeMatrixLayoutRowMajor);
             subgroupMemoryBarrierShared();
             subgroupBarrier();
@@ -159,15 +159,15 @@ void main() {
     subgroupMemoryBarrierShared();
     subgroupBarrier();
     {
-        coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator> acc[2];
-        for (uint j = 0u; j < 2u; j++)
-            acc[j] = coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>(0.0);
+        coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> acc[4];
+        for (uint j = 0u; j < 4u; j++)
+            acc[j] = coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0.0);
         for (uint c = 0u; c < 64u; c += 16u) {
             coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseA> p;
             coopMatLoad(p, h16, scratch * 2u + c, 64u, gl_CooperativeMatrixLayoutRowMajor);
-            for (uint j = 0u; j < 2u; j++) {
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> v;
-                coopMatLoad(v, h16, VALUES + c * 32u + j * 16u, 32u,
+            for (uint j = 0u; j < 4u; j++) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseB> v;
+                coopMatLoad(v, h16, VALUES + c * 32u + j * 8u, 32u,
                             gl_CooperativeMatrixLayoutRowMajor);
                 acc[j] = coopMatMulAdd(p, v, acc[j]);
             }
@@ -175,11 +175,11 @@ void main() {
         /* the probabilities and the output stage are the same bytes */
         subgroupMemoryBarrierShared();
         subgroupBarrier();
-        for (uint j = 0u; j < 2u; j++) {
+        for (uint j = 0u; j < 4u; j++) {
             if (MERGED_OUTPUT)
-                coopMatStore(acc[j], f32, scratch + j * 16u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatStore(acc[j], f32, scratch + j * 8u, 32u, gl_CooperativeMatrixLayoutRowMajor);
             else
-                coopMatStore(acc[j], pc.output_data.v, offset + row * 32u + j * 16u, 32u,
+                coopMatStore(acc[j], pc.output_data.v, offset + row * 32u + j * 8u, 32u,
                              gl_CooperativeMatrixLayoutRowMajor);
         }
     }

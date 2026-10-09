@@ -1,5 +1,28 @@
 # DLSS 5 Neural Rendering on an Intel Xe2 iGPU
 
+> ## 🟢 Arc A770 分支：三步跑起来
+>
+> 这一支是在 **Intel Arc A770 独显 + Windows** 上跑通的（上游讲 Lunar Lake iGPU + Linux）。
+>
+> 1. **双击桌面 `DOOM Eternal (NR).bat`** —— 启动游戏并挂上 NR 层
+>    （真身：`tools\nr_play.bat`，只做「在 cmd 里 set 环境变量 → 从同一个 cmd 启游戏」）
+> 2. 等 `work\nr_daemon.log` 里出现 **`listening on \\.\pipe\nr_lop`**
+> 3. 桌面 **`NR 开启.bat`** 开效果 / **`NR 关闭.bat`** 关效果 —— **实时生效，不用重启游戏**
+>
+> 游戏：`F:\Game\DOOM Eternal\DOOMEternalx64vk.exe`（native Vulkan，**不需要 Steam**）
+>
+> 📄 完整说明（硬件前提、开关台账、实测数据、踩坑记录）：
+> **[`docs/A770-RUNNING.md`](docs/A770-RUNNING.md)**
+>
+> ⚠️ **两条红线**：① **禁止 `setx` / 注册表 / 隐式层**注入（只准进程级环境变量）；
+> ② **daemon 不要手动启**（由游戏自 spawn，手动起会两 daemon 抢管道 = 游戏卡死）。
+>
+> ---
+>
+> 以下是上游原文。
+
+---
+
 NVIDIA's DLSS 5 Neural Rendering pass — the one-step pixel-space diffusion model that
 re-renders a frame's detail — running on an **Intel Arc 140V (Lunar Lake, Xe2)**
 integrated GPU under Linux, in a real game, through a Vulkan layer.
