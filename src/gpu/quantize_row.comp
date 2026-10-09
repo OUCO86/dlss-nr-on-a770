@@ -32,6 +32,20 @@
  * A thread reads whole 16-byte words, the row maximum is four shuffles inside the lanes
  * that own the row, and there is no barrier anywhere. Rows past a dispatch's x extent go
  * into y, as before.
+ *
+ * Bit 0x400000 of `flags` is the window blocks' spelling of the same pass: the rows are a
+ * window partition's, gathered out of the image as they are read rather than written into
+ * a buffer of their own first. The float path folds this gather into the projection's own
+ * loads; the integer path has nowhere to fold it, and until now paid `partition` for it —
+ * a pass that read the whole image and wrote it back in window order for this one to read
+ * straight through. The arithmetic here is unchanged by it: only the trip to memory goes.
+ * A token outside the image is zero, as `partition` wrote, and a token's words are
+ * contiguous in the image because its channels are. `image_h` and `image_w` are the
+ * unpadded image's, `window_cols` the windows across it, and `window_pad` the
+ * shifted-window origin as (top << 16) | left — the same four the projection's own
+ * gather reads (`gemm_staged.comp`). A float32 image is the one case left unfused:
+ * `partition` rounds it to half on the way out, and that rounding belongs to the pass
+ * that writes it.
  */
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference2 : require
@@ -116,11 +130,31 @@ void main() {
     uint held = min(row, pc.m - 1u);
     Uvec4Buf source = Uvec4Buf(uint64_t(pc.a));
     Uvec2Buf packed = Uvec2Buf(uint64_t(pc.b));
+
+    /* Where the row's words live. Straight through, that is the row's own extent; with a
+     * window gather it is the token's pixel, whose channels are contiguous in the image
+     * and whose words therefore are too. */
+    bool gather = (pc.flags & 0x400000u) != 0u;
+    bool outside = false;
     uint base = held * words;
+    if (gather) {
+        /* The same index the partition made: (window, token) back to (y, x), less the pad
+         * the shifted origin asked for. */
+        const uint size = 8u;
+        uint across = pc.window_cols;
+        uint pad_top = pc.window_pad >> 16u, pad_left = pc.window_pad & 0xFFFFu;
+        uint token = held % (size * size), window = held / (size * size);
+        int y = int((window / across) * size + token / size) - int(pad_top);
+        int x = int((window % across) * size + token % size) - int(pad_left);
+        outside = (y < 0 || x < 0 || y >= int(pc.image_h) || x >= int(pc.image_w));
+        if (!outside) base = (uint(y) * pc.image_w + uint(x)) * words;
+    }
 
     float peak = 0.0;
-    for (uint w = within; w < words; w += per_row)
-        peak = max(peak, peak8(source.v[base + w]));
+    if (!outside) {
+        for (uint w = within; w < words; w += per_row)
+            peak = max(peak, peak8(source.v[base + w]));
+    }
     /* Every lane of the group ends up with the row's peak: four shuffles, no barrier. */
     for (uint s = 1u; s < per_row; s <<= 1u)
         peak = max(peak, subgroupShuffleXor(peak, s));
@@ -130,6 +164,9 @@ void main() {
     if (within == 0u) pc.c.v[row] = scale;
 
     float reciprocal = 1.0 / scale;
-    for (uint w = within; w < words; w += per_row)
-        packed.v[row * words + w] = quantise8(source.v[row * words + w], reciprocal);
+    for (uint w = within; w < words; w += per_row) {
+        uint at = row * words + w;
+        packed.v[at] = (outside ? uvec2(0u, 0u)
+                                : quantise8(source.v[base + w], reciprocal));
+    }
 }

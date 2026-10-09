@@ -70,6 +70,24 @@ E:\WorkBuddy\2026-10-09-04-20-55\tools\nr_play.bat
 | 3 | **QKV 投影上 int8** | `NR_INT8_QKV` | `"1"` | **+1.9 ms** |
 | 4 | attention out 投影 | `NR_INT8_OUT` | `"1"` | — |
 | 5 | daemon 去掉 `np.abs` 临时数组 | — | — | −1.7 ms（CPU） |
+| 6 | **window 块的 gather 融进量化** | `NR_INT8_WINDOW_FUSE` | `"1"` | **−4.37 ms（设备）** |
+
+### 第 6 项：它是什么
+
+int8 的 QKV 投影没有 epilogue，窗口 gather 无处可放，所以图里一直是
+`partition`（把图像按窗口顺序写一份 fp16 副本）→ `quantize_row`（读副本逐行量化）
+两趟。float 路径早就把这个 gather 折进 GEMM 自己的 load 里了。
+
+现在 gather 搬进了量化内核：`quantize_row.comp` 的 flags 位 `0x400000`，
+按 `partition` 原来那个索引直接从图像上取 token，副本不再存在，写副本那趟也不再运行。
+`Runtime.quantize_window` / `xmx_rec_quant_window`。
+
+- 一帧 **756 → 600 pass**，`partition` 52 趟归零
+- 设备时间 **31.60 → 27.23 ms**（三轮交替，噪声 ±0.03 ms）
+- 逐字节等价：`work/fuse_equiv.py compare` 报 0 个值不同
+- 只在本来就是 fp16 的图像上融合；float32 那一路留给 `partition` 去取整
+
+`NR_INT8_WINDOW_FUSE=0` 回到两趟，A/B 就是这么比的。
 
 ### ❌ 已证伪：流水线 inflight=2
 
@@ -188,9 +206,9 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIODtt2c4snVUP5LSkjDRQa+Wt8w+Q/7yHtcfJje6l/99
 
 1. ~~**游戏内 A/B 验收流水线**~~ ✅ **已完成 —— 结论是负收益，已回退**。
    数据见第 3 节。不用再测这一项了。
-2. **次要**：window block 为喂 int8 多付 `partition` + `quantize_row` 两趟，
-   合成一趟或给 int8 内核加 `0x400000` 窗口 gather，估计约 1 ms，不损画质。
-   这是**纯 GPU 内核侧**的改动，不碰跨进程握手，风险比流水线那条路低。
+2. ~~**window 块的 gather 融进量化**~~ ✅ **已完成** —— 数据见第 3 节第 6 项。
+   实测 **−4.37 ms**（比当初估的约 1 ms 好不少），整帧输出逐字节不变。
+   这一项**还没在游戏里跑过**（见第 9 节）。
 3. **收尾**：把 PAT `ghp_2OOW...` 去 <https://github.com/settings/tokens> 删掉
 
 ---
@@ -210,4 +228,5 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIODtt2c4snVUP5LSkjDRQa+Wt8w+Q/7yHtcfJje6l/99
 
 - ~~流水线 `inflight=2` 在真实游戏里的帧时间收益~~ —— ✅ 已测，**负收益，已回退**
 - ~~多一帧延迟在操作手感上能不能接受~~ —— ✅ 该路已废弃，不用再评估
-- **window block 两趟合成一趟**（约 1 ms）还没做，也没在真实游戏里测过
+- **window block 两趟合成一趟**已经做了，离线数字和逐字节等价都有，
+  但**还没在真实游戏里跑过**。等你在场、进关卡以后再采样一次才算闭环。

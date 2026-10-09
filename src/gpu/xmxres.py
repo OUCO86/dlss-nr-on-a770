@@ -134,6 +134,7 @@ def _load():
             ("xmx_rec_gemm_int8_fused", [ctypes.c_int] * 5 + [ctypes.c_uint] * 4),
             ("xmx_quant_init", [ctypes.c_char_p]),
             ("xmx_rec_quant", [ctypes.c_int] * 3 + [ctypes.c_uint] * 2),
+            ("xmx_rec_quant_window", [ctypes.c_int] * 3 + [ctypes.c_uint] * 6),
             ("xmx_rec_unary2", [ctypes.c_uint] + [ctypes.c_int] * 5
              + [ctypes.c_uint, ctypes.c_uint, ctypes.c_float] + [ctypes.c_uint] * 5),
             ("xmx_rec_window_attention", [ctypes.c_int] * 5 + [ctypes.c_uint] * 3),
@@ -665,6 +666,14 @@ class Runtime:
         # QKV's included, and off outright on a native build that predates the kernel.
         self.int8_qkv = (self.int8_project and os.environ.get("NR_INT8_QKV", "1") != "0"
                          and hasattr(self.lib, "xmx_rec_gemm_int8_qkv"))
+        # A window block's QKV projection on the integer path has to gather its tokens out
+        # of the image before it can grid them, and the integer kernel has no epilogue to
+        # fold the gather into — so the graph recorded a `partition` pass purely to feed
+        # `quantize_row`. The gather moved into the quantiser makes it one pass instead of
+        # two, with the same values on the same grid. `NR_INT8_WINDOW_FUSE=0` takes it back
+        # to the two passes, which is how the frame time below was measured against.
+        self.int8_window_fuse = (os.environ.get("NR_INT8_WINDOW_FUSE", "1") != "0"
+                                 and hasattr(self.lib, "xmx_rec_quant_window"))
 
     def graph_key(self):
         return (self.lib.xmx_specialization() | (int(self.fuse_qk) << 3)
@@ -689,7 +698,8 @@ class Runtime:
                 | (int(self.fuse_window_block) << 21)
                 | (int(self.fuse_head) << 22)
                 | (int(self.fuse_global_attention) << 23)
-                | (int(self.int8_project) << 24) | (int(self.int8_qkv) << 25))
+                | (int(self.int8_project) << 24) | (int(self.int8_qkv) << 25)
+                | (int(self.int8_window_fuse) << 26))
 
     def scratch_key(self):
         """What decides which scratch a frame's recording touches: the switches, not the
@@ -1046,6 +1056,41 @@ class Runtime:
             raise RuntimeError("quantiser pipeline: " + self.lib.xmx_error().decode())
         if self.lib.xmx_rec_quant(source.id, packed.id, scale.id, rows, inner) != 0:
             raise RuntimeError("xmx_rec_quant: " + self.lib.xmx_error().decode())
+        self.recorded += 1
+        return self
+
+    def quantize_window(self, source, packed, scale, rows, inner, *, height, width,
+                        across, pad):
+        """packed = roundEven(source / scale[row]) over a window partition of `source`.
+
+        The same grid and the same rounding as `quantize_row`, and the same two outputs,
+        but the rows are the partition's: a window block's tokens gathered out of the image
+        as they are read rather than written into `win16` by `partition` for a second pass
+        to read. The float path has always folded this gather into the projection's own
+        loads; the integer path has no epilogue to fold it into, and paid a whole pass for
+        it — 3.08 ms of a 31.57 ms frame, on 52 dispatches that moved 0.17 GB.
+
+        `height` and `width` are the *unpadded* image's, `across` the windows per padded
+        row, and `pad` the shifted-window origin as (top << 16) | left — the four
+        `partition` took. K must be a multiple of 64 so a token's words are whole and
+        aligned; the source is float16, which is what a window block's image is held in.
+        """
+        if rows <= 0 or inner <= 0 or inner % 64:
+            raise ValueError("a gathered quantiser needs a positive extent and inner a "
+                             "multiple of 64")
+        if not (across and height and width):
+            raise ValueError("a gathered quantiser needs the image's extent and its "
+                             "windows per row")
+        for buf, needed in ((source, height * width * inner * 2), (packed, rows * inner),
+                            (scale, rows * 4)):
+            if buf.nbytes < needed:
+                raise ValueError("quantiser buffer is too small")
+        path = os.environ.get("XMX_QUANT_SPV") or str(ROOT / "work" / "quantize_row.spv")
+        if self.lib.xmx_quant_init(path.encode()) != 0:
+            raise RuntimeError("quantiser pipeline: " + self.lib.xmx_error().decode())
+        if self.lib.xmx_rec_quant_window(source.id, packed.id, scale.id, rows, inner,
+                                         height, width, across, pad) != 0:
+            raise RuntimeError("xmx_rec_quant_window: " + self.lib.xmx_error().decode())
         self.recorded += 1
         return self
 

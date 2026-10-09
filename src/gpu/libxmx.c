@@ -2107,6 +2107,47 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K)
 	return 0;
 }
 
+/* The same grid, for a window block: the rows are the partition's, gathered out of the
+ * image as they are read (0x400000) instead of being written into a half buffer by
+ * `partition` for `xmx_rec_quant` to read straight through. What those two passes wrote,
+ * bit for bit, in one — the second-largest row of the frame's pass table was that gather,
+ * and the only reason it existed was that the integer projection had nowhere to fold it.
+ *
+ * `across` is the windows per row of the padded image and `pad` the origin as
+ * (top << 16) | left, both as `partition` takes them; `height` and `width` are the
+ * *unpadded* image's, which is what a token outside it is tested against. K must be a
+ * multiple of 64, so a token's words are whole and its first word 16-byte aligned however
+ * the image's rows are laid out. */
+int xmx_rec_quant_window(int source, int packed, int scale, unsigned M, unsigned K,
+			 unsigned height, unsigned width, unsigned across, unsigned pad)
+{
+	if (!g.recording || !g.rquant) FAIL("the quantiser is not ready for recording", 0);
+	if (!M || !K || K % 64u)
+		FAIL("a gathered quantiser needs a positive extent and K a multiple of 64", 0);
+	if (!across || !height || !width)
+		FAIL("a gathered quantiser needs the image's extent and its windows per row", 0);
+	struct push p = { .a = addr_of(source), .b = addr_of(packed), .c = addr_of(scale),
+			  .m = M, .k = K, .flags = 0x400000u,
+			  .image_h = height, .image_w = width,
+			  .window_cols = across, .window_pad = pad };
+	if (!p.a || !p.b || !p.c)
+		FAIL("quantiser operand is not a live buffer", 0);
+	vkCmdBindPipeline(g.rcb, VK_PIPELINE_BIND_POINT_COMPUTE, g.rquant);
+	vkCmdPushConstants(g.rcb, g.rpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof p, &p);
+	/* The same dispatch `xmx_rec_quant` makes, since it is the shader that decides how
+	 * many workgroups a quantiser is. */
+	unsigned words = K / 8u, per_row = 1u;
+	while (per_row < words && per_row < 32u) per_row <<= 1u;
+	unsigned per = 8u * (32u / per_row);
+	unsigned groups = (M + per - 1u) / per;
+	unsigned x = groups > 65535u ? 65535u : groups;
+	vkCmdDispatch(g.rcb, x, (groups + x - 1u) / x, 1);
+	barrier();
+	stamp(PK_UNARY, 12);
+	g.recorded++;
+	return 0;
+}
+
 int xmx_int8_init(const char *path)
 {
 	if (!g.rready) FAIL("resident runtime not initialised", 0);

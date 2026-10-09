@@ -317,10 +317,13 @@ def record_qkv_projection(runtime, a, w, s, windows, tokens, channels, heads, *,
     `vit`: the ViT's normalisation and query scale, wherever Q and K are made.
 
     On the integer path (`runtime.int8_qkv`, `NR_INT8_QKV`) the same epilogue runs on
-    `gemm_staged_int8`, which has no window gather: a window block partitions first, as it
-    did before the gather was folded into the float GEMM, and then quantises the partition
-    a row at a time. Two passes the float path does not pay, against a product whose K
-    loop covers twice the depth per multiply-add.
+    `gemm_staged_int8`, which has no window gather, so a window block used to partition
+    first — as it did before the gather was folded into the float GEMM — and then quantise
+    the partition a row at a time. It does not any more: the gather moved into the quantiser
+    (`Runtime.quantize_window`, bit 0x400000), which reads the token out of the image where
+    it lies instead of out of a copy written in window order. Same values, same grid, one
+    pass where there were two — and the one that went was 3.08 ms of the 31.57 ms the device
+    spends on a 768x448 frame. `NR_INT8_WINDOW_FUSE=0` pays it again.
     """
     rows = windows * tokens
     qkv8 = getattr(w, "int8_qkv", None)
@@ -328,11 +331,21 @@ def record_qkv_projection(runtime, a, w, s, windows, tokens, channels, heads, *,
         weight8, column_scale = qkv8
         if window is not None:
             height, width, origin = window
-            runtime.partition(a, s.win16, height, width, channels, origin=origin,
-                              narrow=True, a_half=image_half,
-                              epilogue=xmxres.EPI_E4M3 if publish_image else 0)
-            a = s.win16
-        runtime.quantize_row(a, s.aq, s.ascale, rows, channels)
+            if runtime.int8_window_fuse and image_half and not publish_image:
+                # the partition's own index, in the pass that used to follow it
+                _, padded_width, _ = runtime.window_extent(height, width, origin)
+                runtime.quantize_window(a, s.aq, s.ascale, rows, channels,
+                                        height=height, width=width,
+                                        across=padded_width // 8,
+                                        pad=((-origin[0]) << 16) | (-origin[1]))
+            else:
+                runtime.partition(a, s.win16, height, width, channels, origin=origin,
+                                  narrow=True, a_half=image_half,
+                                  epilogue=xmxres.EPI_E4M3 if publish_image else 0)
+                a = s.win16
+                runtime.quantize_row(a, s.aq, s.ascale, rows, channels)
+        else:
+            runtime.quantize_row(a, s.aq, s.ascale, rows, channels)
         runtime.gemm_int8_qkv(s.aq, weight8, s.q16, s.key16, s.v16, s.ascale, column_scale,
                               w.scale, rows, channels, heads, tokens, vit=vit)
         return s.key16
