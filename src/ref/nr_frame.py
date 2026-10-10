@@ -511,6 +511,23 @@ class ResidentBackend:
             self.device_weights = None
         return True
 
+    def set_window_fuse(self, on):
+        """Move the window block's gather between the quantiser and a partition, running.
+
+        Unlike `set_int8` this leaves the weights alone: both spellings quantise the same
+        rows to the same values, and only which pass reads them out of the image differs.
+        So the cached graphs go and nothing else does — one rebuild on the switch, no
+        re-upload, no hitch beyond it. Returns whether anything actually changed.
+        """
+        on = bool(on)
+        if on == bool(getattr(self.runtime, "int8_window_fuse", False)):
+            return False
+        self.runtime.int8_window_fuse = on
+        for frame in self._frames.values():
+            frame.close()
+        self._frames.clear()
+        return True
+
     def close(self):
         for frame in self._frames.values():
             frame.close()

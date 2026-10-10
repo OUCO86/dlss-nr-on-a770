@@ -207,7 +207,8 @@ class Settings:
     """
 
     KNOBS = ("profile", "intensity", "detail_strength", "colour_strength", "render_scale",
-             "temporal", "cut_limit", "hold", "release", "min_extent", "int8")
+             "temporal", "cut_limit", "hold", "release", "min_extent", "int8",
+             "int8_window_fuse")
 
     def __init__(self, args):
         self.path = args.settings
@@ -882,6 +883,11 @@ def stage_prepare(connection, backend, args, pipeline=None):
     if backend.set_int8(live.int8):
         print(f"settings: integer projections "
               f"{'on' if live.int8 else 'off'}; rebuilding the graph", flush=True)
+    # Same shape of knob, cheaper to move: the weights are unchanged, only which pass
+    # reads the window rows is, so this is the one that can be measured in place.
+    if backend.set_window_fuse(live.int8_window_fuse):
+        print(f"settings: window fusion "
+              f"{'on' if live.int8_window_fuse else 'off'}; rebuilding the graph", flush=True)
     clock = time.perf_counter()
     whole = decode(payload, width, height, vk_format)
     # A letterboxed game — DoA5's smallest window is 1024x768 with 16:9 inside it — leaves
@@ -1316,6 +1322,16 @@ def main():
                              "tools/nr_int8_off.bat, which set \"int8\" in nr_settings.json; "
                              "the daemon sees it on the next frame and rebuilds the graph, "
                              "which costs one slow frame, so it A/Bs in place")
+    parser.add_argument("--int8-window-fuse", type=int,
+                        default=int(os.environ.get("NR_INT8_WINDOW_FUSE", "1") != "0"),
+                        help="a window block's QKV projection on the integer path: 1 lets "
+                             "the activation quantiser gather the window rows out of the "
+                             "image itself, 0 goes back to partitioning the image into "
+                             "window order first and quantising the copy. Same values "
+                             "either way, one pass instead of two. Switchable while the "
+                             "game runs by setting \"int8_window_fuse\" in "
+                             "nr_settings.json, which is how it is measured: one game, "
+                             "both spellings")
     parser.add_argument("--min-extent", type=float, default=320.0,
                         help="the smallest side the network's frame is padded to, 128-4096; "
                              "320 is what NVIDIA's own driver does, the graph runs down to 128")

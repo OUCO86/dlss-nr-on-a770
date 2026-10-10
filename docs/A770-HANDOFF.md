@@ -54,7 +54,15 @@ E:\WorkBuddy\2026-10-09-04-20-55\tools\nr_play.bat
 | 实时开 / 关 NR 效果 | `tools\nr_effect_on.bat` / `nr_effect_off.bat` |
 | 切 int8 | `tools\nr_int8_on.bat` / `nr_int8_off.bat` |
 | 应急停 daemon | `tools\nr_daemon_stop.bat` |
+| **关游戏 + 清 daemon（换启动参数前必做）** | `tools\nr_stop_all.bat` |
 | 日志采样 | `python tools\sample_log.py 45` |
+
+⚠️ **daemon 不会随游戏退出。** 退出 DOOM 后它的 python 还活着，占着 `\\.\pipe\nr_lop`；
+再开一局，新游戏连的是那个旧 daemon，而 daemon 的环境变量在它自己启动时就读定了 ——
+**新启动脚本里设的任何 `NR_*` 全被忽略，A/B 两边测到的是同一个东西**。
+判据：新会话的日志里必须出现新的一行 `listening on \\.\pipe\nr_lop`；没有就是没换。
+换启动参数前的顺序：**关游戏 → 清 daemon → 再启动**（`nr_stop_all.bat` 就是这三步的前两步）。
+反过来（游戏还连着就杀 daemon）会把游戏冻住。
 | 离线 A/B 探针 | `work\cpu_cost_probe.py` + `work\cpu_probe_client.py` |
 
 **游戏**：`F:\Game\DOOM Eternal\DOOMEternalx64vk.exe`（native Vulkan，**不需要 Steam**）
@@ -70,7 +78,7 @@ E:\WorkBuddy\2026-10-09-04-20-55\tools\nr_play.bat
 | 3 | **QKV 投影上 int8** | `NR_INT8_QKV` | `"1"` | **+1.9 ms** |
 | 4 | attention out 投影 | `NR_INT8_OUT` | `"1"` | — |
 | 5 | daemon 去掉 `np.abs` 临时数组 | — | — | −1.7 ms（CPU） |
-| 6 | **window 块的 gather 融进量化** | `NR_INT8_WINDOW_FUSE` | `"1"` | **−4.37 ms（设备）** |
+| 6 | **window 块的 gather 融进量化** | `NR_INT8_WINDOW_FUSE` | `"1"` | −4.37 ms（设备）/ **+1.3 ms（端到端）** |
 
 ### 第 6 项：它是什么
 
@@ -88,6 +96,27 @@ int8 的 QKV 投影没有 epilogue，窗口 gather 无处可放，所以图里�
 - 只在本来就是 fp16 的图像上融合；float32 那一路留给 `partition` 去取整
 
 `NR_INT8_WINDOW_FUSE=0` 回到两趟，A/B 就是这么比的。
+
+### 第 6 项的实测：**同一局游戏里切着测的**（跨场次测不出来）
+
+离线说省 4.37 ms 设备时间，但**跨场次根本测不出来**：同一份构建，两场游戏
+分别量到 76.6 ms 和 70.2 ms，自己就差 6.4 ms。所以 fuse 做成了和 `int8` 一样
+可以**运行中切换**（`nr_settings.json` 里的 `int8_window_fuse`，daemon 下一帧
+重建图，权重不动，一帧的卡顿）。同一局、同一场景、轮流采：
+
+| 次序 | 配置 | 帧时间 | fps | gpu |
+|---|---|---|---|---|
+| 开 | 融合 **ON** | 76.2 / 76.0 ms | 13.13 / 13.15 | 43.3 |
+| 关 | 融合 **OFF** | 77.0 / 77.2 ms | 12.98 / 12.95 | 43.3 / 43.2 |
+| 开（切回，验证可重复） | 融合 **ON** | 75.6 / 75.4 ms | 13.22 / 13.26 | 43.3 |
+
+- **融合 ON 中位 75.9 ms，OFF 77.1 ms → ＋1.3 ms（1.7 %）**，方向对，且切换可重复。
+- 端到端只拿到 4.37 ms 里的 1.3 ms：`gpu`（2+40+1）那个数是墙钟，开着关着都是
+  43.3 ms，**对设备侧的变化不敏感**，别拿它判断这类优化；帧时间才是。
+- 画质：整帧输出逐字节相同（`work/fuse_equiv.py`，1032192 个值 0 个不同），NaN 0。
+
+⚠️ **教训**：跨场次对比在此项目上无效（±3.5 ms 噪声 > 要测的效应）。
+凡是"重启一次换个开关"的 A/B 都不可信 —— 要么做成运行时可切，要么多场取中位。
 
 ### ❌ 已证伪：流水线 inflight=2
 
