@@ -17,7 +17,10 @@ import tempfile
 import numpy as np
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-RUNNER = ROOT / "work" / "gemm_runner"
+# MinGW writes `gemm_runner.exe` where the Makefile's target has no suffix, so a test that
+# looks for the bare name finds nothing on Windows and reports a skip - and the test says
+# so itself: *a skip is not a pass*.
+RUNNER = ROOT / "work" / ("gemm_runner.exe" if sys.platform == "win32" else "gemm_runner")
 SPV = ROOT / "work" / "gemm_coopmat_int8.spv"
 TM, TN, TK = 8, 16, 32                      # the only integer shape this hardware exposes
 FAILURES = []

@@ -20,7 +20,10 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src" / "gpu"))
 import int8_quant as Q                                             # noqa: E402
 
-RUNNER = ROOT / "work" / "gemm_runner"
+# MinGW writes `gemm_runner.exe` where the Makefile's target has no suffix, so a test that
+# looks for the bare name finds nothing on Windows and reports a skip - and the test says
+# so itself: *a skip is not a pass*.
+RUNNER = ROOT / "work" / ("gemm_runner.exe" if sys.platform == "win32" else "gemm_runner")
 SPV = ROOT / "work" / "gemm_coopmat_int8.spv"
 FAILURES = []
 
