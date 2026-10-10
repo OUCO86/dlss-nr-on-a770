@@ -63,7 +63,44 @@ payoff is throughput, not latency, unless enough of it lands to shorten the daem
 
 ## building the library on this machine
 
-Read this before touching anything — see §"本机工具链" of the project memory and
-`docs/a770-port/code-map.md`. In short: the shipped `work/libnr_image.dll` is an **MSVC**
-build (it depends on `VCOMP140.DLL` and nothing else) and **this machine has no `cl.exe`**; the
-compiler here is MinGW-W64 gcc, whose dlls `ctypes` will only load with `winmode=0`.
+> ⚠️ **This section was wrong once and is corrected 2026-10-11 07:3x.** It said "this machine
+> has no `cl.exe`". It does: `E:\ProgramData\Microsoft\Microsoft Visual Studio\18\Community\...`.
+> A `find -maxdepth 12` misses it because `ProgramData` is hidden and `cl.exe` sits 13 levels
+> down — the same path was already committed in this tree's own `tools\build_msvc.bat`. Look
+> there first. Machine facts now live in project memory §0.5 and `HANDOFF.md` §1.5.
+
+The shipped `work/libnr_image.dll` is an **MSVC** build (depends on `VCOMP140.DLL` +
+`KERNEL32` only) and it **reproduces byte for byte** here:
+
+| check | shipped | rebuilt |
+|---|---|---|
+| size | 146432 | **146432** |
+| imports | `VCOMP140.DLL`, `KERNEL32` | same |
+| exports | 21 | 21 |
+| `vmulps` / `mulss` / `addss` / `vcvtps2ph` | 0 / 510 / 353 / 67 | **0 / 510 / 353 / 67** |
+| `cmp` | — | differs at **byte 273** only (PE timestamp) |
+
+The command is `build_win.bat`'s step 5/6 (and `tools\build_msvc.bat`'s step 3/4):
+
+```
+cl /nologo /O2 /TP /D_WIN32 /D_CRT_SECURE_NO_WARNINGS /fp:precise /openmp /DNR_F16C \
+   /LD src/ref/nr_image.c /link /DEF:work/libnr_image.def
+```
+
+with the `.def` scraped from the source (MSVC exports nothing unless told to).
+
+### why not `/arch:AVX2`
+
+The rebuild having no `vmulps` at all invites the obvious fix. Tried, same-source:
+
+| build | `vmulps` | temporal, no mask |
+|---|---|---|
+| `/O2` (as shipped) | 0 | 9.49 / 10.40 ms |
+| `/O2 /arch:AVX2` | **16** | 9.57 / 9.45 ms |
+
+MSVC's vectoriser barely moves — 16 instructions out of a pixel loop that gcc's reorganises
+into 2662. Put plainly: **gcc can vectorise this code, MSVC cannot.** So could the dll simply
+be shipped as a gcc build? Benchmarked earlier, the gcc `-march=x86-64-v3` build is the *same*
+speed (8.61 vs 9.01) — because, as §"is it arithmetic?" establishes, this pass is not waiting
+on instructions. Shipping a gcc dll would also trade `VCOMP140` for `libgomp`, and take the
+`winmode=0` loading caveat with it. **Not worth it. Keep MSVC.**

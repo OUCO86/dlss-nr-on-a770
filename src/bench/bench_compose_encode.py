@@ -25,7 +25,11 @@ import time
 import numpy as np
 
 HERE = pathlib.Path(__file__).resolve().parent
+# This bench has lived in work/ (untracked) and in src/bench/ (tracked), and the two sit
+# one level apart, so take whichever parent actually carries src/ref rather than assuming.
 ROOT = HERE.parent
+if not (ROOT / "src" / "ref" / "nr_image.py").exists():
+    ROOT = HERE.parents[1]
 if not os.environ.get("NR_ROOT"):
     os.environ["NR_ROOT"] = str(ROOT)
 for sub in ("src/ref", "src/layer", "src/gpu"):
