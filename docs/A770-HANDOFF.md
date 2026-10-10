@@ -438,6 +438,52 @@ index 配对"的做法**不可信** —— 实测 576 对里 **438 对不一致*
 然后双击第二个脚本。密钥不过期，一次搞定就不用再管 PAT 了。
 （这里的命令写法刻意不带 `@`：那是主机名，`publish_check` 会把它当成邮箱拦下来。）
 
+### ✅ 2026-10-10 15:15 已用这条路推成功（`3cde7e0`）
+
+中途撞了两个都不是 force 能解决的问题，记录如下。
+
+**1. 远端和本地是两条没有共同祖先的历史。** 远端那 20 个提交是当初
+`publish_api.py` 走 REST API **重建对象**的产物——逐 Compare 下来，**每一个的内容树
+都和本地前 20 个相等**，只是 commit 哈希不同。本地另有 4 个新提交。所以 force push
+不丢任何东西，但**必须验证过才能 force**，不能凭"看着像"就动手。验证方法：
+两边 `git log --reverse --format=%T%x09%s` 逐行对齐比。
+
+**2. 真正让 push 失败的是本地仓库是 shallow 的。** 报错是
+`did not receive expected object 7fca5683`，听着像远端坏了，其实是本地缺对象：
+`.git/shallow` 存在，最老的 `7b9caba` **还记着它那个不存在的 parent**。
+shallow 会把 parent 显示隐藏掉，所以直接问 `%P` 会回答"没有 parent"，**这个答案
+是假的**，别信。凡是 `git bundle` 报 `did not receive/send all necessary objects`、
+远端 unpack 失败，先怀疑这里。（`tools\publish_a770_ssh.bat` 已经内置了
+`git push --dry-run` 预检，正常情况下你不用管。）
+
+修法见下一节。下次推送前记得先跑 `git push --dry-run`——它一个字节都不发送，
+却能提前把这类"缺对象"问题暴露出来。
+
+### `tools/git_rebuild_root.py`：把截断的历史重新落地
+
+上面第 2 点的修法。它按拓扑序把每个 commit 重建一遍，遇到不可达的 parent 就丢掉，
+其余全部原样带过来——tree（所以工作区一字节都不动）、author/committer 的名字邮箱、
+原始时间戳、完整的 message 正文。缺省只打印新 tip，加 `--apply` 才写，且**不动原分支**：
+
+```
+python tools\git_rebuild_root.py windows windows-fixed           # 干跑
+python tools\git_rebuild_root.py windows windows-fixed --apply   # 落地
+```
+
+本次 24 个提交里只有最老那一条掉了 1 个悬空 parent，重建后
+**24 条对位的内容树 / 作者 / 日期 / 消息全部一致**，`git diff windows windows-fixed`
+为空。之后对着干跑 bundle（`git bundle create` 之前失败、之后成功）验证 graph 完整。
+
+本地现状：`windows` = `3cde7e0`，与远端一致。旧历史留了两条备份分支
+`backup/shallow-windows`（shallow 那条）和 `backup/api-built-windows`（远端重建版）。
+整段历史另有 bundle 备份：`backups\nr-a770-20261010-after-push.bundle`。
+
+⚠️ **还有一个未处理的遗留**：tag `v0.0.1` 指向 `7f9c364`，那属于被截断的上游历史，
+在本仓库里是残缺的（`rev-list` 会报错）。它不影响当前推送（`--dry-run` 干净），
+但哪天需要发送大量对象时可能再惹麻烦。届时临时挪开即可，恢复命令是
+`git tag v0.0.1 7f9c3643...`。另一个 tag `a770-int8-verified` 是好的，
+已随之重建指向新历史的同名 commit（原 tagger 与时间戳都保留）。
+
 ### `publish_api.py` 修过的一个 bug（别再踩）
 
 脚本原来判断"仓库是不是空的"只看 `heads/main` 和 `heads/master`。这个仓库的
