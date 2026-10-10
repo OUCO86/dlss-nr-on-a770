@@ -20,14 +20,14 @@ conclusion drawn from it is a conclusion about a frame nobody renders.
 
 Three candidate levers, each measured rather than assumed:
 
-- **Weight bytes.** `work/traffic_audit.py`: the GEMMs' weight operands are **0.08 GB of
+- **Weight bytes.** `src/bench/traffic_audit.py`: the GEMMs' weight operands are **0.08 GB of
   3.50 GB**. The whole model read once is 0.29 GB, 8 %. Halving it is worth almost
   nothing — and at 32 % of peak bandwidth, bytes are not what the frame waits on anyway.
   This is the argument `phase23` made from arithmetic before FFN batching; on this card
   it is now a measurement, and it holds.
 - **Pass count.** `work/pass_overhead.py`: one pass costs **4.4 us** that is not its own
   work. 404 of them is 1.8 ms of 37.5. Cutting the pass count in half would buy 0.9 ms.
-- **The work itself.** `work/pass_time.py`, passes with M at or below 8192: **23.49 ms,
+- **The work itself.** `src/bench/pass_time.py`, passes with M at or below 8192: **23.49 ms,
   62.7 % of the frame** — and it does not follow the frame. At 384x224 the whole graph is
   26.35 ms, so nearly all of that 23.5 ms is a fixed cost of the deep blocks: small M,
   very deep K, 0.16 to 0.64 ms a pass at 3 to 14 GB/s.
@@ -298,7 +298,7 @@ bit-exact before its speed is reported, and before that check was added all seve
 reported "wrong" rather than a number.
 
 The frame records itself twice, once dry to size the scratch. An audit that hooks the
-runtime sees both and reports double. `work/traffic_audit.py` and `work/pass_time.py` both
+runtime sees both and reports double. `src/bench/traffic_audit.py` and `src/bench/pass_time.py` both
 clear after `_prepare_scratch`; before they did, a 3.50 GB frame read as 18.43 GB at
 1080p and 36.85 GB — and the first version of the audit printed a confident 36.85.
 

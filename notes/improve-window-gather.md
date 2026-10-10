@@ -18,7 +18,7 @@ gemm_int8_qkv                       (the projection)
 ```
 
 The pass existed only to feed the next one. What it cost, on a real 768x448 frame, device
-timestamps by kind (`work/pass_time.py`):
+timestamps by kind (`src/bench/pass_time.py`):
 
 | kind | ms | n | GB |
 |---|---|---|---|
