@@ -46,12 +46,16 @@ static struct {
 	VkPipeline rtiled8;       /* the 8x32 register block, likewise */
 	VkPipeline rquant;        /* the activation quantiser onto the integer path's grid */
 	VkPipeline rint8f;        /* the integer GEMM that quantises as it goes, built on first use */
+	/* The integer GEMM with a residual epilogue, on a 32-row block: the only build of it
+	 * that does not spill (xmx_shape.h, XMX_STAGED_BM_RESIDUAL). */
+	VkPipeline rint8r;
 	unsigned tiled8;          /* it takes a shape the 16x32 one can, if asked */
 	unsigned tilem8, tilen8;
 	/* 12 is the 32x32 tiled build, 13 the 8x32 one, 14 the quantiser,
-	 * 15 the fused integer GEMM; see xmx_tiled32_init / xmx_tiled8_init /
-	 * xmx_quant_init / xmx_int8_fused_init */
-	char *rpaths[16];
+	 * 15 the fused integer GEMM, 16 the integer GEMM's residual build;
+	 * see xmx_tiled32_init / xmx_tiled8_init / xmx_quant_init /
+	 * xmx_int8_fused_init / xmx_int8_residual_init */
+	char *rpaths[17];
 	unsigned specialize;
 	unsigned tiling, tilem, tilen, tilem32, tilen32;
 	unsigned tiled32;         /* the 32x32 block may take a shape the 16x32 one can */
@@ -2183,6 +2187,90 @@ int xmx_rec_gemm_int8(int a, int b, int c, int a_scale, int b_scale,
 	stamp(PK_GEMM, 30);
 	g.recorded++;
 	return 0;
+}
+
+/* The residual build of the integer GEMM, built on first use: `gemm_staged_int8.comp`
+ * with `-DINT8_RESIDUAL=1 -DSTAGED_BM=32`. It is a separate pipeline rather than a
+ * flag on the first one because it has to be a separate *compilation*: see the comment
+ * on `XMX_STAGED_BM_RESIDUAL` in xmx_shape.h for the register arithmetic, and note the
+ * consequence, which is that this one's grid is over 32-row blocks. */
+int xmx_int8_residual_init(const char *path)
+{
+	if (!g.rready) FAIL("resident runtime not initialised", 0);
+	if (g.rint8r) return 0;
+	free(g.rpaths[16]);
+	if (!(g.rpaths[16] = strdup(path))) FAIL("pipeline path allocation", 0);
+	return build_pipeline(path, g.rpl, &g.rint8r);
+}
+
+/* C = (A @ B^T) * a_scale[row] * b_scale[column] + skip * cosine, the residual folded
+ * into the integer GEMM's epilogue (gemm_staged_int8.comp, bit 0x20000) as it long has
+ * been into the float ones.
+ *
+ * It is worth having for one reason: until now every integer projection paid for its
+ * residual with a pass of its own, writing the float32 branch out and reading it back,
+ * and the frame was carrying 120 of them. The float `-` has never had to, because its
+ * GEMM's epilogue could add `skip * cosine` and then publish. Now this one can too, so
+ * the integer path stops being one pass more expensive than the path it replaces.
+ *
+ * The two pointers have nowhere else to go. 128 bytes is all the push block there is,
+ * this one already fills it, and `a_scale` and `b_scale` at offsets 80 and 88 are the
+ * words the QKV epilogue reuses for its own scales — which never runs at the same time,
+ * hence the guard. With `window` the rows are a window block's, padded and in window
+ * order, and the output lands back in the unpadded image (bit 0x80000). */
+static int record_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale,
+				     int skip, int cosine, unsigned M, unsigned N,
+				     unsigned K, unsigned flags, const uint32_t *window)
+{
+	if (!g.recording || !g.rint8r) FAIL("integer residual GEMM not ready for recording", 0);
+	if (!M || !N || N % 32u || !K || K % 64u)
+		FAIL("the integer GEMM needs N a multiple of 32 and K of 64", 0);
+	if (skip < 0 || cosine < 0) FAIL("invalid residual buffer", 0);
+	if (flags & 0x100000u)
+		FAIL("the integer QKV and residual epilogues read the same two push words", 0);
+	VkDeviceAddress skip_at = addr_of(skip), cos_at = addr_of(cosine);
+	if (!skip_at || !cos_at) FAIL("integer residual operand is not a live buffer", 0);
+	struct push p = { .a = addr_of(a), .b = addr_of(b), .c = addr_of(c), .d = addr_of(a_scale),
+			  .m = M, .n = N, .k = K, .batch = 1u,
+			  .flags = flags | (window ? 0xa0000u : 0x20000u),
+			  .lda = (uint32_t)skip_at, .ldb = (uint32_t)(skip_at >> 32),
+			  .ldc = (uint32_t)cos_at, .spare = (uint32_t)(cos_at >> 32),
+			  .residual_cos = addr_of(b_scale) };
+	if (!p.a || !p.b || !p.c || !p.d || !p.residual_cos)
+		FAIL("integer GEMM operand is not a live buffer", 0);
+	if (window) {
+		p.image_h = window[0];
+		p.image_w = window[1];
+		p.window_cols = window[2];
+		p.window_pad = window[3];
+	}
+	vkCmdBindPipeline(g.rcb, VK_PIPELINE_BIND_POINT_COMPUTE, g.rint8r);
+	vkCmdPushConstants(g.rcb, g.rpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof p, &p);
+	/* This build's block is 32 rows, not 64 (xmx_shape.h). */
+	vkCmdDispatch(g.rcb, N / XMX_STAGED_BN, XMX_DIV_UP(M, XMX_STAGED_BM_RESIDUAL), 1);
+	barrier();
+	stamp(PK_GEMM, 30);
+	g.recorded++;
+	return 0;
+}
+
+int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale,
+			       int skip, int cosine, unsigned M, unsigned N, unsigned K,
+			       unsigned flags)
+{
+	return record_gemm_int8_residual(a, b, c, a_scale, b_scale, skip, cosine,
+					 M, N, K, flags, NULL);
+}
+
+int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_scale,
+				      int skip, int cosine, unsigned M, unsigned N,
+				      unsigned K, unsigned flags, unsigned height,
+				      unsigned width, unsigned across, unsigned pad)
+{
+	if (!height || !width || !across) FAIL("invalid window residual", 0);
+	uint32_t window[] = { height, width, across, pad };
+	return record_gemm_int8_residual(a, b, c, a_scale, b_scale, skip, cosine,
+					 M, N, K, flags, window);
 }
 
 /* The QKV projection on configuration 4: A int8 M x channels, the weights int8

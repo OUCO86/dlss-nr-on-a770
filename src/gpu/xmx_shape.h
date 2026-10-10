@@ -75,6 +75,16 @@
 #define XMX_STAGED_BN 32
 #define XMX_STAGED_BM 64
 
+/* The integer GEMM's residual build takes 32 rows, not 64. It has to: an 8x8 int32
+ * accumulator is 256 bytes, eight GRF of the 128 a thread has, and this kernel keeps
+ * RM x RN = 2 x 4 of them — half the register file on accumulators alone. Adding
+ * `skip * cosine` to the epilogue is what tips it over: the driver's own report goes
+ * from a scratch size of 0 to 20992, and every integer product in the frame, including
+ * the ones with no residual to add, costs three times what it did. One accumulator
+ * fewer in each direction — 32 rows, so RM = 1 — puts the scratch back to 0.
+ * The block it computes is therefore 32 x 32 and its grid is M / 32, not M / 64. */
+#define XMX_STAGED_BM_RESIDUAL 32
+
 /* Ceiling division: a partial tile still needs a workgroup, and it masks the
  * rows and columns past the edge rather than writing them. */
 #define XMX_DIV_UP(a, b) (((a) + (b) - 1) / (b))

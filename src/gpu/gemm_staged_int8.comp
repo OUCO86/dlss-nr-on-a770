@@ -43,7 +43,15 @@
 /* A770 / Xe-HPG: int8 cooperative matrix is 8x8x32 (configs 1,2), not Xe2's 8x16x32. */
 const uint TM = 8, TN = 8, TK = 32;
 const uint WARPS = 4;
-const uint BM = 64, BN = 32, BK = 64;     // the block, and a K step of two multiply-adds
+/* `STAGED_BM` is how many rows a workgroup keeps its accumulators for, and therefore how
+ * many accumulator matrices each lane holds: RM = BM / WARPS / TM of them, two at 64 and
+ * one at 32. `gemm_staged.comp` has had the choice for a long time — `gemm_staged32.spv`
+ * is the 32-row build — and the reason is the same register arithmetic this kernel runs
+ * into below. */
+#ifndef STAGED_BM
+#define STAGED_BM 64
+#endif
+const uint BM = STAGED_BM, BN = 32, BK = 64;   // the block, and a K step of two multiply-adds
 const uint WM = BM / WARPS, RM = WM / TM, RN = BN / TN;
 /* Sixteen bytes of pad keep successive rows off the same banks and every row 16-byte
  * aligned for the vector stores that fill the tiles. */
@@ -72,6 +80,9 @@ layout(push_constant, scalar) uniform Push {
 } pc;
 
 #include "specialize.glsl"
+#ifdef INT8_RESIDUAL
+#include "residual_epilogue.glsl"          // window padding's map into the image
+#endif
 
 /* The tiles as bytes for the matrix loads, as 16-byte words for the fills, and the
  * int32 output stage: all the same 8 KB, never live at once. */
@@ -98,9 +109,15 @@ void main() {
     uint row = gl_WorkGroupID.y * BM, col = gl_WorkGroupID.x * BN;
     uint last = pc.m - 1u;
     uint thread = gl_LocalInvocationID.x, warp = thread / 32u;
-    /* A: 64 rows of 64 bytes, a thread two words of one row. B: 32 columns of 64 bytes,
-     * a thread one word of one column. */
+    /* A: BM rows of BK bytes. At 64 rows a thread takes two whole words of one row —
+     * sixty-four bytes to two of us, and there are 128 of us — and at 32 it takes one
+     * word, four of us to a row. B: 32 columns of BK bytes, a thread one word of one
+     * column, at either block. */
+#if STAGED_BM == 32
+    uint ar = thread / 4u, ah = thread % 4u;
+#else
     uint ar = thread / 2u, ah = (thread % 2u) * 2u;
+#endif
     uint bn = thread / 4u, bh = thread % 4u;
 
     coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> acc[RM][RN];
@@ -114,10 +131,15 @@ void main() {
     for (uint k0 = 0; k0 < pc.k; k0 += BK) {
         barrier();
         uint at = min(row + ar, last) * words + k0 / 16u + ah;
+#if STAGED_BM == 32
+        uvec4 b0 = pc.b.v[(col + bn) * words + k0 / 16u + bh];
+        wa[(ar * SA) / 16u + ah] = pc.a.v[at];
+#else
         uvec4 a0 = pc.a.v[at], a1 = pc.a.v[at + 1u];
         uvec4 b0 = pc.b.v[(col + bn) * words + k0 / 16u + bh];
         wa[(ar * SA) / 16u + ah] = a0;
         wa[(ar * SA) / 16u + ah + 1u] = a1;
+#endif
         wb[(bn * SB) / 16u + bh] = b0;
         barrier();
         for (uint kk = 0; kk < BK; kk += TK) {
@@ -164,18 +186,84 @@ void main() {
      * happens to the value before it is stored. */
     uint epilogue = (operation_flags() >> 8) & 0xFu;
     bool narrow = (operation_flags() & 0x1000u) != 0u;
+    /* Bits 0x20000, 0x40000 and 0x80000 are the three `residual_epilogue.glsl` gives
+     * the float kernels, and they mean the same here: add `skip * cosine` before the
+     * publish, read the skip as half, and write a window block's padded rows back into
+     * the unpadded image. Without them this is the pass it always was.
+     *
+     * The integer path has been paying for its residual with a pass of its own — write
+     * the float32 branch out, read it back, add, publish, write again — because the
+     * kernel had no epilogue. Folding it in saves both trips over M x N float32. What
+     * it costs is two pointers, and the push block has no room: 128 bytes is all a
+     * Vulkan device must give and this one already fills it. So they travel in
+     * `a_scale` and `b_scale`, the two words at 80 and 88 that the QKV epilogue borrows
+     * for its own scales. The epilogues never run together, so neither do the two
+     * readings of those words.
+     *
+     * It costs something else too, and that is why this is a second build of the kernel
+     * rather than the only one. Measured with it compiled in unconditionally, every
+     * integer product in the frame got slower — all 188 of them, including the ones with
+     * no residual to add and bit 0x20000 clear: 8.43 ms became 26.13 ms across the frame,
+     * three times the time for instructions those passes did not execute. Eight
+     * accumulator matrices are most of the registers a workgroup has and the staging eats
+     * what little shared memory is left, so there is nowhere to spill to. `INT8_RESIDUAL`
+     * builds the two shapes apart and the runtime binds this one only to the calls that
+     * use it. */
+#ifdef INT8_RESIDUAL
+    bool adding = (operation_flags() & 0x20000u) != 0u;
+    bool half_skip = (operation_flags() & 0x40000u) != 0u;
+#endif
     for (uint e = thread * 4u; e < BM * BN; e += 32u * WARPS * 4u) {
         uint r = row + e / BN;
         if (r > last) continue;
         uint c = col + e % BN;
+        /* Window padding has no place in the image and must not touch the skip. */
+#ifdef INT8_RESIDUAL
+        uint at = r * pc.n + c;
+        if (adding && !residual_output_index(at)) continue;
+#endif
         float scale = row_scale.v[r];
         vec4 column = Vec4Buf(pc.residual_cos).v[c >> 2];
         vec4 out4;
-        for (uint q = 0; q < 4u; q++)
-            out4[q] = publish(epilogue, float(stage[e + q]) * scale * column[q]);
+#ifdef INT8_RESIDUAL
+        if (adding) {
+            /* Four consecutive channels stay four-aligned through every map here: `pc.n`
+             * is a whole multiple of 32, the offset into it comes from `e % BN`, and an
+             * image index moves by `pc.n`. So the skip and the cosine are two loads, not
+             * eight, and nothing divides by a count read from the device at run time.
+             *
+             * Written as the fused multiply-add, not as `branch + skip * cosine`: left to
+             * the compiler that form was contracted the other way and missed by an ulp in
+             * `ffn_fused.comp`, and `precise` stops it choosing differently here. What has
+             * to come out bit-identical is the pass this removes. */
+            vec4 skipped = half_skip ? vec4(Half4Buf(uint64_t(pc.a_scale)).v4[at >> 2])
+                                     : Vec4Buf(uint64_t(pc.a_scale)).v[at >> 2];
+            vec4 cosine = Vec4Buf(uint64_t(pc.b_scale)).v[(at % pc.n) >> 2];
+            for (uint q = 0u; q < 4u; q++) {
+                precise float total = fma(skipped[q], cosine[q],
+                                         float(stage[e + q]) * scale * column[q]);
+                out4[q] = publish(epilogue, total);
+            }
+        } else
+#endif
+        {
+            for (uint q = 0; q < 4u; q++)
+                out4[q] = publish(epilogue, float(stage[e + q]) * scale * column[q]);
+        }
+        /* Where it lands. The two builds differ, and must: `at` has been through
+         * `residual_output_index`, which moves a window block's row to its place in the
+         * unpadded image, so it is only the plain build's index when there was no map to
+         * apply — and the plain build's is written out as it always was, so that the
+         * pipeline every integer product already runs on is not rebuilt by this change. */
         if (!narrow)
+#ifdef INT8_RESIDUAL
+            Vec4Buf(uint64_t(pc.c)).v[at >> 2] = out4;
+        else
+            Half4Buf(uint64_t(pc.c)).v4[at >> 2] = f16vec4(out4);
+#else
             Vec4Buf(uint64_t(pc.c)).v[(r * pc.n + c) >> 2] = out4;
         else
             Half4Buf(uint64_t(pc.c)).v4[(r * pc.n + c) >> 2] = f16vec4(out4);
+#endif
     }
 }

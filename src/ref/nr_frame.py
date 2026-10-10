@@ -528,6 +528,26 @@ class ResidentBackend:
         self._frames.clear()
         return True
 
+    def set_int8_residual(self, on):
+        """Move the integer path's residual between the GEMM's epilogue and its own pass.
+
+        Cheapest of the three to move: the weights are identical either way and only
+        the number of passes in the graph changes, so this is a rebuild and nothing
+        more — no re-upload, no hitch beyond the frame it lands on. Being switchable
+        in place is the whole point: the frame-level A/B (`src/bench/int8_residual_ab.py`)
+        says 1.88 ms, which is under the drift this project measures between two
+        launches of the same build (70 and 77 ms), so the only measurement that can
+        settle it is one game with both spellings in it. Returns whether it moved.
+        """
+        on = bool(on)
+        if on == bool(getattr(self.runtime, "int8_residual", False)):
+            return False
+        self.runtime.int8_residual = on
+        for frame in self._frames.values():
+            frame.close()
+        self._frames.clear()
+        return True
+
     def close(self):
         for frame in self._frames.values():
             frame.close()

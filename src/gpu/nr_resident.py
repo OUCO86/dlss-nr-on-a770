@@ -382,9 +382,14 @@ def record_project_residual(runtime, a, weight, branch, skip, cosine, target,
     the fused path is bit-identical to. `NR_FUSE_RESIDUAL=0` selects them.
 
     `integer` is `(weight8, column_scale, packed, row_scale)` — the weight quantised
-    per output channel and the activation's row grid — and takes the third path: the
-    kernel has no epilogue, so the residual is a pass of its own after it, and there
-    is one more pass than there was. What that buys is the instruction, not the bytes:
+    per output channel and the activation's row grid — and takes the third path, which
+    is the same two passes as the float one now that `gemm_staged_int8.comp` has a
+    residual epilogue of its own: the quantise, then a product that adds `skip *
+    cosine` and publishes. Before it had one, the integer path was three passes and
+    carried a residual no other path paid for — 120 of them a frame, 2.38 ms
+    (`notes/frame-ledger-a770.md`).
+
+    What it buys is the instruction, not the bytes:
     configuration 4 covers twice the K of the float one per multiply-add, and these
     are the passes that wait on their K loop (`notes/improve-int8-a770.md`).
 
@@ -419,6 +424,12 @@ def record_project_residual(runtime, a, weight, branch, skip, cosine, target,
     if integer is not None:
         weight8, column_scale, packed, row_scale = integer
         runtime.quantize_row(a, packed, row_scale, rows, inner)
+        if runtime.int8_residual:
+            runtime.gemm_int8_residual(packed, weight8, target, row_scale, column_scale,
+                                       skip, cosine, rows, channels, inner,
+                                       epilogue=epilogue, narrow=narrow,
+                                       skip_half=skip_half, reverse=reverse)
+            return
         runtime.gemm_int8(packed, weight8, branch, row_scale, column_scale,
                           rows, channels, inner)
         runtime.residual(branch, skip, cosine, target, count, channels,

@@ -32,6 +32,7 @@ import os
 SETTINGS = {
     "NR_INT8_PROJECT": "1",        # work/nr_settings.json: "int8": 1
     "NR_INT8_WINDOW_FUSE": "1",    # work/nr_settings.json: "int8_window_fuse": 1
+    "NR_INT8_RESIDUAL": "1",       # work/nr_settings.json: "int8_residual": 1
     "NR_INT8_QKV": "1",
     "NR_INT8_WINDOW": "1",
     "NR_INT8_WINDOW_OUT": "1",

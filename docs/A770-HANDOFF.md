@@ -53,9 +53,14 @@ E:\WorkBuddy\2026-10-09-04-20-55\tools\nr_play.bat
 | 启动游戏（**流水线关闭**，旧路径） | `tools\nr_play_legacy.bat` |
 | 实时开 / 关 NR 效果 | `tools\nr_effect_on.bat` / `nr_effect_off.bat` |
 | 切 int8 | `tools\nr_int8_on.bat` / `nr_int8_off.bat` |
+| 切窗口 gather 融合（A/B 用） | `tools\nr_fuse_on.bat` / `nr_fuse_off.bat` |
+| **切 int8 残差融合（A/B 用，本轮新增）** | `tools\nr_residual_on.bat` / `nr_residual_off.bat` |
 | 应急停 daemon | `tools\nr_daemon_stop.bat` |
 | **关游戏 + 清 daemon（换启动参数前必做）** | `tools\nr_stop_all.bat` |
 | 日志采样 | `python tools\sample_log.py 45` |
+| **改任一 `nr_settings.json` 开关（会自检）** | `python tools\nr_switch.py <knob> <0|1>` |
+| 日志按场次分段 | `python tools\log_sessions.py` |
+| 每场 `gpu` 时间直方图 | `python tools\log_gpu_hist.py` |
 
 ⚠️ **daemon 不会随游戏退出。** 退出 DOOM 后它的 python 还活着，占着 `\\.\pipe\nr_lop`；
 再开一局，新游戏连的是那个旧 daemon，而 daemon 的环境变量在它自己启动时就读定了 ——
@@ -79,6 +84,7 @@ E:\WorkBuddy\2026-10-09-04-20-55\tools\nr_play.bat
 | 4 | attention out 投影 | `NR_INT8_OUT` | `"1"` | — |
 | 5 | daemon 去掉 `np.abs` 临时数组 | — | — | −1.7 ms（CPU） |
 | 6 | **window 块的 gather 融进量化** | `NR_INT8_WINDOW_FUSE` | `"1"` | −4.37 ms（设备）/ **+1.3 ms（端到端）** |
+| 7 | **残差折进 int8 的 GEMM epilogue** | `NR_INT8_RESIDUAL` | `"1"` | **−1.88 ms（设备）/ 省 120 趟；游戏内 `gpu` 40 → 38 ms** |
 
 ### 第 6 项：它是什么
 
@@ -119,6 +125,116 @@ int8 的 QKV 投影没有 epilogue，窗口 gather 无处可放，所以图里�
 
 ⚠️ **教训**：跨场次对比在此项目上无效（±3.5 ms 噪声 > 要测的效应）。
 凡是"重启一次换个开关"的 A/B 都不可信 —— 要么做成运行时可切，要么多场取中位。
+
+### 第 7 项：残差折进 int8 的 GEMM epilogue（游戏内已看到 40 → 38 ms，A/B 待补）
+
+int8 的投影原先是三趟：`quantize_row` → `gemm_int8` → 一趟自己的 `residual`
+（把 float32 的 branch 写出来再读回来、加 `skip * cosine`、发布、写回）。
+**120 趟 / 2.39 ms**，是浮点路径从来不用付的一趟——因为浮点 GEMM 有残差 epilogue，
+`gemm_staged_int8.comp` 没有。现在有了。
+
+同进程交替、5 轮、订单每轮反转（`src/bench/int8_residual_ab.py`）：
+
+```
+                  device     wall    passes
+  fused           34.50     37.22     603
+  two-pass        36.38     39.55     723
+  saved            1.88 ms  (+5.2 % of the device's own time), 120 passes
+  spread within a side 0.05 ms
+```
+
+按 family：`unary/5`（残差）**2.39 → 0.00**；`gemm/30`（int8）8.41 → 9.00
+（**+0.59** 是 epilogue 的真实成本）；其余不动。省 2.39 付 0.59，净 **1.88 ms**。
+
+**⚠️ 这一项踩的坑，务必读完再动内核：**
+
+- **第一版把残差无条件编进同一个 spv，整帧从 36.42 掉到 52.27 ms。**
+  不是残差慢，是**所有 188 个 int8 乘积都慢了三倍**——包括那些没置残差位、
+  一条新指令都没执行的趟。用 `XMX_PIPELINE_STATS` 问驱动才看见真因：
+  **Scratch Memory Size 从 0 变成 20992**。GLSL 里一个 8×8 的 int32 累加器是
+  256 B = **8 GRF**（每线程只有 128 GRF），内核挂 RM×RN = 2×4 = **8 个累加器 = 64 GRF**，
+  epilogue 一加就溢出到显存，驻留线程数塌掉。
+- **修法是砍一半累加器，不是调 epilogue**：`-DSTAGED_BM=32` 让 WM=8→RM=1，
+  累加器 8→4 个，scratch 回到 **0**。代价是块从 64×32 变 32×32、grid 变 M/32、
+  SLM 装载索引要分流，所以它是**一条独立流水线**而不是一个 flag：
+  `work/gemm_staged_int8_residual.spv`（`xmx_int8_residual_init`，
+  `XMX_STAGED_BM_RESIDUAL = 32`）。
+- **默认构建必须逐字节不变。** 加 `#ifdef` 时顺手外提一个变量就会让 spv 变 36 字节、
+  基准漂 0.24 ms。现在 `work/gemm_staged_int8.spv` 与改动前 `cmp` 通过。
+- 逐字节等价：`src/gpu/test_gemm_int8_residual.py` **242 例全过**
+  （五种 epilogue × narrow × skip_half × 窗口反排含 shifted origin × 原地写回 ×
+  尾部哨兵）。测试还抓到一个真 bug：残差路径下 `at` 已被 `residual_output_index`
+  **重映射成图像索引**，若统一写成 `(r*pc.n+c)` 就把窗口反排丢了——两个构建各写各的。
+
+**已经做成运行时可切**（`nr_settings.json` 的 `int8_residual`，daemon 下一帧重建图、
+权重不动、一帧卡顿），脚本 `tools\nr_residual_on.bat` / `nr_residual_off.bat`。
+之所以要做成旋钮，就是第 6 项那条教训：**跨场次噪声 ±3.5 ms 比这一笔（1.88 ms）还大**，
+重开一次游戏换开关根本测不出来。
+
+⚠️ **但 `nr_settings.json` 只在有帧到达时才被读**（`Settings.refresh()` 每帧调一次）。
+菜单、读盘、游戏关了——写了也没人看，而且**不留任何痕迹**。
+所以请在**关卡里、画面在动（`change` > 0.02）**时切，并且认 daemon 的回执：
+日志里 `settings: integer residual on/off`。
+要把 when/how 一次搞对的就用 `tools\nr_switch.py`（下面第 7 项那节讲了它踩过的坑）。
+
+**默认开**（`NR_INT8_RESIDUAL` 未设即 1）。关掉回到三趟。
+
+### 第 7 项实测：daemon 的 `gpu` **40 → 38 ms**（罕见：`gpu` 这次能看见了）
+
+第一次实机验证不是按设计好的路径来的（热切换没生效，原因在下一段），但结果反而更干净。
+日志没有时间戳，**`listening on` 就是场次分界**，按它切成 7 段 ≥200 帧的会话
+（`tools/log_gpu_hist.py`）：
+
+```
+gpu ms      38    39    40    41    42    43    44    45    46
+run 1        0     0  1431   167     8     0     1     2     0
+run 2        0     0  8619   807    13     2     2     4     1
+run 3        0     0  1224    47     1     0     0     0     0
+run 4        0     0 12510  3232    63    21    19    13     1
+run 5        0     0  6726  1633    25     3    17     5     2
+run 6        0     0  8929  2448    61    12    76    13     1
+run 7     2821   519    56     5    24     5     1     0     0
+```
+
+| | 帧数 | 中位 | 均值 | 散布 |
+|---|---|---|---|---|
+| run 1–6 合计（**改动前**） | **48139** | **40.0** | 40.20 | 40–46 |
+| run 7（**改动后**） | 3431 | **38.0** | 38.23 | 38–44，82% 的帧正好 38 |
+
+**−2.0 ms**，离线 A/B 预测的 **−1.88 ms**。
+
+✅ **这条可以作为"跨场次对比不一定无效"的反例，前提是选对量**：
+平时不能跨场次比的是**帧时间**（含游戏宿主侧，同一构建两场能差 6 ms）；
+而 daemon 的 `gpu` 段在 **48139 帧里六次中位数都是整 40 ms**，自身漂移远小于 1 ms。
+⚠️ 但它仍然是墙钟，**不是万能**：当年 fuse 那一改动离线省 4.37 ms，它在两边都报 43.3。
+它能看见这一次，是效应落在了它灵敏的地方，**别当成通用判据**。
+
+⚠️ 这**不是局内 A/B**。真正闭环还是要用下面的热切换做一次。
+
+### 第 7 项热切换第一次为什么"看起来没生效"（已修）
+
+bug 的现象：bat 弹窗正常，`nr_settings.json` 确实被改了（`int8_residual` 停在 `0`），
+但日志里**一行 `settings: integer residual` 都没有**。
+
+**根因：`nr_settings.json` 只在有帧到达时才被读**（`Settings.refresh()` 每帧调一次）。
+日志最后一个 daemon 启动之后**一帧都没出**——画面当时已经不再出帧了（游戏关了，或停在
+菜单/读盘）。文件写了，没有人在看。
+
+防复发的两处改动：
+
+1. daemon 第一帧起打印一行 **`settings in effect: int8=1 int8_window_fuse=1
+   int8_residual=1 ...`**。以后任何一段日志都能自证它跑的是哪张图，不用猜。
+2. 开关从一行 `json.dump` 换成 **`tools/nr_switch.py`**：写完盯日志几秒，没被接住就
+   **明确说清是哪一种失败**——「这段时间内没有帧到达 daemon」（正常，等出帧就生效）
+   还是「有帧但 daemon 不认这个名字」（旧进程占着管道 → 关游戏、清 daemon、重开）。
+   ⚠️ 我自己第一版写错：去数日志末尾 400 行的帧数，那是**上一场的旧帧**，永远不会消失，
+   游戏关了三小时它还会说"frames are flowing"。已改成只数新读到的字节。
+
+必须这么做的原因就是第 6 项那条教训：**跨场次噪声 ±3.5 ms 比这一笔（1.88 ms）还大**，
+重开一次游戏换开关根本测不出来。所以请照第 6 项那套流程测：
+**进关卡 → 画面在动（`change` > 0.02）→ 开，稳了采样 → 关，稳了采样 → 开，验证可重复。**
+看的是**帧时间 / fps**，不是 `gpu` 那个数（那是墙钟，对设备侧变化不敏感）。
+测不出来就直说测不出来，别硬凑。
 
 ### ❌ 已证伪：流水线 inflight=2
 
@@ -272,6 +388,21 @@ index 配对"的做法**不可信** —— 实测 576 对里 **438 对不一致*
 17. **基准跑太久就是卡住了，不是慢**。`frame_ledger.py` 连加载 1 GB 权重在内约
     **90 秒**。有一个跑了 33 分钟没出结果，杀了重跑就好。别干等。
 
+### 本轮新增的（内核侧，代价都是真金白银换来的）
+18. **遇到问题先查参考文案，不要自己闷头试。** 用户为这个项目留了两份（见第 10 节）。
+    本轮整帧莫名慢 16 ms，闷头猜是猜不出来的；翻 `docs/a770-port/code-map.md`
+    才发现 `XMX_PIPELINE_STATS` 这个旋钮，一次就定位到寄存器溢出。
+    **"先查文案"是本轮用户明确纠正过的行为要求。**
+19. **给 GLSL 内核加任何代码之前，先问驱动要 `Scratch Memory Size`。**
+    判据非常简单：**scratch 必须是 0**。非 0 就说明溢出到显存了，
+    在本项目上一次直接导致 **所有 188 个 int8 乘积慢三倍（36 → 52 ms）**，
+    而且受害的是那些一行新代码都没执行的趟。参考文案的说法更狠：
+    *"any non-zero compiler spill with RPT>4 is a device-lost trigger"*。
+    怎么问见第 10 节。
+20. **改默认构建（不带新宏的那一份）时，`cmp` 前后 spv 必须逐字节相同。**
+    一个 `#ifdef` 外提一个变量就差 36 字节、基准漂 0.24 ms，
+    这点漂移足以让"省了多少"的判断失准。
+
 ---
 
 ## 6. 这台机器的网络坑（重要）
@@ -287,16 +418,15 @@ index 配对"的做法**不可信** —— 实测 576 对里 **438 对不一致*
 本次上传是用 **GitHub REST API 的 Git Data API** 走 `api.github.com`（代理对它放行且稳定）
 逐对象重建完成的，脚本在 `tools/publish_api.py`。
 
-**已经生成好 SSH 密钥**，公钥加进 GitHub 后，这台机器以后推送就能永久绕开代理：
-```
-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIODtt2c4snVUP5LSkjDRQa+Wt8w+Q/7yHtcfJje6l/99 OUCO86-A770
-```
-（私钥在 `C:\Users\wangz\.ssh\id_ed25519`）
+**这台机器上已经生成好 SSH 密钥**（公钥在 `C:\Users\wangz\.ssh\id_ed25519.pub`）。
+把那把公钥加进账户后，以后推送就能永久绕开代理，不必再拿 PAT。
+（公钥内容不贴在这里——带上它的 comment 等于把身份写进公开仓库。本机随时可以自己读出来。）
 
-⚠️ **2026-10-10 实测：这个公钥还没加进 GitHub 账户。** `ssh -T -p 443 git@ssh.github.com`
-走通了 TCP，但返回 `Permission denied (publickey)`，显式 `-i` 指定私钥也一样。
-所以眼下**只有 API + PAT 这一条路能用**。哪天想摆脱 PAT，去
-<https://github.com/settings/keys> 把上面那串公钥贴进去即可。
+⚠️ **2026-10-10 实测：公钥还没加进账户。** SSH over 443 的 TCP 握上了，
+但服务端返回 `Permission denied (publickey)`，显式 `-i` 指定私钥也一样（那份清单里的
+识别信息也因此没法用）。所以眼下**只有 API + PAT 这一条路能用**。哪天想摆脱 PAT，去
+<https://github.com/settings/keys> 贴进去即可。
+（这里的命令写法刻意不带 `@`：那是主机名，`publish_check` 会把它当成邮箱拦下来。）
 
 ### `publish_api.py` 修过的一个 bug（别再踩）
 
@@ -316,10 +446,12 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIODtt2c4snVUP5LSkjDRQa+Wt8w+Q/7yHtcfJje6l/99
 3. ~~**量化改成一遍读**~~ ❌ **做完并证伪，已回退**。同进程交替 A/B 是
    **36.44 vs 36.50 ms（噪声 ±0.2）= 打平**。第二遍读是免费的：第一遍刚把那一行
    留在 L2 里了。详见 `notes/device-budget-a770.md`。
-4. **设备侧剩下的三块**，已定位到具体出处（`notes/frame-ledger-a770.md`）：
-   - **`gemm_staged_int8` 没有残差 epilogue** → int8 路径每个投影多一趟
-     `residual`，**120 趟 / 2.38 ms**。浮点路径的 `gemm_residual` 就是现成模板。
-     **这一项形状最清楚、风险最可控，建议先做。**
+4. **设备侧剩下的几块**，已定位到具体出处（`notes/frame-ledger-a770.md`）：
+   - ~~**`gemm_staged_int8` 没有残差 epilogue**~~ → ✅ **本轮做完，见第 3 节第 7 项**。
+     离线 **−1.88 ms / 省 120 趟 / 单侧波动 0.05 ms / 242 例逐字节一致**。
+     游戏内也看到了信号：daemon `gpu` **40 → 38 ms**（第 3 节第 7 项）。
+     **剩下的待办：一场游戏内开着/关着轮流采一次，把它闭环。**
+     ⚠️ 别再跨场次测第二回了——那不是证据，只是巧合的可能性一次比一次大。
    - **分块（branched）FFN 没有 int8 分支** → `_ffn_groups`（104 趟）+ 
      `record_split_feed_forward` 的 `w.first`（16 趟）= 120 趟 / 8.50 ms。
      ⚠️ 但这批 pass **不是算力受限**（约 11.4 GFLOP 跑 8.5 ms ≈ 峰值 3-7 %），
@@ -359,6 +491,11 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIODtt2c4snVUP5LSkjDRQa+Wt8w+Q/7yHtcfJje6l/99
 - ~~window block 两趟合成一趟（gather 融进量化）~~ —— ✅ 已在**同一局游戏里热切换
   A/B** 测过：ON 75.9 ms / OFF 77.1 ms，**+1.3 ms**，且输出逐字节相同。闭环了。
 - ~~量化"一遍读"能省一半流量~~ —— ❌ **证伪**，打平，已回退。
+- **第 3 节第 7 项（残差折进 int8 GEMM）的局内 A/B** —— 已经**看到**实机信号：
+  daemon 的 `gpu` **40 → 38 ms**（前 6 场 48139 帧中位一律 40.0，第 7 场 3431 帧中位
+  38.0、82% 正好 38；离线预测 −1.88 ms）。
+  **但这是跨场次对比，不是局内 A/B。** 真正闭环还是要一场游戏里开着/关着轮流采。
+  第一次尝试失败了（热切换那时候画面不在出帧），已修，待重做。
 - **`src/bench/pass_time.py` 里那种"Python 调用名 ↔ 设备 stamp 按 index 配对"的
   分解** —— ❌ **不可信**，576 对里 438 对不一致。要看分解请用
   `src/bench/device_families.py`；`pass_time.py` 现在只用于总量和流量统计。
@@ -367,3 +504,48 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIODtt2c4snVUP5LSkjDRQa+Wt8w+Q/7yHtcfJje6l/99
 - `render_scale` 仍是 **0.4**（网络输入 768×448）。这是**违反你"不降画质"原则的**，
   是上一轮留下的。改回 1.0 设备时间会从约 40 ms 涨到约 214 ms。**等你拍板，
   我没有擅自改过。**
+
+---
+
+## 10. 参考文案在哪（**遇到问题先查这里，别闷头试**）
+
+用户为这个项目留了两份，我本轮翻车之后才想起来查，白绕了很大一圈。
+
+### A. `docs/a770-port/code-map.md`（在本工作区，72 KB 代码测绘报告）
+
+在 `E:\WorkBuddy\2026-10-09-04-20-55\docs\a770-port\code-map.md`，
+**不在 git 仓库里**（仓库根是 `src\dlss-nr-on-a770`），所以 `git status` 看不到它。
+
+- **§2.3 的运行时环境变量表** —— 本轮的救命条目：
+  - `XMX_PIPELINE_STATS=<file>`：让驱动导出每个 pipeline 的
+    `Instruction Count` / **`Scratch Memory Size`** / `Workgroup Memory Size`
+  - `XMX_PIPELINE_IR=<dir>`：导出编译器自己的寄存器/SIMD 报告
+- GLSL 编译期宏表（含 `STAGED_BM` 默认 64、`-DSTAGED_BM=32 → gemm_staged32.spv`，
+  出处 Makefile:98-101 / CMakeLists:81-82 / build_win.bat:87-88）
+- push block 的字节布局、epilogue flags 位表、设备时间戳 family/kind 表
+
+### B. `Blackwood416/A770-Kernel-Optimization`（GitHub，同款 A770 16G）
+
+<https://github.com/Blackwood416> —— 一台一样卡的人写的 skill 包
+（SKILL.md + `references/`）。`references/hardware/hardware.md` 给的是硬数字：
+
+| 事实 | 值 |
+|---|---|
+| GRF | 每线程 **128** 寄存器（large GRF 模式 256 —— **A770 没有这个模式**） |
+| 一个 8×8 float/int32 累加器 | 256 B = **8 GRF** |
+| SLM | 每 Xe-core 128 KB；Max SLM/WG 64 KB；**超约 32 KB 开始丢驻留 workgroup** |
+| spill | *"any non-zero compiler spill with RPT>4 is a device-lost trigger"* |
+
+它的证据纪律也值得照抄：`[ARCH]` / `[MEASURED]` / `[DISPATCH]` / `[HYPOTHESIS]` 标签；
+**<10 μs 的 kernel 要分开报 device time 和 wall time**；**失败变体要保留**（本轮
+"第一次尝试净亏 16 ms"就是靠保留失败变体才挖出根因的）。
+
+### 怎么问驱动要寄存器账
+
+```
+XMX_PIPELINE_STATS=<输出文件> python src/bench/<任一基准>.py
+```
+
+对比同一份内核加代码前后的 **Scratch Memory Size**。**必须是 0。**
+本轮实测：原始 int8 = 0、`-DINT8_RESIDUAL=1` = **20992**、
+`-DINT8_RESIDUAL=1 -DSTAGED_BM=32` = **0**（Workgroup Memory 5120）。

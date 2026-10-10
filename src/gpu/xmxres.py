@@ -155,6 +155,15 @@ def _load():
     if hasattr(lib, "xmx_rec_gemm_int8_qkv"):
         lib.xmx_rec_gemm_int8_qkv.argtypes = [ctypes.c_int] * 8 + [ctypes.c_uint] * 5
         lib.xmx_rec_gemm_int8_qkv.restype = ctypes.c_int
+    # Same reason, same guard: a native build older than this recorder would otherwise
+    # make every runtime in the tree fail to load. `Runtime.int8_residual` reads it back.
+    if hasattr(lib, "xmx_rec_gemm_int8_residual"):
+        lib.xmx_rec_gemm_int8_residual.argtypes = [ctypes.c_int] * 7 + [ctypes.c_uint] * 4
+        lib.xmx_rec_gemm_int8_residual.restype = ctypes.c_int
+        lib.xmx_rec_gemm_window_int8_residual.argtypes = [ctypes.c_int] * 7 + [ctypes.c_uint] * 8
+        lib.xmx_rec_gemm_window_int8_residual.restype = ctypes.c_int
+        lib.xmx_int8_residual_init.argtypes = [ctypes.c_char_p]
+        lib.xmx_int8_residual_init.restype = ctypes.c_int
     lib.xmx_buf_ptr.argtypes = [ctypes.c_int]
     lib.xmx_buf_ptr.restype = ctypes.c_void_p
     lib.xmx_buf_bytes.argtypes = [ctypes.c_int]
@@ -674,6 +683,12 @@ class Runtime:
         # to the two passes, which is how the frame time below was measured against.
         self.int8_window_fuse = (os.environ.get("NR_INT8_WINDOW_FUSE", "1") != "0"
                                  and hasattr(self.lib, "xmx_rec_quant_window"))
+        # The integer GEMM's own residual epilogue, which folds `skip * cosine` into the
+        # publish and saves the pass the integer path has been paying to write its float32
+        # branch out and read it back. `NR_INT8_RESIDUAL=0` takes it back to two passes,
+        # which is the only way to A/B the two within one process anyway.
+        self.int8_residual = (os.environ.get("NR_INT8_RESIDUAL", "1") != "0"
+                              and hasattr(self.lib, "xmx_rec_gemm_int8_residual"))
 
     def graph_key(self):
         return (self.lib.xmx_specialization() | (int(self.fuse_qk) << 3)
@@ -966,6 +981,61 @@ class Runtime:
         if self.lib.xmx_rec_gemm_int8(a.id, b.id, c.id, a_scale.id, b_scale.id,
                                       rows, cols, inner, _publish(epilogue, narrow)) != 0:
             raise RuntimeError("xmx_rec_gemm_int8: " + self.lib.xmx_error().decode())
+        self.recorded += 1
+        return self
+
+    def gemm_int8_residual(self, a, b, c, a_scale, b_scale, skip, cosine, rows, cols, inner,
+                           *, epilogue=0, narrow=False, skip_half=False, reverse=None):
+        """A @ B + skip * cosine on the integer path, the residual in the epilogue.
+
+        What `gemm_residual` is to the float path, and what `gemm_int8` followed by
+        `residual` used to be here: one pass instead of two, with the float32 branch
+        never reaching memory. Bit-identical to that pair on every shape the frame
+        asks for (`src/gpu/test_gemm_int8_residual.py`), including through the publish
+        and a window block's write back into the unpadded image.
+        """
+        if rows <= 0 or cols <= 0 or cols % 32 or inner <= 0 or inner % 64:
+            raise ValueError("the integer GEMM needs cols a multiple of 32 and inner of 64")
+        if not self.int8_residual:
+            raise RuntimeError("this native build has no integer residual epilogue")
+        written = rows
+        window = ()
+        if reverse is not None:
+            height, width, size, origin = reverse
+            if size != 8:
+                raise ValueError("window residual gathers 8x8 windows")
+            ph, pw, (top, left) = self.window_extent(height, width, origin, size)
+            if rows != ph * pw:
+                raise ValueError("window residual rows must match the padded image")
+            written = height * width
+            window = (height, width, pw // size, (top << 16) | left)
+        if c.id in (a.id, b.id) or c.id == cosine.id:
+            raise ValueError("GEMM residual output must not alias matrix inputs or cosine")
+        if c.id == skip.id and narrow != skip_half:
+            raise ValueError("in-place residual requires matching skip and output widths")
+        for buf, needed in ((a, rows * inner), (b, cols * inner),
+                            (a_scale, rows * 4), (b_scale, cols * 4),
+                            (skip, written * cols * (2 if skip_half else 4)),
+                            (cosine, cols * 4),
+                            (c, written * cols * (2 if narrow else 4))):
+            if buf.nbytes < needed:
+                raise ValueError("integer residual GEMM buffer is too small")
+        # The residual's own build: `gemm_staged_int8.comp` with `-DINT8_RESIDUAL=1
+        # -DSTAGED_BM=32`. Not the same pipeline as `gemm_int8`'s, and not a flag on it,
+        # because the two differ at compile time — see XMX_STAGED_BM_RESIDUAL in
+        # xmx_shape.h for why the 32-row block is the one that does not spill.
+        path = os.environ.get("XMX_INT8_RESIDUAL_SPV") or str(
+            ROOT / "work" / "gemm_staged_int8_residual.spv")
+        if self.lib.xmx_int8_residual_init(path.encode()) != 0:
+            raise RuntimeError("integer residual GEMM pipeline: "
+                               + self.lib.xmx_error().decode())
+        flags = _publish(epilogue, narrow) | (0x40000 if skip_half else 0)
+        record = (self.lib.xmx_rec_gemm_window_int8_residual if window
+                  else self.lib.xmx_rec_gemm_int8_residual)
+        if record(a.id, b.id, c.id, a_scale.id, b_scale.id, skip.id, cosine.id,
+                  rows, cols, inner, flags, *window) != 0:
+            raise RuntimeError("xmx_rec_gemm_int8_residual: "
+                               + self.lib.xmx_error().decode())
         self.recorded += 1
         return self
 

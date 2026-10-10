@@ -208,11 +208,17 @@ class Settings:
 
     KNOBS = ("profile", "intensity", "detail_strength", "colour_strength", "render_scale",
              "temporal", "cut_limit", "hold", "release", "min_extent", "int8",
-             "int8_window_fuse")
+             "int8_window_fuse", "int8_residual")
 
     def __init__(self, args):
         self.path = args.settings
         self.stamp = None
+        # Nothing is re-read until a frame arrives, and a file that was edited while no
+        # game was connected is silently ignored - which cost an afternoon once, because
+        # the log then looked exactly like "the switch does not work". So the effective
+        # values go out once, on the first frame, and ever after the log can answer
+        # "which build of the graph was this?" without anyone having to guess.
+        self.announced = False
         for knob in self.KNOBS:
             setattr(self, knob, getattr(args, knob))
 
@@ -281,6 +287,18 @@ class Settings:
             if getattr(self, knob) != value:
                 setattr(self, knob, value)
                 changed.append(f"{knob}={value}")
+        if self.announced:
+            if changed:
+                print("settings: " + ", ".join(changed), flush=True)
+            return
+        self.announced = True
+        # Every switch that changes the graph's shape, whether the file named it or not:
+        # if an A/B in one game session is the only measurement that means anything, the
+        # log has to be able to prove which arm a run was actually on.
+        effective = ", ".join(f"{knob}={getattr(self, knob)}" for knob in self.KNOBS
+                              if knob in ("int8", "int8_window_fuse", "int8_residual",
+                                          "render_scale", "profile"))
+        print(f"settings in effect: {effective}", flush=True)
         if changed:
             print("settings: " + ", ".join(changed), flush=True)
 
@@ -888,6 +906,12 @@ def stage_prepare(connection, backend, args, pipeline=None):
     if backend.set_window_fuse(live.int8_window_fuse):
         print(f"settings: window fusion "
               f"{'on' if live.int8_window_fuse else 'off'}; rebuilding the graph", flush=True)
+    # Cheapest of the three: same weights, one fewer pass per projection. It is a knob
+    # at all only because 1.88 ms is below the drift between two launches of one build,
+    # so the frame-level A/B cannot settle it and an in-place one has to be possible.
+    if backend.set_int8_residual(live.int8_residual):
+        print(f"settings: integer residual "
+              f"{'on' if live.int8_residual else 'off'}; rebuilding the graph", flush=True)
     clock = time.perf_counter()
     whole = decode(payload, width, height, vk_format)
     # A letterboxed game — DoA5's smallest window is 1024x768 with 16:9 inside it — leaves
@@ -1315,7 +1339,7 @@ def main():
                         help="the projections on the integer path: 1 runs the bottleneck's "
                              "two and every window block's feed-forward down and attention "
                              "out in configuration 4, worth 4.8 ms of a 46 ms frame and "
-                             "costing 14.5 % of the network's own effect against the float "
+                             "costing 14.5%% of the network's own effect against the float "
                              "path; 0 keeps the float path. `NR_INT8_WINDOW=0` and "
                              "NR_INT8_WINDOW_OUT=0 keep the bottleneck's alone. Switchable "
                              "while the game runs with tools/nr_int8_on.bat and "
@@ -1332,6 +1356,15 @@ def main():
                              "game runs by setting \"int8_window_fuse\" in "
                              "nr_settings.json, which is how it is measured: one game, "
                              "both spellings")
+    parser.add_argument("--int8-residual", type=int,
+                        default=int(os.environ.get("NR_INT8_RESIDUAL", "1") != "0"),
+                        help="the integer path's residual: 1 adds `skip * cosine` in the "
+                             "GEMM's own epilogue, 0 writes the float branch out and adds "
+                             "it in a pass of its own. Same values either way, one pass "
+                             "instead of two, worth 1.88 ms of a 36 ms device frame and "
+                             "120 of its 723 passes. Switchable while the game runs by "
+                             "setting \"int8_residual\" in nr_settings.json, which is how "
+                             "it has to be measured: one game, both spellings")
     parser.add_argument("--min-extent", type=float, default=320.0,
                         help="the smallest side the network's frame is padded to, 128-4096; "
                              "320 is what NVIDIA's own driver does, the graph runs down to 128")
