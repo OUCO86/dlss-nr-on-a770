@@ -12,7 +12,7 @@
 
 | 交付物 | 位置 | 状态 |
 |---|---|---|
-| GitHub 公开库 | <https://github.com/OUCO86/dlss-nr-on-a770> | ✅ 已推送（`windows` 分支 + `a770-int8-verified` 标签，362 文件 / 约 3.6 MB） |
+| GitHub 公开库 | <https://github.com/OUCO86/dlss-nr-on-a770> | ✅ 已同步到 **`42cd8a6c`**（本地 `416ed98` 的重建），18 个提交，`windows` 为默认分支，标签 `a770-int8-verified` 同步更新 |
 | 本地全量快照 | `E:\WorkBuddy\2026-10-09-04-20-55\backups\dlss-nr-on-a770-20261010-0110` | ✅ 994 文件 / 675 MB（含 `.git`、419 MB 模型权重、dll、spv、日志、基准数据） |
 | 可恢复 git 包 | 上述目录内 `repo-all.bundle` | ✅ 含全部分支与标签 |
 | 启动脚本真身 | `E:\WorkBuddy\2026-10-09-04-20-55\tools\` | ✅ 桌面三个 bat 是薄封装 |
@@ -229,6 +229,18 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIODtt2c4snVUP5LSkjDRQa+Wt8w+Q/7yHtcfJje6l/99
 ```
 （私钥在 `C:\Users\wangz\.ssh\id_ed25519`）
 
+⚠️ **2026-10-10 实测：这个公钥还没加进 GitHub 账户。** `ssh -T -p 443 git@ssh.github.com`
+走通了 TCP，但返回 `Permission denied (publickey)`，显式 `-i` 指定私钥也一样。
+所以眼下**只有 API + PAT 这一条路能用**。哪天想摆脱 PAT，去
+<https://github.com/settings/keys> 把上面那串公钥贴进去即可。
+
+### `publish_api.py` 修过的一个 bug（别再踩）
+
+脚本原来判断"仓库是不是空的"只看 `heads/main` 和 `heads/master`。这个仓库的
+默认分支是 **`windows`**，没有 main/master，于是**有内容的仓库被当成空仓库**，
+脚本转去用 contents API 建 README，撞 422（README 已存在，更新要带 sha）。
+现在改成先看**要推送的那个分支**是否存在。空仓库仍会正常 bootstrap。
+
 ---
 
 ## 7. 待办（按优先级）
@@ -238,7 +250,9 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIODtt2c4snVUP5LSkjDRQa+Wt8w+Q/7yHtcfJje6l/99
 2. ~~**window 块的 gather 融进量化**~~ ✅ **已完成** —— 数据见第 3 节第 6 项。
    实测 **−4.37 ms**（比当初估的约 1 ms 好不少），整帧输出逐字节不变。
    这一项**还没在游戏里跑过**（见第 9 节）。
-3. **收尾**：把 PAT `ghp_2OOW...` 去 <https://github.com/settings/tokens> 删掉
+3. **收尾**：验收全部通过以后，把 PAT `ghp_2OOW...` 去
+   <https://github.com/settings/tokens> 删掉。**在验收完成前先别删** —— 这台机器上
+   `git push` 走不通，后续同步还要靠它（或先把 SSH 公钥加进账户）。
 
 ---
 
