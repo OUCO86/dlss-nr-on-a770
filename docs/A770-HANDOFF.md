@@ -411,8 +411,8 @@ index 配对"的做法**不可信** —— 实测 576 对里 **438 对不一致*
 |---|---|
 | `git push` 报 `CONNECT tunnel failed, response 502` | `github.com:443` 被网络层挡 |
 | curl 报 `CRYPT_E_NO_REVOCATION_CHECK` | 代理是 TLS 中间人，吊销检查失败；加 `--ssl-no-revoke` 可通 |
-| `github.com:22` 有时拒连 | 新代理把 22 挡了 |
-| `ssh.github.com:443` 通 | 可用作 SSH 备用端口 |
+| `github.com:22` | **实测 Connection refused**（2026-10-10），不要再试 |
+| `ssh.github.com:443` | **TCP + SSH 握手成功**，是这台机器唯一能通的路 |
 
 **结论**：HTTPS `git push` 在这台机器上不可靠（代理会破坏 pack 数据流），别再调参数了。
 本次上传是用 **GitHub REST API 的 Git Data API** 走 `api.github.com`（代理对它放行且稳定）
@@ -422,10 +422,20 @@ index 配对"的做法**不可信** —— 实测 576 对里 **438 对不一致*
 把那把公钥加进账户后，以后推送就能永久绕开代理，不必再拿 PAT。
 （公钥内容不贴在这里——带上它的 comment 等于把身份写进公开仓库。本机随时可以自己读出来。）
 
-⚠️ **2026-10-10 实测：公钥还没加进账户。** SSH over 443 的 TCP 握上了，
-但服务端返回 `Permission denied (publickey)`，显式 `-i` 指定私钥也一样（那份清单里的
-识别信息也因此没法用）。所以眼下**只有 API + PAT 这一条路能用**。哪天想摆脱 PAT，去
-<https://github.com/settings/keys> 贴进去即可。
+⚠️ **2026-10-10 实测：公钥还没加进账户。** SSH over 443 的 TCP 和 SSH 握手都过了，
+但服务端返回 `Permission denied (publickey)`，显式 `-i` 指定私钥也一样。
+**所以通道本身是好的，缺的只是账户里没登记这把公钥。**
+
+已经配好的东西（`origin` 走 `ssh.github.com:443` 上的 `OUCO86/dlss-nr-on-a770`，
+用户名为 `git`，`git remote -v` 可查）：
+
+| 入口 | 作用 |
+|---|---|
+| `tools\copy_ssh_key.bat` | 把公钥写进剪贴板，并打印添加步骤和指纹 |
+| `tools\publish_a770_ssh.bat` | 先验密钥是否被接受，再 `git push -u origin windows` |
+
+**流程**：去 <https://github.com/settings/keys> → `New SSH key` → 粘贴 → `Add SSH key`，
+然后双击第二个脚本。密钥不过期，一次搞定就不用再管 PAT 了。
 （这里的命令写法刻意不带 `@`：那是主机名，`publish_check` 会把它当成邮箱拦下来。）
 
 ### `publish_api.py` 修过的一个 bug（别再踩）
