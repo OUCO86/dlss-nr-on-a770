@@ -91,7 +91,9 @@ int8 的 QKV 投影没有 epilogue，窗口 gather 无处可放，所以图里�
 `Runtime.quantize_window` / `xmx_rec_quant_window`。
 
 - 一帧 **756 → 600 pass**，`partition` 52 趟归零
-- 设备时间 **31.60 → 27.23 ms**（三轮交替，噪声 ±0.03 ms）
+- 设备时间 ~~**31.60 → 27.23 ms**~~ ⚠️ **这两个数因账户错误作废**（实际低估约 34 %，
+  见第 4 节）。**相对差值（−4.37 ms）本身仍然成立**，因为它是同口径前后比；
+  但**端到端 +1.3 ms 那一行才是这一项真正该看的数字。**
 - 逐字节等价：`work/fuse_equiv.py compare` 报 0 个值不同
 - 只在本来就是 fp16 的图像上融合；float32 那一路留给 `partition` 去取整
 
@@ -175,6 +177,61 @@ DOOM Eternal 关卡内，45 秒窗口 774 帧。
 笔记 `notes/daemon-cpu-cost.md` 里的离线数字仍然保留，但请当作历史记录读，
 不要当作收益依据。
 
+### 本轮重测：设备时间此前被低估 34 %（27.25 → **36.42 ms**）
+
+⚠️ **第 3 节第 6 项里那个「设备时间 31.60 → 27.23 ms」是错的**，别再引用。
+原因有三条，都已修：
+
+1. `traffic_audit.py` 的 `HOOKS` 字典**漏掉了默认就开着的 6 类 pass**
+   （最要紧的是 `gemm_int8_qkv`，一帧 60 趟，此前没人给它命过名）。
+2. `ffn_fused` 一次 Python 调用会在设备侧打**多个** stamp，
+   按调用序号去配对设备 stamp 必然错位。
+3. 总时间取的是 `sum(by_kind.values())`，**只累加了"有名字的"pass**，
+   剩下的 9.17 ms 被静默丢掉。
+
+修好以后（`src/bench/pass_time.py`、`src/bench/device_families.py`、
+`src/bench/graph_gap.py`，8 帧 replay 取平均，按设备时间戳的 **family** 归因，
+不再按序号配对）：
+
+```
+family    ms   share      n   ms/pass
+gemm    13.94   38.3 %    198     0.070
+row      9.54   26.2 %     70     0.136
+tiled    8.49   23.3 %    130     0.065
+unary    4.45   12.2 %    325     0.014
+-- device 36.42 100.0 %    723
+```
+
+最忙的几类（family/sub-kind）：
+
+```
+gemm   sub 30: 8.40 ms   sub 31: 5.54 ms
+row    sub 4:  6.20 ms   sub 3:  3.00 ms   sub 5: 0.34 ms
+unary  sub 5:  2.38 ms   sub 12: 1.64 ms   sub 21: 0.24 ms   sub 18: 0.17 ms
+```
+
+**修正了旧表两个错得离谱的数**：量化（`UNARY/12`）实际只有 **1.64 ms**，
+不是 8.03 ms；`window_block` 是 **6.20 ms**（`ROW/4`）。
+
+**整帧账目（闭环，加得起来了）**：
+
+| 段 | ms |
+|---|---|
+| 设备 pass 时间 | 36.42 |
+| 提交 + 等 fence 的缺口 | 3.27 |
+| host write（喂输入） | 2.1 |
+| host read（取输出） | 0.9 |
+| **= daemon 日志里的 `gpu`** | **42.7** |
+| ＋ 宿主侧（daemon Python） | 24.4 |
+| ＋ 跨进程握手约 | 9 |
+| **= 游戏侧帧时间** | **75.6** |
+
+之前担心的"12.8 ms 黑洞"不存在，缺口只有 **3.27 ms（墙钟的 8 %）**。
+
+⚠️ **方法论教训**：`src/bench/pass_time.py` 那种"Python 调用名 ↔ 设备 stamp 按
+index 配对"的做法**不可信** —— 实测 576 对里 **438 对不一致**。
+要看分解就用 `src/bench/device_families.py`（按 family 累加，不配对）。
+
 ---
 
 ## 5. 🚫 不许再犯的错误清单
@@ -207,6 +264,13 @@ DOOM Eternal 关卡内，45 秒窗口 774 帧。
     真身，不要另起一套启动路径。
 15. **长任务要先说一句话再动手**。跑 3 分钟采样前先讲"我在采样，约 1 分钟"，
     不要闷头跑完才说话——用户会以为我卡死了。
+16. **离线基准脚本默认跑的是 int8 关闭的配置**。`xmxres.Runtime` 读
+    `NR_INT8_PROJECT`，**代码默认 `"0"`**，是 daemon 读 `nr_settings.json` 后才注入的。
+    会不会自己发现？不会——浮点图是"趟数更少、时间更长"（43.49 ms / 415 趟 vs
+    36.41 ms / 723 趟），看着完全合理。**所有独立基准必须先
+    `import game_settings; game_settings.apply()`**（`src/bench/game_settings.py`）。
+17. **基准跑太久就是卡住了，不是慢**。`frame_ledger.py` 连加载 1 GB 权重在内约
+    **90 秒**。有一个跑了 33 分钟没出结果，杀了重跑就好。别干等。
 
 ---
 
@@ -247,12 +311,33 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIODtt2c4snVUP5LSkjDRQa+Wt8w+Q/7yHtcfJje6l/99
 
 1. ~~**游戏内 A/B 验收流水线**~~ ✅ **已完成 —— 结论是负收益，已回退**。
    数据见第 3 节。不用再测这一项了。
-2. ~~**window 块的 gather 融进量化**~~ ✅ **已完成** —— 数据见第 3 节第 6 项。
-   实测 **−4.37 ms**（比当初估的约 1 ms 好不少），整帧输出逐字节不变。
-   这一项**还没在游戏里跑过**（见第 9 节）。
-3. **收尾**：验收全部通过以后，把 PAT `ghp_2OOW...` 去
+2. ~~**window 块的 gather 融进量化**~~ ✅ **已完成，并在游戏里测过** ——
+   数据见第 3 节第 6 项，同一局内热切换 A/B **+1.3 ms**，整帧输出逐字节不变。
+3. ~~**量化改成一遍读**~~ ❌ **做完并证伪，已回退**。同进程交替 A/B 是
+   **36.44 vs 36.50 ms（噪声 ±0.2）= 打平**。第二遍读是免费的：第一遍刚把那一行
+   留在 L2 里了。详见 `notes/device-budget-a770.md`。
+4. **设备侧剩下的三块**，已定位到具体出处（`notes/frame-ledger-a770.md`）：
+   - **`gemm_staged_int8` 没有残差 epilogue** → int8 路径每个投影多一趟
+     `residual`，**120 趟 / 2.38 ms**。浮点路径的 `gemm_residual` 就是现成模板。
+     **这一项形状最清楚、风险最可控，建议先做。**
+   - **分块（branched）FFN 没有 int8 分支** → `_ffn_groups`（104 趟）+ 
+     `record_split_feed_forward` 的 `w.first`（16 趟）= 120 趟 / 8.50 ms。
+     ⚠️ 但这批 pass **不是算力受限**（约 11.4 GFLOP 跑 8.5 ms ≈ 峰值 3-7 %），
+     而 int8 的全部收益就是"乘加指令减半"，**对等待型的 pass 杠杆很弱**，
+     还要额外付约 120 趟 `quantize_row`（约 1 ms）。**先量再建，别直接开工。**
+   - `window_block` **6.20 ms / 10 趟**（0.62 ms 一趟，全帧最贵的单趟），
+     已经是融合写法，没有现成的下一步。
+5. **收尾**：验收全部通过以后，把 PAT `ghp_2OOW...` 去
    <https://github.com/settings/tokens> 删掉。**在验收完成前先别删** —— 这台机器上
    `git push` 走不通，后续同步还要靠它（或先把 SSH 公钥加进账户）。
+
+### 宿主侧已经查过，别再当悬念
+
+`nr_image.c` 那些 pass（一帧约 16.8 ms）**已经是 OpenMP 并行的**，不是漏了多线程：
+`tools/build_win.bat` 带 `/openmp`、DLL 导入 `VCOMP140.DLL`，实测 `decode8`
+1 线程 6.92 ms → 4 线程 3.06 ms，`to_half` 2.60 → 0.48 ms。
+（`src/bench/host_threads.py` 就是问这件事的。）`bilinear` 反而线程越多越慢，
+像是带宽受限，不是漏并行。
 
 ---
 
@@ -271,5 +356,14 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIODtt2c4snVUP5LSkjDRQa+Wt8w+Q/7yHtcfJje6l/99
 
 - ~~流水线 `inflight=2` 在真实游戏里的帧时间收益~~ —— ✅ 已测，**负收益，已回退**
 - ~~多一帧延迟在操作手感上能不能接受~~ —— ✅ 该路已废弃，不用再评估
-- **window block 两趟合成一趟**已经做了，离线数字和逐字节等价都有，
-  但**还没在真实游戏里跑过**。等你在场、进关卡以后再采样一次才算闭环。
+- ~~window block 两趟合成一趟（gather 融进量化）~~ —— ✅ 已在**同一局游戏里热切换
+  A/B** 测过：ON 75.9 ms / OFF 77.1 ms，**+1.3 ms**，且输出逐字节相同。闭环了。
+- ~~量化"一遍读"能省一半流量~~ —— ❌ **证伪**，打平，已回退。
+- **`src/bench/pass_time.py` 里那种"Python 调用名 ↔ 设备 stamp 按 index 配对"的
+  分解** —— ❌ **不可信**，576 对里 438 对不一致。要看分解请用
+  `src/bench/device_families.py`；`pass_time.py` 现在只用于总量和流量统计。
+- **离线 replay 的任何数字** —— 只能用来排除明显错误，**不能当收益依据**。
+  流水线那一项就是这么翻的车（离线 71→43，游戏里 72.8→130.9）。
+- `render_scale` 仍是 **0.4**（网络输入 768×448）。这是**违反你"不降画质"原则的**，
+  是上一轮留下的。改回 1.0 设备时间会从约 40 ms 涨到约 214 ms。**等你拍板，
+  我没有擅自改过。**

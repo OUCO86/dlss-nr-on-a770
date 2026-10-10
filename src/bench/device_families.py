@@ -30,6 +30,19 @@ sys.path.insert(0, str(ROOT / "src" / "ref"))
 
 FAMILIES = ("gemm", "tiled", "staged", "unary", "row", "history", "copy", "start")
 
+# What each (family, sub) is, read off the `stamp()` call in `src/gpu/libxmx.c`.
+# A sub that is not listed here is the kernel's own kind word (a unary op, or the
+# block type `bt` of a float GEMM) and is printed as a bare number.
+NAMES = {
+    ("gemm", 30): "int8 GEMM, staged (xmx_rec_gemm_int8 / _qkv / _fused)",
+    ("gemm", 31): "ffn_fused / _merge / _stem",
+    ("unary", 12): "quantize_row",
+    ("row", 2): "qkv (attention.comp)",
+    ("row", 3): "window_attention",
+    ("row", 4): "window_block",
+    ("row", 5): "global_attention",
+}
+
 
 def main():
     rounds = int(sys.argv[1]) if len(sys.argv) > 1 else 8
@@ -49,6 +62,7 @@ def main():
     totals = collections.Counter()
     counts = collections.Counter()
     per_sub = collections.Counter()
+    per_sub_n = collections.Counter()
     frames = []
     for _ in range(rounds):
         xmxres.profile_reset()
@@ -64,6 +78,7 @@ def main():
             totals[name] += ms
             counts[name] += 1
             per_sub[(name, sub)] += ms
+            per_sub_n[(name, sub)] += 1
 
     device = statistics.median(frames)
     print(f"\n{width_}x{height}: mean of {rounds} replayed frames, "
@@ -77,16 +92,12 @@ def main():
           f"{sum(counts.values()) / rounds:6.0f}   (min {min(frames):.2f}, "
           f"max {max(frames):.2f} over the rounds)")
 
-    print("\n  the busiest kind within each family, where a family has more than one:")
-    seen = collections.defaultdict(list)
-    for (name, sub), ms in per_sub.items():
-        seen[name].append((ms, sub))
-    for name in [n for n, _ in totals.most_common()]:
-        rows = sorted(seen[name], reverse=True)[:4]
-        if len(rows) < 2:
-            continue
-        print(f"    {name:10s} " + "  ".join(
-            f"sub {sub}: {ms / rounds:6.2f} ms" for ms, sub in rows))
+    print(f"\n  {'kind':12s} {'ms':>7s} {'share':>7s} {'n':>6s} {'ms/pass':>9s}   what")
+    for (name, sub), ms in per_sub.most_common():
+        n = per_sub_n[(name, sub)] / rounds
+        label = NAMES.get((name, sub), "")
+        print(f"  {name}/{sub:<7d} {ms / rounds:7.2f} {100 * ms / rounds / device:6.1f} % "
+              f"{n:6.0f} {ms / rounds / n:9.3f}   {label}")
     return 0
 
 
