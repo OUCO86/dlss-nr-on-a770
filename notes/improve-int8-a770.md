@@ -375,6 +375,16 @@ Accuracy is a price, not a prohibition. The 32 calls today cost 10.1 % of the ef
 grows with how much is converted; the per-row numbers say the activations have room, but the
 end-to-end figure would have to be re-measured before any of this is switched on.
 
+**2026-10-11: the wiring was built for the window blocks, and the rest was measured and
+declined.** `src/bench/ffn_int8_probe.py` puts the 130 float16 products still in a frame
+against the integer path, in one process and alternating: at the group count a frame
+actually runs, the integer path is **0.26 ms slower**, and the reason is not the
+arithmetic — with both routes taken apart into separate calls, integer is 34 % faster.
+It is `gemm_int8` having no batch, where `_ffn_groups` calls `gemm` with `batch=groups`
+and that batch is worth 35 % of the work. See `notes/frame-ledger-a770.md`. The useful
+question is therefore "does the integer kernel get a batch", not "does this get
+converted" — and the answer to the second one, as things stand, is no.
+
 ## The window blocks' out projection, and the count that cost the device
 
 Routing the window blocks' out projection through `record_project_residual` lost the

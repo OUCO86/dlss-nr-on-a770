@@ -14,6 +14,13 @@ import sys
 import numpy as np
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "src" / "bench"))
+# The integer path is off unless something turns it on: `xmxres.Runtime` reads
+# `NR_INT8_PROJECT`, whose default is "0", and only the daemon injects it. Without this
+# the frame recorded here is not the frame a game runs — 415 passes of the float graph
+# instead of 603 — and the shapes counted are not the ones left over.
+import game_settings
+game_settings.apply()
 sys.path.insert(0, str(ROOT / "src" / "gpu"))
 sys.path.insert(0, str(ROOT / "src" / "ref"))
 sys.path.insert(0, str(ROOT / "work"))
