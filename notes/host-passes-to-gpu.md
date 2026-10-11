@@ -306,3 +306,54 @@ daemon 日志第一行就写着：
 
 另：`inner` 存成 fp16 对 `PRE_FEATURES` 是**零代价**（它第一件事就是 `half_round(x)`，
 x 已经是 half 就是恒等），但会轻微扰动 `cut`（0.0049，相对扰动约 1e-4）——可接受，仍非必要。
+
+## 10. 前后段都上卡之后，一帧的钱花在哪（2026-10-11，离线实测）
+
+### 10.1 `daemon_stages.py`（1920x1080@0.4，12 帧中位，实机开关 `NR_POSTPASS=1`）
+
+| stage | fresh | held |
+|---|---|---|
+| receive（管道收 8.3 MB） | 1.48 | 1.47 |
+| settings | 0.09 | 0.08 |
+| **decode（宿主全帧解码）** | **2.00** | 1.92 |
+| letterbox | 0.11 | 0.08 |
+| history_take | 0.00 | 0.00 |
+| gpu_in | 0.03 | 0.03 |
+| **gpu_run（网络图墙钟）** | **43.50** | 43.49 |
+| send | 1.04 | 0.99 |
+| post_send | 0.11 | 0.42 |
+| to_answer / round_trip | 53.23 / 54.23 | 52.63 / 53.67 |
+| **rest（往返减图）** | **10.74** | 10.04 |
+
+往返约 53 ms，图 43.5，宿主+传输约 **10 ms**。
+
+### 10.2 `graph_gap.py` —— 那个 gap 到底是 2.75 ms，不是 8.9 ms
+
+⚠️ **这个脚本不 `apply()` 游戏设置，默认跑的是 int8 关闭的浮点图**（415 趟 / 43.54 ms）。
+必须 `NR_INT8_PROJECT=1` 才是实机那张图（603 趟）。判据：**趟数 603 而不是 415**。
+
+    NR_INT8_PROJECT=1 NR_PROFILE_GAP=1 python src/bench/graph_gap.py 6
+      wall clock around the graph   38.50 ms
+      device, passes only           35.75 ms
+      unaccounted for                2.75 ms  (7 %)
+      pass count                      603
+
+所以**设备"没记账"的时间只有 2.75 ms**。
+（曾经以为的 8.9 ms 是拿 `daemon_stages` 的图墙钟 43.5 减 `frame_ledger` 的 34.61 得来的，
+两者不是同一段：账本只跑网络图，不含前后段的 pass 和它们各自那一次 submit。）
+
+### 10.3 剩下的宿主开销，按大小
+
+1. **`decode` 2.00 ms —— 最可疑**：`nr_daemon.py:80` 的 `nr_image.decode8`，全帧 8.3 MB 解成
+   25 MB fp32。而 `PRE_INNER` **已经在设备上解码过同一帧**（还顺手算了 cut）。设备路径下
+   宿主这份 `whole` 只剩 letterbox 检测在用，而那个只想知道哪些行列是黑的，
+   **在字节上就能判，不必解码成 fp32**。
+2. 管道 `receive` 1.48 + `send` 1.04 = 2.52 ms：8.3 MB 一来一回，跨进程固有成本。
+3. `to_answer` 53.23 减去上面各项之和约 48.4 → **约 4.9 ms 未归因**，下一轮要拆开。
+4. `post_send` 0.11（fresh）/ 0.42（held）。
+
+### 10.4 下一步
+
+先做 10.3 的第 1 条：设备路径下让 `decode` 只在真正需要全帧 fp32 时才做
+（letterbox 改在字节上判），**省约 2 ms**，且不动任何已验证的开关。
+再回头拆那 4.9 ms 的未归因部分。

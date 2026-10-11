@@ -379,6 +379,32 @@ def resample(image, size):
 LETTERBOX_TOLERANCE = np.float32(2.0 / 255.0)
 
 
+# A decoded value is its byte over 255, so `tolerance` is a statement about a whole
+# number: at 2/255 a bar is black when every colour byte is at most 2. Those three bytes
+# are the low three of the word in both `bgra8` and `rgba8` — only their order differs,
+# and a maximum does not care — with alpha above them, so one comparison against
+# `WORD_DARK` answers for a whole pixel. `a2b10g10r10` packs three channels into ten bits
+# each and has no such byte, which is why it keeps the host's path.
+WORD_RGB = 0x00FFFFFF
+WORD_DARK = int(LETTERBOX_TOLERANCE * 255.0 + 0.5) * 0x010101
+
+
+def _runs(dark, extent, limit=0.45):
+    """How far a run of dark lines reaches in from each end, as `active_region` wants.
+
+    Takes the answer per line rather than the values, so the frame and the bytes it was
+    decoded from can share it.
+    """
+    cap = int(extent * limit)
+    lead = tail = 0
+    while lead < cap and dark[lead]:
+        lead += 1
+    while tail < cap and dark[extent - 1 - tail]:
+        tail += 1
+    # asymmetric bars are not a letterbox; a single row of slack covers odd extents
+    return (lead, extent - tail) if lead and tail and abs(lead - tail) <= 1 else (0, extent)
+
+
 def active_region(colour, tolerance=LETTERBOX_TOLERANCE, limit=0.45):
     """The rows and columns a letterboxed game did not draw into.
 
@@ -393,24 +419,30 @@ def active_region(colour, tolerance=LETTERBOX_TOLERANCE, limit=0.45):
     a letterbox is symmetric and a dark sky is not.
     """
     height, width = colour.shape[:2]
-    rows = colour.max(axis=(1, 2))
-    columns = colour.max(axis=(0, 2))
-
-    def run(values, extent):
-        cap = int(extent * limit)
-        lead = tail = 0
-        while lead < cap and values[lead] <= tolerance:
-            lead += 1
-        while tail < cap and values[extent - 1 - tail] <= tolerance:
-            tail += 1
-        # asymmetric bars are not a letterbox; a single row of slack covers odd extents
-        return (lead, extent - tail) if lead and tail and abs(lead - tail) <= 1 else (0, extent)
-
-    top, bottom = run(rows, height)
-    left, right = run(columns, width)
+    top, bottom = _runs(colour.max(axis=(1, 2)) <= tolerance, height, limit)
+    left, right = _runs(colour.max(axis=(0, 2)) <= tolerance, width, limit)
     # A black frame — a fade, a loading screen — is bars all the way in from both sides
     # and would leave a sliver in the middle. 16:9 inside 4:3 keeps 75 %; anything under
     # half is not a letterbox, it is a dark frame.
+    if (bottom - top) * (right - left) < height * width // 2:
+        return 0, height, 0, width
+    return top, bottom, left, right
+
+
+def active_region_words(words, width, height, limit=0.45):
+    """The same bars, read off the bytes the game sent instead of the frame they decode to.
+
+    The bars are the only thing the host still wanted a decoded whole frame for once the
+    device took the resample and the composition, and a bar is a question about bytes:
+    whether every colour channel of a whole line is at or below `WORD_DARK`. Answering it
+    in place costs one pass over the words — and on the frames that matter, only over the
+    eight lines `Letterbox` checks — against widening 8 MB into 25 MB to ask the same
+    thing of floats.
+    """
+    packed = np.frombuffer(words, np.uint32).reshape(height, width)
+    body = packed & np.uint32(WORD_RGB)
+    top, bottom = _runs(body.max(axis=1) <= np.uint32(WORD_DARK), height, limit)
+    left, right = _runs(body.max(axis=0) <= np.uint32(WORD_DARK), width, limit)
     if (bottom - top) * (right - left) < height * width // 2:
         return 0, height, 0, width
     return top, bottom, left, right
@@ -434,30 +466,47 @@ class Letterbox:
         self.key = None
         self.bounds = None
 
-    def region(self, colour, key):
-        if self.key == key and self.bounds is not None and self._holds(colour):
+    def region(self, colour, key, words=None, shape=None):
+        if self.key == key and self.bounds is not None and self._holds(colour, words, shape):
             return self.bounds
         self.key = key
-        self.bounds = active_region(colour)
+        self.bounds = (active_region(colour) if words is None
+                       else active_region_words(words, *shape))
         return self.bounds
 
-    def _holds(self, colour):
+    def _holds(self, colour, words=None, shape=None):
         top, bottom, left, right = self.bounds
-        height, width = colour.shape[:2]
+        # `shape` is (width, height) as an extent is written everywhere else here, so a
+        # caller can hand it straight to `active_region_words`.
+        height, width = colour.shape[:2] if colour is not None else shape[::-1]
         # The key is the caller's word that this is the same swapchain; the bounds fitting
         # is ours. Without this a mismatched key reads other rows and crops to them.
         if bottom > height or right > width:
             return False
 
-        def dark(line):
-            return float(line.max()) <= LETTERBOX_TOLERANCE
+        if words is None:
+            def dark(line):
+                return float(line.max()) <= LETTERBOX_TOLERANCE
 
-        for line, wanted_dark in ((colour[top - 1] if top else None, True),
-                                  (colour[bottom] if bottom < height else None, True),
-                                  (colour[:, left - 1] if left else None, True),
-                                  (colour[:, right] if right < width else None, True),
-                                  (colour[top], False), (colour[bottom - 1], False),
-                                  (colour[:, left], False), (colour[:, right - 1], False)):
+            lines = ((colour[top - 1] if top else None, True),
+                     (colour[bottom] if bottom < height else None, True),
+                     (colour[:, left - 1] if left else None, True),
+                     (colour[:, right] if right < width else None, True),
+                     (colour[top], False), (colour[bottom - 1], False),
+                     (colour[:, left], False), (colour[:, right - 1], False))
+        else:
+            packed = np.frombuffer(words, np.uint32).reshape(height, width)
+
+            def dark(line):
+                return bool((line & np.uint32(WORD_RGB)).max() <= np.uint32(WORD_DARK))
+
+            lines = ((packed[top - 1] if top else None, True),
+                     (packed[bottom] if bottom < height else None, True),
+                     (packed[:, left - 1] if left else None, True),
+                     (packed[:, right] if right < width else None, True),
+                     (packed[top], False), (packed[bottom - 1], False),
+                     (packed[:, left], False), (packed[:, right - 1], False))
+        for line, wanted_dark in lines:
             if line is not None and dark(line) != wanted_dark:
                 return False
         return True
@@ -989,16 +1038,24 @@ def stage_prepare(connection, backend, args, pipeline=None):
         print(f"settings: integer residual "
               f"{'on' if live.int8_residual else 'off'}; rebuilding the graph", flush=True)
     clock = time.perf_counter()
-    whole = decode(payload, width, height, vk_format)
     # A letterboxed game — DoA5's smallest window is 1024x768 with 16:9 inside it — leaves
     # a quarter of the frame black, and every stage below is measured at the output
     # resolution (`notes/phase51`). Working on the active region alone skips that, and the
     # bars are handed back untouched: `encode(decode(v)) == v` for all 256 values, so
     # leaving them in the output array is byte-exact.
-    top, bottom, left, right = args.letterbox.region(whole, (width, height, vk_format))
+    #
+    # The bars are a question about bytes, and once the device carries the resample and
+    # the composition they are the only thing the host wanted a decoded whole frame for.
+    # So they are answered here, in the words the game sent, and the widening of 8 MB into
+    # 25 MB happens only when something still asks for it — a letterbox to crop, a format
+    # whose channels are not bytes, or the host's own composition. `stage_finish` knows
+    # which, and decodes there.
+    kind = FORMATS[vk_format][0]
+    top, bottom, left, right = args.letterbox.region(
+        None, (width, height, vk_format),
+        words=payload if kind in ("bgra8", "rgba8") else None, shape=(width, height))
     boxed = (top, bottom, left, right) != (0, height, 0, width)
-    colour = whole[top:bottom, left:right] if boxed else whole
-    active_height, active_width = colour.shape[:2]
+    active_height, active_width = bottom - top, right - left
     # The network's cost follows the extent it is given and nothing else, so a smaller
     # internal frame is the only lever that changes the frame rate (notes/phase37,
     # phase45). What comes back up is the *head* — the detail the network drew — which
@@ -1018,8 +1075,18 @@ def stage_prepare(connection, backend, args, pipeline=None):
     # frame keeps the host's path: the pass reads the request's whole extent, so
     # cropping it would mean carrying the bars through the decode as well.
     request = _request_pass(args, backend, geometry, (width, height), inner_shape,
-                            boxed, live.profile, FORMATS[vk_format][0])
+                            boxed, live.profile, kind)
     cut = request.prepare(payload) if request is not None else None
+    # Left undecoded while the device is carrying the frame, which is the case worth
+    # having: the widening of the game's bytes into floats was the most expensive host
+    # pass left in the frame once the resample and the composition moved
+    # (`notes/host-passes-to-gpu.md` section 10). A crop, a host composition or a frame
+    # being saved still wants it, and `stage_finish` decodes it there when it does.
+    whole = colour = None
+    if (request is None or boxed or args.dump or args.meter is not None
+            or not getattr(args, "postpass", False)):
+        whole = decode(payload, width, height, vk_format)
+        colour = whole[top:bottom, left:right] if boxed else whole
     inner = (inner_shape if request is not None else
              colour if extent == (active_width, active_height)
              else resample(colour, (extent[1], extent[0])))
@@ -1118,7 +1185,6 @@ def stage_prepare(connection, backend, args, pipeline=None):
     # are the same (`nr_frame.compose_encode`, `test_native_image.py`). The answer is
     # written into the request's own buffer when nothing needs the request's bytes
     # afterwards — the interface restore does.
-    kind = FORMATS[vk_format][0]
     return Frame(connection=connection, payload=payload, interface=interface,
                  width=width, height=height, vk_format=vk_format, clock=clock,
                  live=_knobs(live), top=top, bottom=bottom, left=left, right=right,
@@ -1204,6 +1270,13 @@ def stage_finish(frame, backend, args):
         fused = DEVICE
         metred = 0
     else:
+        if whole is None:
+            # The device was going to carry this frame and did not — an interface mask, a
+            # strength away from one — so the widening it was spared is paid here, and the
+            # host's composition has the frame it needs.
+            whole = decode(payload, width, height, vk_format)
+            colour = whole[top:bottom, left:right] if boxed else whole
+            frame.whole, frame.colour = whole, colour
         if head is None:
             # The device kept the head, which the host's composition needs, and this
             # frame cannot be composed there — an interface mask has no counterpart
