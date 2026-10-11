@@ -192,6 +192,12 @@ def _load():
         # that waits on it. Windows only; the dll built elsewhere does not have them.
         lib.xmx_sem_import.argtypes = [ctypes.c_ulonglong, ctypes.c_int]
         lib.xmx_sem_import.restype = ctypes.c_int
+        if hasattr(lib, "xmx_sem_export"):
+            lib.xmx_sem_export.argtypes = []
+            lib.xmx_sem_export.restype = ctypes.c_int
+        if hasattr(lib, "xmx_sem_handle"):
+            lib.xmx_sem_handle.argtypes = [ctypes.c_int]
+            lib.xmx_sem_handle.restype = ctypes.c_ulonglong
         lib.xmx_extmem_wait.argtypes = [ctypes.c_int, ctypes.c_ulonglong]
         lib.xmx_extmem_wait.restype = ctypes.c_int
         lib.xmx_extmem_wait_clear.argtypes = []
@@ -1992,6 +1998,34 @@ class Runtime:
     def extmem_available():
         lib = _load()
         return hasattr(lib, "xmx_sem_import") and hasattr(lib, "xmx_buf_handle")
+
+    def export_semaphore(self):
+        """Make a timeline semaphore of our own to hand the layer, as an id.
+
+        The layer writes into buffers *we* allocated, so we are the side that waits and
+        the semaphore has to be ours to give out. Timeline because a binary one may not
+        be waited on before its signal has been submitted, which is exactly the shape of
+        "the frame is on its way".
+        """
+        if not hasattr(self.lib, "xmx_sem_export"):
+            raise RuntimeError("this libxmx build cannot export a semaphore")
+        sid = self.lib.xmx_sem_export()
+        if sid < 0:
+            raise failure(self.lib, "xmx_sem_export")
+        return sid
+
+    def semaphore_handle(self, sem_id):
+        """The NT handle behind an exported semaphore, as a number.
+
+        It is a handle in *this* process. Whoever wants it in another one has to
+        DuplicateHandle it, and the number they get back is a different one.
+        """
+        if not hasattr(self.lib, "xmx_sem_handle"):
+            raise RuntimeError("this libxmx build cannot export a semaphore")
+        value = int(self.lib.xmx_sem_handle(int(sem_id)))
+        if not value:
+            raise failure(self.lib, "xmx_sem_handle")
+        return value
 
     def import_semaphore(self, handle, timeline=False):
         """Take over an OPAQUE_WIN32 semaphore handle the layer duplicated to us.

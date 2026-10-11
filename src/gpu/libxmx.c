@@ -115,6 +115,10 @@ static struct {
 	VkSemaphore wait_sem;
 	VkSemaphore xsems[MAX_XSEM];
 	int xsems_timeline[MAX_XSEM];
+	/* The NT handle behind an exported one, kept so it can be closed. An imported
+	 * handle is the application's too (importing does not hand it to the driver),
+	 * but a caller that already had one can close it, so only ours are tracked. */
+	HANDLE xsem_handles[MAX_XSEM];
 	/* The value a timeline wait is for. Binary semaphores have no value; a timeline
 	 * one is waited on at a value and signalled to a value, and the wait only lets go
 	 * once the counter has reached it. */
@@ -1326,6 +1330,76 @@ unsigned long long xmx_buf_handle(int id)
 int xmx_buf_exported(int id)
 {
 	return (id >= 0 && id < MAX_RBUF && rbufs[id].live && rbufs[id].exported) ? 1 : 0;
+}
+
+/* Make a timeline semaphore of our own and export it, so the layer can say "the frame
+ * is in your buffer" without any bytes crossing. Returns the id xmx_extmem_wait takes,
+ * or negative on failure; xmx_sem_handle gives the number to duplicate across.
+ *
+ * It has to be ours, not the layer's: the layer writes into a buffer *we* allocated,
+ * so we are the side that waits, and the semaphore has to be the side's that waits.
+ * Timeline rather than binary because a binary one may not be waited on before its
+ * signal has been submitted — VUID-vkQueueSubmit-pWaitSemaphores-03238 — and "the frame
+ * is on its way" is exactly that. See refs/vulkan-sync/README.md. */
+int xmx_sem_export(void)
+{
+#ifdef _WIN32
+	if (!g.rready) FAIL("resident runtime not initialised", 0);
+	int id;
+	for (id = 0; id < MAX_XSEM && g.xsems[id]; id++);
+	if (id == MAX_XSEM) FAIL("out of external semaphore slots", 0);
+	VkExportSemaphoreCreateInfo esci = {
+		.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+		.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+	};
+	VkSemaphoreTypeCreateInfo stci = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, .pNext = &esci,
+		.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+	};
+	VkSemaphoreCreateInfo sci = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &stci,
+	};
+	VkSemaphore sem;
+	if (vkCreateSemaphore(g.dev, &sci, NULL, &sem) != VK_SUCCESS)
+		FAIL("vkCreateSemaphore (export)", 0);
+	PFN_vkGetSemaphoreWin32HandleKHR get = (PFN_vkGetSemaphoreWin32HandleKHR)
+		vkGetDeviceProcAddr(g.dev, "vkGetSemaphoreWin32HandleKHR");
+	if (!get) {
+		vkDestroySemaphore(g.dev, sem, NULL);
+		FAIL("vkGetSemaphoreWin32HandleKHR absent", 0);
+	}
+	VkSemaphoreGetWin32HandleInfoKHR gi = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR,
+		.semaphore = sem,
+		.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+	};
+	HANDLE h = NULL;
+	VkResult r = get(g.dev, &gi, &h);
+	if (r || !h) {
+		vkDestroySemaphore(g.dev, sem, NULL);
+		FAIL("vkGetSemaphoreWin32HandleKHR", r);
+	}
+	g.xsems[id] = sem;
+	g.xsems_timeline[id] = 1;
+	g.xsem_handles[id] = h;
+	return id;
+#else
+	FAIL("exporting a semaphore is Windows only", 0);
+#endif
+}
+
+/* The NT handle behind an exported semaphore, as a number, or 0. It is a handle in
+ * *this* process: whoever wants it in another one has to DuplicateHandle it, and the
+ * number they get is a different one. */
+unsigned long long xmx_sem_handle(int id)
+{
+#ifdef _WIN32
+	if (id < 0 || id >= MAX_XSEM || !g.xsem_handles[id]) FAIL("semaphore is not exported", 0);
+	return (unsigned long long)(uintptr_t)g.xsem_handles[id];
+#else
+	(void)id;
+	FAIL("external memory is Windows only", 0);
+#endif
 }
 
 /* Take over an OPAQUE_WIN32 semaphore handle that came from the layer. The handle is

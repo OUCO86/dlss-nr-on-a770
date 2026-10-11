@@ -893,6 +893,101 @@ static int waittest(struct side *s, unsigned long ms)
 	return (elapsed >= 0.8 * (double)ms && after_aa == 0) ? 0 : 1;
 }
 
+/* The mirror of semhost: take a semaphore *somebody else* exported and signal it from
+ * here. `src/bench/check_extmem_export_sem.py` uses it to ask whether a semaphore
+ * libxmx exported behaves like one this probe exported — the same payload shared the
+ * other way round is not something the earlier test covered, and libxmx is the side
+ * that will own it in Phase 2. */
+static int sigpeer_main(void)
+{
+	setvbuf(stdout, NULL, _IONBF, 0);
+	VkInstance inst = make_instance();
+	if (!inst)
+		return 1;
+	g_pd = pick_intel(inst);
+	if (!g_pd) {
+		printf("sigpeer: no Intel physical device\n");
+		return 1;
+	}
+	struct side b = { 0 };
+	if (make_side(&b))
+		return 1;
+	HANDLE hin = GetStdHandle(STD_INPUT_HANDLE);
+	char line[256];
+	if (!read_line(hin, line, sizeof line)) {
+		printf("sigpeer: no handle arrived\n");
+		return 1;
+	}
+	unsigned long long hv = 0;
+	if (sscanf(line, "sem %llx", &hv) != 1 || !hv) {
+		printf("sigpeer: bad handle line '%s'\n", line);
+		return 1;
+	}
+	/* A timeline semaphore, because that is what libxmx exports: importing one handle
+	 * as the wrong kind is refused, and the two cannot be told apart from the number. */
+	VkSemaphoreTypeCreateInfo stci = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+		.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+	};
+	VkSemaphoreCreateInfo sci = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &stci,
+	};
+	VkSemaphore sem = VK_NULL_HANDLE;
+	if (vkCreateSemaphore(b.dev, &sci, NULL, &sem) != VK_SUCCESS) {
+		printf("sigpeer: vkCreateSemaphore failed\n");
+		return 1;
+	}
+	PFN_vkImportSemaphoreWin32HandleKHR imp = (PFN_vkImportSemaphoreWin32HandleKHR)
+		vkGetDeviceProcAddr(b.dev, "vkImportSemaphoreWin32HandleKHR");
+	if (!imp) {
+		printf("sigpeer: vkImportSemaphoreWin32HandleKHR absent\n");
+		return 1;
+	}
+	VkImportSemaphoreWin32HandleInfoKHR ii = {
+		.sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR,
+		.semaphore = sem,
+		.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+		.handle = (HANDLE)(uintptr_t)hv,
+	};
+	if (imp(b.dev, &ii) != VK_SUCCESS) {
+		printf("sigpeer: import failed\n");
+		return 1;
+	}
+	printf("READY\n");
+	fflush(stdout);
+
+	while (read_line(hin, line, sizeof line)) {
+		unsigned long ms = 0;
+		unsigned long long value = 0;
+		if (!strcmp(line, "quit")) {
+			printf("R 0 sigpeer done\n");
+			break;
+		} else if (sscanf(line, "signal %llu after %lu", &value, &ms) == 2) {
+			Sleep(ms);
+			PFN_vkSignalSemaphore sig = (PFN_vkSignalSemaphore)
+				vkGetDeviceProcAddr(b.dev, "vkSignalSemaphore");
+			if (!sig) {
+				printf("R 999 vkSignalSemaphore absent\n");
+				continue;
+			}
+			VkSemaphoreSignalInfo ssi = {
+				.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
+				.semaphore = sem, .value = value,
+			};
+			VkResult r = sig(b.dev, &ssi);
+			if (r) {
+				printf("R 999 vkSignalSemaphore failed (%d)\n", r);
+				continue;
+			}
+			printf("R 0 signalled %llu after %lu ms\n", value, ms);
+		} else {
+			printf("sigpeer: unknown command '%s'\n", line);
+		}
+		fflush(stdout);
+	}
+	return 0;
+}
+
 /* The layer's half of Phase 2, standing on its own: make a semaphore somebody else can
  * wait on, hand it to the process whose pid we are given, and signal it only after a
  * delay. A submit that really waits on it cannot finish before the delay is up, and one
@@ -1384,6 +1479,10 @@ int main(int argc, char **argv)
 		 * the host rather than by a submitted batch. */
 		return semhost_main(strtoul(argv[2], NULL, 10),
 				   argc >= 4 && !strcmp(argv[3], "timeline"));
+	if (argc >= 2 && !strcmp(argv[1], "sigpeer"))
+		/* takes the handle on stdin, not the command line: it is duplicated in after
+		 * this process is already running */
+		return sigpeer_main();
 	if (argc >= 4 && !strcmp(argv[1], "guest"))
 		return guest_main(argv[2], argv[3], argc >= 5 ? argv[4] : "0");
 	if (argc >= 2 && strcmp(argv[1], "guest") && strcmp(argv[1], "child")) {
