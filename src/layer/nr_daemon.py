@@ -65,6 +65,13 @@ MAGIC = 0x304E524E
 MASK_COVERAGE_LIMIT = 0.55   # above this the mask is the scene, not the interface
 MAGIC_MASKED = 0x314E524E     # the same, with a one-byte-per-pixel interface mask after the colour
 
+# The same two, when the frame's bytes are in a file mapping rather than on the wire:
+# the header is twenty bytes then, the last four the slot the frame was put in, and only
+# those four bytes come back instead of the answer. A daemon that does not know these
+# rejects the frame rather than reading a frame's worth out of a pipe that holds none.
+MAGIC_SHM = 0x324E524E
+MAGIC_SHM_MASKED = 0x334E524E
+
 # The swapchain formats a compositor or VKD3D actually hands out. A game writes
 # sRGB-encoded values into a UNORM swapchain just as it does into an SRGB one, so both
 # decode the same way; what differs is only how the display reads them back.
@@ -192,6 +199,33 @@ def receive(connection, count, probe_ok=False, keep=None):
             chunks.append(chunk)
         got += size
     return buffer if buffer is not None else b"".join(chunks)
+
+
+def _mapping(args):
+    """Where a frame's bytes cross when they do not cross on the wire, or None.
+
+    Only a daemon that made one has the attribute at all — a test that hands these
+    stages an args of its own has not — and the frame goes on the pipe without it,
+    which is where it went before there was anywhere else to put it.
+    """
+    return getattr(args, "mapping", None)
+
+
+def send_answer(connection, mapping, slot, words):
+    """The answer on its way back to the layer.
+
+    Through the mapping when the frame came in one: the bytes are copied into the frame's
+    own slot and four bytes on the pipe say they are there, which is 8.3 MB the pipe does
+    not have to copy twice. Through the pipe when that is where the frame came from, and
+    whenever the answer is too large for a slot — a larger extent than the mapping was
+    made for, which the layer itself refuses to put in one, so this is only a guard.
+    """
+    raw = memoryview(words).cast("B")
+    if slot is None or mapping is None or len(raw) > mapping.colour:
+        connection.sendall(words)
+        return
+    mapping.answer(slot, len(raw))[:] = raw
+    connection.sendall(struct.pack("<I", len(raw)))
 
 
 SOLID_RADIUS = 3
@@ -952,7 +986,7 @@ class Frame:
                  "colour", "active_height", "active_width", "inner", "geometry", "shot",
                  "history_inner", "history_full", "history_pixels", "features",
                  "channels", "grade", "neural", "control", "held", "previous", "kind",
-                 "head", "split", "request", "head_device", "head_stride")
+                 "head", "split", "request", "head_device", "head_stride", "shm")
 
     def __init__(self, **fields):
         for name in self.__slots__:
@@ -1005,17 +1039,32 @@ def stage_prepare(connection, backend, args, pipeline=None):
     if header is None:
         return
     magic, width, height, vk_format = struct.unpack("<4I", header)
-    if magic not in (MAGIC, MAGIC_MASKED):
+    if magic not in (MAGIC, MAGIC_MASKED, MAGIC_SHM, MAGIC_SHM_MASKED):
         raise ValueError(f"bad magic {magic:#x}")
     if not width or not height or width * height > args.max_pixels:
         raise ValueError(f"rejected extent {width}x{height}; limit {args.max_pixels} pixels")
-    payload = receive(connection, width * height * 4, keep="frame")
-    interface = (receive(connection, width * height, keep="interface")
-                 if magic == MAGIC_MASKED else None)
+    # A frame that crossed in the mapping names the slot it went in after the header, and
+    # its colour and mask are already where they can be read. One that came by pipe is
+    # read out of it. Either way `slot` is what says which on the way back.
+    pixels = width * height
+    mapping = _mapping(args)
+    slot = None
+    if magic in (MAGIC_SHM, MAGIC_SHM_MASKED) and mapping is not None:
+        slot = struct.unpack("<I", bytes(receive(connection, 4)))[0]
+        if slot >= mapping.slots:
+            raise ValueError(f"slot {slot} is not one of {mapping.slots}")
+    masked = magic in (MAGIC_MASKED, MAGIC_SHM_MASKED)
+    if slot is not None and pixels * 4 + (pixels if masked else 0) <= mapping.stride:
+        payload = mapping.request(slot, pixels * 4)
+        interface = mapping.interface(slot, pixels) if masked else None
+    else:
+        payload = receive(connection, pixels * 4, keep="frame")
+        interface = receive(connection, pixels, keep="interface") if masked else None
+        slot = None
     if vk_format not in FORMATS:
         print(f"unsupported VkFormat {vk_format}; passing the frame through",
               flush=True)
-        connection.sendall(payload)
+        send_answer(connection, _mapping(args), slot, payload)
         return
 
     live = args.live
@@ -1194,7 +1243,7 @@ def stage_prepare(connection, backend, args, pipeline=None):
                  history_pixels=history_pixels, features=features, channels=channels,
                  grade=grade, neural=neural, control=control, held=held,
                  previous=previous, kind=kind, head=None, split=None,
-                 request=request, head_device=None, head_stride=0)
+                 request=request, head_device=None, head_stride=0, shm=slot)
 
 
 def stage_network(frame, backend):
@@ -1282,7 +1331,7 @@ def stage_finish(frame, backend, args):
             # frame cannot be composed there — an interface mask has no counterpart
             # in the shader. Hand it back as the game sent it rather than fall over.
             # No game this was measured on sends a mask at all.
-            connection.sendall(payload)
+            send_answer(connection, _mapping(args), frame.shm, payload)
             print("  passed through: an interface mask, which the device's "
                   "composition does not have", flush=True)
             return
@@ -1370,7 +1419,7 @@ def stage_finish(frame, backend, args):
         # so a --dump shows what was actually sent
         if composed is not None:
             (full[top:bottom, left:right] if full is not None else composed)[held] = colour[held]
-    connection.sendall(encoded)
+    send_answer(connection, _mapping(args), frame.shm, encoded)
     if changed is None and composed is not None:
         changed = mean_change(composed[rows], colour[rows], "change")
     # What the game was handed at the active region, for the dump below.
@@ -1643,6 +1692,11 @@ def main():
     args.postpass = os.environ.get("NR_POSTPASS", "0") != "0"
     args.request = None
     args.request_key = None
+    # Where a frame's bytes cross when they do not cross on the wire. Made here, because
+    # the pixel limit that sizes it is this daemon's, and found by the layer by name.
+    # None — on Linux, or with NR_SHM=0 — and the frame goes on the pipe as it always
+    # did, which is the only transport a layer that has never heard of a mapping speaks.
+    args.mapping = None
 
     if not nr_frame.WEIGHTS.exists():
         # The first thing a new clone hits, and a traceback is a poor way to say it.
@@ -1699,12 +1753,25 @@ def main():
         # The headroom costs nothing — an instance is a handle until someone connects.
         server = nr_pipe.NamedPipeServer(args.socket, backlog=16, timeout=None)
         print(f"listening on {args.socket}", flush=True)
+        if os.environ.get("NR_SHM", "1") != "0":
+            try:
+                args.mapping = nr_pipe.FrameMapping(args.socket, args.max_pixels)
+            except OSError as error:
+                # Not a reason to stop: the frame goes on the pipe, which is where it
+                # went before there was a mapping to put it in.
+                print(f"no mapping for the frame to cross in ({error}); "
+                      f"it goes on the pipe", flush=True)
+            else:
+                print(f"frames cross in a mapping: {args.mapping.slots} slots of "
+                      f"{args.mapping.stride >> 20} MB", flush=True)
         try:
             serve(server, backend, args)
         except KeyboardInterrupt:
             pass
         finally:
             server.close()
+            if args.mapping is not None:
+                args.mapping.close()
             backend.close()
         return
 

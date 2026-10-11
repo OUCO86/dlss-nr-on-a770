@@ -21,6 +21,8 @@
 #ifdef _WIN32
 
 #include <windows.h>
+#include <stdint.h>
+#include <string.h>      /* memcpy, memset: the mapping is copied into and out of */
 #include <stdio.h>   /* snprintf, used by both arms */
 
 /* One connected endpoint. `handle` is a pipe handle; `deadline` is the same
@@ -30,8 +32,30 @@ typedef struct {
 	DWORD deadline_ms;
 } nr_link;
 
+/* A wait of one millisecond is only one millisecond if somebody has asked for one:
+ * the timer Windows keeps otherwise is 15.6 ms, and then a Sleep(1) costs sixteen
+ * and the layer's wait for the answer — the whole of the daemon's time for the frame —
+ * is spent in steps that size. Asked once, when the layer first connects, and left
+ * asked: it is a per-process count that the process's own exit undoes.
+ *
+ * winmm is loaded rather than linked, so building the layer needs no import library.
+ */
+static void nr_link_timer(void)
+{
+	HMODULE winmm = LoadLibraryA("winmm.dll");
+	if (!winmm) return;
+	UINT (*begin)(UINT) = (UINT (*)(UINT))(void *)GetProcAddress(winmm,
+								     "timeBeginPeriod");
+	if (begin) begin(1);
+}
+
 static int nr_link_connect(nr_link *link, const char *path)
 {
+	static int timer_asked;
+	if (!timer_asked) {
+		timer_asked = 1;
+		nr_link_timer();
+	}
 	link->handle = INVALID_HANDLE_VALUE;
 	link->deadline_ms = 60000;
 
@@ -115,9 +139,17 @@ static int nr_link_read(nr_link *link, void *data, size_t count)
 		if (!PeekNamedPipe(link->handle, NULL, 0, NULL, &available, NULL))
 			return -1;
 		if (available == 0) {
+			/* One millisecond, not ten. The layer sends a frame and reads its answer
+			 * in the same present, so this wait is the whole of the daemon's time
+			 * for the frame — 40 ms and more — and the answer is there somewhere in
+			 * it. Polling it in tens of milliseconds gave away half a step's worth
+			 * of that every frame for no reason: the deadline is a minute, and
+			 * nothing is being saved by being slow to notice. Measured on this
+			 * machine, Sleep's own granularity is 1.5 ms at 1 and 10.2 ms at 10.
+			 */
 			if (waited >= link->deadline_ms) return -1;
-			Sleep(10);
-			waited += 10;
+			Sleep(1);
+			waited += 1;
 			continue;
 		}
 		DWORD want = (DWORD)(count < available ? count : available);
@@ -130,7 +162,185 @@ static int nr_link_read(nr_link *link, void *data, size_t count)
 	return 0;
 }
 
+/* ---- the frame's bytes through a file mapping instead of the pipe ------------
+ *
+ * A byte-mode pipe copies twice: once into the kernel buffer on the way out and once
+ * out of it on the way in. A mapping both processes can see copies once, the writer's
+ * own memcpy into it, and the reader reads the bytes where they lie. At 1920x1080,
+ * 8.29 MB each way, `src/bench/shm_vs_pipe.py` times the round trip at 5.96 ms through
+ * the pipe and 2.12 ms through a mapping, alternating within one process so the two
+ * cannot be told apart by drift.
+ *
+ * The pipe still carries the header and, on the way back, a four-byte notice. That is
+ * what synchronises the pair, so there is no event to create and none to wait on: the
+ * header is written after the request is in the mapping, and the notice after the
+ * answer is, so a byte read out of the pipe is proof the bytes behind it are there.
+ *
+ * The mapping is made by the daemon, which knows its own pixel limit; the layer opens
+ * it by name and reads the layout out of its first 64 bytes. A layer that finds no
+ * mapping — an older daemon, or `NR_SHM=0` — sends the frame through the pipe and
+ * nothing else changes.
+ */
+
+#define NR_SHM_MAGIC 0x4D52534Eu      /* what the daemon writes in the layout head */
+#define NR_SHM_VERSION 1u
+#define NR_SHM_MAX_SLOTS 8u
+#define NR_SHM_HEAD 64u               /* the layout head, and the slots' alignment */
+
+/* The magic on the wire. The two shared-memory values are the pipe's two with 2 added,
+ * so a daemon that has never heard of a mapping rejects them rather than reading the
+ * bytes behind them out of a pipe that holds none. */
+#define NR_MAGIC 0x304E524Eu
+#define NR_MAGIC_MASKED 0x314E524Eu
+#define NR_MAGIC_SHM 0x324E524Eu
+#define NR_MAGIC_SHM_MASKED 0x334E524Eu
+
+typedef struct {
+	HANDLE mapping;
+	unsigned char *base;
+	unsigned slots;      /* how many frames may be in the mapping at once */
+	size_t colour;       /* bytes of one colour plane, 4 x the pixel limit */
+	size_t mask;         /* bytes of one interface plane, 1 x the pixel limit */
+	size_t stride;       /* bytes of one slot: colour, then mask, then the answer */
+	int usable;
+} nr_shm;
+
+/* Where the daemon writes its layout, as 32-bit words then two 64-bit sizes. */
+static void nr_shm_write_layout(unsigned char *base, unsigned slots, size_t colour,
+				size_t mask)
+{
+	uint32_t *head = (uint32_t *)base;
+	head[0] = NR_SHM_MAGIC;
+	head[1] = NR_SHM_VERSION;
+	head[2] = slots;
+	head[3] = 0;
+	uint64_t *sizes = (uint64_t *)(base + 16);
+	sizes[0] = (uint64_t)colour;
+	sizes[1] = (uint64_t)mask;
+}
+
+/* Opens the mapping the daemon made for this pipe, and reads its layout. Returns -1
+ * when there is none, which is the ordinary state of an older daemon or of `NR_SHM=0`;
+ * the caller then sends the frame through the pipe. */
+static int nr_shm_open(nr_shm *shm, const char *pipe_path)
+{
+	memset(shm, 0, sizeof *shm);
+	const char *tail = strrchr(pipe_path, '\\');
+	tail = tail ? tail + 1 : pipe_path;
+	char name[128];
+	if (snprintf(name, sizeof name, "Local\\NR_SHM_%s", tail) >= (int)sizeof name)
+		return -1;
+	HANDLE mapping = OpenFileMappingA(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, name);
+	if (mapping == NULL || mapping == INVALID_HANDLE_VALUE) return -1;
+	unsigned char *base = MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE,
+					   0, 0, 0);
+	if (!base) {
+		CloseHandle(mapping);
+		return -1;
+	}
+	uint32_t *head = (uint32_t *)base;
+	if (head[0] != NR_SHM_MAGIC || head[1] != NR_SHM_VERSION ||
+	    head[2] == 0 || head[2] > NR_SHM_MAX_SLOTS) {
+		UnmapViewOfFile(base);
+		CloseHandle(mapping);
+		return -1;
+	}
+	uint64_t *sizes = (uint64_t *)(base + 16);
+	shm->mapping = mapping;
+	shm->base = base;
+	shm->slots = head[2];
+	shm->colour = (size_t)sizes[0];
+	shm->mask = (size_t)sizes[1];
+	shm->stride = 2 * shm->colour + shm->mask;
+	shm->usable = shm->colour > 0 && shm->mask > 0;
+	if (!shm->usable) {
+		UnmapViewOfFile(base);
+		CloseHandle(mapping);
+		memset(shm, 0, sizeof *shm);
+		return -1;
+	}
+	return 0;
+}
+
+static void nr_shm_close(nr_shm *shm)
+{
+	if (shm->base) UnmapViewOfFile(shm->base);
+	if (shm->mapping && shm->mapping != INVALID_HANDLE_VALUE) CloseHandle(shm->mapping);
+	memset(shm, 0, sizeof *shm);
+}
+
+/* The three planes of one slot: what the layer put in, its interface mask, and where
+ * the daemon leaves the answer. The mask follows the colour so a masked frame's one
+ * memcpy fills both. */
+static unsigned char *nr_shm_request(nr_shm *shm, unsigned slot)
+{
+	return shm->base + NR_SHM_HEAD + (size_t)slot * shm->stride;
+}
+
+static unsigned char *nr_shm_mask(nr_shm *shm, unsigned slot)
+{
+	return nr_shm_request(shm, slot) + shm->colour;
+}
+
+static unsigned char *nr_shm_answer(nr_shm *shm, unsigned slot)
+{
+	return nr_shm_mask(shm, slot) + shm->mask;
+}
+
 #else  /* the Linux build, unchanged: a Unix socket */
+
+/* The mapping is a Windows answer to a Windows cost. On Linux the frame crosses on the
+ * socket, which is already a single copy, so there is nothing here to replace and these
+ * are defined only so the layer's one set of call sites compiles unchanged. */
+
+#define NR_MAGIC 0x304E524Eu
+#define NR_MAGIC_MASKED 0x314E524Eu
+#define NR_MAGIC_SHM 0x324E524Eu
+#define NR_MAGIC_SHM_MASKED 0x334E524Eu
+
+/* The layer's one set of call sites has to compile here too, so the shape is the same
+ * and the three places are never reached: `usable` is what keeps them that way. */
+typedef struct {
+	int usable;
+	unsigned slots;
+	size_t colour;
+	size_t mask;
+	size_t stride;
+	void *base;
+} nr_shm;
+
+static int nr_shm_open(nr_shm *shm, const char *pipe_path)
+{
+	(void)pipe_path;
+	memset(shm, 0, sizeof *shm);
+	return -1;
+}
+
+static void nr_shm_close(nr_shm *shm)
+{
+	memset(shm, 0, sizeof *shm);
+}
+
+static unsigned char *nr_shm_request(nr_shm *shm, unsigned slot)
+{
+	(void)shm;
+	(void)slot;
+	return NULL;
+}
+
+static unsigned char *nr_shm_mask(nr_shm *shm, unsigned slot)
+{
+	(void)shm;
+	(void)slot;
+	return NULL;
+}
+
+static unsigned char *nr_shm_answer(nr_shm *shm, unsigned slot)
+{
+	(void)shm;
+	(void)slot;
+	return NULL;
+}
 
 #include <sys/socket.h>
 #include <sys/types.h>   /* ssize_t, which <sys/socket.h> does not promise */
@@ -142,6 +352,7 @@ static int nr_link_read(nr_link *link, void *data, size_t count)
 #include <unistd.h>
 #include <errno.h>
 #include <stdio.h>
+#include <string.h>      /* memset, for the shape the Windows arm has */
 
 typedef struct {
 	int fd;

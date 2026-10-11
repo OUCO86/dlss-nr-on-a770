@@ -17,8 +17,12 @@ connection — so the daemon's frame loop stays as it is.
 """
 import ctypes
 import errno
+import mmap
+import struct
 import time
 from ctypes import wintypes
+
+import numpy as np
 
 _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
@@ -206,3 +210,72 @@ class NamedPipeServer:
 
 def server(path, backlog=4, timeout=None):
     return NamedPipeServer(path, backlog=backlog, timeout=timeout)
+
+
+class FrameMapping:
+    """The file mapping a frame crosses in, in place of the pipe.
+
+    A byte-mode pipe copies the frame twice: once into the kernel's buffer on the way
+    out of the layer and once out of it into the daemon, and the same again for the
+    answer. Here the layer writes the frame where the daemon reads it, and the daemon
+    leaves the answer where the layer reads it — one copy each way, made by whoever
+    already has the bytes. `src/bench/shm_vs_pipe.py` times the round trip at
+    1920x1080 at 5.96 ms through the pipe and 2.12 ms through this, alternating within
+    one process so the two cannot be told apart by drift.
+
+    The daemon makes the mapping, because the pixel limit that sizes it is the daemon's,
+    and the layer finds it by name — the pipe's name with `NR_SHM_` in front — and reads
+    the layout out of its first 64 bytes, which is all it needs to know where a slot is.
+    A layer that finds no mapping sends the frame on the pipe and nothing else changes.
+
+    A slot holds one frame: the colour, then its interface mask, then the answer. There
+    are as many as frames may be on their way at once. The pipe still carries the header
+    and, on the way back, four bytes saying the answer is in the slot — which is what
+    keeps the two ends in order without another object to wait on: the header is written
+    after the request is, and the four bytes after the answer is.
+    """
+
+    MAGIC = 0x4D52534E
+    VERSION = 1
+    HEAD = 64
+    SLOTS = 4
+
+    def __init__(self, pipe_path, pixels, slots=SLOTS):
+        self.name = "Local\\NR_SHM_" + pipe_path.rsplit("\\", 1)[-1]
+        self.slots = slots
+        self.colour = pixels * 4
+        self.mask = pixels
+        self.stride = 2 * self.colour + self.mask
+        self._map = mmap.mmap(-1, self.HEAD + self.stride * slots, tagname=self.name)
+        # The mapping's pages are committed as they are written, and one frame in a slot
+        # was committing the whole slot: the first frame in each of the four ran 5 ms
+        # slower than every frame after it, measured over twelve frames. Touching a byte
+        # a page makes them the daemon's start-up cost instead of the game's first four
+        # frames'. Before the layout goes in, which the first page carries.
+        np.frombuffer(self._map, np.uint8)[::4096] = 0
+        struct.pack_into("<4I", self._map, 0, self.MAGIC, self.VERSION, slots, 0)
+        struct.pack_into("<QQ", self._map, 16, self.colour, self.mask)
+
+    def _plane(self, slot, offset, count):
+        at = self.HEAD + slot * self.stride + offset
+        return memoryview(self._map)[at:at + count]
+
+    def request(self, slot, count):
+        """Where the layer left the frame's colour, and the mask after it."""
+        return self._plane(slot, 0, count)
+
+    def interface(self, slot, count):
+        return self._plane(slot, self.colour, count)
+
+    def answer(self, slot, count):
+        """Where the answer goes, for the layer to read out of the same slot."""
+        return self._plane(slot, self.colour + self.mask, count)
+
+    def close(self):
+        self._map.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()

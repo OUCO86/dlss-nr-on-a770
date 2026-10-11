@@ -195,16 +195,91 @@ static int ui_mask;
 /* `reply_size` is deliberately separate from `payload_size`: the interface mask makes
  * the request larger than the answer, and reusing one size meant asking for bytes the
  * daemon never sends — the read hit EOF and every masked frame came back unchanged. */
+/* The frame's bytes cross in a file mapping when there is one, and on the pipe when
+ * there is not. The mapping is the daemon's to make and the layer's to find, so it is
+ * looked for on the first frame and either held for the session or never looked for
+ * again — an older daemon and `NR_SHM=0` both simply have none.
+ *
+ * Which slot a frame went out in has to survive until its answer comes back, and the
+ * connection is the only thing here that says which frame is which, so the two are kept
+ * together. Never more than NR_INFLIGHT_MAX frames are on their way at once. */
+static nr_shm shm;
+static int shm_state;            /* 0 not looked for yet, 1 held, -1 there is none */
+static unsigned shm_turn;        /* the slots are used in turn */
+
+#define SHM_TRACKED (NR_INFLIGHT_MAX + 4)
+static int shm_tracked_fd[SHM_TRACKED];
+static int shm_tracked_slot[SHM_TRACKED];
+
+static void shm_look(void)
+{
+	if (shm_state) return;
+	for (int i = 0; i < SHM_TRACKED; i++) {
+		shm_tracked_fd[i] = -1;
+		shm_tracked_slot[i] = -1;
+	}
+	shm_state = -1;
+	const char *want = getenv("NR_SHM");
+	if (want && (!strcmp(want, "0") || !strcmp(want, "off"))) return;
+	if (!socket_path || nr_shm_open(&shm, socket_path) != 0) return;
+	shm_state = 1;
+	fprintf(stderr, "[nr_layer] the frame crosses in a mapping: %u slots, "
+			"%zu MB the colour and %zu MB the mask\n",
+		shm.slots, shm.colour >> 20, shm.mask >> 20);
+}
+
+static void shm_track(int fd, int slot)
+{
+	for (int i = 0; i < SHM_TRACKED; i++)
+		if (shm_tracked_fd[i] < 0) {
+			shm_tracked_fd[i] = fd;
+			shm_tracked_slot[i] = slot;
+			return;
+		}
+}
+
+/* The slot this connection's answer will be in, or -1 when the frame went by pipe. */
+static int shm_untrack(int fd)
+{
+	for (int i = 0; i < SHM_TRACKED; i++)
+		if (shm_tracked_fd[i] == fd) {
+			int slot = shm_tracked_slot[i];
+			shm_tracked_fd[i] = -1;
+			shm_tracked_slot[i] = -1;
+			return slot;
+		}
+	return -1;
+}
+
 /* Sends the request and leaves the connection open: in asynchronous live mode the
  * answer is read on the next present, so the endpoint has to outlive this call.
  * Returns the open link, or -1. */
 static int exchange_send(const void *header, size_t header_size, const void *payload,
-			 size_t payload_size)
+			 size_t payload_size, size_t reply_size)
 {
 	nr_link link;
 	if (nr_link_connect(&link, socket_path) != 0) {
 		fprintf(stderr, "[nr_layer] no daemon at %s\n", socket_path);
 		return -1;
+	}
+	shm_look();
+	if (shm.usable && payload_size <= shm.colour + shm.mask
+	    && reply_size <= shm.colour) {
+		/* The colour and, for a masked frame, its mask: one memcpy, the two planes
+		 * being laid out one after the other in the slot. */
+		unsigned slot = shm_turn++ % shm.slots;
+		memcpy(nr_shm_request(&shm, slot), payload, payload_size);
+		uint32_t extended[5];
+		memcpy(extended, header, header_size < 16 ? header_size : 16);
+		extended[0] = extended[0] == NR_MAGIC_MASKED ? NR_MAGIC_SHM_MASKED
+							    : NR_MAGIC_SHM;
+		extended[4] = slot;
+		if (nr_link_write(&link, extended, sizeof extended) != 0) {
+			nr_link_close(&link);
+			return -1;
+		}
+		shm_track(nr_link_handle(link), (int)slot);
+		return nr_link_handle(link);
 	}
 	if (nr_link_write(&link, header, header_size) != 0
 	    || nr_link_write(&link, payload, payload_size) != 0) {
@@ -214,10 +289,24 @@ static int exchange_send(const void *header, size_t header_size, const void *pay
 	return nr_link_handle(link);
 }
 
-/* Reads the whole answer and closes the connection, whichever way it ends. */
+/* Reads the whole answer and closes the connection, whichever way it ends.
+ *
+ * Through a mapping the pipe carries four bytes — "the answer is in your slot" — and
+ * the frame itself is read out of the mapping. */
 static int exchange_receive(int fd, void *reply, size_t reply_size)
 {
 	nr_link link = nr_link_from_handle(fd);
+	int slot = shm_untrack(fd);
+	if (slot >= 0) {
+		uint32_t notice = 0;
+		if (nr_link_read(&link, &notice, sizeof notice) != 0) {
+			nr_link_close(&link);
+			return -1;
+		}
+		memcpy(reply, nr_shm_answer(&shm, slot), reply_size);
+		nr_link_close(&link);
+		return 0;
+	}
 	if (nr_link_read(&link, reply, reply_size) != 0) {
 		nr_link_close(&link);
 		return -1;
@@ -230,7 +319,7 @@ static int exchange_receive(int fd, void *reply, size_t reply_size)
 static int exchange(const void *header, size_t header_size, const void *payload,
 		    size_t payload_size, void *reply, size_t reply_size)
 {
-	int fd = exchange_send(header, header_size, payload, payload_size);
+	int fd = exchange_send(header, header_size, payload, payload_size, reply_size);
 	return fd < 0 ? -1 : exchange_receive(fd, reply, reply_size);
 }
 
@@ -252,21 +341,34 @@ static int take_inflight(struct device_data *data, VkDeviceSize *size)
  * daemon is single-file and would log a broken pipe for it, and the panel reads that log.
  * It costs at most one frame of the daemon's, and only when the effect is switched off,
  * the swapchain changes or the device goes. With two frames allowed out at once this can
- * be two of the daemon's, which is still only on the way out. */
+ * be two of the daemon's, which is still only on the way out.
+ *
+ * A frame that crossed in the mapping has four bytes on the pipe, not a frame's worth,
+ * and which it is is known by the connection. */
+static void discard_answer(int fd, VkDeviceSize size)
+{
+	nr_link link = nr_link_from_handle(fd);
+	if (shm_untrack(fd) >= 0) {
+		uint32_t notice = 0;
+		nr_link_read(&link, &notice, sizeof notice);
+		nr_link_close(&link);
+		return;
+	}
+	unsigned char sink[65536];
+	for (VkDeviceSize got = 0; got < size; ) {
+		size_t want = size - got < sizeof sink ? (size_t)(size - got) : sizeof sink;
+		if (nr_link_read(&link, sink, want) != 0) break;
+		got += want;
+	}
+	nr_link_close(&link);
+}
+
 static void drop_inflight(struct device_data *data)
 {
 	VkDeviceSize size = 0;
 	int fd;
-	while ((fd = take_inflight(data, &size)) >= 0) {
-		nr_link link = nr_link_from_handle(fd);
-		unsigned char sink[65536];
-		for (VkDeviceSize got = 0; got < size; ) {
-			size_t want = size - got < sizeof sink ? (size_t)(size - got) : sizeof sink;
-			if (nr_link_read(&link, sink, want) != 0) break;
-			got += want;
-		}
-		nr_link_close(&link);
-	}
+	while ((fd = take_inflight(data, &size)) >= 0)
+		discard_answer(fd, size);
 }
 
 static struct device_data *find_device(VkDevice device)
@@ -1312,8 +1414,8 @@ static int process_frame(struct device_data *data, struct swapchain_data *chain,
 	if (!socket_path) return -1;
 	/* The mask travels immediately after the colour, one byte a pixel. */
 	if (masked) {
-		if (exchange(header, sizeof header, data->outgoing,
-			     (size_t)needed + pixels, data->result, (size_t)needed)) {
+		if (exchange(header, sizeof header, data->outgoing, (size_t)needed + pixels,
+			     data->result, (size_t)needed)) {
 			fprintf(stderr, "[nr_layer] the daemon did not answer; frame unchanged\n");
 			return -1;
 		}
@@ -1365,15 +1467,7 @@ static int process_frame_async(struct device_data *data, struct swapchain_data *
 		if (fd < 0) break;
 		if (size != needed) {
 			/* The extent changed under it: it fits nothing on screen now. */
-			nr_link link = nr_link_from_handle(fd);
-			unsigned char sink[65536];
-			for (VkDeviceSize got = 0; got < size; ) {
-				size_t want = size - got < sizeof sink
-					      ? (size_t)(size - got) : sizeof sink;
-				if (nr_link_read(&link, sink, want) != 0) break;
-				got += want;
-			}
-			nr_link_close(&link);
+			discard_answer(fd, size);
 			continue;
 		}
 		answered = exchange_receive(fd, data->result, (size_t)needed) == 0;
@@ -1384,7 +1478,8 @@ static int process_frame_async(struct device_data *data, struct swapchain_data *
 	if (socket_path) {
 		uint32_t header[4] = { 0x304E524Eu, chain->extent.width, chain->extent.height,
 				       (uint32_t)chain->format };
-		int fd = exchange_send(header, sizeof header, data->mapped, (size_t)needed);
+		int fd = exchange_send(header, sizeof header, data->mapped, (size_t)needed,
+				       (size_t)needed);
 		if (fd >= 0 && data->inflight_count < NR_INFLIGHT_MAX) {
 			data->inflight_fd[data->inflight_count] = fd;
 			data->inflight_size[data->inflight_count] = needed;
