@@ -270,8 +270,19 @@ static void extmem_look(void)
 	}
 	if (nrx_open(raw, raw_bytes, answer, answer_bytes, sem) != 0) {
 		nr_layer_log("the frame's buffers could not be imported (%s); "
-			"it crosses in the mapping instead",
+			"it crosses in the mapping instead, and the layer stops asking",
 			nrx_error() ? nrx_error() : "for a reason the layer did not record");
+		/* One try, then the mapping for good - not a per-frame question after all.
+		 * A try is nrx_open, and nrx_open builds a VkInstance and a VkDevice of the
+		 * layer's own inside the game's process and destroys them when it fails.
+		 * Measured on 2026-10-12, the answer's buffer in host memory: 1163 tries
+		 * over one session, one per frame, and the game went from 16.7 ms a frame
+		 * to 105.4 ms - 9.5 fps against 60.0 with the layer handing frames straight
+		 * through. The handles come out of the mapping's head, which the daemon
+		 * fills in once, and a try that used to fail closed them, so every try
+		 * after the first was handed a dead handle and could not have worked
+		 * whatever the import asked for. Both halves are fixed: see nr_extmem.c. */
+		extmem_state = -1;
 		return;
 	}
 	extmem_state = 1;

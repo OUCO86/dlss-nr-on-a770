@@ -318,17 +318,13 @@ static int import_semaphore(unsigned long long handle)
 
 /* ------------------------------------------------------------------ public ---- */
 
-/* The handles were duplicated into this process by the daemon, which cannot close
- * them from where it is. Importing does not take them over either, so a caller that
- * gave up on them has to let them go itself. */
-static void nrx_drop_handles(unsigned long long raw_handle,
-			     unsigned long long answer_handle,
-			     unsigned long long sem_handle)
-{
-	if (raw_handle) CloseHandle((HANDLE)(uintptr_t)raw_handle);
-	if (answer_handle) CloseHandle((HANDLE)(uintptr_t)answer_handle);
-	if (sem_handle) CloseHandle((HANDLE)(uintptr_t)sem_handle);
-}
+/* The handles in the mapping's head are the daemon's, duplicated into this process
+ * for it because it cannot close them from where it is. Importing does not take them
+ * over either, so this side must *not* close them: the head is read again on every
+ * frame that has not given up, and closing the handle the head still names leaves
+ * every later try holding a dead one. A failed import used to close all three, and
+ * the second try onwards failed on the dead handle rather than on the import -
+ * 1161 times in one session, all of them reported as vkAllocateMemory (import). */
 
 /* `answer_handle` may be 0: the answer still crosses in a slot in the file mapping,
  * and Phase 2's first half — the frame going into the daemon's own buffer instead of
@@ -341,18 +337,15 @@ int nrx_open(unsigned long long raw_handle, unsigned long long raw_bytes,
 	nrx_err = NULL;
 	if (!raw_handle || !sem_handle || !raw_bytes) {
 		nrx_fail("the daemon gave an incomplete set of handles");
-		nrx_drop_handles(raw_handle, answer_handle, sem_handle);
 		return -1;
 	}
 	if (make_device()) {
-		nrx_drop_handles(raw_handle, answer_handle, sem_handle);
 		return -1;
 	}
 	uint32_t raw_type = UINT32_MAX, answer_type = UINT32_MAX;
 	/* The daemon's device reads this one every frame; the host only writes it. */
 	if (import_buffer((VkDeviceSize)raw_bytes, raw_handle, WANT_RAW, &nrx_raw_buf,
 			  &nrx_raw_mem, &nrx_raw_p, &raw_type)) {
-		nrx_drop_handles(raw_handle, answer_handle, sem_handle);
 		return -1;
 	}
 	nrx_raw_n = (size_t)raw_bytes;
@@ -361,13 +354,11 @@ int nrx_open(unsigned long long raw_handle, unsigned long long raw_bytes,
 	     * read that decides whether the way back is worth having. */
 	    && import_buffer((VkDeviceSize)answer_bytes, answer_handle, WANT_HOST,
 			     &nrx_ans_buf, &nrx_ans_mem, &nrx_ans_p, &answer_type)) {
-		nrx_drop_handles(raw_handle, answer_handle, sem_handle);
 		nrx_close();
 		return -1;
 	}
 	nrx_ans_n = answer_handle && answer_bytes ? (size_t)answer_bytes : 0;
 	if (import_semaphore(sem_handle)) {
-		nrx_drop_handles(raw_handle, answer_handle, sem_handle);
 		nrx_close();
 		return -1;
 	}
