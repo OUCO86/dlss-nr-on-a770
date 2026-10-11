@@ -396,3 +396,147 @@ x 已经是 half 就是恒等），但会轻微扰动 `cut`（0.0049，相对扰
 1. 拆 `to_answer` 里**约 4.9 ms 未归因**的部分（10.3 第 3 条）。
 2. 补设备模式的 `held%` / `released%`（previous 现在是字节，没解码）。
 3. 管道 `receive` 1.48 + `send` 1.04 是跨进程固有成本，暂不动。
+
+## 11. 一帧剩下的钱：不在算力上，在搬运和等待上（2026-10-11，`daemon_stages` 加计时后）
+
+`daemon_stages` 原来有约 4.9 ms 不在任何 stage 里。原因是三个 `RequestPass` 调用
+（`prepare` / `assemble` / `finish`）**根本没被计时** —— 三次派发到显卡，一次都没包。
+现在包上了（`commit b0657ff`），并且输出多一行 `unaccounted`。
+
+### 11.1 完整的一帧（1920x1080@0.4，12 帧中位，`NR_POSTPASS=1`，离线）
+
+| stage | ms | 其中设备时间 |
+|---|---|---|
+| receive（管道收 8.3 MB） | 1.52 | — |
+| settings | 0.08 | — |
+| letterbox（字节上判） | 0.07 | — |
+| **pass_prepare**（PRE_INNER + PRE_FEATURES） | **2.06** | 0.36 |
+| pass_assemble | 0.28 | 0.20 |
+| **gpu_run**（网络图，墙钟） | **43.51** | 34.61（账本） |
+| **pass_finish**（POST_COMPOSE + POST_HISTORY） | **2.20** | 0.34 |
+| send（管道发 8.3 MB） | 1.04 | — |
+| post_send | 0.10 | — |
+| **unaccounted** | **0.22** | — |
+| **to_answer** | **51.24** | |
+| **round_trip** | **52.17** | |
+
+（改前：54.23。`decode` 那一行整条消失了。）
+
+### 11.2 🚩 三个 pass 花 4.54 ms，设备只干 0.70 ms
+
+差出来的 **3.84 ms** 是提交、同步和搬运。两件事：
+
+**① `xmx_submit` 每次都 `vkWaitForFences`**（`libxmx.c` 的 `submit_commands`）——
+也就是说**每次提交都是同步的**，一帧四次：prepare / assemble / 图 / finish。
+每两次之间 GPU 是空的，等宿主把下一段录好。这就是"显卡占用率上不去"的机理：
+不是算不完，是**被切成四段、段与段之间在等 Python**。
+
+**② 那 8.3 MB 一帧里过了四趟总线**：
+
+    游戏 --管道--> daemon          1.52 ms   （receive）
+    daemon --PCIe 上传--> 显存     ~1.5 ms   （host_write，按 49.8 MB = 8.98 ms 推的）
+    显存 --PCIe 回读--> daemon     1.63 ms   （words，HOST_READ，实测）
+    daemon --管道--> 游戏          1.04 ms   （send）
+                                   ------
+                                   ~5.7 ms
+
+`POST_COMPOSE` 本身的设备时间是 0.34 ms（`notes` §9 实测），`PRE_INNER` 0.16、
+`PRE_FEATURES` 0.20 —— 前后段全部算力加起来 **0.70 ms**，而为了把字节搬到它能算的
+地方、再把结果搬回去，付了 5.7 ms。
+
+### 11.3 能不能合并提交 —— 屏障的情况
+
+`libxmx.c` 里 `vkCmdPipelineBarrier` 只有 **4 处**（transfer 前后等特定场合），
+603 趟 pass 之间**一道屏障都没有**，而画面是对的。说明在这张卡上，
+**同一个 command buffer 里连续的 dispatch，顺序由驱动保证**。
+
+所以把 prepare / assemble / 图 / finish 合成一次提交是**有可能**的，但要动 C：
+- 图的命令在它自己的 `VkCommandBuffer` 里（`xmx_graph_run` 提交 `graphs[id].commands`），
+  合并意味着一次 `vkQueueSubmit` 带多个 cb —— **跨 cb 的顺序不由规范保证**，
+  需要驱动兜底，风险比同一 cb 内高。
+- `prepare` 之后必须同步一次：`cut` 要 `partial.download()`，而 `cut` 在
+  `history.take` 里用，那时图还没跑。除非让 cut 晚一帧。
+
+### 11.4 下一步的三个选项（按性价比）
+
+| | 做什么 | 省 | 风险 |
+|---|---|---|---|
+| **A** | 合并提交（改 C，一次 submit 带多 cb） | ~0.5–1 ms，且 GPU 段间不再空转 | 中（跨 cb 同步） |
+| **B** | 攻设备侧 34.61 ms（占 69%） | 未知，要找新内核点 | 低（已有账本） |
+| **C** | 管道改共享内存（改 C 层 + daemon） | ~2.6 ms | 高（跨进程改传输） |
+
+⚠️ **A 的前提**：先确认"离线 43.5 ms vs 游戏内 38 ms"这 5.5 ms 差是不是 GPU 降频。
+离线跑 bench 时显卡没压力会降频，那样所有离线数字都偏慢，A 的收益也会跟着变。
+→ **前提已澄清，见 §12.4：不是降频，是两个数字跑的图不一样（int8 开关）。**
+
+## 12. 选项 A（合并提交 / 让录制与图重叠）做过了：收益 0.03 ms，已回退（2026-10-11）
+
+### 12.1 做法
+
+`RequestPass.finish` 拆成 `record_finish`（只把两趟录进 `rcb`）+ `submit_finish`；
+新增 `xmx_graph_launch`（提交图、**不等 fence**）与 `xmx_graph_wait`。
+顺序只能是 **launch → record → wait → submit**：`xmx_graph_run` 拒绝在 `rcb` 打开时
+replay（`libxmx.c` 的 "cannot replay during recording"），而先录制再提交图就等于没重叠。
+
+### 12.2 数字（1920x1080@0.4，12 帧中位，两个场景各一组）
+
+    NR_POSTPASS=1 NR_INT8_PROJECT=1 python src/bench/daemon_stages.py 1920x1080@0.4 --frames 12
+
+| | off（录制在图之后） | on（录制与图重叠） |
+|---|---|---|
+| pass_record | 0.06（含在 finish 里） | **0.04** |
+| pass_submit / pass_finish | 2.15 / **2.21** | **2.16** / — |
+| gpu_run | 34.41 | 34.34 |
+| **to_answer** | **42.41** | **42.38** |
+| round_trip | 43.40 | 43.55 |
+
+**−0.03 ms，就是噪声。A 不成立，代码已回退（dll 按 HEAD 重建过）。**
+
+### 12.3 为什么不成立
+
+假设是"GPU 在段与段之间空转等 Python 录命令"。实测**录两个 dispatch 只要 0.04 ms**：
+Python 侧就是两次 ctypes 调用加一次标量组装，参数表只在第一帧建。**这项根本不存在。**
+
+`pass_finish` 那 2.20 ms 的真实构成：
+
+- 设备 **0.34 ms**（PRE_INNER 0.16 + PRE_FEATURES 0.20 之外的 POST_COMPOSE 0.34）
+- **1.84 ms 是把 8.3 MB 答案写进 `HOST_READ` —— 那在本卡是系统内存**
+  （`prec_traffic.py`：同一个 POST_COMPOSE，answer 在 HOST_READ **2.20 ms** vs 在 VRAM
+  **0.36 ms**，差 1.84 ≈ 0.22 ms/MB ≈ 4.5 GB/s，与 §9 的 0.197 ms/MB 一致）
+- 剩下约 0.2 ms 是 `vkQueueSubmit` + `vkWaitForFences` 的固定开销
+
+**一次提交的固定开销只有 0.1–0.2 ms**（旁证：`pass_assemble` 0.28 = 设备 0.20 + 开销 0.08）。
+四次提交合并到底最多省 0.3–0.4 ms，而要冒"跨 command buffer 顺序"的险。**不划算。**
+
+### 12.4 🚩 顺带钉死：离线 43.5 vs 游戏 38，不是降频，是图的配置不同
+
+`daemon_stages` 的 `--int8` 取 `NR_INT8_PROJECT`，**代码默认 "0"** → 之前每一次
+"离线一帧"测的都是**浮点图**。同一条命令加 `NR_INT8_PROJECT=1`：
+
+    gpu_run  43.89 → 34.41 ms （账本 603 趟，int8 图）
+    settings in effect: ... int8=1 ...
+
+游戏里 int8 是开的（38 ms）。所以 43.5 − 38 这 5.5 ms 是**两张不同的图**，不是频率。
+（用户已限功耗，不存在撞墙降频 —— 用户说的是对的，只是原因不是我们猜的那个。）
+
+还剩 38 − 34.4 = **3.6 ms**：游戏里 A770 同时在渲染和跑 NR，bench 时它只跑 NR。
+
+**判据**：日志里 `settings in effect: … int8=1 …` 和 `runtime options … NR_INT8_PROJECT=1`。
+以后所有离线一帧的数字都要带 `NR_INT8_PROJECT=1`，否则测的是没有游戏跑过的配置
+（`game_settings.py` 的 docstring 说的就是这件事）。
+
+### 12.5 一帧剩下的钱（int8=1，离线 `to_answer` 42.4 ms）
+
+| 项 | ms |
+|---|---|
+| 设备图 | 34.4 |
+| PCIe 上传 8.3 MB（`pass_prepare` 的 host_write） | ~1.5 |
+| PCIe 回写 8.3 MB（answer 在系统内存） | 1.84 |
+| 管道收 | 1.5 |
+| 管道发 | 1.04 |
+| 其余（letterbox / settings / 提交开销） | ~0.7 |
+
+**那 8.3 MB 一帧过四趟总线，一共约 5.8 ms** —— 比合并提交能拿到的 0.3 ms 大 20 倍。
+下一步要么动它（选项 C：共享内存；Phase 2：external memory，连上传回写一起省），
+要么回到设备侧的 34.4 ms（选项 B）。
+（判据：游戏内日志 `gpu 0+38+0` vs 离线 `gpu_run 43.51`。）
