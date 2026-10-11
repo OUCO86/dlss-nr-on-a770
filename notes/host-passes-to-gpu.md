@@ -649,3 +649,69 @@ layer 是**同步**模式（`NR_LAYER_ASYNC` 没设），send 完立刻 receive�
 | 管道（共享内存化之后已经很小） | ~0.15 |
 
 **约 3.5 ms**，外加 layer 端那次拷贝。仍未动的是设备侧的 32.8 ms。
+
+## 15. ✅ 跨进程那一关也过了：两个进程共享一块 buffer，CPU 写的 GPU 立刻读得到（2026-10-11）
+
+`src/gpu/extmem_xproc.c`（编译 `tools\build_extmem_xproc.bat`，运行 `work\extmem_xproc.exe`）。
+一个 exe 两个角色：父进程 = layer 那一侧，子进程 = daemon 那一侧，中间两条匿名管道传命令。
+父导出一块 1 MB 显存 + 两个 semaphore，`DuplicateHandle` 给子进程，子进程导入。
+
+| # | 谁写 | 谁读 | 怎么排序 | 错字节 |
+|---|---|---|---|---|
+| 4 | 父 GPU（`CmdFill`） | 子 GPU | 导出 semaphore | **0** |
+| 5 | 父 GPU | 子 GPU | 无 semaphore（父先等了自己的 fence） | 0 |
+| 6 | 父 GPU，**父不等 fence** | 子 GPU | 只有 semaphore | **0** |
+| 7 | 子 GPU | 父 GPU | 另一个 semaphore | **0** |
+| 8 | **父 CPU 写 BAR** | 子 GPU | 空 batch signal semaphore | **0** |
+| 9 | 父 CPU 写 BAR + `FlushMappedMemoryRanges` | 子 GPU | 同上 | **0** |
+
+连跑四次，`total bytes wrong` 一律 0。
+
+- 第 6 项是真正有用的那条：**semaphore 跨进程把依赖带过去了**，父进程压根没等自己的
+  fence，子进程照样读到新值。第 5 项 0 错不能拿来当"不需要 semaphore"的证据——那时父
+  进程自己 block 过，是宿主侧的顺序在兜底。
+- 第 8/9 项：CPU 写的是 **type 3**（flags 0x7 = `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`，
+  heap 15.9 GiB，就是 §结论 3 测绘的那块 BAR 显存，daemon 的图缓冲也在这儿）。
+  **不 flush 也干净**。
+
+### ⚠ 驱动把 `memoryTypeBits` 报成 0
+
+`vkGetMemoryWin32HandlePropertiesKHR` 对这两个 handle 都返回 **0x0**。规范原话是"one bit
+set for every memory type which the specified handle can be imported as"，0 等于说"哪都
+导不进去"，可这 handle 就是这块卡自己发的。同进程 probe（§14）根本没问过这个 API 也导入
+成功了，所以按 0 判死就是把自己卡住。现在的实现：**bits == 0 时退回 buffer 自己的
+`memoryTypeBits`**，让 `vkAllocateMemory` 来当裁判（实测放行）。
+
+### 对那个 NaN 的裁决
+
+§五 的嫌疑是"host 写 DEVICE_LOCAL|HOST_VISIBLE 的 BAR 映射，GPU 侧读到陈旧数据"。
+**这一条现在可以划掉**：跨进程、1 MB、CPU 整块写、不 flush，另一个进程的 GPU 读到的是
+新值，0 错。
+
+但别把话说满：probe 写的是 `memset` 整块 1 MB，而 `NR_INPUT_VIEW=1` 是 NumPy 在 8.3 MB
+mapped 内存上**逐元素**算完写。所以现在能确定的是"BAR 的可见性没问题"，**NaN 的真因仍
+未定位**——它更可能在 NumPy 那侧的写入模式或 `nr_resident.py` 自己的路径上。
+要钉死它还得单独 probe（NumPy 逐元素写 → GPU 读）。
+
+### 收益重估（比 §14 那张表保守）
+
+§结论 3 已经说了：`HOST_WRITE` 本来就是 type 3 = VRAM + BAR，**"上传"其实是 CPU 写 BAR**，
+不是 GPU 过 PCIe 去系统内存读。所以 Phase 2 省不掉那次写 8.3 MB，省的是**多出来的那几趟
+memcpy**：
+
+| 方向 | 现在 | Phase 2 | 省 |
+|---|---|---|---|
+| 输入 | layer→共享内存 + daemon 读出来再写进 BAR | layer 直接写进导入的 BAR | 一趟 8.3 MB 读 + 一趟写，约 1.5–2 ms |
+| 输出 | GPU 写 `HOST_READ`(系统内存) 1.84 + daemon 读 + 写共享内存 + layer 读 | GPU 写 VRAM(~0) + layer 读 BAR | 约 1–2 ms |
+
+**合计 3 ms 上下**（§14 那张表的 3.5 ms 量级是对的，但"省掉 PCIe 上传"这个说法不准确，
+上传还在，只是换了个进程做）。设备侧的 32.8 ms 仍未动。
+
+### 接下来要动的地方
+
+1. daemon 侧：把输入 buffer 和输出 buffer 都建成可导出的（type 3 / GRAPH），把 handle
+   （`DuplicateHandle` 到 layer 进程）和两个 semaphore 的 handle 一起发给 layer。
+2. layer 侧（`nr_layer.c`）：导入它们，帧字节直接写进导入的 BAR，回程直接读 BAR。
+3. 同步：帧开始靠 layer 给 daemon 的 semaphore，帧结束靠 daemon 给 layer 的 semaphore。
+   第 6 项证明这条路走得通。
+4. **先做离线验证再碰游戏**：`nr_settings.json` 加一个开关，默认关，跑通了再开。
