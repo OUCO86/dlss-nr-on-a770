@@ -365,6 +365,21 @@ def controls(profile="standard", style_index=None, local_tone=None,
     return values
 
 
+def control_vector(profile="standard", **overrides):
+    """The five conditioning values `build_features` writes into channels 10-14.
+
+    Each of the three is rounded to half, which is what the C pass does with them, and
+    the last two are the vendor's constant -1. Built here so that the host's assembly
+    and `RequestPass` — which puts the same five into the device's own plan — cannot
+    come to disagree about them.
+    """
+    values = controls(profile, **overrides)
+    return np.array([half(values.get("normalized_style", 0.0)),
+                     half(values.get("local_tone_strength", 1.0)),
+                     half(values.get("local_structure_strength", 1.0)),
+                     -1.0, -1.0], np.float32)
+
+
 # The colour grade the vendor applies after the network for each style: an exposure in
 # EV, a smoothstep contrast and a saturation offset, each the preset times the local tone
 # strength clamped to [0, 1]. Read out of the DLL itself — the per-style table at
@@ -569,6 +584,18 @@ class ResidentBackend:
         head = frame.run(features)
         self.split = frame.split          # host write, graph, host read
         return head
+
+    def request_pass(self, geometry, *, source, inner, noise, controls, bgra=True):
+        """The game's frame to the graph's input, in two passes on the device.
+
+        `source` is the game's own extent, `inner` the one the network is handed. The
+        returned object decodes and resamples, then assembles once the caller knows
+        whether there is a history — the cut it reports is what decides that.
+        """
+        return self._module.RequestPass(
+            self.runtime, self.frame(geometry.network_height, geometry.network_width),
+            geometry, source=source, inner=inner, noise=noise, controls=controls,
+            bgra=bgra)
 
 
 def run_head(model, color, *, profile="standard", frame_index=0, style_index=None,

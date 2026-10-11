@@ -24,6 +24,10 @@ layout(local_size_x = 256) in;
 
 layout(buffer_reference, scalar, buffer_reference_align = 16) buffer HalfBuf  { float16_t v[]; };
 layout(buffer_reference, scalar, buffer_reference_align = 16) buffer FloatBuf { float     v[]; };
+/* The game's frame as it arrives: one whole BGRA pixel per word, which is how the
+ * request crosses the pipe and how it can be handed to the device without a decode
+ * on the host. Only the two request passes read it. */
+layout(buffer_reference, scalar, buffer_reference_align = 4)  buffer U32Buf   { uint      v[]; };
 
 layout(push_constant, scalar) uniform Push {
     FloatBuf a, b, c, d;
@@ -44,7 +48,18 @@ const uint E4M3 = 0u, GATE = 1u, HALF = 2u, TO_HALF = 3u, SCALE = 4u,
            /* fused: one read of float32 and one write of float16 where the graph
             * otherwise makes three round trips over the same buffer */
            GATE_E4M3_HALF = 17u, E4M3_HALF = 18u, GATE_HALF = 19u,
-           UPSAMPLE_MERGE = 20u, UPSAMPLE_ADD = 21u, POOL2_SKIP = 22u;
+           UPSAMPLE_MERGE = 20u, UPSAMPLE_ADD = 21u, POOL2_SKIP = 22u,
+           /* the request's two own passes, which take the frame from the game's bytes
+            * to the sixteen channels the graph reads without the host touching a pixel:
+            * PRE_INNER decodes and resamples, PRE_FEATURES assembles and narrows. */
+           PRE_INNER = 23u, PRE_FEATURES = 24u;
+
+/* Flags above the ones the graph's passes share, so nothing here can be read as an
+ * epilogue or an operand width. Bit 24 is BGRA byte order, 25 a previous inner to
+ * difference against, 26 a history for feature channels 7-9. */
+const uint F_BGRA = 0x1000000u, F_PREVIOUS = 0x2000000u, F_HISTORY = 0x4000000u;
+
+shared float partial_sum[256];
 
 
 
@@ -74,8 +89,100 @@ void store(uint index, float value) {
 
 void main() {
     uint index = gl_GlobalInvocationID.x;
-    if (index >= pc.m) return;
     uint kind = operation_flags() & 0xFFu;
+
+    /* Both request passes are read before the extent test: PRE_INNER ends in a
+     * workgroup reduction, whose barriers every invocation of the group has to
+     * reach, including the ones past the end. */
+    if (kind == PRE_INNER) {
+        /* The game's bytes into the network's input extent: one BGRA word to three
+         * floats, then the two bilinear axes the host ran one after the other. One
+         * pass, but their order kept — the row pair first, then the column pair over
+         * those two results — because float32 addition is not associative and
+         * `nr_resize_axis` writes its intermediate out as float32 between the two.
+         * `b` carries the six gather tables; `d` is the frame before's inner, and
+         * `second` takes one partial sum of |this - that| a workgroup, which is what
+         * the cut test averages. */
+        uint width = pc.sa, height = pc.sb, source_w = pc.sc, source_h = pc.k;
+        uint x = index % width, y = index / width, table = 3u * height;
+        /* The host's own `(float)byte / 255.0f`, all 256 of them, at the end of the
+         * plan. A division here is a multiply by the reciprocal once this compiler
+         * has seen the constant, and that disagrees with the host in the last bit on
+         * about half the values — measured, and the whole reason this is a table. */
+        uint scale_at = pc.batch;
+        int row_low = floatBitsToInt(pc.b.v[y]);
+        int row_high = floatBitsToInt(pc.b.v[height + y]);
+        float row_weight = pc.b.v[2u * height + y];
+        int col_low = floatBitsToInt(pc.b.v[table + x]);
+        int col_high = floatBitsToInt(pc.b.v[table + width + x]);
+        float col_weight = pc.b.v[table + 2u * width + x];
+        float moved = 0.0;
+        if (index < pc.m) {
+            U32Buf raw = U32Buf(pc.a);
+            for (uint c = 0u; c < 3u; c++) {
+                /* bytes 2, 1, 0 as the host reads R, G, B out of a BGRA word */
+                uint shift = (operation_flags() & F_BGRA) != 0u ? 16u - 8u * c : 8u * c;
+                float corner[4];
+                corner[0] = pc.b.v[scale_at + ((raw.v[uint(row_low) * source_w + uint(col_low)]
+                                                >> shift) & 0xFFu)];
+                corner[1] = pc.b.v[scale_at + ((raw.v[uint(row_high) * source_w + uint(col_low)]
+                                                >> shift) & 0xFFu)];
+                corner[2] = pc.b.v[scale_at + ((raw.v[uint(row_low) * source_w + uint(col_high)]
+                                                >> shift) & 0xFFu)];
+                corner[3] = pc.b.v[scale_at + ((raw.v[uint(row_high) * source_w + uint(col_high)]
+                                                >> shift) & 0xFFu)];
+                precise float low = corner[0] * (1.0 - row_weight) + corner[1] * row_weight;
+                precise float high = corner[2] * (1.0 - row_weight) + corner[3] * row_weight;
+                precise float value = low * (1.0 - col_weight) + high * col_weight;
+                pc.c.v[index * 3u + c] = value;
+                if ((operation_flags() & F_PREVIOUS) != 0u)
+                    moved += abs(value - pc.d.v[index * 3u + c]);
+            }
+        }
+        if ((operation_flags() & F_PREVIOUS) != 0u) {
+            /* One sum a workgroup, added by the host: the cut test wants a mean over
+             * the whole extent, and this way nothing waits on the device for it. */
+            partial_sum[gl_LocalInvocationID.x] = moved;
+            barrier();
+            for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+                if (gl_LocalInvocationID.x < stride)
+                    partial_sum[gl_LocalInvocationID.x] += partial_sum[gl_LocalInvocationID.x + stride];
+                barrier();
+            }
+            if (gl_LocalInvocationID.x == 0u)
+                FloatBuf(uint64_t(pc.second)).v[gl_WorkGroupID.x] = partial_sum[0];
+        }
+        return;
+    }
+    if (kind == PRE_FEATURES) {
+        /* The sixteen channels of one pixel, in half: the mirror onto the network
+         * extent, the three roundings of `scaled_color`, and the history that stands
+         * in channels 7-9, as `nr_features_half` computes them. `b` carries the row
+         * gather, then the column gather, then the noise, then the five controls. */
+        uint width = pc.sa, inner_w = pc.sb, columns_at = pc.sc;
+        uint noise_at = pc.k, controls_at = pc.batch;
+        uint x = index % width, y = index / width;
+        uint at = (uint(floatBitsToInt(pc.b.v[y])) * inner_w
+                   + uint(floatBitsToInt(pc.b.v[columns_at + x]))) * 3u;
+        bool history = (operation_flags() & F_HISTORY) != 0u;
+        float values[16];
+        for (uint c = 0u; c < 3u; c++) {
+            float scaled = half_round(half_round(half_round(pc.a.v[at + c]) - 0.5) * 0.125);
+            values[c] = pc.b.v[noise_at + index * 3u + c];
+            values[4u + c] = scaled;
+            values[7u + c] = history
+                ? half_round(half_round(half_round(pc.d.v[at + c]) - 0.5) * 0.125)
+                : scaled;
+        }
+        values[3u] = 1.0;
+        for (uint c = 0u; c < 5u; c++) values[10u + c] = pc.b.v[controls_at + c];
+        values[15u] = 0.0;
+        HalfBuf target = HalfBuf(uint64_t(pc.c));
+        for (uint c = 0u; c < 16u; c++)
+            target.v[index * 16u + c] = float16_t(values[c]);
+        return;
+    }
+    if (index >= pc.m) return;
 
     if (kind == GATE_E4M3_HALF || kind == E4M3_HALF || kind == GATE_HALF) {
         float value = pc.a.v[index];

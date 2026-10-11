@@ -515,22 +515,34 @@ class History:
         # The cut's difference, written into rather than made: `np.abs(source - self.source)`
         # builds two arrays the size of the network's frame every frame and drops them.
         # 2.2 ms of the frame before, 1.2 after, at 1920x1080 with the network at 768x448.
+        # The device can difference it instead, and then none of this is wanted here.
         self._difference = None
+        self.source_shape = None
 
-    def take(self, key, source, limit):
+    def take(self, key, source, limit, cut=None):
         """History for this frame: at the network's extent, at the output's, and the
-        game's own frame behind it. `(None, None, None)` when there is nothing to trust."""
-        previous, self.cut = self.output, 0.0
-        if key != self.key or previous is None or self.source.shape != source.shape:
-            self.key, self.output, self.source, self.pixels, self.frames = key, None, None, None, 0
+        game's own frame behind it. `(None, None, None)` when there is nothing to trust.
+
+        `source` is the frame's inner, or only its shape when the device already
+        differenced it and `cut` carries the number — then neither the difference nor
+        the frame before's inner is wanted on the host at all (`RequestPass`), and the
+        cut test costs a read of one sum instead of a pass over the whole extent.
+        """
+        previous = self.output
+        self.cut = 0.0 if cut is None else cut
+        shape = source if isinstance(source, tuple) else tuple(source.shape)
+        if key != self.key or previous is None or self.source_shape != shape:
+            self.key, self.output, self.pixels, self.frames = key, None, None, 0
+            self.source_shape = shape
             self.inner = None
             return None, None, None
-        difference = self._difference
-        if difference is None or difference.shape != source.shape:
-            difference = self._difference = np.empty(source.shape, np.float32)
-        np.subtract(source, self.source, out=difference)
-        np.abs(difference, out=difference)
-        self.cut = float(difference.mean())
+        if cut is None:
+            difference = self._difference
+            if difference is None or difference.shape != shape:
+                difference = self._difference = np.empty(shape, np.float32)
+            np.subtract(source, self.source, out=difference)
+            np.abs(difference, out=difference)
+            self.cut = float(difference.mean())
         if self.cut > limit:
             # A round transition, a replay cut or a menu. The gate rejects wrong history
             # per pixel, but it was characterised at full scale on a pan (phase12); a
@@ -538,21 +550,25 @@ class History:
             self.output = self.source = self.pixels = self.inner = None
             self.frames = 0
             return None, None, None
-        if self.inner is not None and self.inner.shape[:2] == source.shape[:2]:
+        if self.inner is not None and self.inner.shape[:2] == shape[:2]:
             inner = self.inner
         else:
-            inner = previous if previous.shape[:2] == source.shape[:2] else resample(previous, source.shape[:2])
+            inner = previous if previous.shape[:2] == shape[:2] else resample(previous, shape[:2])
         return inner, previous, self.pixels
 
     def keep(self, key, output, source, pixels):
-        self.key, self.output, self.source, self.pixels = key, output, source, pixels
+        shape = source if isinstance(source, tuple) else tuple(source.shape)
+        self.key, self.output, self.pixels = key, output, pixels
+        self.source_shape = shape
+        if not isinstance(source, tuple):
+            self.source = source
         self.frames += 1
         # The next frame's history at the network's extent, resampled now — the daemon
         # calls this after the answer has gone, while the game draws its next frame —
         # instead of on that frame's own path: the same resample of the same array, so the
         # same bytes. A different extent next time falls back to resampling then.
-        self.inner = (output if output.shape[:2] == source.shape[:2]
-                      else resample(output, source.shape[:2]))
+        self.inner = (output if output.shape[:2] == shape[:2]
+                      else resample(output, shape[:2]))
 
 
 # Over how many levels of 255 the hold lets go. A pixel the game handed back unchanged
@@ -874,6 +890,35 @@ class Frame:
             raise TypeError(f"Frame got unknown field(s): {sorted(fields)}")
 
 
+def _request_pass(args, backend, geometry, source, inner_shape, boxed, profile, kind):
+    """The device's own two request passes for this extent, or None to keep the host's.
+
+    Rebuilt when the extent, the profile or the byte order moves. The noise and the
+    conditioning values, being constant, go up once with it — which is most of what
+    the object holds. NR_PREPASS=0 keeps every frame on the host's path.
+    """
+    # Only the two eight-bit byte orders: the pass reads a channel as a byte out of a
+    # word, which A2B10G10R10 is not. Anything else keeps the host's own decode.
+    if kind not in ("bgra8", "rgba8"):
+        return None
+    if not getattr(args, "prepass", True) or boxed:
+        return None
+    if not isinstance(backend, nr_frame.ResidentBackend):
+        return None
+    bgra = kind == "bgra8"
+    key = (source, inner_shape, geometry.network_height, geometry.network_width,
+           profile, kind)
+    if getattr(args, "request_key", None) != key:
+        args.request, args.request_key = None, key
+    if args.request is None:
+        args.request = backend.request_pass(
+            geometry, source=source, inner=(inner_shape[1], inner_shape[0]),
+            noise=nr_frame.deterministic_noise(geometry.network_height,
+                                               geometry.network_width, 0),
+            controls=nr_frame.control_vector(profile), bgra=bgra)
+    return args.request
+
+
 def stage_prepare(connection, backend, args, pipeline=None):
     """The request up to the network: decode it, resample it, build its features.
 
@@ -933,16 +978,25 @@ def stage_prepare(connection, backend, args, pipeline=None):
     # phase45). What comes back up is the *head* — the detail the network drew — which
     # is then composed against the full-resolution original, so the game's own pixels
     # are never resampled and only the synthesised part is interpolated.
-    inner = colour
+    extent = (active_width, active_height)
     if live.render_scale < 1.0:
         # The scale's own frame, or the largest that lands on the same network field — the
         # same cost, more of the picture and less of its mirror image (`render_extent`).
         extent = nr_frame.render_extent(active_width, active_height, float(live.render_scale),
                                         int(live.min_extent))
-        if extent != (active_width, active_height):
-            inner = resample(colour, (extent[1], extent[0]))
-    geometry = nr_frame.network_geometry(inner.shape[1], inner.shape[0],
+    geometry = nr_frame.network_geometry(extent[0], extent[1],
                                          minimum=int(live.min_extent))
+    inner_shape = (extent[1], extent[0], 3)
+    # Where the device can carry the request from the game's own bytes to the graph's
+    # input, it does, and the host never sees the resampled frame at all. A letterboxed
+    # frame keeps the host's path: the pass reads the request's whole extent, so
+    # cropping it would mean carrying the bars through the decode as well.
+    request = _request_pass(args, backend, geometry, (width, height), inner_shape,
+                            boxed, live.profile, FORMATS[vk_format][0])
+    cut = request.prepare(payload) if request is not None else None
+    inner = (inner_shape if request is not None else
+             colour if extent == (active_width, active_height)
+             else resample(colour, (extent[1], extent[0])))
     # `inner` is a view of the decoded frame at scale 1; the history keeps it for the next
     # frame's cut test, and aliasing the decode buffer through it has caused two bugs in
     # this function already.
@@ -955,7 +1009,7 @@ def stage_prepare(connection, backend, args, pipeline=None):
         pipeline.history_gate.clear()
     with args.history_lock:
         history_inner, history_full, history_pixels = args.history.take(
-            shot, inner, live.cut_limit if live.temporal > 0 else -1.0)
+            shot, inner, live.cut_limit if live.temporal > 0 else -1.0, cut=cut)
     # Built in the graph's own mapped input where the backend offers it, so nothing is
     # copied on the way in — on Linux that is measured and clean (test_input_fp16.py).
     #
@@ -969,14 +1023,19 @@ def stage_prepare(connection, backend, args, pipeline=None):
     # Intel's own driver builds into it cleanly (notes/phase71), and there it also spares a
     # fresh features array a frame, which on Windows is page faults. NR_INPUT_VIEW=1 or 0
     # decides either way.
-    discrete = getattr(getattr(getattr(backend, "runtime", None), "lib", None), "xmx_discrete", None)
-    default = "0" if os.name == "nt" and discrete is not None and discrete() else "1"
-    input_view = (getattr(backend, "input_view", None)
-                  if os.environ.get("NR_INPUT_VIEW", default) == "1" else None)
-    features = nr_frame.build_features(
-        inner, geometry=geometry, history=history_inner,
-        out=input_view(geometry.network_height, geometry.network_width) if input_view else None,
-        **nr_frame.PROFILES[live.profile])
+    if request is not None:
+        # The sixteen channels are already in the graph's own input, written there.
+        features = request.assemble(history_inner)
+    else:
+        discrete = getattr(getattr(getattr(backend, "runtime", None), "lib", None),
+                           "xmx_discrete", None)
+        default = "0" if os.name == "nt" and discrete is not None and discrete() else "1"
+        input_view = (getattr(backend, "input_view", None)
+                      if os.environ.get("NR_INPUT_VIEW", default) == "1" else None)
+        features = nr_frame.build_features(
+            inner, geometry=geometry, history=history_inner,
+            out=input_view(geometry.network_height, geometry.network_width) if input_view else None,
+            **nr_frame.PROFILES[live.profile])
     # The fourth channel is the temporal gate. Without history it reaches nothing —
     # carrying it through the upscale would be a quarter of that pass for nothing
     # (notes/phase48) — and with history it is what decides the blend, per pixel.
@@ -1062,6 +1121,8 @@ def stage_finish(frame, backend, args):
     colour = frame.colour
     active_height, active_width = frame.active_height, frame.active_width
     inner = frame.inner
+    # a tuple when the device built the request and the host never held the frame
+    inner_width = (inner if isinstance(inner, tuple) else inner.shape)[1]
     geometry = frame.geometry
     shot = frame.shot
     history_full = frame.history_full
@@ -1216,8 +1277,8 @@ def stage_finish(frame, backend, args):
           f"change {changed:.5f}{note}{split}{box}"
           f"  network {geometry.network_width}x{geometry.network_height}"
           f" scale {live.render_scale:g}"
-          + (f" (runs as {inner.shape[1] / active_width:.3g})"
-             if inner.shape[1] != round(active_width * live.render_scale)
+          + (f" (runs as {inner_width / active_width:.3g})"
+             if inner_width != round(active_width * live.render_scale)
              and live.render_scale < 1.0 else ""), flush=True)
     if args.meter is not None:
         print(args.meter.report(), flush=True)
@@ -1417,6 +1478,10 @@ def main():
     args.history_lock = threading.Lock()
     args.letterbox = Letterbox()
     args.meter = Meter() if args.meter else None
+    # The device's own request passes, and the extent they were built for.
+    args.prepass = os.environ.get("NR_PREPASS", "1") != "0"
+    args.request = None
+    args.request_key = None
 
     if not nr_frame.WEIGHTS.exists():
         # The first thing a new clone hits, and a traceback is a poor way to say it.

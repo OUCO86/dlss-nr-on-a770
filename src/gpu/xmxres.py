@@ -34,8 +34,13 @@ TM, TN, TK = 8, 16, 16
 
 (E4M3, GATE, HALF, TO_HALF, SCALE, RESIDUAL, FROM_HALF, PARTITION, REVERSE, ADD_BIAS,
  SPLIT_HEADS, MERGE_HEADS, POOL2, UPSAMPLE2, SCALE_CHANNEL, ADD, PAD_END,
- GATE_E4M3_HALF, E4M3_HALF, GATE_HALF, UPSAMPLE_MERGE, UPSAMPLE_ADD, POOL2_SKIP) = range(23)
+ GATE_E4M3_HALF, E4M3_HALF, GATE_HALF, UPSAMPLE_MERGE, UPSAMPLE_ADD, POOL2_SKIP,
+ PRE_INNER, PRE_FEATURES) = range(25)
 COSINE_PUBLISH, SOFTMAX, VIT_SOFTMAX = 0, 1, 6
+
+# Flags above every bit the graph's own passes read, so none of them can be mistaken
+# for an epilogue or an operand width. `resident.comp` is the other half of this.
+F_BGRA, F_PREVIOUS, F_HISTORY = 0x1000000, 0x2000000, 0x4000000
 
 # GEMM epilogues, applied to the accumulator on its way out of the kernel
 EPI_NONE, EPI_E4M3, EPI_GATE, EPI_GATE_E4M3, EPI_HALF = 0, 1, 2, 3, 4
@@ -1499,6 +1504,53 @@ class Runtime:
     def to_half(self, source, target, count, scale=1.0):
         """float32 -> float16, for a GEMM operand."""
         return self.unary(TO_HALF, source, target, count, scale=scale)
+
+    def pre_inner(self, raw, plan, inner, *, width, height, source_width,
+                  source_height, partial, scale_at, previous=None, bgra=True,
+                  channels=3):
+        """The game's own bytes into the network's input extent, on the device.
+
+        `nr_decode8` and the two bilinear axes `nr_daemon.resample` runs, as one pass:
+        a BGRA word to three floats, then the row pair and the column pair over it.
+        The order is theirs because float32 addition is not associative and the host
+        wrote the intermediate out as float32 between the two axes.
+
+        `plan` is the six gather tables — low, high and weight for each axis — packed
+        as float and read back as int where they are indices, followed by the 256
+        entries of `byte / 255.0f` that `scale_at` points at. `previous`, when given,
+        is the frame before's inner at this same extent, and `partial` takes one sum
+        of |this - that| a workgroup: the cut test's mean, whose workgroup sums the
+        host adds.
+        """
+        flags = PRE_INNER | (F_BGRA if bgra else 0)
+        previous_id = inner.id
+        if previous is not None:
+            flags |= F_PREVIOUS
+            previous_id = previous.id
+        if self.lib.xmx_rec_unary2(flags, raw.id, plan.id, inner.id, previous_id,
+                                   partial.id, int(width * height), int(channels), 0.0,
+                                   int(scale_at), int(width), int(height), int(source_width),
+                                   int(source_height)) != 0:
+            raise RuntimeError("xmx_rec_unary2: " + self.lib.xmx_error().decode())
+        self.recorded += 1
+        return self
+
+    def pre_features(self, inner, plan, features, *, width, height, inner_width,
+                     columns_at, noise_at, controls_at, history=None, channels=16):
+        """The sixteen channels of a pixel, in half, on the device.
+
+        `nr_features_half`: the mirror onto the network extent, the three roundings of
+        `scaled_color`, the noise in channels 0-2, the five controls in 10-14, and the
+        history standing in 7-9. `plan` carries the row gather, then the column gather,
+        then the noise, then the controls — one float buffer, in that order.
+        """
+        return self.unary(PRE_FEATURES | (F_HISTORY if history is not None else 0),
+                          inner, features, width * height, second=plan,
+                          third=history if history is not None else inner,
+                          channels=channels, scale=0.0,
+                          _dims=(int(controls_at), int(width), int(inner_width),
+                                 int(columns_at)),
+                          _pad=int(noise_at))
 
     def from_half(self, source, target, count, scale=1.0):
         return self.unary(FROM_HALF, source, target, count, scale=scale)

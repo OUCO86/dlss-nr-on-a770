@@ -1,0 +1,172 @@
+# 把 CPU 从像素世界里踢出去（2026-10-11 起主导的优化）
+
+## 出发点
+
+用户提了一个观察，然后下了决断：
+
+> 显卡占用率很低才 50% 多，功耗才 90 多 W。…… **占用率在变低证明优化有效果，这个必须做；
+> 但优先级是先让它提上去 …… 现在明摆着就是有闲置。前半段能挪也要挪过来，争取 CPU 少用甚至不用。**
+
+于是本轮的**目标函数变了**：不再是「压缩设备时间」，而是「**把宿主仍在做的事搬上卡**」。
+前一类优化会让帧更快但占用率更低；这一类是同时抬两头。
+
+⚠️ 与本文最相关的一条旧结论（`daemon-cpu-cost.md`）需要重读：那里把「把 features 直接建在
+mapped 显存里」的方案记为 **NR_INPUT_VIEW=1 在独显上每帧全 NaN**。这条挡在本轮主方向上，
+见下面「先决条件」。
+
+## 一、现状：70 ms 里各站哪一段
+
+实测口径（游戏在跑，`src/bench/daemon_stages.py` 的分解 + GPU Enginetimestamp）：
+
+| 段 | ms | 谁在干活 |
+|---|---|---|
+| **设备（NR 图）** | **~33** | A770，自己就是它 47% 占用率的全部来源 |
+| 宿主：receive | 0.66 | CPU（8.3 MB 进 daemon）|
+| 宿主：decode8 | 1.90 | CPU，转格式 + 归一化 |
+| 宿主：`nr_image.bilinear` × 2 | 4.00 | CPU，缩放到网络 extent 和 history |
+| 宿主：`nr_image.features` | 1.89 | CPU，组装 10/N 通道输入 |
+| 宿主：`nr_image.to_half` | 2.17 | CPU，cast 到 fp16 再写 mapped 显存 |
+| 宿主：read_head | 0.54 | CPU，把结果读回来 |
+| 宿主：`nr_image.compose_encode` | **~4**（今天从 8.98 降下来的）| CPU，合成 + 量化 + 编码 |
+| 宿主：sendall | 1.11 | CPU（8.3 MB 回 layer）|
+| 其余更小的项（history keep/take、grading gate 统计等） | ~5 | CPU |
+
+**能搬走的那一大块 ≈ 10 到 13 ms，全是在 1920x1080 的全分辨率上跑的像素活。**
+
+## 二、被推翻的前提：渲染根本不在另一张卡上
+
+旧笔记一直按「GPU0 AMD 渲染 / GPU1 A770 跑 NR」来推理。**这是错的，而且错得不轻。**
+
+typeperf 按 pid 和 luid 拆开后的实测（游戏正在跑）：
+
+| 进程 | pid | luid | per-sample max占用 |
+|---|---|---|---|
+| daemon（跑 NR） | 28064 | `0x000126F9` | **47.42%** |
+| DOOM Eternal | 27700 | **同一个 `0x000126F9`** | 5.29% |
+| 一大堆桌面进程 | 各种 | `0x00012B34` | ~0.1% |
+
+DOOM **在自己的 luid 之外完全是 0**。它所有 GPU 工作都和 NR 在同一张卡上。
+
+这条修正带来的东西比想象的多：
+
+1. 9070XT 从此不进任何推理。
+2. **不需要 device-to-device 传输**了：渲染结果和 NR 的输入在同一颗 GPU 上，
+   理想形态里那条 `vkCmdCopyImageToBuffer → 映射 → 管道 → CPU 搬运 → 再上传` 的回路**可以不复存在**。
+3. 现在仍能不清零。（代价：**同一条 3D 队列**既画 DOOM 又跑 NR 的 723 趟 dispatch，
+   两者串行，23 类是 Compute/Copy/Video 引擎常年为 0。）
+
+## 三、目标形态
+
+```
+layer: swapchain image
+       → cmd_blit 到一个允许导出的 VkImage（避开 swapchain image 不可导出的限制）
+       → 导出 NT handle + external semaphore
+daemon: 导入 image
+       → GPU 上完成 解码/缩放/features/to_half/网络/compose/编码 全部
+       → 输出到一个共享 image
+layer:  直接 present，或 cmd_copy 回 swapchain
+```
+**CPU 全程不碰一个像素。** 现阶段流通的 16.6 MB/帧सी管道双向搬运也就一并消失。
+
+## 四、分阶段
+
+### Phase 1 — 不改 layer，只把宿主的活做成 GPU pass（收益确定，风险低）
+
+分两个出口：
+- **后处理**：head 已经在显存里，且 `resident.comp` 已有 `UPSAMPLE2 / UPSAMPLE_MERGE /
+  UPSAMPLE_ADD / TO_HALF / FROM_HALF / GATE / SCALE / ADD / RESIDUAL` 一整套元素算子，
+  把 `nr_image.compose_encode` 的语义（grade + temporal blend + quantize + encode）写成一条同样的路子；
+- **前处理**：`decode8 → bilinear → features → to_half` 融合成一个「从 BGRA 字节到 features16」的输入 pass。
+
+预期：宿主 ~13 ms → ~3 ms（只剩一次 8.3 MB 上传 + 一次下传 + IPC）。
+预期 resid：帧 ~70 → ~55 ms，GPU 忙 33 → ~45 ms，**占用率 ~47% → ~65%**。
+
+### Phase 2 — external memory：连 8.3 MB 也不要传（**这是目标形态的关键一步**）
+
+layer 与 daemon 各有一个 `VkDevice`（即使同一颗 GPU），要让 daemon 直接用 layer 拷出来的
+那一帧，跨进程共享 VkImage/VkBuffer 得走 `VK_KHR_external_memory_win32`（配
+`VK_KHR_external_semaphore_win32` 做同步）。**必须先验证 Intel Arc 在 Windows 上支持，
+否则 Phase 2 不成立，退回 Phase 1。**
+
+### Phase 3 — 更远的：把图搬进 layer（暂不计划）
+
+彻底消灭进程边界，代价是把 C/NumPy 的前处理也移植到 C。不在本轮。
+
+## 五、先决条件：先钉死那个 NaN（**价格最低、信息最大**）
+
+`NR_INPUT_VIEW=1`（features 直接建在 mapped 显存）在 Arc 140V / Intel Linux 驱动上正常，
+在 Windows 独显上每帧全 NaN ── 这个现象现在**只被当成「独显就这样」，没真正解释过**。
+
+嫌疑：**host 写 DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT 的 BAR 映射，GPU 侧读到陈旧数据**。
+（按 P2 测绘，daemon 的图缓冲正是 type 3 DEVICE_LOCAL + HOST_VISIBLE + HOST_COHERENT。）
+
+如果根因是缓存可见性，那么：
+
+* 它可能很容易修（`vkFlushMappedMemoryRanges` / `vkInvalidateMappedMemoryRanges`）；
+* Phase 1/2 能不能成立也挂在同一件事上 —— **Phase 2 里 layer 和 daemon 要互相读写对方导出的
+  显存，「能不能写出 GPU 立刻看得见的值」是整个方案的前提。**
+
+所以本轮第一步不是写新的融合 pass，而是**写一个 50 行的 C probe**：
+映射一块 DEVICE_LOCAL|HOST_VISIBLE buffer → CPU 写 → GPU 读 → 校验；
+分别试「直接写」「`vkFlushMappedMemoryRanges` 后」「cop中转后」三种。
+把 NaN 的原因从「独显就这样」变成一句可验证的话。
+
+## 六、验收标准（沿用本仓规矩）
+
+1. 每步都要**同进程 A/B**，outputs **逐字节相同**（`test_native_image.py` 那一套）。
+2. 每一步都要同时报**帧时间**和**GPU 占用率**两个数字 —— 本轮的目标是抬后者，
+   只看帧时间会把 Phase 1 这类改动判成「没及格」，那是错的口径。
+3. 一条本轮专用的判据：本轮的目标是**抬占用率**，所以「帧时间没降」不等于失败 ——
+   每一步都要把「CPU 少做了多少」和「GPU 多做了多少」两个数分开报，
+   只报帧时间会把这类改动错判成没及格。
+
+---
+
+## 七、Phase 1 的前处理已落地（2026-10-11）
+
+`resident.comp` 多了两个算子，宿主侧由 `nr_frame_resident.RequestPass` 管着：
+
+| kind | 干什么 | 输入 → 输出 |
+|---|---|---|
+| `PRE_INNER`（23） | `nr_decode8` + `resample` 的两个轴合成一趟；顺带按 workgroup 求 \|本帧 inner − 上一帧 inner\| 的和 | 游戏的 BGRA 字节（显存）→ inner fp32（显存）+ 分组和 |
+| `PRE_FEATURES`（24） | `nr_features_half` 的全部语义：三级 half 舍入、geometry 镜像、noise、五个 controls、history 通道 7-9 | inner + history + noise → 16 通道 fp16，**写进图自己的输入 buffer** |
+
+于是 `decode → resample → features → to_half → 写进 mapped 显存` 这四趟宿主活变成两趟设备活，
+**解码后的帧和缩放后的帧都不再回宿主**（后处理还要用全分辨率的解码结果，所以 `decode8`
+本身仍在宿主，见「还没搬走的」）。
+
+开关：`NR_PREPASS=0` 整条回宿主路径。信箱之外自动回退的两种情况：letterbox 裁过的帧，
+以及 `a2b10g10r10`（那个 pass 按字节读通道，10-bit 不是字节）。
+
+### 数字
+
+`src/bench/daemon_stages.py 1920x1080@0.4`，同一份构建只切 `NR_PREPASS`（ms，15 帧中位）：
+
+| 阶段 | 宿主（=0） | 设备（=1） |
+|---|---|---|
+| resample | 3.46 | **1.98**（只剩后处理那一次） |
+| history_take | 1.22 | **0.00**（cut 由设备算） |
+| features | 1.79 | **0**（融进 pass） |
+| gpu_in（写进图） | 2.23 | **0.02** |
+| gpu_run | 43.96 | 43.76 |
+| to_answer | 62.34 | **55.40** |
+| round_trip | 65.15 | **58.14** |
+
+端到端 `src/bench/check_request_pass.py`：前处理 **13.44 → 3.05 ms**，整帧 **67.69 → 54.57 ms**。
+`src/bench/check_pre_inner.py` / `check_pre_features.py`：随机全分辨率帧 **5/5 与 6/6 逐字节相同**，
+cut 的分组和与宿主的差 6e-08（浮点求和顺序，非误差）。
+
+### 三个坑
+
+1. **shader 里的 `/ 255.0` 会被编译成乘倒数**，和宿主 C 的除法在最后一位上分道扬镳，
+   约一半的值差 1 ULP（identity 几何下测出来的：`check_pre_inner.py identity`）。
+   改成查 256 项表，表由宿主自己算 —— 顺带也更快。
+2. **`buffer.download` 极慢**（4.7 MB 要 179 ms）。验证脚本里读回来比对可以，
+   生产路径一次都不读（inner 直接喂给下一个 pass），别被这个数吓到。
+3. `a2b10g10r10` 也是 4 字节/像素，按字节解会全错。`_request_pass` 只认 `bgra8` / `rgba8`。
+
+### 还没搬走的
+
+- `decode8`（1.7 ms）：后处理要用全分辨率解码帧，除非把 `compose_encode` 也搬上卡。
+- `compose_encode`（3.8–5.5 ms）和 `history.keep` 的那次 resample（~2 ms）：Phase 1 的后半。
+- 那条 `CopyImageToBuffer → 管道 8.3 MB → 宿主` 的来路：要等 Phase 2 的 external memory。

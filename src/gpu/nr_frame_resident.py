@@ -684,3 +684,127 @@ class ResidentFrame:
         if submits is not None:
             submits.append(counter[0])
         return self.read_head()
+
+
+def _upload(runtime, array):
+    buffer = runtime.buffer(array.size, np.float32, xmxres.HOST_WRITE)
+    xmxres.host_write(buffer, array)
+    return buffer
+
+
+def _resample_plan(source_height, source_width, inner_height, inner_width):
+    """The two bilinear axes' six gather tables, and where the byte scale starts.
+
+    `nr_image.bilinear` runs the rows first and then the columns, and hands each axis
+    its own low, high and weight; the order here is the order PRE_INNER reads them in,
+    and the tables are the host's own so the gather is the host's to the bit. The 256
+    entries of `byte / 255.0f` follow: a division by a constant in the shader becomes a
+    multiply by its reciprocal on this compiler, and that disagrees with the host's in
+    the last bit on about half the values.
+    """
+    packed = []
+    for extent, count in ((source_height, inner_height), (source_width, inner_width)):
+        for array in nr_image._axis_plan(extent, count):
+            flat = np.ascontiguousarray(np.asarray(array).reshape(-1))
+            if flat.dtype != np.float32:
+                flat = np.ascontiguousarray(flat.astype(np.int32)).view(np.float32)
+            packed.append(flat.astype(np.float32))
+    packed.append((np.arange(256, dtype=np.float32) / np.float32(255.0)).astype(np.float32))
+    joined = np.ascontiguousarray(np.concatenate(packed))
+    return joined, joined.size - 256
+
+
+def _feature_plan(geometry, noise, controls):
+    """Row gather, column gather, noise, controls — one float buffer, in that order."""
+    rows = np.ascontiguousarray(geometry.source_rows()).astype(np.int32).view(np.float32)
+    columns = np.ascontiguousarray(geometry.source_columns()).astype(np.int32).view(np.float32)
+    flat = np.ascontiguousarray(np.asarray(noise).reshape(-1)).astype(np.float32)
+    joined = np.ascontiguousarray(np.concatenate([rows, columns, flat,
+                                                  np.asarray(controls, np.float32)]))
+    return joined, rows.size, rows.size + columns.size
+
+
+class RequestPass:
+    """The game's frame to the graph's input, on the device.
+
+    Four host passes over the full frame are two device passes here: `nr_decode8` and
+    the two bilinear axes of `resample` are PRE_INNER, and `nr_features_half` together
+    with the copy into the graph's mapped input is PRE_FEATURES. Neither the decoded
+    frame nor the resampled one ever comes back to the host, and the inner of the frame
+    before stays on the device too, so the cut test's difference costs one small read
+    rather than a subtraction over the whole extent.
+    """
+
+    def __init__(self, runtime, frame, geometry, *, source, inner, noise, controls,
+                 bgra=True):
+        if nr_image is None:
+            raise RuntimeError("the request passes need the host library for their tables")
+        self.rt = runtime
+        self.frame = frame
+        self.geometry = geometry
+        self.source_width, self.source_height = source
+        self.inner_width, self.inner_height = inner
+        self.bgra = bgra
+        self.pixels = self.inner_width * self.inner_height
+        self.groups = -(-self.pixels // 256)
+        self.raw = runtime.buffer(self.source_width * self.source_height, np.uint32,
+                                  xmxres.HOST_WRITE)
+        # Two inners, so the frame before's can stay exactly where the device left it.
+        self.inner = [runtime.buffer(self.pixels * 3, np.float32, xmxres.GRAPH)
+                      for _ in range(2)]
+        self.which = 0
+        self.know_previous = False
+        self.current = None
+        self.history = runtime.buffer(self.pixels * 3, np.float32, xmxres.HOST_WRITE)
+        self.partial = runtime.buffer(self.groups, np.float32, xmxres.HOST_READ)
+        self.inner_plan, self.scale_at = _resample_plan(
+            self.source_height, self.source_width, self.inner_height, self.inner_width)
+        self.feature_plan, self.columns_at, self.noise_at = _feature_plan(
+            geometry, noise, controls)
+        self.controls_at = self.feature_plan.size - 5
+        self.plan_inner = _upload(runtime, self.inner_plan)
+        self.plan_features = _upload(runtime, self.feature_plan)
+
+    def prepare(self, payload):
+        """Decode and resample `payload` into the network's extent.
+
+        Returns how much the frame moved against the one before, or None on the first
+        frame, which has nothing to difference against — which is what the host's own
+        history does there too. The history has to wait for this: the cut decides
+        whether there is one at all.
+        """
+        target = self.inner[self.which]
+        xmxres.host_write(self.raw, np.frombuffer(payload, np.uint32))
+        self.rt.begin()
+        self.rt.pre_inner(self.raw, self.plan_inner, target,
+                          width=self.inner_width, height=self.inner_height,
+                          source_width=self.source_width, source_height=self.source_height,
+                          partial=self.partial, scale_at=self.scale_at, bgra=self.bgra,
+                          previous=self.inner[self.which ^ 1] if self.know_previous else None)
+        self.rt.submit()
+        cut = None
+        if self.know_previous:
+            total = float(self.partial.download(np.float32, self.groups).sum())
+            cut = total / float(self.pixels * 3)
+        self.know_previous = True
+        self.which ^= 1
+        self.current = target
+        return cut
+
+    def assemble(self, history=None):
+        """Those pixels into the sixteen channels the graph reads, in the graph's input.
+
+        Returns the input itself, so `ResidentFrame.run` sees the features already
+        there and copies nothing.
+        """
+        if history is not None:
+            xmxres.host_write(self.history, history)
+        self.rt.begin()
+        self.rt.pre_features(self.current, self.plan_features, self.frame.input_buffer(),
+                             width=self.geometry.network_width,
+                             height=self.geometry.network_height,
+                             inner_width=self.inner_width, columns_at=self.columns_at,
+                             noise_at=self.noise_at, controls_at=self.controls_at,
+                             history=None if history is None else self.history)
+        self.rt.submit()
+        return self.frame.input_view()
