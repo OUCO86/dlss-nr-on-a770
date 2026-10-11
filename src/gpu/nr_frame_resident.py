@@ -735,12 +735,16 @@ class RequestPass:
     rather than a subtraction over the whole extent.
     """
 
-    def __init__(self, runtime, frame, geometry, *, source, inner, noise, controls,
+    def __init__(self, runtime, backend, geometry, *, source, inner, noise, controls,
                  bgra=True):
         if nr_image is None:
             raise RuntimeError("the request passes need the host library for their tables")
         self.rt = runtime
-        self.frame = frame
+        # Held by backend rather than by frame: the backend keeps one extent at a time
+        # and closes the frame it drops, so a frame captured here would dangle as soon
+        # as another extent — a letterboxed one, say — was asked for.
+        self.backend = backend
+        self.extent = (geometry.network_height, geometry.network_width)
         self.geometry = geometry
         self.source_width, self.source_height = source
         self.inner_width, self.inner_height = inner
@@ -764,6 +768,13 @@ class RequestPass:
         self.controls_at = self.feature_plan.size - 5
         self.plan_inner = _upload(runtime, self.inner_plan)
         self.plan_features = _upload(runtime, self.feature_plan)
+
+    def close(self):
+        """Give the buffers back. An extent change builds a new pass, and waiting for
+        the garbage collector to get to the old one leaves both resident."""
+        for buffer in (self.raw, self.history, self.partial, self.plan_inner,
+                       self.plan_features, *self.inner):
+            buffer.free()
 
     def prepare(self, payload):
         """Decode and resample `payload` into the network's extent.
@@ -799,12 +810,15 @@ class RequestPass:
         """
         if history is not None:
             xmxres.host_write(self.history, history)
+        frame = self.backend.frame(*self.extent)
         self.rt.begin()
-        self.rt.pre_features(self.current, self.plan_features, self.frame.input_buffer(),
+        self.rt.pre_features(self.current, self.plan_features, frame.input_buffer(),
                              width=self.geometry.network_width,
                              height=self.geometry.network_height,
                              inner_width=self.inner_width, columns_at=self.columns_at,
                              noise_at=self.noise_at, controls_at=self.controls_at,
                              history=None if history is None else self.history)
         self.rt.submit()
-        return self.frame.input_view()
+        # The graph's own input, so `ResidentFrame.run` sees the features already there
+        # and copies nothing — the same frame it will ask the backend for.
+        return frame.input_view()

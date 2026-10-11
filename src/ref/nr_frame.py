@@ -592,10 +592,12 @@ class ResidentBackend:
         returned object decodes and resamples, then assembles once the caller knows
         whether there is a history — the cut it reports is what decides that.
         """
+        # The backend, not a frame: `ResidentBackend` keeps one extent and closes the
+        # frame it evicts, so a pass that held one would be left writing into released
+        # device memory the moment a letterboxed frame asked for a different extent.
         return self._module.RequestPass(
-            self.runtime, self.frame(geometry.network_height, geometry.network_width),
-            geometry, source=source, inner=inner, noise=noise, controls=controls,
-            bgra=bgra)
+            self.runtime, self, geometry, source=source, inner=inner, noise=noise,
+            controls=controls, bgra=bgra)
 
 
 def run_head(model, color, *, profile="standard", frame_index=0, style_index=None,

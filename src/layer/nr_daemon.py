@@ -897,19 +897,23 @@ def _request_pass(args, backend, geometry, source, inner_shape, boxed, profile, 
     conditioning values, being constant, go up once with it — which is most of what
     the object holds. NR_PREPASS=0 keeps every frame on the host's path.
     """
+    bgra = kind == "bgra8"
+    key = (source, inner_shape, geometry.network_height, geometry.network_width,
+           profile, kind)
+    if getattr(args, "request_key", None) != key:
+        if getattr(args, "request", None) is not None:
+            args.request.close()
+        args.request, args.request_key = None, key
     # Only the two eight-bit byte orders: the pass reads a channel as a byte out of a
-    # word, which A2B10G10R10 is not. Anything else keeps the host's own decode.
+    # word, which A2B10G10R10 is not. Anything else keeps the host's own decode. A
+    # letterboxed frame keeps it too: the pass reads the request's whole extent, so
+    # cropping it would mean carrying the bars through the decode as well.
     if kind not in ("bgra8", "rgba8"):
         return None
     if not getattr(args, "prepass", True) or boxed:
         return None
     if not isinstance(backend, nr_frame.ResidentBackend):
         return None
-    bgra = kind == "bgra8"
-    key = (source, inner_shape, geometry.network_height, geometry.network_width,
-           profile, kind)
-    if getattr(args, "request_key", None) != key:
-        args.request, args.request_key = None, key
     if args.request is None:
         args.request = backend.request_pass(
             geometry, source=source, inner=(inner_shape[1], inner_shape[0]),
