@@ -565,7 +565,8 @@ static int child_main(void)
  *
  * This is the whole point of the exercise: the buffer was allocated by a different
  * process, on a device this process never saw being created. */
-static int guest_main(const char *handle_hex, const char *expect_hex, const char *size_hex)
+static int guest_main(const char *handle_hex, const char *expect_hex, const char *size_hex,
+		      const char *mode)
 {
 	VkInstance inst = make_instance();
 	if (!inst)
@@ -609,11 +610,47 @@ static int guest_main(const char *handle_hex, const char *expect_hex, const char
 	}
 	VkMemoryRequirements rb;
 	vkGetBufferMemoryRequirements(b.dev, bb, &rb);
-	/* the driver answers 0x0 here (see §15); fall back to what the buffer asks for */
-	uint32_t type = pick_memory(rb, ~0u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-					       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+	/* What the driver will let this import be mapped as, and what each type on the
+	 * card actually is. The CACHED bit is the one that decides whether a host read
+	 * is cached and prefetched or a round trip per cache line, so say plainly
+	 * whether an import is even allowed to ask for it. */
+	{
+		VkPhysicalDeviceMemoryProperties mp;
+		vkGetPhysicalDeviceMemoryProperties(g_pd, &mp);
+		printf("guest: the import's buffer allows memoryTypeBits 0x%x\n",
+		       rb.memoryTypeBits);
+		for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+			unsigned f = mp.memoryTypes[i].propertyFlags;
+			printf("guest:   type %u flags 0x%02x  %-13s %-13s %-9s %-6s  %s\n",
+			       i, f,
+			       (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? "DEVICE_LOCAL" : "-",
+			       (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? "HOST_VISIBLE" : "-",
+			       (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ? "COHERENT" : "-",
+			       (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? "CACHED" : "-",
+			       (rb.memoryTypeBits & (1u << i)) ? "allowed" : "");
+		}
+	}
+	/* Two ways to ask, because what the import is mapped *as* is not what it was
+	 * allocated as, and the host's read of the answer costs one of two prices:
+	 *
+	 *   device   DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT  — type 3 here,
+	 *            device memory behind the bar, uncached.
+	 *   cached   HOST_VISIBLE | HOST_COHERENT | HOST_CACHED   — type 2 here,
+	 *            system memory, cached and prefetched.
+	 *
+	 * The default is what this probe always asked for. `cached` is what
+	 * nr_extmem.c asks for the answer since the frame rate followed the read down.
+	 *
+	 * The driver answers 0x0 for the handle's memoryTypeBits (see §15), so it is
+	 * the buffer's own requirements that are looked at. */
+	VkMemoryPropertyFlags want = (mode && !strcmp(mode, "cached"))
+		? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+		   VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
+		: (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+		   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+	uint32_t type = pick_memory(rb, ~0u, want);
 	if (type == UINT32_MAX)
-		type = pick_memory(rb, ~0u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+		type = pick_memory(rb, ~0u, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
 	if (type == UINT32_MAX)
 		type = pick_memory(rb, ~0u, 0);
 	VkImportMemoryWin32HandleInfoKHR ihi = {
@@ -636,6 +673,32 @@ static int guest_main(const char *handle_hex, const char *expect_hex, const char
 	}
 	printf("guest: imported %llu bytes from handle %s (memory type %u)\n",
 	       (unsigned long long)bytes, handle_hex, type);
+
+	/* How long the host takes to read the frame straight out of the imported
+	 * buffer — not through a copy, which is what the read-back below does, but
+	 * the way the layer reads the answer every frame. This is the number that
+	 * decides whether the way back is worth having. */
+	{
+		void *imp = NULL;
+		if (vkMapMemory(b.dev, mb, 0, bytes, 0, &imp) == VK_SUCCESS) {
+			LARGE_INTEGER freq, t0, t1;
+			QueryPerformanceFrequency(&freq);
+			unsigned long long sink = 0;
+			QueryPerformanceCounter(&t0);
+			for (size_t i = 0; i < bytes; i++)
+				sink += ((unsigned char *)imp)[i];
+			QueryPerformanceCounter(&t1);
+			double ms = (double)(t1.QuadPart - t0.QuadPart) /
+				    (double)freq.QuadPart * 1000.0;
+			double mb_read = (double)bytes / 1048576.0;
+			printf("guest: host read of the imported buffer: %.2f ms for %.1f MB "
+			       "= %.2f GB/s (checksum %llu)\n",
+			       ms, mb_read, mb_read / (ms / 1000.0) / 1024.0, sink);
+			vkUnmapMemory(b.dev, mb);
+		} else {
+			printf("guest: could not map the imported buffer\n");
+		}
+	}
 
 	/* read it back: does what the other process wrote look like what it wrote? */
 	VkBufferCreateInfo hci = {
@@ -1484,9 +1547,11 @@ int main(int argc, char **argv)
 		 * this process is already running */
 		return sigpeer_main();
 	if (argc >= 4 && !strcmp(argv[1], "guest"))
-		return guest_main(argv[2], argv[3], argc >= 5 ? argv[4] : "0");
+		return guest_main(argv[2], argv[3], argc >= 5 ? argv[4] : "0",
+				  argc >= 6 ? argv[5] : "device");
 	if (argc >= 2 && strcmp(argv[1], "guest") && strcmp(argv[1], "child")) {
-		printf("usage: %s [guest <handle-hex> <expect-hex> [bytes] | child]\n", argv[0]);
+		printf("usage: %s [guest <handle-hex> <expect-hex> [bytes [device|cached]]"
+		       " | child]\n", argv[0]);
 		return 1;
 	}
 	return parent_main();
