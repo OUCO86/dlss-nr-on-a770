@@ -217,3 +217,81 @@ effect，转的越多代价越大），真要做，画质必须先重测。
 - ⏳ 给 int8 内核加 batch：理论 3.2 ms，**内核工作 + 精度代价**，要用户拍板。
 - ⏳ 设备侧剩下两坨更大的：`window_block` **6.20 ms / 10 趟**（0.62 ms/趟，全帧最贵
   单趟）和 `gemm/31 ffn_fused` **5.60 ms / 10 趟**。
+
+## 2026-10-11：window_block 的三阶段，在 768x448 上实测
+
+`src/bench/window_block_probe.py`。账本说这十趟是 6.20 ms，是设备侧最大的单趟
+（0.62 ms 一趟），而它已经是融合写法，没有 pass 可以从它身上拿走。
+`notes/HANDOFF.md` 量过一次三阶段，在 1920x1088：5.8 / 5.5 / 1.6 of 12.9。
+这里是 768x448，且阶段是真的被拿掉的，不是估的。
+
+### 怎么量的
+
+`window_block.comp` 加了 `PROBE_STOP`（**0 = 什么都不停，每个 shipping 构建都是 0**：
+`work/_probe_wb0.spv` 与在跑的 `work/window_block.spv` 逐字节相同，可以自己 cmp）：
+1 = K/V 进共享内存后就返回，2 = attention 做完就返回，没有输出投影、残差、publish。
+一个阶段 = 两个 stop 之差。
+
+    glslang --target-env vulkan1.3 -DPROBE_STOP=<n> -Isrc/gpu \
+            -o work/_probe_wb<n>.spv src/gpu/window_block.comp
+
+两个坑：
+- **一个 pipeline 一个进程**（`libxmx.c`: `if (g.rblock) return 0;`），所以三个 stop 是
+  三个进程，必须**两个顺序各跑一遍**。跑了的：正序 6.02 / 2.48 / 4.64，倒序
+  6.02 / 2.47 / 4.65 —— 差 ≤ 0.01 ms，可以相减。
+- **规划那一遍也会录窗块**，不清掉就是 20 趟 12.07 ms，正好翻倍，看着像"账本错了"。
+
+### 结果
+
+| | ms | 占 |
+|---|---:|---:|
+| 完整 | **6.02** | |
+| A：QKV 投影、归一化、K/V 进共享内存 | **2.48** | 41 % |
+| B：attention（QK^T、softmax、PV） | **2.17** | 36 % |
+| C：输出投影、残差、publish、pool/head 的尾巴 | **1.37** | 23 % |
+
+十趟里两趟是 level 0（448x768，5529 / 5376 个窗），各 1.68 和 1.47 ms，**占 52 %**；
+八趟是 level 1（224x384，约 1392 个窗），各约 0.35 ms。
+
+### 硬件账（`XMX_PIPELINE_STATS`）
+
+四个 specialization（flags 0 / 4352 / 0x800000 pool / 0x1000000 head）：
+**Instruction Count 6472-7500，Scratch Memory Size = 0（无溢出，安全），
+Workgroup Memory 16384，Loop Count 1**（循环全展开）。
+
+每趟的乘加只有 64 次 8x8x16 —— 一个 workgroup 131072 FLOP，level 0 的 5529 个
+workgroup 共 724 MFLOP，1.68 ms → **431 GFLOP/s，峰值约 1.7 %**。
+
+**99 % 的指令是逐元素的。** 这就是它为什么慢，也是为什么改它这么难。
+
+### 结论：这块没有结构性的钱
+
+对照 Blackwood416 的 A770 skill（`E:/WorkBuddy/a770-speedopt/refs/`，
+`references/techniques/sdpa-a770.md`），它的 VTune 结论是同一件事：
+*"XVE 57 % Stalled, XMX pipeline 19.5 % active"*，
+*"instruction volume and operand relay dominate"*。还有一句是这里的刹车：
+> Higher occupancy is not the goal by itself: oneDNN ran at 28.7 % occupancy and beat
+> an ESIMD variant at 58.4 % because it issued fewer instructions.
+
+所以提高驻留不是方向（何况槽位大概已经满：256 线程 x 4 个 workgroup 一个 Xe-core，
+16 KB SLM 也不是限制，作者的阈值是"超过约 32 KB 才开始丢"）。能做的只有减指令，
+而减指令在这里就是动数值语义。
+
+**已经有人试过并否掉的，别再试：**
+- K/V/Q 存成 E4M3 字节省一半共享内存和流量 —— 更慢（projection 3.78 -> 3.93，
+  attention 3.22 -> 3.93，`notes/improve-b.md`）。编码解码比省下的字节贵。
+- 把 FFN 塞进 window block —— 0.95x（`improve-b.md`）。
+- B 按列 / 按 K 对在共享内存里 —— 更慢（同上）。
+- 作者自己已经做掉的两条：QKV epilogue 的归一化摊到 4 个 lane 一行
+  （10.9 -> 7.1 ms），权重进共享内存（7.1 -> 6.2）。
+
+**剩下的都是 1-3 % 一处，每处都要重验 bit-identical：**
+- attention 里那条分母归一化的循环，每 lane 16 个值各做 `e4m3(half_round(x))`，
+  两个量化串在一起，约 300 条指令。去掉 `half_round` 是双重舍入，会改结果。
+- gather 那 8 次 `e4m3` 在 `image_half=0` 时是幂等的（e4m3(e4m3(x)) == e4m3(x)，
+  尾数只剩 4 位，再过一遍的 roundEven 吃整数），可以跳过 —— 约 2 %，且只在
+  image 为 float32 时成立。
+- 一个 workgroup 做两个窗，权重那 6 KB 只读一次用两次。这是唯一还有点结构的，
+  估 0.3-0.5 ms，但要重做几何和 pad，且共享内存从 16 KB 涨到 24 KB。
+
+→ **建议转 B2（int8 内核加 batch，估 3.2 ms）**，比在这里抠这些划算得多。

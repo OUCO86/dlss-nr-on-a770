@@ -79,6 +79,16 @@ layout(scalar) shared AsHalf4 { f16vec4 h4[2048]; };
 const uint VALUES = 2048u;   // where V starts, in halves; K is at 0
 const uint WINDOW_BLOCK = 4u; // row-family profile kind: attention.comp owns 0-2 and 6, window attention 3
 
+/* Where a probe may stop the kernel, to time the three phases apart. It is 0 — nothing
+ * stops — in every build that ships; `src/bench/window_block_probe.py` builds it as 1 and
+ * 2. A stop is a whole workgroup's return after a workgroup barrier, so it is uniform
+ * and legal. What it measures is biased low: the phases after the stop are gone from the
+ * compiled kernel, and with them their registers and some of the shared memory, so the
+ * part that does run may be scheduled better than it is in the kernel that runs it all. */
+#if !defined(PROBE_STOP)
+#define PROBE_STOP 0
+#endif
+
 bool image_half() { return (operation_flags() & 0x8000u) != 0u; }
 
 /* window_attention.comp's transform, on two adjacent logits of one row, the bias in them */
@@ -224,6 +234,9 @@ void main() {
         u32[(VALUES + (row + r) * 32u + g * 8u + 2u * l) / 2u] = values[g];
     }
     barrier();                                   // every row's K and V in place
+#if PROBE_STOP == 1
+    return;                                      // the projection, and nothing after it
+#endif
 
     /* Window attention, as window_attention.comp computes it for one head, merged. */
     uint head_bias = row * 64u;
@@ -329,6 +342,9 @@ void main() {
     }
     subgroupMemoryBarrierShared();
     subgroupBarrier();
+#if PROBE_STOP == 2
+    return;                                      // the attention is done, the output's is not
+#endif
     coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseA> attended[2];
     for (uint kk = 0u; kk < 2u; kk++)
         coopMatLoad(attended[kk], h16, scratch * 2u + kk * 16u, 32u,
