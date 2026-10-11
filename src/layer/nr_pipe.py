@@ -236,8 +236,11 @@ class FrameMapping:
     """
 
     MAGIC = 0x4D52534E
-    VERSION = 1
-    HEAD = 64
+    # 2 added the handles at the end of the head; the head grew from 64 to 128 bytes to
+    # hold them. A layer that only knows version 1 refuses the mapping, which is what
+    # makes growing it safe.
+    VERSION = 2
+    HEAD = 128
     SLOTS = 4
 
     def __init__(self, pipe_path, pixels, slots=SLOTS):
@@ -255,6 +258,20 @@ class FrameMapping:
         np.frombuffer(self._map, np.uint8)[::4096] = 0
         struct.pack_into("<4I", self._map, 0, self.MAGIC, self.VERSION, slots, 0)
         struct.pack_into("<QQ", self._map, 16, self.colour, self.mask)
+        # No handles yet, and the flag that says so: the layer must not read a handle
+        # out of a head that was never given one.
+        struct.pack_into("<5Q", self._map, 32, 0, 0, 0, 0, 0)
+        struct.pack_into("<I", self._map, 12, 0)
+
+    def publish_extmem(self, raw, answer, sem, raw_bytes, answer_bytes):
+        """Offer the layer the frame's buffers, as handles in *its* process.
+
+        The three numbers have to have been duplicated into the layer's process first:
+        a handle is only meaningful where it was made. The flag goes in last, so a
+        layer reading the head never sees sizes without the handles they belong to.
+        """
+        struct.pack_into("<5Q", self._map, 32, raw, answer, sem, raw_bytes, answer_bytes)
+        struct.pack_into("<I", self._map, 12, 1)
 
     def _plane(self, slot, offset, count):
         at = self.HEAD + slot * self.stride + offset

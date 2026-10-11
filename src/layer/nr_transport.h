@@ -183,9 +183,21 @@ static int nr_link_read(nr_link *link, void *data, size_t count)
  */
 
 #define NR_SHM_MAGIC 0x4D52534Eu      /* what the daemon writes in the layout head */
-#define NR_SHM_VERSION 1u
+#define NR_SHM_VERSION 2u
 #define NR_SHM_MAX_SLOTS 8u
-#define NR_SHM_HEAD 64u               /* the layout head, and the slots' alignment */
+#define NR_SHM_HEAD 128u              /* the layout head, and the slots' alignment */
+
+/* Version 2 added the three handles at the end of the head: the layout only had the
+ * two sizes in it before, and there was no room for what Phase 2 needs to say. The
+ * head grew from 64 to 128 bytes, which is also a change of version, so a layer and a
+ * daemon that disagree about it refuse the mapping instead of reading a handle out of
+ * a head that never had one.
+ *
+ * The handles are only there when `NR_EXTMEM` is set on the daemon's side. A handle is
+ * a number inside the process that holds it, so the daemon has to DuplicateHandle all
+ * three into the layer's process before writing them — the numbers it writes are not
+ * the ones it got from the driver. */
+#define NR_SHM_EXTMEM 12u             /* offset of the flag, 1 when the handles are set */
 
 /* The magic on the wire. The two shared-memory values are the pipe's two with 2 added,
  * so a daemon that has never heard of a mapping rejects them rather than reading the
@@ -194,6 +206,13 @@ static int nr_link_read(nr_link *link, void *data, size_t count)
 #define NR_MAGIC_MASKED 0x314E524Eu
 #define NR_MAGIC_SHM 0x324E524Eu
 #define NR_MAGIC_SHM_MASKED 0x334E524Eu
+/* The same two with 4 added: the frame is already in the daemon's own buffer, put
+ * there by this process, and the answer is to be read out of the daemon's own. Per
+ * frame rather than per session, because the layer may fail to import the buffers the
+ * daemon offered and then has to fall back — and a daemon that waited for a signal
+ * that was never going to come would hang until its fence timed out. */
+#define NR_MAGIC_EXTMEM 0x344E524Eu
+#define NR_MAGIC_EXTMEM_MASKED 0x354E524Eu
 
 typedef struct {
 	HANDLE mapping;
@@ -205,7 +224,9 @@ typedef struct {
 	int usable;
 } nr_shm;
 
-/* Where the daemon writes its layout, as 32-bit words then two 64-bit sizes. */
+/* Where the daemon writes its layout, as 32-bit words then 64-bit sizes. The three
+ * handles are left zero here: they are a per-process number nobody can fill in but the
+ * daemon, which writes them once it has duplicated them. */
 static void nr_shm_write_layout(unsigned char *base, unsigned slots, size_t colour,
 				size_t mask)
 {
@@ -217,6 +238,27 @@ static void nr_shm_write_layout(unsigned char *base, unsigned slots, size_t colo
 	uint64_t *sizes = (uint64_t *)(base + 16);
 	sizes[0] = (uint64_t)colour;
 	sizes[1] = (uint64_t)mask;
+	for (size_t at = 32; at < NR_SHM_HEAD; at += 8)
+		*(uint64_t *)(base + at) = 0;
+}
+
+/* The three handles the daemon duplicated into this process, or 0 for any it did not.
+ * Returns 1 when the head says they are there. The caller is expected to check the
+ * sizes too: a buffer the layer thinks is bigger than it is would be written past. */
+static int nr_shm_extmem(const nr_shm *shm, unsigned long long *raw,
+			 unsigned long long *answer, unsigned long long *sem,
+			 size_t *raw_bytes, size_t *answer_bytes)
+{
+	if (!shm->usable) return 0;
+	uint32_t *head = (uint32_t *)shm->base;
+	if (head[1] < 2 || head[NR_SHM_EXTMEM / 4] != 1) return 0;
+	uint64_t *words = (uint64_t *)(shm->base + 32);
+	*raw = words[0];
+	*answer = words[1];
+	*sem = words[2];
+	*raw_bytes = (size_t)words[3];
+	*answer_bytes = (size_t)words[4];
+	return *raw && *answer && *sem && *raw_bytes && *answer_bytes;
 }
 
 /* Opens the mapping the daemon made for this pipe, and reads its layout. Returns -1
@@ -297,6 +339,13 @@ static unsigned char *nr_shm_answer(nr_shm *shm, unsigned slot)
 #define NR_MAGIC_MASKED 0x314E524Eu
 #define NR_MAGIC_SHM 0x324E524Eu
 #define NR_MAGIC_SHM_MASKED 0x334E524Eu
+/* The same two with 4 added: the frame is already in the daemon's own buffer, put
+ * there by this process, and the answer is to be read out of the daemon's own. Per
+ * frame rather than per session, because the layer may fail to import the buffers the
+ * daemon offered and then has to fall back — and a daemon that waited for a signal
+ * that was never going to come would hang until its fence timed out. */
+#define NR_MAGIC_EXTMEM 0x344E524Eu
+#define NR_MAGIC_EXTMEM_MASKED 0x354E524Eu
 
 /* The layer's one set of call sites has to compile here too, so the shape is the same
  * and the three places are never reached: `usable` is what keeps them that way. */
@@ -340,6 +389,16 @@ static unsigned char *nr_shm_answer(nr_shm *shm, unsigned slot)
 	(void)shm;
 	(void)slot;
 	return NULL;
+}
+
+static int nr_shm_extmem(const nr_shm *shm, unsigned long long *raw,
+			 unsigned long long *answer, unsigned long long *sem,
+			 size_t *raw_bytes, size_t *answer_bytes)
+{
+	(void)shm;
+	*raw = *answer = *sem = 0;
+	*raw_bytes = *answer_bytes = 0;
+	return 0;
 }
 
 #include <sys/socket.h>

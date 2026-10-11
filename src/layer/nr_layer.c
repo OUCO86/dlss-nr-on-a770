@@ -35,6 +35,7 @@
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
 #include "nr_transport.h"
+#include "nr_extmem.h"
 
 #ifdef _WIN32
 #  include <io.h>
@@ -228,6 +229,47 @@ static void shm_look(void)
 		shm.slots, shm.colour >> 20, shm.mask >> 20);
 }
 
+/* ---- Phase 2: the frame never crosses to the CPU at all ---------------------
+ *
+ * With the daemon's own buffers imported, the layer writes the frame where the daemon
+ * reads it and reads the answer where the daemon left it. Both copies go away, and so
+ * does the pipe's part in carrying them.
+ *
+ * The daemon says which buffers in the layout head, as handles it has already
+ * duplicated into this process. Whether that worked is a per-frame question, not a
+ * per-session one: a layer that could not import them has to be able to fall back, and
+ * the magic says which way each frame went.
+ */
+static int extmem_state;              /* 0 not looked for yet, 1 held, -1 there is none */
+static unsigned long long extmem_frame;
+
+static void extmem_look(void)
+{
+	if (extmem_state) return;
+	extmem_state = -1;
+	const char *want = getenv("NR_EXTMEM");
+	if (!want || !strcmp(want, "0") || !strcmp(want, "off")) return;
+	if (shm_state != 1) return;
+	unsigned long long raw = 0, answer = 0, sem = 0;
+	size_t raw_bytes = 0, answer_bytes = 0;
+	if (!nr_shm_extmem(&shm, &raw, &answer, &sem, &raw_bytes, &answer_bytes)) return;
+	if (nrx_open(raw, raw_bytes, answer, answer_bytes, sem) != 0) {
+		fprintf(stderr, "[nr_layer] the frame's buffers could not be imported (%s); "
+			"it crosses in the mapping instead\n",
+			nrx_error() ? nrx_error() : "for a reason the layer did not record");
+		return;
+	}
+	extmem_state = 1;
+	/* One buffer, one frame: the daemon's input buffer is a single one every frame
+	 * shares, so frames must not be allowed to overlap on it. */
+	if (async_depth > 1) {
+		fprintf(stderr, "[nr_layer] the frame's buffers are shared between frames, so "
+			"they cannot overlap: %d at once was asked for, 1 will be used\n",
+			async_depth);
+		async_depth = 1;
+	}
+}
+
 static void shm_track(int fd, int slot)
 {
 	for (int i = 0; i < SHM_TRACKED; i++)
@@ -263,6 +305,39 @@ static int exchange_send(const void *header, size_t header_size, const void *pay
 		return -1;
 	}
 	shm_look();
+	extmem_look();
+	{
+		size_t raw_bytes = 0, answer_bytes = 0;
+		void *into = extmem_state == 1 ? nrx_raw(&raw_bytes) : NULL;
+		void *back = extmem_state == 1 ? nrx_answer(&answer_bytes) : NULL;
+		if (into && back && payload_size <= raw_bytes && reply_size <= answer_bytes) {
+			/* The frame number only ever goes up, which is what a timeline
+			 * semaphore's payload does too: the daemon waits for the value it is
+			 * told here, so an older frame can never satisfy a newer one. */
+			unsigned long long frame = ++extmem_frame;
+			if (nrx_signal(frame) == 0) {
+				uint32_t ext[4];
+				memcpy(ext, header, header_size < 16 ? header_size : 16);
+				ext[0] = ext[0] == NR_MAGIC_MASKED ? NR_MAGIC_EXTMEM_MASKED
+								    : NR_MAGIC_EXTMEM;
+				if (nr_link_write(&link, ext, sizeof ext) != 0) {
+					nr_link_close(&link);
+					return -1;
+				}
+				/* -2 rather than a slot: the answer is not in a slot, it is in
+				 * the buffer the daemon writes it in. */
+				shm_track(nr_link_handle(link), -2);
+				return nr_link_handle(link);
+			}
+			/* Nobody was told, so nobody must be left waiting. Give the buffers
+			 * back and send this frame the way it has always gone. */
+			fprintf(stderr, "[nr_layer] the frame could not be announced (%s); it "
+				"crosses in the mapping instead\n",
+				nrx_error() ? nrx_error() : "for a reason the layer did not record");
+			nrx_close();
+			extmem_state = -1;
+		}
+	}
 	if (shm.usable && payload_size <= shm.colour + shm.mask
 	    && reply_size <= shm.colour) {
 		/* The colour and, for a masked frame, its mask: one memcpy, the two planes
@@ -297,6 +372,24 @@ static int exchange_receive(int fd, void *reply, size_t reply_size)
 {
 	nr_link link = nr_link_from_handle(fd);
 	int slot = shm_untrack(fd);
+	if (slot == -2) {
+		/* The pipe carries four bytes — "the answer is in your buffer" — and that is
+		 * also what orders the read: it is written after the answer is. */
+		uint32_t notice = 0;
+		if (nr_link_read(&link, &notice, sizeof notice) != 0) {
+			nr_link_close(&link);
+			return -1;
+		}
+		size_t have = 0;
+		void *from = nrx_answer(&have);
+		if (!from || reply_size > have) {
+			nr_link_close(&link);
+			return -1;
+		}
+		memcpy(reply, from, reply_size);
+		nr_link_close(&link);
+		return 0;
+	}
 	if (slot >= 0) {
 		uint32_t notice = 0;
 		if (nr_link_read(&link, &notice, sizeof notice) != 0) {
@@ -778,8 +871,14 @@ static void ensure_daemon(void)
 		 * environment larger than the guess would have been truncated silently, and
 		 * the daemon would start with a partial environment and no sign of why. */
 		const char marker[] = "NR_LAYER_SPAWNED=1";
+		/* Our own pid, for Phase 2: the daemon holds the handles to the frame's
+		 * buffers, and the only way the layer can get one is for the daemon to
+		 * DuplicateHandle it across, which needs to know where to send it. */
+		char pid_var[64];
+		snprintf(pid_var, sizeof pid_var, "NR_LAYER_PID=%lu",
+			 (unsigned long)GetCurrentProcessId());
 		char *env = GetEnvironmentStringsA();
-		size_t need = sizeof marker + 1;
+		size_t need = sizeof marker + 1 + strlen(pid_var) + 1;
 		if (env)
 			for (char *e = env; *e; e += strlen(e) + 1)
 				need += strlen(e) + 1;
@@ -794,6 +893,7 @@ static void ensure_daemon(void)
 		if (env) {
 			for (char *e = env; *e; e += strlen(e) + 1) {
 				if (strncmp(e, "NR_LAYER_SPAWNED=", 17) == 0) continue;
+				if (strncmp(e, "NR_LAYER_PID=", 13) == 0) continue;
 				if (strncmp(e, "VK_INSTANCE_LAYERS=", 19) == 0) continue;
 				size_t len = strlen(e) + 1;
 				memcpy(env_block + used, e, len);
