@@ -77,6 +77,11 @@ layout(push_constant, scalar) uniform Push {
     uint64_t residual_cos;                     // the weights' per-column scales
     uint image_h, image_w, window_cols, window_pad;
     uint64_t qkv_scale;
+    /* The grouped feed-forward's row strides, past the 128 bytes every Vulkan device
+     * owes, where `libxmx.c` puts them: 80 and 88 — every other GEMM's `lda` and
+     * `ldc` — hold this kernel's two scale vectors, so there was no room at home.
+     * Zero means the dense default, which is what an unbatched call leaves them at. */
+    uint blda, bldb, bldc, bspare;
 } pc;
 
 #include "specialize.glsl"
@@ -109,6 +114,34 @@ void main() {
     uint row = gl_WorkGroupID.y * BM, col = gl_WorkGroupID.x * BN;
     uint last = pc.m - 1u;
     uint thread = gl_LocalInvocationID.x, warp = thread / 32u;
+    /* The group, and where this group's operands start.
+     *
+     * `sa`/`sb`/`sc` advance the group and are element counts, as they are for every
+     * other GEMM; the row strides default to the dense K and N. A batch of one with no
+     * strides gives every offset below zero, so the addressing a call already makes is
+     * not disturbed by any of this. A zero `sa` broadcasts A, which is what the
+     * branched feed-forward wants: one activation, `groups` sets of weights.
+     *
+     * A and B are read a `uvec4` at a time — sixteen int8 operands to a word — so
+     * their counts are divided once here, not per load. The division is exact because
+     * the integer GEMM takes K a multiple of 64 and each stride is a whole number of
+     * rows or columns of it. */
+    uint batch = gl_WorkGroupID.z;
+    uint lda = pc.blda != 0u ? pc.blda : pc.k;
+    uint ldb = pc.bldb != 0u ? pc.bldb : pc.k;
+    uint ldc = pc.bldc != 0u ? pc.bldc : pc.n;
+    uint ao = batch * (pc.sa / 16u), bo = batch * (pc.sb / 16u), co = batch * pc.sc;
+    uint awords = lda / 16u, bwords = ldb / 16u;
+    /* One scale per row of A, and how far apart the groups' are. Zero is the cheap case
+     * and the one the grouped feed-forward wants: one quantise pass over the whole wide
+     * activation, one scale per row, every group reading the same one. A group of its
+     * own would cost a partition first — the slices are column slices of a wider buffer,
+     * not consecutive rows — and that is a pass this change exists to avoid paying. */
+    uint roff = batch * pc.bspare;
+    /* The same for the weights' per-column scales: a strided B gives every group a
+     * whole matrix of its own (`sb` is N x K for all four grouped feed-forwards), so
+     * its scales are a group's worth apart too. */
+    uint soff = pc.sb != 0u ? batch * pc.n : 0u;
     /* A: BM rows of BK bytes. At 64 rows a thread takes two whole words of one row —
      * sixty-four bytes to two of us, and there are 128 of us — and at 32 it takes one
      * word, four of us to a row. B: 32 columns of BK bytes, a thread one word of one
@@ -127,16 +160,15 @@ void main() {
     coopmat<int8_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> fa[RM];
     coopmat<int8_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> fb[RN];
 
-    uint words = pc.k / 16u;                   // a row of A or a column of B, in words
     for (uint k0 = 0; k0 < pc.k; k0 += BK) {
         barrier();
-        uint at = min(row + ar, last) * words + k0 / 16u + ah;
+        uint at = ao + min(row + ar, last) * awords + k0 / 16u + ah;
 #if STAGED_BM == 32
-        uvec4 b0 = pc.b.v[(col + bn) * words + k0 / 16u + bh];
+        uvec4 b0 = pc.b.v[bo + (col + bn) * bwords + k0 / 16u + bh];
         wa[(ar * SA) / 16u + ah] = pc.a.v[at];
 #else
         uvec4 a0 = pc.a.v[at], a1 = pc.a.v[at + 1u];
-        uvec4 b0 = pc.b.v[(col + bn) * words + k0 / 16u + bh];
+        uvec4 b0 = pc.b.v[bo + (col + bn) * bwords + k0 / 16u + bh];
         wa[(ar * SA) / 16u + ah] = a0;
         wa[(ar * SA) / 16u + ah + 1u] = a1;
 #endif
@@ -171,7 +203,7 @@ void main() {
             uint r = min(row + e / BN, last);
             uint c = col + e % BN;
             float scale = pc.a_scale.v[r];
-            vec4 column = Vec4Buf(uint64_t(pc.b_scale)).v[c >> 2];
+            vec4 column = Vec4Buf(uint64_t(pc.b_scale)).v[(soff + c) >> 2];
             for (uint q = 0u; q < 4u; q++)
                 stage[e + q] = floatBitsToInt(float(stage[e + q]) * scale * column[q]);
         }
@@ -219,11 +251,11 @@ void main() {
         uint c = col + e % BN;
         /* Window padding has no place in the image and must not touch the skip. */
 #ifdef INT8_RESIDUAL
-        uint at = r * pc.n + c;
+        uint at = co + r * ldc + c;
         if (adding && !residual_output_index(at)) continue;
 #endif
-        float scale = row_scale.v[r];
-        vec4 column = Vec4Buf(pc.residual_cos).v[c >> 2];
+        float scale = row_scale.v[roff + r];
+        vec4 column = Vec4Buf(pc.residual_cos).v[(soff + c) >> 2];
         vec4 out4;
 #ifdef INT8_RESIDUAL
         if (adding) {
@@ -261,9 +293,9 @@ void main() {
         else
             Half4Buf(uint64_t(pc.c)).v4[at >> 2] = f16vec4(out4);
 #else
-            Vec4Buf(uint64_t(pc.c)).v[(r * pc.n + c) >> 2] = out4;
+            Vec4Buf(uint64_t(pc.c)).v[(co + r * ldc + c) >> 2] = out4;
         else
-            Half4Buf(uint64_t(pc.c)).v4[(r * pc.n + c) >> 2] = f16vec4(out4);
+            Half4Buf(uint64_t(pc.c)).v4[(co + r * ldc + c) >> 2] = f16vec4(out4);
 #endif
     }
 }

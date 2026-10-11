@@ -143,12 +143,26 @@ struct push {
 	/* The QKV projection's epilogue (`qkv_epilogue.glsl`): the query's per-head scale.
 	 * 128 bytes in all, the push-constant size every Vulkan device must support. */
 	uint64_t qkv_scale;
+	/* The batched integer GEMM's row strides, appended past the 128 bytes above.
+	 *
+	 * The 128 are full: `gemm_staged_int8.comp` spends 80 and 88 — where every other
+	 * GEMM keeps `lda` and `ldc` — on its two scale vectors, because the QKV epilogue
+	 * needs two more pointers than the block had room for and the grouped feed-forward
+	 * was not on the integer path when the block was laid out. Rather than move a
+	 * field and rebuild every shader and recorded graph against a new ABI, the integer
+	 * GEMM reads its leading from here when `flags` carries `INT8_BATCHED`.
+	 *
+	 * Every Vulkan device owes 128; the Arc's limit is 256 (`vulkaninfo`, measured on
+	 * both adapters here), so 160 costs nothing. A shader declaring only the first 128
+	 * still links: it is the layout that is wider, not the block the shaders read. */
+	uint32_t blda, bldb, bldc, bspare;
 };
 _Static_assert(offsetof(struct push, lda) == 80, "attention QKV scale pointer ABI");
 _Static_assert(offsetof(struct push, residual_cos) == 96, "residual epilogue ABI");
 _Static_assert(offsetof(struct push, qkv_scale) == 120, "QKV epilogue ABI");
 _Static_assert(offsetof(struct push, p0) == 64, "the merged feed-forward reads p0-p1 as an address");
-_Static_assert(sizeof(struct push) == 128, "push block matches the GEMM shaders");
+_Static_assert(offsetof(struct push, blda) == 128, "batched integer GEMM ABI");
+_Static_assert(sizeof(struct push) <= 256, "push block fits the Arc's limit");
 
 const char *xmx_error(void) { return g.err; }
 int xmx_device_lost(void) { return g.lost; }
@@ -2183,6 +2197,50 @@ int xmx_rec_gemm_int8(int a, int b, int c, int a_scale, int b_scale,
 	 * BN / TN, so the tile grid inside the block changes with the shape while
 	 * the block itself does not. */
 	vkCmdDispatch(g.rcb, N / XMX_STAGED_BN, XMX_DIV_UP(M, XMX_STAGED_BM), 1);
+	barrier();
+	stamp(PK_GEMM, 30);
+	g.recorded++;
+	return 0;
+}
+
+/* The grouped feed-forward on the integer path: the same product as above, `batch`
+ * independent groups at a time.
+ *
+ * The call above has nowhere to put a group index — the push block below 128 bytes is
+ * full of scale pointers — so the groups it runs become one dispatch each, and the
+ * float16 GEMM it competes with (`xmx_rec_gemm`) needs only one for all of them. That
+ * is the whole of what `src/bench/ffn_int8_probe.py` measured as the integer path
+ * losing: at four groups it is 9.81 ms against 9.55 ms float and batched, while the
+ * same integer product unbatched beats the same float product unbatched by 1.55x
+ * (`work/probe-ffn-int8.txt`). Batching is worth 5.37 ms of the 14.92 the unbatched
+ * float call costs, and the integer GEMM was never able to take it.
+ *
+ * `sa`/`sb`/`sc` advance the group, in elements; `sa == 0` broadcasts A, which is how
+ * the branched feed-forward feeds one activation to every group. `blda`/`bldb`/`bldc`
+ * override the row strides — the groups' inputs and outputs are column slices of wider
+ * buffers, not consecutive dense matrices. Zero means the dense default, so a call
+ * with `batch == 1` and no strides is bit-identical to `xmx_rec_gemm_int8`.
+ */
+int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
+			      unsigned M, unsigned N, unsigned K, unsigned batch,
+			      unsigned sa, unsigned sb, unsigned sc,
+			      unsigned lda, unsigned ldb, unsigned ldc,
+			      unsigned scale_stride, unsigned flags)
+{
+	if (!g.recording || !g.rint8) FAIL("integer GEMM not ready for recording", 0);
+	if (!M || !N || N % 32u || !K || K % 64u)
+		FAIL("the integer GEMM needs N a multiple of 32 and K of 64", 0);
+	if (!batch) FAIL("the batched integer GEMM needs at least one group", 0);
+	struct push p = { .a = addr_of(a), .b = addr_of(b), .c = addr_of(c), .d = addr_of(a_scale),
+			  .m = M, .n = N, .k = K, .batch = batch, .flags = flags,
+			  .residual_cos = addr_of(b_scale),
+			  .sa = sa, .sb = sb, .sc = sc,
+			  .blda = lda, .bldb = ldb, .bldc = ldc, .bspare = scale_stride };
+	if (!p.a || !p.b || !p.c || !p.d || !p.residual_cos)
+		FAIL("integer GEMM operand is not a live buffer", 0);
+	vkCmdBindPipeline(g.rcb, VK_PIPELINE_BIND_POINT_COMPUTE, g.rint8);
+	vkCmdPushConstants(g.rcb, g.rpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof p, &p);
+	vkCmdDispatch(g.rcb, N / XMX_STAGED_BN, XMX_DIV_UP(M, XMX_STAGED_BM), batch);
 	barrier();
 	stamp(PK_GEMM, 30);
 	g.recorded++;

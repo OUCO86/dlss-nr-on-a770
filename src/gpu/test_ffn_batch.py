@@ -99,6 +99,11 @@ def host_checks():
                 "fuse_stem_ffn", "fuse_pool", "fuse_window_block", "fuse_head",
                 "fuse_global_attention", "int8_project")
     rt = object.__new__(xmxres.Runtime)
+    # `graph_key` reads every switch that changes the graph, three of which this sweep
+    # does not vary. Pinned off here rather than added to it, since each switch added
+    # doubles the sweep. (`int8_qkv` and `int8_window_fuse` were missing outright, which
+    # made the sweep raise before it reached the first key.)
+    rt.int8_qkv = rt.int8_window_fuse = rt.int8_ffn_groups = False
     seen = bytearray(1 << 22)
     walked = 0
 

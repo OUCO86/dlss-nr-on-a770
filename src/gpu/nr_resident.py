@@ -46,6 +46,60 @@ def quantise_weight(runtime, array):
             runtime.buffer_from(scale, np.float32))
 
 
+def quantise_grouped_weight(runtime, array):
+    """A per-group weight tensor on the integer path, or None if the shape will not pay.
+
+    `array` is (groups, inner, cols) — `group_expand_weight`, `group_project_weight` and
+    the branched blocks' fused expansion alike. Each group is quantised on its own: the
+    scale is one per output column, and a single grid over all of them would let a group
+    with large weights flatten its neighbours'.
+
+    The kernel reads group `g`'s matrix at `g * cols * inner` and its scales at
+    `g * cols`, which is the order these are concatenated in.
+
+    Only the tile gate is applied here: whether a shape is worth putting on the integer
+    path at all depends on the row count, which is a property of the extent and is
+    known only where the product is recorded, so `grouped_integer_pays` decides there.
+    """
+    groups, inner, cols = array.shape
+    if cols % 32 or inner % 64:
+        return None
+    packed = np.empty((groups, cols, inner), np.int8)
+    scale = np.empty((groups, cols), np.float32)
+    for group in range(groups):
+        p, s = int8_quant.quantise(array[group], 0)
+        packed[group] = p.T
+        scale[group] = s
+    return (runtime.buffer_from(np.ascontiguousarray(packed.reshape(-1, inner)), np.int8),
+            runtime.buffer_from(np.ascontiguousarray(scale.reshape(-1)), np.float32))
+
+
+def grouped_integer_pays(rows, cols, inner):
+    """Whether a grouped product's shape is faster on the integer path. Measured, not argued.
+
+    `work/probe-ffn-int8-batched.txt` times all seven shapes the frame groups, four
+    routes each, alternating in one process. Two of the seven lose, and both lose by
+    less than ten microseconds a call, against wins of twelve to eighty-two elsewhere:
+
+        1344 x  32 x 128    +6.3 us      384 x 256 x  64    +9.6 us
+        1344 x 128 x 256   -34.1 us      384 x  64 x 256   -12.2 us
+        5376 x  32 x 128    -4.6 us    21504 x  32 x 128   -28.7 us
+                                       21504 x 128 x  64   -82.2 us
+
+    The two that lose are the shallow ones at a small row count: at 1344 rows a group
+    has 1344 x 32 outputs to show for its quantise, and the integer GEMM's halved
+    multiply-add cannot give back what that costs. At 21504 rows the same 32 columns
+    win by 28.7, so it is not the narrow N on its own — it is narrow N over too few
+    rows. Below 64 columns the product has to be over 5376 rows to pay; at 256 columns
+    and 64 deep it does not pay at any row count the frame runs.
+    """
+    if cols % 32 or inner % 64:
+        return False
+    if (cols, inner) == (256, 64):
+        return False
+    return cols >= 64 or rows >= 5376
+
+
 def integer_pair(w, s):
     """A block's quantised down projection with this scratch's row grid, or None.
 
@@ -98,6 +152,20 @@ class SplitBlockWeights:
         # be carried: Q, K and V, whose Q and K are normalised after the scales land
         self.int8_qkv = (quantise_weight(runtime, weights[f"block{index}.layer2.qkv_weight"])
                          if runtime.int8_qkv else None)
+        # The split family's first projection is not grouped — it is one 512x512 product
+        # a block — but it is the single largest win left in the frame's float16 products:
+        # 16 of them, 63.6 us each cheaper on the integer path
+        # (`work/probe-ffn-int8-batched.txt`). It needs no batch to take it.
+        self.int8_first = (quantise_weight(
+            runtime, weights[f"block{index}.layer0.first_projection_weight"])
+            if runtime.int8_ffn_groups else None)
+        # the split family's per-group expansion and projection, on the integer grid
+        self.int8_expand = self.int8_project = None
+        if runtime.int8_ffn_groups:
+            self.int8_expand = quantise_grouped_weight(
+                runtime, weights[f"block{index}.layer0.group_expand_weight"])
+            self.int8_project = quantise_grouped_weight(
+                runtime, weights[f"block{index}.layer0.group_project_weight"])
 
 
 class BlockWeights:
@@ -164,6 +232,13 @@ class BlockWeights:
                 self.int8_out = quantise_weight(runtime, self.projection)
         self.int8_qkv = (quantise_weight(runtime, weights[f"{prefix}.qkv_weight"])
                          if runtime.int8_qkv else None)
+        # the branched blocks' per-group expansion and contraction, the same way. Only
+        # the branched blocks have groups, so an ordinary block leaves these None and
+        # its feed-forward is the single product it always was.
+        self.int8_expand = self.int8_branch = None
+        if runtime.int8_ffn_groups and self.branched:
+            self.int8_expand = quantise_grouped_weight(runtime, expansion)
+            self.int8_branch = quantise_grouped_weight(runtime, branch)
 
 
 class GlobalBlockWeights:
@@ -590,13 +665,24 @@ class BlockScratch:
 
 
 def _ffn_groups(runtime, a, b, c, rows, cols, inner, groups, *, leading, strides,
-                epilogue):
+                epilogue, integer=None):
     """Independent group products, with the same tiles and rounding in either mode.
 
     Batch strides advance the group, row strides advance the pixel within that group.
     In particular, a zero A batch stride broadcasts the branched FFN input; output
     groups occupy disjoint column slices, not consecutive dense matrices.
+
+    `integer` is `(weights, scales, activations, row scales)` on the integer grid, the
+    activations already quantised by the caller — one pass over the whole of them, one
+    scale per row, which every group then reads. Without it the float call is made
+    exactly as it always was.
     """
+    if integer is not None:
+        weight8, column_scale, a8, row_scale = integer
+        runtime.gemm_int8_batched(a8, weight8, c, row_scale, column_scale,
+                                  rows, cols, inner, batch=groups, strides=strides,
+                                  leading=leading, epilogue=epilogue, narrow=True)
+        return
     if runtime.batch_ffn:
         runtime.gemm(a, b, c, rows, cols, inner, batch=groups, strides=strides,
                      leading=leading, epilogue=epilogue, narrow=True)
@@ -669,12 +755,30 @@ def record_feed_forward(runtime, w, s, source, source_half=False, source16=None,
             runtime.ffn_fused(value16, w.expand, w.branch, s.heads16, pixels, channels, 128,
                               groups=w.groups, epilogue=xmxres.EPI_E4M3, narrow=True)
         else:
+            # One quantise over the whole activation, one scale per row, every group
+            # reading both: the expansion broadcasts A, so there is only one grid to
+            # make and no partition to pay for.
+            integer = None
+            if (getattr(w, "int8_expand", None) is not None
+                    and grouped_integer_pays(pixels, 128, channels)):
+                runtime.quantize_row(value16, s.aq, s.ascale, pixels, channels)
+                integer = (w.int8_expand[0], w.int8_expand[1], s.aq, s.ascale)
             _ffn_groups(runtime, value16, w.expand, s.hidden16, pixels, 128, channels,
                         w.groups, leading=(0, 0, s.hidden_width),
-                        strides=(0, channels * 128, 128), epilogue=xmxres.EPI_GATE_E4M3)
+                        strides=(0, channels * 128, 128), epilogue=xmxres.EPI_GATE_E4M3,
+                        integer=integer)
+            # The contraction is 32 columns over the same rows, and at the extents where
+            # that pays — 5376 rows and more — it does, while at 1344 it does not. The
+            # gate decides; at the small extents this stays the float call it was.
+            integer = None
+            if (getattr(w, "int8_branch", None) is not None
+                    and grouped_integer_pays(pixels, 32, 128)):
+                runtime.quantize_row(s.hidden16, s.aq, s.ascale, pixels, s.hidden_width)
+                integer = (w.int8_branch[0], w.int8_branch[1], s.aq, s.ascale)
             _ffn_groups(runtime, s.hidden16, w.branch, s.heads16, pixels, 32, 128,
                         w.groups, leading=(s.hidden_width, 0, channels),
-                        strides=(128, 128 * 32, 32), epilogue=xmxres.EPI_E4M3)
+                        strides=(128, 128 * 32, 32), epilogue=xmxres.EPI_E4M3,
+                        integer=integer)
         # the fused multi-head kernels publish the residual before attention reads it,
         # which the residual now does on its way out — as half, which holds it exactly
         record_project_residual(runtime, s.heads16, w.ffn_out, s.branch, source, w.ffn_cos,
@@ -712,14 +816,29 @@ def record_split_feed_forward(runtime, w, s, source, source_half=False):
     value16 = source if source_half else s.value16
     if not source_half:
         runtime.e4m3_half(source, s.value16, pixels * channels)
-    runtime.gemm(value16, w.first, s.heads16, pixels, channels, channels,
-                 epilogue=xmxres.EPI_E4M3, narrow=True)
+    if getattr(w, "int8_first", None) is not None:
+        runtime.quantize_row(value16, s.aq, s.ascale, pixels, channels)
+        runtime.gemm_int8(s.aq, w.int8_first[0], s.heads16, s.ascale, w.int8_first[1],
+                          pixels, channels, channels, epilogue=xmxres.EPI_E4M3, narrow=True)
+    else:
+        runtime.gemm(value16, w.first, s.heads16, pixels, channels, channels,
+                     epilogue=xmxres.EPI_E4M3, narrow=True)
     _ffn_groups(runtime, s.heads16, w.expand, s.hidden16, pixels, 256, 64,
                 groups, leading=(channels, 0, wide),
                 strides=(64, 64 * 256, 256), epilogue=xmxres.EPI_GATE)
+    # The projection is the one of the split family's two group products that pays: its
+    # K is 256, four tiles deep, where the expansion's is 64 and too shallow to hide a
+    # quantise behind. The groups take column slices of one wide activation, so the
+    # quantise is one pass over all of it and they share its row scales.
+    integer = None
+    if (getattr(w, "int8_project", None) is not None
+            and grouped_integer_pays(pixels, 64, 256)):
+        runtime.quantize_row(s.hidden16, s.aq, s.ascale, pixels, wide)
+        integer = (w.int8_project[0], w.int8_project[1], s.aq, s.ascale)
     _ffn_groups(runtime, s.hidden16, w.project, s.core16, pixels, 64, 256,
                 groups, leading=(wide, 0, channels),
-                strides=(256, 256 * 64, 64), epilogue=xmxres.EPI_E4M3)
+                strides=(256, 256 * 64, 64), epilogue=xmxres.EPI_E4M3,
+                integer=integer)
     record_project_residual(runtime, s.core16, w.weight3, s.branch, source, w.ffn_cos,
                             s.ffn, pixels, channels, channels, skip_half=source_half,
                             epilogue=xmxres.EPI_E4M3, narrow=True, integer=integer_pair(w, s))

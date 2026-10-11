@@ -175,6 +175,12 @@ def _load():
         lib.xmx_rec_gemm_window_int8_residual.restype = ctypes.c_int
         lib.xmx_int8_residual_init.argtypes = [ctypes.c_char_p]
         lib.xmx_int8_residual_init.restype = ctypes.c_int
+    # The grouped feed-forward's recorder, guarded for the same reason: the daemon holds a
+    # native build open, and a build without this symbol must still load. `int8_ffn_groups`
+    # reads it back, so a tree running an older library keeps the float grouped GEMM.
+    if hasattr(lib, "xmx_rec_gemm_int8_batched"):
+        lib.xmx_rec_gemm_int8_batched.argtypes = [ctypes.c_int] * 5 + [ctypes.c_uint] * 10
+        lib.xmx_rec_gemm_int8_batched.restype = ctypes.c_int
     lib.xmx_buf_ptr.argtypes = [ctypes.c_int]
     lib.xmx_buf_ptr.restype = ctypes.c_void_p
     lib.xmx_buf_bytes.argtypes = [ctypes.c_int]
@@ -700,6 +706,26 @@ class Runtime:
         # which is the only way to A/B the two within one process anyway.
         self.int8_residual = (os.environ.get("NR_INT8_RESIDUAL", "1") != "0"
                               and hasattr(self.lib, "xmx_rec_gemm_int8_residual"))
+        # The grouped feed-forward on the integer path: the branched and split blocks'
+        # per-group expansion and projection, which are 104 of a frame's dispatches and
+        # 8.5 of its 34.6 ms on the device.
+        #
+        # They stayed float for a reason that was measured and is now gone. `gemm_int8`
+        # had no group index, so the integer path had to record one dispatch per group
+        # while the float one recorded one for all of them; `work/probe-ffn-int8.txt`
+        # measured that as a 0.26 ms loss and it was read as the integer GEMM losing.
+        # What it was losing was the batching: unbatched against unbatched it wins by
+        # 1.55x, and batching the float call is worth 5.37 ms of 14.92. With the group
+        # inside the dispatch the two combine — `work/probe-ffn-int8-batched.txt` puts
+        # the frame's 130 products at 6.98 ms integer against 9.57 float, 27 %, and that
+        # includes the quantise pass each one costs.
+        #
+        # Off until the picture has been looked at: every other integer projection in the
+        # graph paid for its speed with some of the network's own effect, and this is the
+        # largest group of them yet. `NR_INT8_FFN_GROUPS=1` turns it on.
+        self.int8_ffn_groups = (self.int8_project
+                                and os.environ.get("NR_INT8_FFN_GROUPS", "0") != "0"
+                                and hasattr(self.lib, "xmx_rec_gemm_int8_batched"))
 
     def graph_key(self):
         return (self.lib.xmx_specialization() | (int(self.fuse_qk) << 3)
@@ -725,7 +751,8 @@ class Runtime:
                 | (int(self.fuse_head) << 22)
                 | (int(self.fuse_global_attention) << 23)
                 | (int(self.int8_project) << 24) | (int(self.int8_qkv) << 25)
-                | (int(self.int8_window_fuse) << 26))
+                | (int(self.int8_window_fuse) << 26)
+                | (int(self.int8_ffn_groups) << 27))
 
     def scratch_key(self):
         """What decides which scratch a frame's recording touches: the switches, not the
@@ -992,6 +1019,61 @@ class Runtime:
         if self.lib.xmx_rec_gemm_int8(a.id, b.id, c.id, a_scale.id, b_scale.id,
                                       rows, cols, inner, _publish(epilogue, narrow)) != 0:
             raise RuntimeError("xmx_rec_gemm_int8: " + self.lib.xmx_error().decode())
+        self.recorded += 1
+        return self
+
+    def gemm_int8_batched(self, a, b, c, a_scale, b_scale, rows, cols, inner, *,
+                          batch=1, strides=None, leading=None, scale_stride=0,
+                          epilogue=0, narrow=False):
+        """`batch` independent integer products, one dispatch for all of them.
+
+        The grouped feed-forward's shape: `batch` groups, each its own slice of the
+        weights and of the output, all of them over the same rows. `strides` are element
+        counts per group, defaulting to the dense packing; a zero `strides[0]`
+        broadcasts A, which is what the branched feed-forward wants — one activation,
+        `groups` sets of weights.         `leading` overrides the row strides of A, B and C,
+        because the groups' operands are column slices of wider buffers rather than
+        consecutive dense matrices.
+
+        `scale_stride` is how far apart the groups' row scales are: zero for one set of
+        scales every group reads, which is one quantise pass over the whole activation,
+        and `rows` for a set per group, which costs a partition first because a group's
+        rows are a column slice.
+
+        With `batch=1` and no strides or leading this is the call above, and the kernel
+        is built so that every offset it computes is then zero.
+        """
+        if rows <= 0 or cols <= 0 or cols % 32 or inner <= 0 or inner % 64:
+            raise ValueError("the integer GEMM needs cols a multiple of 32 and inner of 64")
+        if batch <= 0:
+            raise ValueError("the batched integer GEMM needs at least one group")
+        lda, ldb, ldc = leading or (0, 0, 0)
+        lda = lda or inner
+        ldb = ldb or inner
+        ldc = ldc or cols
+        sa, sb, sc = strides or (rows * lda, cols * ldb, rows * ldc)
+        row_bytes = 2 if narrow else 4
+        # A broadcast A needs only one group's worth of rows, scales included; a strided
+        # one needs `batch` lots, and the kernel adds `batch * rows` to reach them.
+        # How many row scales there have to be: one set, or one set per group.
+        a_rows = rows if scale_stride == 0 else (batch - 1) * scale_stride + rows
+        # A group's slice is an offset on the whole operand plus a row stride within it,
+        # not a slice out of each row, so the last row contributes `inner` (or `cols`)
+        # elements rather than a whole stride's worth.
+        for buf, needed in ((a, (rows - 1) * lda + (batch - 1) * sa + inner),
+                            (b, (cols - 1) * ldb + (batch - 1) * sb + inner),
+                            (c, ((rows - 1) * ldc + (batch - 1) * sc + cols) * row_bytes),
+                            (a_scale, a_rows * 4), (b_scale, cols * batch * 4)):
+            if buf.nbytes < needed:
+                raise ValueError("integer GEMM buffer is too small")
+        path = os.environ.get("XMX_INT8_SPV") or str(ROOT / "work" / "gemm_staged_int8.spv")
+        if self.lib.xmx_int8_init(path.encode()) != 0:
+            raise RuntimeError("integer GEMM pipeline: " + self.lib.xmx_error().decode())
+        if self.lib.xmx_rec_gemm_int8_batched(
+                a.id, b.id, c.id, a_scale.id, b_scale.id, rows, cols, inner, batch,
+                sa, sb, sc, lda, ldb, ldc, scale_stride,
+                _publish(epilogue, narrow)) != 0:
+            raise RuntimeError("xmx_rec_gemm_int8_batched: " + self.lib.xmx_error().decode())
         self.recorded += 1
         return self
 
