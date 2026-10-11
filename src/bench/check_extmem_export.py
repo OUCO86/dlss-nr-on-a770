@@ -91,6 +91,14 @@ def main():
         print(f"kind must be one of {sorted(KINDS)}")
         return 1
     kind = KINDS[which]
+    # How the *import* asks to be mapped, which is a separate question from what the
+    # buffer was allocated as. `device` asks for DEVICE_LOCAL, `cached` for
+    # HOST_CACHED; on this card that is type 3 against type 2, and it is the whole
+    # difference between the host reading the answer at 0.02 GB/s and at 19.5 GB/s.
+    mapped = sys.argv[3].lower() if len(sys.argv) > 3 else "device"
+    if mapped not in ("device", "cached", "visible"):
+        print("the import must be mapped device, cached or visible")
+        return 1
     nbytes = int(megabytes * (1 << 20))
     if not EXE.exists():
         print(f"missing {EXE} — build it with tools\\build_extmem_xproc.bat")
@@ -116,7 +124,7 @@ def main():
     view[:] = WROTE
     print(f"wrote {view.nbytes} bytes of {WROTE:#02x}")
 
-    proc = subprocess.Popen([str(EXE), "guest", "-", f"{WROTE:02x}", str(nbytes)],
+    proc = subprocess.Popen([str(EXE), "guest", "-", f"{WROTE:02x}", str(nbytes), mapped],
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True)
     dup = duplicate_into(proc.pid, handle)

@@ -643,11 +643,19 @@ static int guest_main(const char *handle_hex, const char *expect_hex, const char
 	 *
 	 * The driver answers 0x0 for the handle's memoryTypeBits (see §15), so it is
 	 * the buffer's own requirements that are looked at. */
-	VkMemoryPropertyFlags want = (mode && !strcmp(mode, "cached"))
-		? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-		   VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
-		: (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-		   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+	VkMemoryPropertyFlags want;
+	if (mode && !strcmp(mode, "cached"))
+		want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+		       VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+	else if (mode && !strcmp(mode, "visible"))
+		/* What nr_extmem.c asked for before: the first host-visible type found,
+		 * which on this card is type 1 — host-visible and coherent, but neither
+		 * device-local nor cached. Kept so the three can stand next to each
+		 * other, because it is the one that was in the game. */
+		want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+	else
+		want = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+		       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 	uint32_t type = pick_memory(rb, ~0u, want);
 	if (type == UINT32_MAX)
 		type = pick_memory(rb, ~0u, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);

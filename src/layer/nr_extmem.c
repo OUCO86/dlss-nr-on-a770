@@ -170,28 +170,23 @@ static int make_device(void)
 
 /* ------------------------------------------------------------ imported memory -- */
 
-/* The memory types an imported buffer may ask for, in the order they suit the two
- * halves of Phase 2. They are opposites, on purpose:
+/* The memory types an imported buffer may ask for.
  *
- *   RAW_    the daemon's *device* reads it every frame. Device-local is the fast
- *           place for that, and the host side only ever writes, which is the cheap
- *           direction through the bar even uncached. This is type 3 here.
- *   HOST_   the *host* reads it every frame — the answer, in the layer. A read of
- *           device memory through the bar is uncached and cannot be posted: 7.9 MB
- *           measures 376.77 ms there against 0.40 ms out of cached system memory
- *           (check_bar_read.py). HOST_CACHED is what buys that. This is type 2 here,
- *           and it is the same bit nr_layer.c:1346 asks for first for its own
- *           staging buffer, which is why the host read on the way in was never slow.
+ * Both halves ask for the same thing, and that is not laziness — it is measured.
  *
- * Picking "the first host-visible type" answers both with type 3, and with it a
- * frame rate that follows the answer's read down.
+ * The guess was that the answer wanted HOST_CACHED and the frame's bytes wanted
+ * DEVICE_LOCAL, because the host reads one and the device reads the other. Timed
+ * on the same handle, all three asks read the same: 1.78 ms for 8 MB as type 1,
+ * 1.78 as type 3, 1.78 as type 2, over three rounds (`check_extmem_export.py 8
+ * HOST_READ visible|device|cached`). What an import may be mapped *as* does not
+ * move the memory; the handle already names physical pages, and it is the source
+ * the daemon allocated that decides what a read costs. So there is nothing here
+ * to choose, and the way in — which has been measured in the game at 40.0 ms —
+ * is not being changed on a guess.
  *
- * The driver answers vkGetMemoryWin32HandlePropertiesKHR with memoryTypeBits 0x0 on
- * this card, so the buffer's own requirements are what is looked at. */
-#define WANT_RAW   (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | \
-		    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-#define WANT_HOST  (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | \
-		    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
+ * The two names stay, because the question is worth being able to ask again. */
+#define WANT_RAW   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+#define WANT_HOST  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
 
 static uint32_t pick_type(VkMemoryRequirements *req, VkMemoryPropertyFlags want)
 {
