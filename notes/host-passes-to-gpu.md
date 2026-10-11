@@ -352,8 +352,47 @@ x 已经是 half 就是恒等），但会轻微扰动 `cut`（0.0049，相对扰
 3. `to_answer` 53.23 减去上面各项之和约 48.4 → **约 4.9 ms 未归因**，下一轮要拆开。
 4. `post_send` 0.11（fresh）/ 0.42（held）。
 
-### 10.4 下一步
+### 10.4 ✅ 已做：letterbox 改在字节上判，`decode` 不再每帧做（commit 5933b8f）
 
-先做 10.3 的第 1 条：设备路径下让 `decode` 只在真正需要全帧 fp32 时才做
-（letterbox 改在字节上判），**省约 2 ms**，且不动任何已验证的开关。
-再回头拆那 4.9 ms 的未归因部分。
+**为什么可以**：`LETTERBOX_TOLERANCE` 是 `2/255`，这是一句关于整数的话 —— 一条黑边
+就是"每个颜色字节 ≤ 2"。而 RGB 三个字节恰好是 u32 的**低 24 位**（`bgra8` 与 `rgba8`
+只是顺序不同，取最大值不在乎），alpha 在上面那个字节，不参与。
+
+    所以整条线是否全黑 = `(word & 0x00FFFFFF).max() <= 0x020202`
+
+`WORD_DARK` 由 `int(LETTERBOX_TOLERANCE * 255 + 0.5) * 0x010101` 算出来，跟着 tolerance 走。
+`a2b10g10r10` 是 10-bit 打包、没有这样的字节 → 保留宿主路径。
+
+**代价对比**（1920×1080，中位，纯 CPU）：
+
+| | 之前 | 之后 |
+|---|---|---|
+| `decode`（8 MB → 25 MB fp32） | **3.08 ms** | 0（不做了） |
+| `Letterbox` 缓存命中（8 条线） | 0.02 ms | **0.02 ms** |
+| 合计 | 3.10 ms | **0.02 ms** |
+
+（`daemon_stages` 里量到的是 2.00 ms，这次 3.08 是因为量的时候游戏在跑、CPU 有争用。
+相对值可信。）
+
+**什么时候仍然解码**（`stage_prepare`）：`request is None`（前段没上设备）、`boxed`、
+`--dump` / `--meter`、或 `NR_POSTPASS=0`。`stage_finish` 里 `device` 判据为假时也会
+补一次解码（带 interface mask 的帧、强度不为 1），**任何回退路径都不会拿到 None**。
+
+**验证**：新增 `src/bench/check_letterbox_words.py`，**30 例 0 分歧** ——
+条形边 / 条形边＋柱子 / **恰好压在阈值上（字节 2）** / **阈值之上（字节 3）** /
+暗场景 / 全黑帧 / 只有一侧（不是 letterbox）／三种分辨率，外加缓存路径的 6 帧
+（其中一帧强制失效重扫）。
+
+### 10.5 🚩 这次踩的坑：解包顺序
+
+`Letterbox._holds(colour, words, shape)` 里我写成 `height, width = shape`，
+而 `active_region_words(words, *shape)` 要的是 `(width, height)` —— **行列反了**，
+`reshape(1920, 1080)` 还能成功（总数一样），于是判定每帧失效、退回全帧扫描
+（**2.20 ms** 而不是 0.02 ms）。修复后 `shape[::-1]`。
+⚠️ 这类 bug 不会报错、不会算错，只会变慢 —— 只能靠时间断言抓。
+
+### 10.6 下一步
+
+1. 拆 `to_answer` 里**约 4.9 ms 未归因**的部分（10.3 第 3 条）。
+2. 补设备模式的 `held%` / `released%`（previous 现在是字节，没解码）。
+3. 管道 `receive` 1.48 + `send` 1.04 是跨进程固有成本，暂不动。
