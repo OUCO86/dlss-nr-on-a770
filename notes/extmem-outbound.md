@@ -313,3 +313,59 @@ answer 留在 type 2（系统内存）并导出它，layer 仍从系统内存读
 离线账本当时就给了信号：回程关 34.80 ms / 回程开 **35.77 ms**（+0.97 ms）。
 我把它解释成"账本只量设备时间，省的是宿主 memcpy，量不到"就开了。
 **那个信号是对的，我不该绕过去。** 离线数字与预期相反时，先解释清楚再上线。
+
+## 修正与补全（回答"去程不也一样吗"）
+
+### 用户问得对：去程里 layer 本来就在读一块 BAR 映射，为什么不慢？
+
+因为**那块不是 BAR 显存**。`nr_layer.c:1346` 分配 staging 时的优先顺序是：
+
+```c
+type = memory_type(data, bits, HOST_VISIBLE | HOST_COHERENT | HOST_CACHED);
+if (type == UINT32_MAX)
+    type = memory_type(data, bits, HOST_VISIBLE | HOST_COHERENT);
+```
+
+**`HOST_CACHED` 排在最前面**，而独显一定提供这种类型——它就是**系统内存**，
+进 CPU cache、有硬件预取。所以 layer 读 AMD 的 staging 是在读系统内存，
+19.5 GB/s 那一档，不是 0.02 GB/s 那一档。
+
+而 A770 的 **type 3** 是 `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT`，
+**没有 HOST_CACHED** —— 它是真 VRAM 通过 BAR，uncached。回程把答案放进它，
+layer 再读，就落到了 0.02 GB/s 那一档。
+
+🚩 **分水岭不是"显存 vs 系统内存"，是那块内存带不带 `HOST_CACHED`。**
+
+| 内存 | 标志 | CPU 读 7.9 MB |
+|---|---|---|
+| 系统内存（layer 的 staging 在这） | HOST_VISIBLE+COHERENT+**CACHED** | 0.40 ms |
+| 真 VRAM 过 BAR（回程把答案放这儿） | DEVICE_LOCAL+HOST_VISIBLE+COHERENT（**无 CACHED**） | 376.77 ms |
+
+### 所以不对称的根源是"写还是读"，不是"谁在做"
+
+两个方向里 GPU 那一步都很快、且都不是变量（`gpu` 两场都是 38 ms，一动没动）：
+- 去程：GPU 把 image 拷进 staging（AMD 卡上，与 Intel 无关）
+- 回程：GPU 把答案写进 buffer（写自己的内存，0.36 ms）
+
+Phase 2 真正改动的，都是 layer 对**同一块 uncached BAR 显存**做的那个动作：
+
+| | layer 对 BAR 显存做 | 事务类型 | 价 |
+|---|---|---|---|
+| 去程 | **写** | posted，可合并，不等回应 | 8.3 MB ≈ 1.5 ms　**成立** |
+| 回程 | **读** | non-posted，uncached 无预取，64 B 一次往返 | 7.9 MB ≈ 376 ms　**不成立** |
+
+### 要说清楚的一点：376 ms 不是游戏里看到的数字
+
+游戏里回程的表现是 **40.0 → 50.0 ms 掉了一个帧率档（25→20 fps），然后 255 帧后闪退**，
+不是 +376 ms。帧时间只有 10 ms 精度且被 vsync 量化，量不出真实代价；
+layer 里的 memcpy 与我离线测的读取粒度也不一定一样。
+
+**方向是确定的（掉档 + 崩溃），幅度不能拿 376 ms 直接套。**
+离线那个数字的作用是说明"这个方向差 950 倍"，不是预测游戏里会慢多少。
+
+### 那为什么去程也没看到收益？
+
+同样是精度问题：帧时间只有 10 ms 精度 + vsync 量化，
+量不出设计文档估的 1.5–2 ms。去程开与不开**都是 40.0 ms**——
+这既不能证明有收益，也不能证明没收益。**要看清这个量级的差异，得换指标**
+（daemon 自己记的分段时间，或者不看 vsync 的裸时间）。
