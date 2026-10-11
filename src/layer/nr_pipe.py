@@ -184,11 +184,26 @@ class NamedPipeServer:
         if not self._handle:
             # Every instance was in use last time round; make a new one now.
             self._handle = self._make()
-        ok = _k32.ConnectNamedPipe(self._handle, None)
-        if not ok:
+        # ConnectNamedPipe says no in two ways that are not failures, and both have
+        # to be told apart from one that is:
+        #   ERROR_PIPE_CONNECTED (535) - the client was already there, which is the
+        #     ordinary case when it connected while we were between instances;
+        #   ERROR_NO_DATA (232) - a client connected and hung up again before we
+        #     got here, which a layer that closed its frame's connection does as a
+        #     matter of course. The endpoint has to be reset and waited on again.
+        #   Anything else is a real error.
+        # Raising on the second is what let one closed connection end the daemon
+        # and leave the game waiting on a pipe nobody answered.
+        for attempt in range(64):
+            ok = _k32.ConnectNamedPipe(self._handle, None)
+            if ok:
+                break
             err = ctypes.get_last_error()
-            if err != ERROR_PIPE_CONNECTED:
+            if err == ERROR_PIPE_CONNECTED:
+                break
+            if err != ERROR_NO_DATA:
                 raise OSError(err, "ConnectNamedPipe")
+            _k32.DisconnectNamedPipe(self._handle)
         connection = NamedPipeConnection(self._handle, self._timeout)
         # A fresh pipe instance replaces the one just handed over, so the next
         # `accept` waits on a new endpoint rather than the one in use. When the
@@ -244,6 +259,25 @@ class FrameMapping:
     SLOTS = 4
 
     def __init__(self, pipe_path, pixels, slots=SLOTS):
+        """Make the mapping, or open the one already there — and lay the head out.
+
+        Constructing one is not a read-only act, and that is worth saying plainly
+        because it cost a day. It rewrites the head (so handles published in it
+        are gone) and it touches a byte a page across the *whole* mapping, slots
+        included. Open one after an answer has been written into a slot and you
+        have zeroed a byte of every 4096 of that answer.
+
+        At 1920x1080 that is 2024 bytes: one byte a page, every 8 rows by every
+        128 columns, channel 0 only, and the same ones every time — which is what
+        a frame that came back wrong looks like, and is not. `check_extmem_
+        roundtrip.py` had this in the loop that read the answer back and spent a
+        day measuring its own footprint.
+
+        Only the daemon makes one (`_mapping`), once, before any frame. The layer
+        opens the mapping in C, `nr_shm_open`, which reads the head and writes
+        nothing. A test that wants to read an answer out of a slot has to open
+        the mapping before the frame, and keep it.
+        """
         self.name = "Local\\NR_SHM_" + pipe_path.rsplit("\\", 1)[-1]
         self.slots = slots
         self.colour = pixels * 4

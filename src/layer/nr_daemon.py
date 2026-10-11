@@ -723,9 +723,22 @@ class History:
         inner = None
         if self.inner is not None and self.inner.shape[:2] == shape[:2]:
             inner = self.inner
-        elif isinstance(previous, np.ndarray):
+        elif isinstance(previous, np.ndarray) and previous.ndim >= 3:
             # Absent when the device kept the prediction: `POST_HISTORY` writes the
-            # resample as part of the frame before's own submission.
+            # resample as part of the frame before's own submission. What is here
+            # then is `self.words` — the bytes the game sent, undecoded, one
+            # dimension and four channels to a pixel, which is not a frame and
+            # cannot be resampled.
+            #
+            # It is here at all because `history_full` is a flag as much as a
+            # frame: three callers ask `history_full is not None` and mean "the
+            # device has it". The `ndim` is what keeps the flag from being taken
+            # for the frame. Without it a game running Phase 2 lost every frame
+            # to `resample`'s `height, width = image.shape[:2]` — "expected 2,
+            # got 1" — because a frame that crossed in the daemon's own buffer
+            # is a NumPy array where one that crossed on the wire is bytes, and
+            # `isinstance(..., np.ndarray)` alone let the array through.
+            # `check_history_words.py` asks both ways.
             inner = (previous if previous.shape[:2] == shape[:2]
                      else resample(previous, shape[:2]))
         return inner, previous, self.pixels
@@ -826,6 +839,31 @@ def explain(error):
     return FAILURES.get(int(code.group(1)), "") if code else ""
 
 
+# A frame that fails does so every frame, and a message a frame is a message that
+# buries the one thing that would have said where: it says "not enough values to
+# unpack" seven thousand times and never once which line. So the traceback goes
+# with the first failure of each kind and not with the rest — the log keeps one
+# line a frame, and the one frame that had something to say still said it.
+_seen_failures = set()
+
+
+def frame_failure(error):
+    """`error` as it is printed for a frame the game will not get back, once with
+    its traceback."""
+    text = f"frame rejected/failed; game keeps original: {error}{explain(error)}"
+    key = (type(error).__name__, str(error))
+    if key in _seen_failures:
+        return text
+    _seen_failures.add(key)
+    import traceback
+    return (text + "\n  the first frame to fail this way, and where:\n"
+            + "".join(traceback.format_exception(type(error), error,
+                                                 error.__traceback__)))
+
+
+
+
+
 class Pipeline:
     """The three stages on three threads: prepare, network, finish.
 
@@ -918,8 +956,7 @@ class Pipeline:
             try:
                 stage_finish(frame, self.backend, self.args)
             except (EOFError, OSError, ValueError, RuntimeError) as error:
-                print(f"frame rejected/failed; game keeps original: {error}{explain(error)}",
-                      flush=True)
+                print(frame_failure(error), flush=True)
             except BaseException as error:      # noqa: BLE001 - DeviceLost reaches the loop
                 self._fail(error)
             finally:
@@ -1022,8 +1059,7 @@ def serve(server, backend, args):
             print(DEVICE_LOST.format(error=error), flush=True)
             raise SystemExit(1) from error
         except (EOFError, OSError, ValueError, RuntimeError) as error:
-            print(f"frame rejected/failed; game keeps original: {error}{explain(error)}",
-                  flush=True)
+            print(frame_failure(error), flush=True)
         finally:
             if pipeline is None:
                 connection.close()

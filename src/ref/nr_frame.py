@@ -520,6 +520,18 @@ class ResidentBackend:
         if self._extmem_raw is None or self._extmem_raw.nbytes < pixels * 4:
             if self._extmem_raw is not None:
                 self._extmem_raw.free()
+            # HOST_WRITE, which on this card is the card's own memory seen through
+            # the bar - the same place every other host-written buffer in the graph
+            # lives, and the nearer of the two for the device that reads this one.
+            #
+            # HOST_READ was tried here and put back. It was a cure for 2024 bytes a
+            # frame that were never the buffer's to answer for: the round-trip check
+            # opened a second FrameMapping over the slot after the answer had gone
+            # into it, and opening one touches a byte a page across the whole
+            # mapping - one byte of every 4096 of the answer, which is 2024 of them
+            # at 1920x1080, every 8 rows by every 128 columns, channel 0 only. The
+            # bytes were the test's own. `check_answer_where.py` reads every frame's
+            # answer out of the same slot and finds none.
             self._extmem_raw = self.runtime.buffer(pixels, np.uint32,
                                                    self._module.xmxres.HOST_WRITE,
                                                    exportable=True)
