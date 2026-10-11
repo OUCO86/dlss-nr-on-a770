@@ -1138,6 +1138,10 @@ def stage_prepare(connection, backend, args, pipeline=None):
     slot = None
     frame = 0
     in_raw = False
+    # Named here because an unmasked frame never reaches a line that would: only the
+    # two older arms assign it, so a frame in the daemon's own buffer arrived at
+    # `if interface is not None` with no such name and took the daemon down.
+    interface = None
     extmem = magic in (MAGIC_EXTMEM, MAGIC_EXTMEM_MASKED)
     if magic in (MAGIC_SHM, MAGIC_SHM_MASKED) and mapping is not None:
         slot = struct.unpack("<I", bytes(receive(connection, 4)))[0]
@@ -1906,7 +1910,16 @@ def main():
         finally:
             server.close()
             if args.mapping is not None:
-                args.mapping.close()
+                # A frame's bytes are still-handed-out views of the mapping when the
+                # daemon is told to stop mid-frame, and an mmap with exported pointers
+                # refuses to close. On the way out that is noise, not a failure - but
+                # an exception here replaces whatever actually ended the run, which is
+                # the only thing the log was going to say about it.
+                try:
+                    args.mapping.close()
+                except (BufferError, ValueError) as error:
+                    print(f"the mapping would not close on the way out ({error})",
+                          flush=True)
             backend.close()
         return
 
