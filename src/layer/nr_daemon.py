@@ -1204,6 +1204,15 @@ def stage_finish(frame, backend, args):
         fused = DEVICE
         metred = 0
     else:
+        if head is None:
+            # The device kept the head, which the host's composition needs, and this
+            # frame cannot be composed there — an interface mask has no counterpart
+            # in the shader. Hand it back as the game sent it rather than fall over.
+            # No game this was measured on sends a mask at all.
+            connection.sendall(payload)
+            print("  passed through: an interface mask, which the device's "
+                  "composition does not have", flush=True)
+            return
         # Nothing downstream reads the composition unless --dump is saving it or
         # --meter is differencing it, and neither is on while a game is running;
         # everyone else wanted one number from it, so meter it inside the pass and

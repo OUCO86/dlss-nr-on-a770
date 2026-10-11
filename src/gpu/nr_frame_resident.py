@@ -811,7 +811,7 @@ class RequestPass:
         # The head's samples for the log's gate: every `step`-th pixel of every
         # `step`-th row of the *output*, chosen so the count is the head's own every
         # eighth — the host sampled `head[::8, ::8]`, at the network's extent.
-        self.step = max(1, 8 * self.source_width // max(1, self.inner_width))
+        self.step = 8
         self.sampled_w = -(-self.source_width // self.step)
         self.sampled_h = -(-self.source_height // self.step)
         self.partial_at = 0
@@ -929,11 +929,20 @@ class RequestPass:
         have taken to put in a HOST_READ buffer, which on this card is system
         memory, measured 4.91 ms against 0.03 ms.
         """
+        # `grade_for` is None for a profile with no grade, and the three slots have to
+        # be there either way — the scalar block is a fixed layout, and a short one
+        # would shift `hist_at` and `write_at` into the grade's place.
+        values = np.zeros(3, np.float32)
+        flat = (np.asarray(grade, np.float32).reshape(-1)
+                if grade is not None else values)
+        do_grade = flat.size >= 3
+        if do_grade:
+            values = flat[:3]
         scalars = np.asarray([
             intensity, scale, hold, slope, release, confidence,
             0.0, 0.0, float(self.source_width), float(change_rows), float(self.step),
             float(self.samples_at), float(self.encoded_at), float(self.partial_at), 0.0,
-            *(grade if grade is not None else (0.0, 0.0, 0.0)),
+            float(values[0]), float(values[1]), float(values[2]),
             float(self.hist_at), float(self.write_at)], np.float32)
         params = self._parameters(scalars)
         self.rt.begin()
@@ -944,7 +953,7 @@ class RequestPass:
             head_height=self.inner_height, channels=channels,
             with_history=has_history,
             with_previous=has_history and self.know_bytes and (hold > 0 or release > 0),
-            grade=grade is not None, neural=keep_neural, bgra=bgra)
+            grade=do_grade, neural=keep_neural, bgra=bgra)
         if keep_neural:
             # After the composition, in the same submission: what it wrote is what
             # this gathers. It could not ride in the composition's own dispatch —
