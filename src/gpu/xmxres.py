@@ -35,7 +35,7 @@ TM, TN, TK = 8, 16, 16
 (E4M3, GATE, HALF, TO_HALF, SCALE, RESIDUAL, FROM_HALF, PARTITION, REVERSE, ADD_BIAS,
  SPLIT_HEADS, MERGE_HEADS, POOL2, UPSAMPLE2, SCALE_CHANNEL, ADD, PAD_END,
  GATE_E4M3_HALF, E4M3_HALF, GATE_HALF, UPSAMPLE_MERGE, UPSAMPLE_ADD, POOL2_SKIP,
- PRE_INNER, PRE_FEATURES, POST_COMPOSE) = range(26)
+ PRE_INNER, PRE_FEATURES, POST_COMPOSE, POST_HISTORY) = range(27)
 COSINE_PUBLISH, SOFTMAX, VIT_SOFTMAX = 0, 1, 6
 
 # Flags above every bit the graph's own passes read, so none of them can be mistaken
@@ -1581,6 +1581,25 @@ class Runtime:
                                    answer.id, int(width * height), int(channels), 0.0,
                                    int(head_height), int(width), int(height),
                                    int(source_width), int(head_width)) != 0:
+            raise RuntimeError("xmx_rec_unary2: " + self.lib.xmx_error().decode())
+        self.recorded += 1
+        return self
+
+    def post_history(self, state, plan, target, *, width, at, inner_width,
+                     inner_height):
+        """The prediction a frame just made, at the extent the network reads.
+
+        Two `nr_resize_axis` passes over what the composition wrote into `state` at
+        `at` — what the host's `History.inner` used to be, a resample of the frame
+        before's output, so the frame after can stand it in channels 7 to 9. It runs
+        after the composition in the same submission, which is what makes reading
+        the prediction it just wrote safe.
+        """
+        if self.lib.xmx_rec_unary2(POST_HISTORY, state.id, plan.id, target.id,
+                                   state.id, target.id,
+                                   int(inner_width * inner_height), 3, 0.0,
+                                   int(inner_height), int(width), int(at),
+                                   int(inner_width), 0) != 0:
             raise RuntimeError("xmx_rec_unary2: " + self.lib.xmx_error().decode())
         self.recorded += 1
         return self

@@ -162,7 +162,7 @@ class ResidentFrame:
             return getattr(self.__dict__["w"], name)
         raise AttributeError(name)
 
-    def __init__(self, runtime, weights, height, width):
+    def __init__(self, runtime, weights, height, width, head_on_device=False):
         self.split = (0.0, 0.0, 0.0)      # host write, graph, host read, of the last frame
         # a caller may hand over shared weights or the raw tensors; the benches and tests
         # hand over tensors, and then this frame owns the upload as it always did
@@ -177,6 +177,15 @@ class ResidentFrame:
         self._planned = None      # what the arena was planned for: `_prepare_scratch`
         self._closed = False
         self._head_free = []      # host blocks a returned head was in and nobody holds now
+        # The head is the one thing the host used to take back, and it is the reason
+        # the composition had to stay on the host: 25 MB of float32 would have to cross
+        # the bus to get back onto the card. Leaving it where the graph put it is what
+        # lets the rest of the frame follow it.
+        self.head_on_device = head_on_device
+        self.host_side = dict(self.HOST_SIDE)
+        if head_on_device:
+            self.host_side.pop("head", None)
+            self.host_side.pop("head4", None)
 
     @staticmethod
     def _plan(height, width):
@@ -255,7 +264,7 @@ class ResidentFrame:
             if existing is not None:
                 existing.free()
             existing = self.rt.buffer(elements, dtype,
-                                      kind=self.HOST_SIDE.get(name, xmxres.GRAPH))
+                                      kind=self.host_side.get(name, xmxres.GRAPH))
             self._buffers[name] = existing
         return existing
 
@@ -683,6 +692,10 @@ class ResidentFrame:
             counter[0] = rt.submit()
         if submits is not None:
             submits.append(counter[0])
+        if self.head_on_device:
+            # Where the graph left it, and how many channels apart one pixel is: the
+            # composition reads it there and nothing is copied either way.
+            return self.head_buffer(), (4 if rt.compact_head else 16)
         return self.read_head()
 
 
@@ -722,6 +735,21 @@ def _feature_plan(geometry, noise, controls):
     joined = np.ascontiguousarray(np.concatenate([rows, columns, flat,
                                                   np.asarray(controls, np.float32)]))
     return joined, rows.size, rows.size + columns.size
+
+
+def _axis(source_extent, count):
+    """`nr_image._axis_plan`'s three arrays, packed as one float32 run.
+
+    The two integer indices travel as bits in floats, which is how the other plans
+    in this file carry them: one buffer, no second descriptor.
+    """
+    packed = []
+    for array in nr_image._axis_plan(source_extent, count):
+        flat = np.ascontiguousarray(np.asarray(array).reshape(-1))
+        if flat.dtype != np.float32:
+            flat = np.ascontiguousarray(flat.astype(np.int32)).view(np.float32)
+        packed.append(flat.astype(np.float32))
+    return np.ascontiguousarray(np.concatenate(packed))
 
 
 class RequestPass:
@@ -769,12 +797,51 @@ class RequestPass:
         self.plan_inner = _upload(runtime, self.inner_plan)
         self.plan_features = _upload(runtime, self.feature_plan)
 
+        # -- what the composition needs -----------------------------------------
+        # The output extent is the request's own: a letterboxed frame keeps the host's
+        # path, so here the active region is the whole frame.
+        self.frame_pixels = self.source_width * self.source_height
+        # Two of the frame before's state — the prediction it made, then the words it
+        # was given — read at `hist_at` and written at `write_at`. The host's `History`
+        # kept 25 MB of float32 pixels and resampled them; this keeps neither.
+        self.before = runtime.buffer(8 * self.frame_pixels, np.float32, xmxres.GRAPH)
+        self.hist_at, self.write_at = 0, 4 * self.frame_pixels
+        self.know_bytes = False
+        self.groups_f = -(-self.frame_pixels // 256)
+        # The head's samples for the log's gate: every `step`-th pixel of every
+        # `step`-th row of the *output*, chosen so the count is the head's own every
+        # eighth — the host sampled `head[::8, ::8]`, at the network's extent.
+        self.step = max(1, 8 * self.source_width // max(1, self.inner_width))
+        self.sampled_w = -(-self.source_width // self.step)
+        self.sampled_h = -(-self.source_height // self.step)
+        self.partial_at = 0
+        self.samples_at = self.groups_f
+        self.encoded_at = self.groups_f + self.sampled_w * self.sampled_h * 4
+        self.answer_size = self.encoded_at + self.frame_pixels
+        # Only the words have to reach the host, and they are what makes this a
+        # HOST_READ buffer: 8.3 MB of it, against 24.9 more for a composition nothing
+        # reads.
+        self.answer = runtime.buffer(self.answer_size, np.float32, xmxres.HOST_READ)
+        self.params = None
+        self._params_view = None
+        self._plan_size = 0
+        self._plan_block = None
+        # The prediction, brought back to the network's extent for the frame after:
+        # both axes of the resample the host's `History.inner` used to be.
+        self.inner_gather = _upload(runtime, np.concatenate([
+            _axis(self.source_height, self.inner_height),
+            _axis(self.source_width, self.inner_width)]))
+
     def close(self):
         """Give the buffers back. An extent change builds a new pass, and waiting for
         the garbage collector to get to the old one leaves both resident."""
         for buffer in (self.raw, self.history, self.partial, self.plan_inner,
-                       self.plan_features, *self.inner):
+                       self.plan_features, self.before, self.answer,
+                       self.inner_gather, *self.inner):
             buffer.free()
+        if self.params is not None:
+            self.params.free()
+            self.params = None
 
     def prepare(self, payload):
         """Decode and resample `payload` into the network's extent.
@@ -802,12 +869,16 @@ class RequestPass:
         self.current = target
         return cut
 
-    def assemble(self, history=None):
+    def assemble(self, history=None, history_on_device=False):
         """Those pixels into the sixteen channels the graph reads, in the graph's input.
 
         Returns the input itself, so `ResidentFrame.run` sees the features already
         there and copies nothing.
+
+        `history_on_device` when the frame before left its prediction there —
+        `finish` writes it in `POST_HISTORY` — and there is nothing to upload.
         """
+        there = history is not None or history_on_device
         if history is not None:
             xmxres.host_write(self.history, history)
         frame = self.backend.frame(*self.extent)
@@ -817,8 +888,87 @@ class RequestPass:
                              height=self.geometry.network_height,
                              inner_width=self.inner_width, columns_at=self.columns_at,
                              noise_at=self.noise_at, controls_at=self.controls_at,
-                             history=None if history is None else self.history)
+                             history=self.history if there else None)
         self.rt.submit()
         # The graph's own input, so `ResidentFrame.run` sees the features already there
         # and copies nothing — the same frame it will ask the backend for.
         return frame.input_view()
+
+    def _parameters(self, scalars):
+        """The one block the composition reads: both gather tables, the 256 byte
+        values, the gate's 65536 entries, and the scalars that move with the knobs.
+
+        Only the scalars change from frame to frame, and the block is HOST_WRITE —
+        the card's own memory, mapped — so a frame writes twenty floats rather than
+        rebuilding three hundred kilobytes.
+        """
+        if self.params is None:
+            import nr_frame as reference
+            plan = np.concatenate([
+                _axis(self.inner_height, self.source_height),
+                _axis(self.inner_width, self.source_width),
+                np.arange(256, dtype=np.float32) / np.float32(255.0),
+                reference.gate_table(float(reference.BLEND_SCALE))])
+            self._plan_size = plan.size
+            self.params = self.rt.buffer(plan.size + scalars.size, np.float32,
+                                          xmxres.HOST_WRITE)
+            self._params_view = xmxres.host_view(self.params,
+                                                 shape=(plan.size + scalars.size,))
+            self._params_view[:plan.size] = plan
+        self._params_view[self._plan_size:] = scalars
+        return self.params
+
+    def finish(self, head, head_stride, *, channels, intensity, scale, grade,
+               confidence, hold, slope, release, has_history, keep_neural,
+               change_rows=4, bgra=True):
+        """The head brought up to the frame, composed, and encoded into the words.
+
+        Returns `(words, change, samples)`: what the game is handed, the figure the
+        log prints, and the head's samples the gate is read off. The composition
+        itself is not among them — it stays on the card, and the 24.9 MB it would
+        have taken to put in a HOST_READ buffer, which on this card is system
+        memory, measured 4.91 ms against 0.03 ms.
+        """
+        scalars = np.asarray([
+            intensity, scale, hold, slope, release, confidence,
+            0.0, 0.0, float(self.source_width), float(change_rows), float(self.step),
+            float(self.samples_at), float(self.encoded_at), float(self.partial_at), 0.0,
+            *(grade if grade is not None else (0.0, 0.0, 0.0)),
+            float(self.hist_at), float(self.write_at)], np.float32)
+        params = self._parameters(scalars)
+        self.rt.begin()
+        self.rt.post_compose(
+            self.raw, head, params, self.before, self.answer,
+            width=self.source_width, height=self.source_height,
+            source_width=self.source_width, head_width=head_stride,
+            head_height=self.inner_height, channels=channels,
+            with_history=has_history,
+            with_previous=has_history and self.know_bytes and (hold > 0 or release > 0),
+            grade=grade is not None, neural=keep_neural, bgra=bgra)
+        if keep_neural:
+            # After the composition, in the same submission: what it wrote is what
+            # this gathers. It could not ride in the composition's own dispatch —
+            # the pixels it reads are other invocations' writes.
+            self.rt.post_history(self.before, self.inner_gather, self.history,
+                                 width=self.source_width, at=self.write_at,
+                                 inner_width=self.inner_width,
+                                 inner_height=self.inner_height)
+        self.rt.submit()
+        view = self._answer_view()
+        words = view[self.encoded_at:].view(np.uint32)
+        rows = -(-self.source_height // change_rows)
+        change = (float(view[self.partial_at:self.samples_at].sum())
+                  / float(rows * self.source_width * 3))
+        count = self.sampled_h * self.sampled_w * channels
+        samples = view[self.samples_at:self.samples_at + count].reshape(
+            self.sampled_h, self.sampled_w, channels)
+        # What was written is what the frame after this one reads.
+        self.hist_at, self.write_at = self.write_at, self.hist_at
+        self.know_bytes = True
+        return words, change, samples
+
+    def _answer_view(self):
+        if getattr(self, "_answer_mapped", None) is None:
+            self._answer_mapped = xmxres.host_view(self.answer,
+                                                   shape=(self.answer_size,))
+        return self._answer_mapped

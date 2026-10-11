@@ -201,6 +201,10 @@ SOLID_RADIUS = 3
 # quarter of the time; `--dump` and `--meter` aside, only the figure wants the frame.
 CHANGE_ROWS = 4
 
+# What `fused` is when the card composed the frame: there is no host composition to
+# unwrap, because the answer went from the device straight to the game.
+DEVICE = "device"
+
 
 class Settings:
     """The knobs, re-read from a JSON file whenever it changes.
@@ -510,6 +514,10 @@ class History:
         self.source = None      # (inner_h, inner_w, 3), the game's own last frame
         self.pixels = None      # (active_h, active_w, 3), the game's own last frame, whole
         self.inner = None       # `output` at the network's input extent, taken ahead
+        # When the device keeps the frame before, this is the only part the host
+        # still holds: the bytes the game sent, undecoded. The prediction lives in
+        # the composition's own buffer and the pixels are decoded inside the pass.
+        self.words = None
         self.frames = 0
         self.cut = 0.0
         # The cut's difference, written into rather than made: `np.abs(source - self.source)`
@@ -528,11 +536,12 @@ class History:
         the frame before's inner is wanted on the host at all (`RequestPass`), and the
         cut test costs a read of one sum instead of a pass over the whole extent.
         """
-        previous = self.output
+        previous = self.output if self.output is not None else self.words
         self.cut = 0.0 if cut is None else cut
         shape = source if isinstance(source, tuple) else tuple(source.shape)
         if key != self.key or previous is None or self.source_shape != shape:
             self.key, self.output, self.pixels, self.frames = key, None, None, 0
+            self.words = None
             self.source_shape = shape
             self.inner = None
             return None, None, None
@@ -548,21 +557,34 @@ class History:
             # per pixel, but it was characterised at full scale on a pan (phase12); a
             # whole-frame replacement is the one case worth refusing outright.
             self.output = self.source = self.pixels = self.inner = None
+            self.words = None
             self.frames = 0
             return None, None, None
+        inner = None
         if self.inner is not None and self.inner.shape[:2] == shape[:2]:
             inner = self.inner
-        else:
-            inner = previous if previous.shape[:2] == shape[:2] else resample(previous, shape[:2])
+        elif isinstance(previous, np.ndarray):
+            # Absent when the device kept the prediction: `POST_HISTORY` writes the
+            # resample as part of the frame before's own submission.
+            inner = (previous if previous.shape[:2] == shape[:2]
+                     else resample(previous, shape[:2]))
         return inner, previous, self.pixels
 
-    def keep(self, key, output, source, pixels):
+    def keep(self, key, output, source, pixels, words=None):
         shape = source if isinstance(source, tuple) else tuple(source.shape)
-        self.key, self.output, self.pixels = key, output, pixels
+        self.key = key
         self.source_shape = shape
         if not isinstance(source, tuple):
             self.source = source
         self.frames += 1
+        if words is not None:
+            # The device keeps the prediction and it decodes the pixels, so the host
+            # keeps neither: what it holds is the bytes the game sent, undecoded —
+            # 8.3 MB against the 25 MB of float32 and a resample this used to be.
+            self.words = words
+            self.output = self.pixels = self.inner = None
+            return
+        self.output, self.pixels = output, pixels
         # The next frame's history at the network's extent, resampled now — the daemon
         # calls this after the answer has gone, while the game draws its next frame —
         # instead of on that frame's own path: the same resample of the same array, so the
@@ -881,7 +903,7 @@ class Frame:
                  "colour", "active_height", "active_width", "inner", "geometry", "shot",
                  "history_inner", "history_full", "history_pixels", "features",
                  "channels", "grade", "neural", "control", "held", "previous", "kind",
-                 "head", "split")
+                 "head", "split", "request", "head_device", "head_stride")
 
     def __init__(self, **fields):
         for name in self.__slots__:
@@ -1029,7 +1051,12 @@ def stage_prepare(connection, backend, args, pipeline=None):
     # decides either way.
     if request is not None:
         # The sixteen channels are already in the graph's own input, written there.
-        features = request.assemble(history_inner)
+        # `history_inner` being absent while there is a history is how the device says
+        # it kept the prediction itself: `POST_HISTORY` wrote it after the frame
+        # before's composition, and there is nothing to upload.
+        features = request.assemble(
+            history_inner,
+            history_on_device=history_inner is None and history_full is not None)
     else:
         discrete = getattr(getattr(getattr(backend, "runtime", None), "lib", None),
                            "xmx_discrete", None)
@@ -1081,7 +1108,9 @@ def stage_prepare(connection, backend, args, pipeline=None):
     # (`nr_frame.compose`, `history_previous`); only its share for the log line is taken
     # here, on every eighth pixel of every eighth row — exactly the values the full floor
     # has there.
-    previous = (history_pixels if history_pixels is not None
+    # An array when the host kept the frame before's pixels; bytes when the device
+    # did, and then the floor is taken inside the composition, which already has them.
+    previous = (history_pixels if isinstance(history_pixels, np.ndarray)
                 and (live.hold > 0 or live.release > 0) else None)
     # The head's upscale, the composition and the encoder as one pass where the knobs
     # leave `compose_detail` a no-op: separately they were three passes over the full
@@ -1098,7 +1127,8 @@ def stage_prepare(connection, backend, args, pipeline=None):
                  history_inner=history_inner, history_full=history_full,
                  history_pixels=history_pixels, features=features, channels=channels,
                  grade=grade, neural=neural, control=control, held=held,
-                 previous=previous, kind=kind, head=None, split=None)
+                 previous=previous, kind=kind, head=None, split=None,
+                 request=request, head_device=None, head_stride=0)
 
 
 def stage_network(frame, backend):
@@ -1108,7 +1138,15 @@ def stage_network(frame, backend):
     would overwrite it before this one's log line is written. It is copied out here,
     while it is still this frame's.
     """
-    frame.head = frame.geometry.crop(backend.run_features(frame.features))
+    result = backend.run_features(frame.features)
+    if isinstance(result, tuple):
+        # Left where the graph put it. The composition reads it there, and the 25 MB
+        # of float32 it would take to bring it back — and to send it out again —
+        # stays on the card.
+        frame.head_device, frame.head_stride = result
+        frame.head = None
+    else:
+        frame.head = frame.geometry.crop(result)
     frame.split = tuple(getattr(backend, "split", (0.0, 0.0, 0.0)))
 
 
@@ -1138,29 +1176,59 @@ def stage_finish(frame, backend, args):
     previous = frame.previous
     kind = frame.kind
     head = frame.head
+    request = frame.request
     fused = None
-    # Nothing downstream reads the composition unless --dump is saving it or --meter is
-    # differencing it, and neither is on while a game is running; everyone else wanted one
-    # number from it, so meter it inside the pass and withhold the frame.
-    metred = 0
-    if (kind in ("bgra8", "rgba8") and live.detail_strength == 1 and live.colour_strength == 1
-            and head.shape[0] <= active_height and head.shape[1] <= active_width):
-        if not (args.dump or args.meter is not None):
-            metred = CHANGE_ROWS
-        answer = (payload if isinstance(payload, bytearray) and held is None
-                  else bytearray(payload))
-    fused = nr_frame.compose_encode(
-        head[..., :channels], colour,
-        np.frombuffer(answer, np.uint8).reshape(height, width, 4),
-        top=top, left=left, bgra=kind == "bgra8", intensity=live.intensity,
-        control_mask=control, history=history_full, history_confidence=live.temporal,
-        history_previous=previous, history_hold=live.hold,
-        history_release=live.release, samples=8, grade=grade, neural=neural,
-        change_rows=metred)
+    changed = None
+    # Where the device can carry the composition and the encoding as well, it does,
+    # and the host never holds the composed frame at all. An interface mask has no
+    # counterpart in the shader yet, and --dump and --meter want the composition
+    # itself, so all three keep the host's path.
+    device = (getattr(args, "postpass", False) and request is not None
+              and frame.head_device is not None and held is None
+              and not (args.dump or args.meter is not None)
+              and kind in ("bgra8", "rgba8")
+              and live.detail_strength == 1 and live.colour_strength == 1
+              and inner_width <= active_width)
+    if device:
+        words, changed, samples = request.finish(
+            frame.head_device, frame.head_stride, channels=channels,
+            intensity=float(live.intensity), scale=float(nr_frame.BLEND_SCALE),
+            grade=tuple(np.asarray(grade).reshape(-1)[:3]),
+            confidence=float(np.clip(np.float32(live.temporal), 0.0, 1.0)),
+            hold=float(live.hold),
+            slope=float(np.float32(-255.0 * live.hold / HOLD_RAMP)),
+            release=float(nr_frame.release_slope(live.release)),
+            has_history=history_full is not None, keep_neural=live.temporal > 0,
+            change_rows=CHANGE_ROWS, bgra=kind == "bgra8")
+        encoded, composed, full = words, None, None
+        fused = DEVICE
+        metred = 0
+    else:
+        # Nothing downstream reads the composition unless --dump is saving it or
+        # --meter is differencing it, and neither is on while a game is running;
+        # everyone else wanted one number from it, so meter it inside the pass and
+        # withhold the frame.
+        metred = 0
+        if (kind in ("bgra8", "rgba8") and live.detail_strength == 1
+                and live.colour_strength == 1
+                and head.shape[0] <= active_height and head.shape[1] <= active_width):
+            if not (args.dump or args.meter is not None):
+                metred = CHANGE_ROWS
+            answer = (payload if isinstance(payload, bytearray) and held is None
+                      else bytearray(payload))
+        fused = nr_frame.compose_encode(
+            head[..., :channels], colour,
+            np.frombuffer(answer, np.uint8).reshape(height, width, 4),
+            top=top, left=left, bgra=kind == "bgra8", intensity=live.intensity,
+            control_mask=control, history=history_full, history_confidence=live.temporal,
+            history_previous=previous, history_hold=live.hold,
+            history_release=live.release, samples=8, grade=grade, neural=neural,
+            change_rows=metred)
     full = None
     rows = slice(None, None, CHANGE_ROWS)
-    changed = None
-    if fused is not None:
+    if fused is DEVICE:
+        pass                    # the words, the change and the samples came together
+    elif fused is not None:
         # With metring the composition never left the pass: `(change, samples)` comes back
         # instead of `(composition, samples)`. Either way `samples` the gate reads the same.
         if metred:
@@ -1234,7 +1302,10 @@ def stage_finish(frame, backend, args):
         # what it holds. Three frame copies a frame were 0.4 ms at 640x360 and 2-3 at
         # 1280x720.
         with args.history_lock:
-            args.history.keep(shot, neural, inner, colour)
+            if device:
+                args.history.keep(shot, None, inner, None, words=payload)
+            else:
+                args.history.keep(shot, neural, inner, colour)
     if args.dump:
         import image_io
         try:
@@ -1484,6 +1555,10 @@ def main():
     args.meter = Meter() if args.meter else None
     # The device's own request passes, and the extent they were built for.
     args.prepass = os.environ.get("NR_PREPASS", "1") != "0"
+    # The composition and the encoding on the device as well, and the frame before
+    # kept there instead of on the host. Off until it has been measured in a game:
+    # it needs the head to stay on the card, which is what the graph hands back.
+    args.postpass = os.environ.get("NR_POSTPASS", "0") != "0"
     args.request = None
     args.request_key = None
 
@@ -1498,7 +1573,7 @@ def main():
     # while XMX_UNARY_SPV can still select the probe shader - the graph's own runtime is
     # built below and picks its shader then.
     check_half_rounding()
-    backend = nr_frame.ResidentBackend()
+    backend = nr_frame.ResidentBackend(head_on_device=args.postpass)
     # which GPU, because the library takes the first Vulkan device and a machine can
     # have more than one, or a different one than the person assumes
     print(f"model ready in {time.perf_counter() - started:.1f}s"

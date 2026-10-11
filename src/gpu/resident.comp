@@ -430,6 +430,33 @@ void main() {
         }
         return;
     }
+    if (kind == POST_HISTORY) {
+        /* The prediction the composition just wrote, brought back to the extent the
+         * network reads. The host's `History.inner` was a resample of the frame
+         * before's output, which is 25 MB of float32 it had to hold and take down;
+         * this is that resample, done where the prediction already is. It is a
+         * separate dispatch after the composition, which is what makes reading what
+         * that one wrote safe. */
+        uint width = pc.sa, at = pc.sb, inner_w = pc.sc, inner_h = pc.batch;
+        uint x = index % inner_w, y = index / inner_w;
+        int row_low = floatBitsToInt(pc.b.v[y]);
+        int row_high = floatBitsToInt(pc.b.v[inner_h + y]);
+        float row_w = pc.b.v[2u * inner_h + y];
+        uint col_at = 3u * inner_h;
+        int col_low = floatBitsToInt(pc.b.v[col_at + x]);
+        int col_high = floatBitsToInt(pc.b.v[col_at + inner_w + x]);
+        float col_w = pc.b.v[col_at + 2u * inner_w + x];
+        for (uint c = 0u; c < 3u; c++) {
+            float a0 = pc.a.v[at + (uint(row_low) * width + uint(col_low)) * 3u + c];
+            float a1 = pc.a.v[at + (uint(row_high) * width + uint(col_low)) * 3u + c];
+            float a2 = pc.a.v[at + (uint(row_low) * width + uint(col_high)) * 3u + c];
+            float a3 = pc.a.v[at + (uint(row_high) * width + uint(col_high)) * 3u + c];
+            precise float low = a0 * (1.0 - row_w) + a1 * row_w;
+            precise float high = a2 * (1.0 - row_w) + a3 * row_w;
+            pc.c.v[index * 3u + c] = low * (1.0 - col_w) + high * col_w;
+        }
+        return;
+    }
     if (index >= pc.m) return;
 
     if (kind == GATE_E4M3_HALF || kind == E4M3_HALF || kind == GATE_HALF) {

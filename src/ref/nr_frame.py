@@ -472,7 +472,7 @@ class ResidentBackend:
     not keep using a frame after asking this backend for a different extent.
     """
 
-    def __init__(self, weights_path=None, *, max_cached_frames=1):
+    def __init__(self, weights_path=None, *, max_cached_frames=1, head_on_device=False):
         if not isinstance(max_cached_frames, int) or max_cached_frames < 1:
             raise ValueError("max_cached_frames must be a positive integer")
         sys.path.insert(0, str(ROOT / "src" / "gpu"))
@@ -489,6 +489,11 @@ class ResidentBackend:
         self._frames = {}
         self.split = (0.0, 0.0, 0.0)
         self.max_cached_frames = max_cached_frames
+        # Where the head goes when the graph is done with it. Off, it comes back to
+        # the host as it always did and the composition runs there; on, it stays on
+        # the card and the composition runs there too, which is the whole reason to
+        # have the switch — see `RequestPass.finish`.
+        self.head_on_device = head_on_device
 
     def frame(self, height, width):
         key = (height, width)
@@ -500,7 +505,8 @@ class ResidentBackend:
             if self.device_weights is None:
                 self.device_weights = self._module.DeviceWeights(self.runtime, self.weights)
             frame = self._module.ResidentFrame(self.runtime, self.device_weights,
-                                               height, width)
+                                               height, width,
+                                               head_on_device=self.head_on_device)
         self._frames[key] = frame
         return frame
 
