@@ -75,8 +75,22 @@ def duplicate_into(pid, handle):
     return int(dup.value or 0)
 
 
+# Phase 2 has needed two different kinds of buffer, and whether a kind can be
+# shared is not something one kind answers for another. HOST_WRITE is device
+# memory behind the bar, which the way in uses. HOST_READ is system memory, and
+# it is the one the way back wants — see `check_bar_read.py` for why the way back
+# cannot use the bar. Ask for either by name.
+KINDS = {"HOST_WRITE": xmxres.HOST_WRITE, "HOST_READ": xmxres.HOST_READ,
+         "GRAPH": xmxres.GRAPH}
+
+
 def main():
     megabytes = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
+    which = sys.argv[2].upper() if len(sys.argv) > 2 else "HOST_WRITE"
+    if which not in KINDS:
+        print(f"kind must be one of {sorted(KINDS)}")
+        return 1
+    kind = KINDS[which]
     nbytes = int(megabytes * (1 << 20))
     if not EXE.exists():
         print(f"missing {EXE} — build it with tools\\build_extmem_xproc.bat")
@@ -88,14 +102,15 @@ def main():
         print("this libxmx.dll cannot export buffers — rebuild with tools\\build_msvc.bat")
         return 1
 
-    # HOST_WRITE is where the frame's bytes go today: device memory with a BAR mapping,
-    # which is the memory type this whole idea rests on.
-    buf = rt.buffer(nbytes // 4, np.float32, kind=xmxres.HOST_WRITE, exportable=True)
+    buf = rt.buffer(nbytes // 4, np.float32, kind=kind, exportable=True)
     if not buf.exportable:
         print("the buffer came back not exportable")
         return 1
     handle = buf.handle()
-    print(f"buffer {buf.id}: {nbytes} bytes, kind HOST_WRITE, handle {handle:#x}")
+    coherent, memory_type, _ = xmxres.buffer_place(buf)
+    print(f"buffer {buf.id}: {nbytes} bytes, kind {which}, landed in memory type "
+          f"{memory_type} ({'host-coherent' if coherent else 'NOT coherent'}), "
+          f"handle {handle:#x}")
 
     view = buf.view(np.uint8)
     view[:] = WROTE

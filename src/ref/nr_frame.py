@@ -551,12 +551,27 @@ class ResidentBackend:
         leave the layer reading through a handle that no longer exists. One buffer, one
         handle, for the life of the daemon.
 
-        HOST_WRITE, not HOST_READ — which is the whole point of the way back
-        (`notes/phase2-extmem-design.md` section 2): the device writing into system
-        memory measured 1.84 ms, and writing into its own memory behind the bar is
-        what that column becomes when the layer reads it over the bar instead of out
-        of a slot. Type 3 is HOST_COHERENT, so on the host side nothing has to be
-        invalidated — see `refs/vulkan-sync/host-write-visibility.md`.
+        HOST_READ — system memory, and **cached** — not HOST_WRITE.
+
+        This is the opposite of what `notes/phase2-extmem-design.md` section 2 asks
+        for, and the measurement says the section is wrong. It wanted the device to
+        stop writing the answer into system memory (1.84 ms) by moving it into VRAM
+        (0.36 ms). But the layer then has to *read* it, and the host reading 7.9 MB
+        out of the bar takes 376.77 ms against 0.40 ms out of system memory: the bar
+        window is uncached, a read cannot be posted, and 7.9 MB is 129,600 round
+        trips. Measured in the game, that version turned 40.0 ms into 50.0 ms and
+        crashed after 255 frames. `check_bar_read.py` has the numbers.
+
+        The watershed is the `HOST_CACHED` bit, not VRAM versus system memory —
+        it is what makes a read cached and prefetched. `nr_layer.c:1346` asks for
+        it first for its own staging buffer, which is why the host read on the way
+        in was never slow. Type 2 is HOST_VISIBLE | HOST_COHERENT | HOST_CACHED,
+        and it exports: `check_extmem_export.py 1 HOST_READ`, 0 bytes wrong.
+
+        So the way back takes the gain it can take without touching the read. The
+        device still writes into system memory, and what goes away is the daemon
+        copying the words into a slot — 8.3 MB, about 0.7 ms. The layer reads them
+        where they already are, at the speed it reads system memory.
 
         Sized for the daemon's own pixel limit. The answer is the encoded words plus
         the cut's groups and the gate's samples, which is a little over one float a
@@ -569,7 +584,7 @@ class ResidentBackend:
             if self._extmem_answer is not None:
                 self._extmem_answer.free()
             self._extmem_answer = self.runtime.buffer(
-                want, np.float32, self._module.xmxres.HOST_WRITE, exportable=True)
+                want, np.float32, self._module.xmxres.HOST_READ, exportable=True)
         return self._extmem_answer
 
     def extmem_answer_handles(self):
