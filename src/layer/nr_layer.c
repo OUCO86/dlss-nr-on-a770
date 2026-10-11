@@ -912,6 +912,11 @@ static void ensure_daemon(void)
 		}
 		memcpy(env_block + used, marker, sizeof marker);
 		used += sizeof marker;
+		/* Our pid last. It was sized for and then left out, which is how a daemon
+		 * came to say "the layer's pid is not in the environment" with the spawn
+		 * looking right: the entry has to be written, not only counted. */
+		memcpy(env_block + used, pid_var, strlen(pid_var) + 1);
+		used += strlen(pid_var) + 1;
 		env_block[used] = '\0';
 
 		/* A console without a window, not DETACHED_PROCESS: a virtual environment's
