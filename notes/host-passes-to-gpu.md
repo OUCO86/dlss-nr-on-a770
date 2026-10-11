@@ -599,3 +599,53 @@ layer 是**同步**模式（`NR_LAYER_ASYNC` 没设），send 完立刻 receive�
 
 剩下能动的：**设备侧 34.4 ms（选项 B，一组工作）**，以及 Phase 2 的 external memory
 ——让 layer 直接映射 daemon 那块 HOST_READ 内存，连上传回写一起省（理论 5.8 ms）。
+
+## 14. Phase 2 的前提已验证：A770 上两个 VkDevice 能共享同一块 buffer（2026-10-11）
+
+`src/gpu/extmem_probe.c`（编译：`tools\build_extmem_probe.bat`，运行：`work\extmem_probe.exe`）。
+一块 1 MB 的 DEVICE_LOCAL buffer，从 device A 导出 `OPAQUE_WIN32` handle 到 device B 导入，
+两边各自 `vkCmdFillBuffer` / `vkCmdCopyBuffer` 回读到宿主比对。
+
+| | 结果 |
+|---|---|
+| `opaque_win32` buffer 的 exportable / importable | **1 / 1** |
+| 两个 VkDevice 建在同一物理设备上 | 成功（两边 queue family 都是 0） |
+| 导出 handle + 导入 + 绑定 | 成功 |
+| A 写 → A 读（自洽） | 0 / 1048576 字节错 |
+| B 写 → B 读（自洽） | 0 / 1048576 字节错 |
+| **A 写 → B 读（无 semaphore，只等 A 的 fence）** | **0 / 1048576 字节错** |
+| **A 写 → B 读（带共享 semaphore）** | **0 / 1048576 字节错** |
+| **B 写 → A 读** | **0 / 1048576 字节错** |
+
+**结论：Phase 2 在 A770 上成立。** 导入的是同一块内存（规范：`VkImportMemoryWin32HandleInfoKHR`
+的 "the imported memory object holds a reference to its payload"，不是拷贝），双向都对。
+
+### ⚠ 这个 probe 第一版报告"全部 stale"，那是它自己的 bug
+
+第一版用 `vkCmdFillBuffer(..., 0xAB)` 而 `vkCmdFillBuffer` 填的是 **32 位** pattern，
+所以内存里是 `AB 00 00 00`；比对却要求**每个字节**都等于 `0xAB` → 四个字节里三个必然不符，
+于是 262144 个 word 全错。当时我把它解释成"fence 不够、需要 semaphore"，**那是猜的，而且猜错了**。
+现在的 pattern 一律是四字节重复（`0xA5A5A5A5` / `0x5A5A5A5A` / `0x3C3C3C3C` / `0xC3C3C3C3`）。
+⚠️ 教训：**"全部错"先怀疑测量本身**，尤其"按字节比对一个按字写入的值"这类单位错配。
+
+### 关于 semaphore：实测不需要，但规范不保证
+
+| 依据 | 内容 |
+|---|---|
+| 规范（`VkImportMemoryWin32HandleInfoKHR`） | 导入的是同一 payload；可以导入多次，每次是独立的 `VkDeviceMemory` |
+| 规范（`VK_KHR_external_memory_win32` Issues 1） | OPAQUE_WIN32 的 handle 由应用 `CloseHandle`；与 fd 不同，导入不会把所有权交回驱动 |
+| 引用到的规范原理 | "writes are only visible to the queue family that did them unless you transfer ownership"；漏掉的症状是"间歇性陈旧帧" |
+
+本卡上两边 queue family 相同（都是 0），所以 fence 就够。但这是**同进程、同 family** 的情形；
+真正的 Phase 2 是**跨进程**（layer 在游戏进程，daemon 单独进程），handle 要 `DuplicateHandle`，
+同步要走 semaphore。**下一步 probe 就该测跨进程那一步，别拿同进程的结果当跨进程已验证。**
+
+### 这一步能省的钱（沿用 §13.5）
+
+| 项 | ms |
+|---|---|
+| PCIe 上传 8.3 MB（`pass_prepare` 的 host_write） | ~1.5 |
+| PCIe 回写 8.3 MB（answer 落在系统内存的 `HOST_READ`） | 1.84 |
+| 管道（共享内存化之后已经很小） | ~0.15 |
+
+**约 3.5 ms**，外加 layer 端那次拷贝。仍未动的是设备侧的 32.8 ms。
