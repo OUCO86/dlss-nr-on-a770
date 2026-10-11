@@ -44,16 +44,27 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 for sub in ("src/bench", "src/layer", "src/ref", "src/gpu"):
     sys.path.insert(0, str(ROOT / sub))
 
-import live_rates  # noqa: E402
-import nr_daemon   # noqa: E402
-import nr_frame    # noqa: E402
+import live_rates          # noqa: E402
+import nr_daemon           # noqa: E402
+import nr_frame            # noqa: E402
+import nr_frame_resident   # noqa: E402
 
 FRAMES = []        # one record of stage times a request, appended when the daemon is done
 current = {}       # the request in progress
 
-ORDER = ("receive", "settings", "decode", "letterbox", "resample", "history_take", "features",
-         "gpu_in", "gpu_run", "gpu_out", "compose_encode", "compose", "encode", "send",
-         "post_send", "to_answer", "total", "round_trip", "daemon_rest", "rest")
+ORDER = ("receive", "settings", "decode", "letterbox", "resample", "history_take",
+         "pass_prepare", "pass_assemble", "features",
+         "gpu_in", "gpu_run", "gpu_out", "pass_finish",
+         "compose_encode", "compose", "encode", "send",
+         "post_send", "to_answer", "total", "round_trip", "daemon_rest", "rest",
+         "unaccounted")
+
+# `to_answer` is the whole request, and every stage above is a piece of it. Whatever is
+# left is either the daemon's own work between stages or a stage nobody wrapped yet --
+# which is how `RequestPass.prepare`, `assemble` and `finish` turned up: three dispatches
+# to the card, none of them in the list.
+NOT_A_STAGE = ("post_send", "to_answer", "total", "round_trip", "daemon_rest", "rest",
+               "unaccounted")
 
 
 def timed(name, function):
@@ -98,7 +109,10 @@ def instrument():
             (nr_daemon.History, "take", "history_take"),
             (nr_daemon.History, "keep", "history_keep"),
             (nr_daemon.Letterbox, "region", "letterbox"),
-            (nr_daemon.Settings, "refresh", "settings")):
+            (nr_daemon.Settings, "refresh", "settings"),
+            (nr_frame_resident.RequestPass, "prepare", "pass_prepare"),
+            (nr_frame_resident.RequestPass, "assemble", "pass_assemble"),
+            (nr_frame_resident.RequestPass, "finish", "pass_finish")):
         setattr(cls, name, timed(label, getattr(cls, name)))
 
     geometry = nr_frame.network_geometry
@@ -188,6 +202,8 @@ def drive(endpoint, ready, settings, plan, frames, warmup, out):
                 record["daemon_rest"] = (record["total"] - record.get("receive", 0.0)
                                          - record["gpu_run"])
                 record["rest"] = took - record["gpu_run"]
+                record["unaccounted"] = record["to_answer"] - sum(
+                    record.get(key, 0.0) for key in ORDER if key not in NOT_A_STAGE)
                 if i >= warmup:
                     rows.append(record)
             lines.append(f"\n{width}x{height} at {scale:g}, {kind}, network "
