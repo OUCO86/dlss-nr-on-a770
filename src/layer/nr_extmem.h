@@ -28,9 +28,14 @@
 
 #ifdef _WIN32
 
-/* Take over the two buffers and the semaphore the daemon duplicated to this process,
- * and map the buffers. `*_bytes` are the sizes the daemon created them with; the import
+/* Take over the buffers and the semaphore the daemon duplicated to this process, and
+ * map the buffers. `*_bytes` are the sizes the daemon created them with; the import
  * allocates that much. Returns 0, or -1 with `nrx_error()` set.
+ *
+ * `answer_handle` may be 0: the answer crossing in a slot in the file mapping is the
+ * ordinary way still, and the half of this that is built first — the frame going into
+ * the daemon's buffer instead of the mapping — needs the frame's buffer and the
+ * semaphore and nothing else. `nrx_answer()` then says no for the whole session.
  *
  * The semaphore is a timeline semaphore: binary semaphores may not be waited on before
  * their signal has been submitted (VUID-vkQueueSubmit-pWaitSemaphores-03238), which is

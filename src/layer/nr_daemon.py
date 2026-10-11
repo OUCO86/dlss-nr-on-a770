@@ -72,6 +72,16 @@ MAGIC_MASKED = 0x314E524E     # the same, with a one-byte-per-pixel interface ma
 MAGIC_SHM = 0x324E524E
 MAGIC_SHM_MASKED = 0x334E524E
 
+# Phase 2: the same two, when the frame's bytes are already in a buffer of the daemon's,
+# put there by the layer across a process. The header is twenty-eight bytes then: the
+# slot the answer is to be left in, then the frame's number, which is the value the
+# layer has signalled the frame's timeline semaphore with and the one this side waits
+# for. Only four bytes come back, as they do for a frame that crossed in the mapping —
+# the answer is in the slot, which is the one part of the round trip Phase 2 has not
+# taken off the host yet.
+MAGIC_EXTMEM = 0x344E524E
+MAGIC_EXTMEM_MASKED = 0x354E524E
+
 # The swapchain formats a compositor or VKD3D actually hands out. A game writes
 # sRGB-encoded values into a UNORM swapchain just as it does into an SRGB one, so both
 # decode the same way; what differs is only how the display reads them back.
@@ -199,6 +209,58 @@ def receive(connection, count, probe_ok=False, keep=None):
             chunks.append(chunk)
         got += size
     return buffer if buffer is not None else b"".join(chunks)
+
+
+def _extmem_publish(args, backend):
+    """Offer the layer the frame's buffer and the frame's semaphore, once.
+
+    Phase 2. Both are the daemon's to make, and both are handles in *this* process,
+    so they have to be duplicated into the layer's before the layer can import
+    either; `publish_extmem` then writes them where the layer looks for them.
+
+    Fail-soft throughout, and tried once: a layer that never sees the handles keeps
+    putting the frame in the mapping, and the daemon keeps reading it there, which is
+    where it has always read it.
+    """
+    if getattr(args, "extmem_published", False):
+        return
+    args.extmem_published = True
+    mapping = _mapping(args)
+    if mapping is None:
+        return
+    pid = int(os.environ.get("NR_LAYER_PID", "0") or 0)
+    if not pid:
+        print("the layer's pid is not in the environment; the frame stays in the "
+              "mapping", flush=True)
+        return
+    try:
+        args.extmem_sem = backend.runtime.export_semaphore()
+        raw_handle, raw_bytes = backend.extmem_handles()
+        handles = nr_pipe.duplicate_to(
+            pid, (raw_handle, backend.runtime.semaphore_handle(args.extmem_sem)))
+    except (OSError, RuntimeError, AttributeError) as error:
+        print(f"the frame's buffer could not be offered to the layer ({error}); "
+              f"it stays in the mapping", flush=True)
+        return
+    # No answer handle: the answer still crosses in the slot, which is what the four
+    # bytes on the pipe are for.
+    mapping.publish_extmem(handles[0], 0, handles[1], raw_bytes, 0)
+    print(f"the frame goes into a buffer of the daemon's own: {raw_bytes >> 20} MB, "
+          f"announced on a timeline semaphore", flush=True)
+
+
+def _extmem_payload(args, backend, pixels):
+    """Where the layer wrote this frame's bytes: a buffer of the daemon's own.
+
+    Made on the first frame that wants it and kept, sized for the daemon's own pixel
+    limit so that no extent that moves later needs a second one.
+    """
+    getter = getattr(backend, "extmem_input", None)
+    if getter is None or getter(args.max_pixels) is None:
+        return None
+    _extmem_publish(args, backend)
+    view = getattr(backend, "extmem_view", None)
+    return view(pixels * 4) if view is not None else None
 
 
 def _mapping(args):
@@ -1039,28 +1101,62 @@ def stage_prepare(connection, backend, args, pipeline=None):
     if header is None:
         return
     magic, width, height, vk_format = struct.unpack("<4I", header)
-    if magic not in (MAGIC, MAGIC_MASKED, MAGIC_SHM, MAGIC_SHM_MASKED):
+    if magic not in (MAGIC, MAGIC_MASKED, MAGIC_SHM, MAGIC_SHM_MASKED,
+                     MAGIC_EXTMEM, MAGIC_EXTMEM_MASKED):
         raise ValueError(f"bad magic {magic:#x}")
     if not width or not height or width * height > args.max_pixels:
         raise ValueError(f"rejected extent {width}x{height}; limit {args.max_pixels} pixels")
     # A frame that crossed in the mapping names the slot it went in after the header, and
     # its colour and mask are already where they can be read. One that came by pipe is
     # read out of it. Either way `slot` is what says which on the way back.
+    #
+    # A frame that crossed in the daemon's own buffer names its slot and the frame's
+    # number after the header, and its colour is already in the buffer the layer wrote
+    # it into. The answer still goes back in the slot, which is the one copy the host
+    # makes of the frame that Phase 2 has not taken away yet.
     pixels = width * height
     mapping = _mapping(args)
     slot = None
+    frame = 0
+    in_raw = False
+    extmem = magic in (MAGIC_EXTMEM, MAGIC_EXTMEM_MASKED)
     if magic in (MAGIC_SHM, MAGIC_SHM_MASKED) and mapping is not None:
         slot = struct.unpack("<I", bytes(receive(connection, 4)))[0]
         if slot >= mapping.slots:
             raise ValueError(f"slot {slot} is not one of {mapping.slots}")
-    masked = magic in (MAGIC_MASKED, MAGIC_SHM_MASKED)
-    if slot is not None and pixels * 4 + (pixels if masked else 0) <= mapping.stride:
+    elif extmem and mapping is not None:
+        slot = struct.unpack("<I", bytes(receive(connection, 4)))[0]
+        frame = struct.unpack("<Q", bytes(receive(connection, 8)))[0]
+        if slot >= mapping.slots:
+            raise ValueError(f"slot {slot} is not one of {mapping.slots}")
+    masked = magic in (MAGIC_MASKED, MAGIC_SHM_MASKED, MAGIC_EXTMEM_MASKED)
+    if extmem:
+        # Nothing is read off the wire: the layer wrote the frame into a buffer of
+        # ours, and this is that buffer. Offered to the layer once, in the mapping's
+        # head, by `_extmem_publish` below — a layer that never saw the handles never
+        # sends this magic, so the buffer is there whenever this is reached.
+        payload = _extmem_payload(args, backend, pixels)
+        if payload is None:
+            raise ValueError("an external frame with no buffer to have come in")
+        if getattr(args, "extmem_sem", None) is None:
+            # The layer only sends this magic when the head gave it handles, and the
+            # handles and the semaphore are published together — so this is a frame
+            # that cannot be waited for, which is worse than a frame refused.
+            raise ValueError("an external frame with no semaphore to wait on")
+        # The wait hangs on the next submit rather than blocking the host: the layer
+        # wrote the bytes before it signalled, so a submit that waits for the signal
+        # cannot read them before they are there.
+        backend.runtime.extmem_wait(args.extmem_sem, frame)
+        in_raw = True
+    elif slot is not None and pixels * 4 + (pixels if masked else 0) <= mapping.stride:
         payload = mapping.request(slot, pixels * 4)
         interface = mapping.interface(slot, pixels) if masked else None
     else:
         payload = receive(connection, pixels * 4, keep="frame")
         interface = receive(connection, pixels, keep="interface") if masked else None
         slot = None
+    if extmem and masked:
+        interface = mapping.interface(slot, pixels)
     if vk_format not in FORMATS:
         print(f"unsupported VkFormat {vk_format}; passing the frame through",
               flush=True)
@@ -1131,7 +1227,10 @@ def stage_prepare(connection, backend, args, pipeline=None):
     # cropping it would mean carrying the bars through the decode as well.
     request = _request_pass(args, backend, geometry, (width, height), inner_shape,
                             boxed, live.profile, kind)
-    cut = request.prepare(payload) if request is not None else None
+    # `in_raw`: the bytes are already in the pass's buffer, put there by the layer, and
+    # the host write that would otherwise have copied them is the whole of what that
+    # saved.
+    cut = request.prepare(payload, in_raw=in_raw) if request is not None else None
     # Left undecoded while the device is carrying the frame, which is the case worth
     # having: the widening of the game's bytes into floats was the most expensive host
     # pass left in the frame once the resample and the composition moved

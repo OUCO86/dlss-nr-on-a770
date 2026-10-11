@@ -796,7 +796,7 @@ class RequestPass:
     """
 
     def __init__(self, runtime, backend, geometry, *, source, inner, noise, controls,
-                 bgra=True):
+                 bgra=True, raw=None):
         if nr_image is None:
             raise RuntimeError("the request passes need the host library for their tables")
         self.rt = runtime
@@ -811,8 +811,14 @@ class RequestPass:
         self.bgra = bgra
         self.pixels = self.inner_width * self.inner_height
         self.groups = -(-self.pixels // 256)
-        self.raw = runtime.buffer(self.source_width * self.source_height, np.uint32,
-                                  xmxres.HOST_WRITE)
+        # Phase 2: with `NR_EXTMEM` this is the buffer the layer itself writes the
+        # game's pixels into, and then it is the backend's, not this pass's — the pass
+        # is rebuilt whenever the extent moves and a buffer that came and went with it
+        # would leave the layer writing through a handle that no longer exists. A pass
+        # given one does not own it and must not free it.
+        self._raw_owned = raw is None
+        self.raw = raw if raw is not None else runtime.buffer(
+            self.source_width * self.source_height, np.uint32, xmxres.HOST_WRITE)
         # Two inners, so the frame before's can stay exactly where the device left it.
         self.inner = [runtime.buffer(self.pixels * 3, np.float32, xmxres.GRAPH)
                       for _ in range(2)]
@@ -867,24 +873,41 @@ class RequestPass:
     def close(self):
         """Give the buffers back. An extent change builds a new pass, and waiting for
         the garbage collector to get to the old one leaves both resident."""
-        for buffer in (self.raw, self.history, self.partial, self.plan_inner,
-                       self.plan_features, self.before, self.answer,
-                       self.inner_gather, *self.inner):
+        # `self.raw` is only freed when this pass made it: a shared one belongs to the
+        # backend, which goes on handing it to the passes it builds after this one.
+        for buffer in ((self.raw,) if self._raw_owned else ()) + (
+                self.history, self.partial, self.plan_inner,
+                self.plan_features, self.before, self.answer,
+                self.inner_gather, *self.inner):
             buffer.free()
         if self.params is not None:
             self.params.free()
             self.params = None
 
-    def prepare(self, payload):
+    def raw_view(self, count):
+        """The game's own bytes as the daemon would have read them off the wire.
+
+        Phase 2: the layer wrote them here, into this pass's own buffer, so there is
+        nothing to copy and `prepare` is told so. The same shape `payload` has
+        everywhere else — `np.frombuffer(payload, np.uint32)` and the byte views the
+        composition and the encode take both work on it.
+        """
+        return xmxres.host_view(self.raw, dtype=np.uint8, shape=(int(count),))
+
+    def prepare(self, payload, in_raw=False):
         """Decode and resample `payload` into the network's extent.
 
         Returns how much the frame moved against the one before, or None on the first
         frame, which has nothing to difference against — which is what the host's own
         history does there too. The history has to wait for this: the cut decides
         whether there is one at all.
+
+        `in_raw` says the bytes are already in `self.raw`: the layer put them there
+        across a process (Phase 2), and the host write is the whole of what that saved.
         """
         target = self.inner[self.which]
-        xmxres.host_write(self.raw, np.frombuffer(payload, np.uint32))
+        if not in_raw:
+            xmxres.host_write(self.raw, np.frombuffer(payload, np.uint32))
         self.rt.begin()
         self.rt.pre_inner(self.raw, self.plan_inner, target,
                           width=self.inner_width, height=self.inner_height,

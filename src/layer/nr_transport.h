@@ -242,9 +242,14 @@ static void nr_shm_write_layout(unsigned char *base, unsigned slots, size_t colo
 		*(uint64_t *)(base + at) = 0;
 }
 
-/* The three handles the daemon duplicated into this process, or 0 for any it did not.
+/* The handles the daemon duplicated into this process, or 0 for any it did not.
  * Returns 1 when the head says they are there. The caller is expected to check the
- * sizes too: a buffer the layer thinks is bigger than it is would be written past. */
+ * sizes too: a buffer the layer thinks is bigger than it is would be written past.
+ *
+ * `answer` may be 0: the answer crossing in a slot is the ordinary way still, and
+ * Phase 2's first half — the frame going straight into the daemon's buffer — does not
+ * need it. What has to be there is the frame's buffer and the semaphore, so those are
+ * what this asks for. */
 static int nr_shm_extmem(const nr_shm *shm, unsigned long long *raw,
 			 unsigned long long *answer, unsigned long long *sem,
 			 size_t *raw_bytes, size_t *answer_bytes)
@@ -258,7 +263,7 @@ static int nr_shm_extmem(const nr_shm *shm, unsigned long long *raw,
 	*sem = words[2];
 	*raw_bytes = (size_t)words[3];
 	*answer_bytes = (size_t)words[4];
-	return *raw && *answer && *sem && *raw_bytes && *answer_bytes;
+	return *raw && *sem && *raw_bytes;
 }
 
 /* Opens the mapping the daemon made for this pipe, and reads its layout. Returns -1

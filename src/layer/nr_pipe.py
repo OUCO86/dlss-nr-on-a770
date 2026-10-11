@@ -296,3 +296,44 @@ class FrameMapping:
 
     def __exit__(self, *exc):
         self.close()
+
+
+PROCESS_DUP_HANDLE = 0x0040
+DUPLICATE_SAME_ACCESS = 0x00000002
+
+_k32.GetCurrentProcess.restype = wintypes.HANDLE
+_k32.OpenProcess.restype = wintypes.HANDLE
+_k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+_k32.DuplicateHandle.restype = wintypes.BOOL
+_k32.DuplicateHandle.argtypes = [wintypes.HANDLE, wintypes.HANDLE, wintypes.HANDLE,
+                                 ctypes.POINTER(wintypes.HANDLE), wintypes.DWORD,
+                                 wintypes.BOOL, wintypes.DWORD]
+
+
+def duplicate_to(pid, handles):
+    """Put handles into another process, and return the numbers it will know them by.
+
+    A handle is only a number where it was made. The daemon's buffers are the daemon's
+    to export, so the layer needs them duplicated into its own process before it can
+    import either, and the numbers it gets are not the ones the driver handed out.
+
+    The duplicated handles live in the layer's process, which closes them when it is
+    done with them; nothing here can, and nothing here needs to.
+    """
+    source = _k32.GetCurrentProcess()
+    target = _k32.OpenProcess(PROCESS_DUP_HANDLE, False, int(pid))
+    if not target:
+        raise OSError(ctypes.get_last_error(), f"OpenProcess({pid})")
+    out = []
+    try:
+        for handle in handles:
+            got = wintypes.HANDLE()
+            ok = _k32.DuplicateHandle(source, wintypes.HANDLE(int(handle)), target,
+                                      ctypes.byref(got), 0, False,
+                                      DUPLICATE_SAME_ACCESS)
+            if not ok:
+                raise OSError(ctypes.get_last_error(), "DuplicateHandle")
+            out.append(int(got.value))
+    finally:
+        _k32.CloseHandle(target)
+    return out

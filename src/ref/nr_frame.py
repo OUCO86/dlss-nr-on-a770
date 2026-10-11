@@ -494,6 +494,58 @@ class ResidentBackend:
         # the card and the composition runs there too, which is the whole reason to
         # have the switch — see `RequestPass.finish`.
         self.head_on_device = head_on_device
+        # Phase 2, the frame's own bytes: with NR_EXTMEM the layer writes the game's
+        # pixels straight into a buffer of ours instead of into a file mapping, and the
+        # daemon's copy of them goes away. Off, everything is as it was.
+        #
+        # The buffer is the backend's, not the request pass's, and it is sized for the
+        # largest frame the daemon will accept rather than the one it is handed: the
+        # pass is rebuilt whenever the extent moves — the network's, which is the
+        # `render_scale`'s to change while the game runs, or the game's own — and a
+        # buffer that came and went with it would leave the layer writing into a
+        # released one, or hand out a second handle the layer never asked for. One
+        # buffer, one handle, for the life of the daemon.
+        self.extmem = os.environ.get("NR_EXTMEM", "0") != "0"
+        self._extmem_raw = None
+
+    def extmem_input(self, pixels):
+        """The buffer the layer is to write the game's own bytes into, or None.
+
+        Made once, big enough for `pixels`, and kept: see `__init__`. `pixels` is the
+        daemon's own limit, so a frame under it never needs a larger buffer and the
+        handle the layer was given stays the one that works.
+        """
+        if not self.extmem:
+            return None
+        if self._extmem_raw is None or self._extmem_raw.nbytes < pixels * 4:
+            if self._extmem_raw is not None:
+                self._extmem_raw.free()
+            self._extmem_raw = self.runtime.buffer(pixels, np.uint32,
+                                                   self._module.xmxres.HOST_WRITE,
+                                                   exportable=True)
+        return self._extmem_raw
+
+    def extmem_handles(self):
+        """`(raw_handle, raw_bytes)` for the layer, or None when there is no buffer.
+
+        The handle is a number in *this* process; whoever wants it in the layer's has
+        to DuplicateHandle it there first, which is the daemon's job, not this one's.
+        """
+        if self._extmem_raw is None:
+            return None
+        return (self._extmem_raw.handle(), self._extmem_raw.nbytes)
+
+    def extmem_view(self, count):
+        """The frame's own bytes, read the way the wire's would be.
+
+        The layer wrote them here. Everything downstream asks no more of a payload
+        than `np.frombuffer` and a byte view, and a mapped buffer's own memory gives
+        both without a copy.
+        """
+        if self._extmem_raw is None:
+            return None
+        return self._module.xmxres.host_view(self._extmem_raw, dtype=np.uint8,
+                                             shape=(int(count),))
 
     def frame(self, height, width):
         key = (height, width)
@@ -604,7 +656,7 @@ class ResidentBackend:
         # device memory the moment a letterboxed frame asked for a different extent.
         return self._module.RequestPass(
             self.runtime, self, geometry, source=source, inner=inner, noise=noise,
-            controls=controls, bgra=bgra)
+            controls=controls, bgra=bgra, raw=self._extmem_raw)
 
 
 def run_head(model, color, *, profile="standard", frame_index=0, style_index=None,

@@ -241,18 +241,32 @@ static void shm_look(void)
  * the magic says which way each frame went.
  */
 static int extmem_state;              /* 0 not looked for yet, 1 held, -1 there is none */
+static int extmem_tries;
 static unsigned long long extmem_frame;
 
 static void extmem_look(void)
 {
 	if (extmem_state) return;
-	extmem_state = -1;
 	const char *want = getenv("NR_EXTMEM");
-	if (!want || !strcmp(want, "0") || !strcmp(want, "off")) return;
+	if (!want || !strcmp(want, "0") || !strcmp(want, "off")) {
+		extmem_state = -1;
+		return;
+	}
 	if (shm_state != 1) return;
 	unsigned long long raw = 0, answer = 0, sem = 0;
 	size_t raw_bytes = 0, answer_bytes = 0;
-	if (!nr_shm_extmem(&shm, &raw, &answer, &sem, &raw_bytes, &answer_bytes)) return;
+	/* The buffer is the daemon's to make, and it cannot make it until the first frame
+	 * has told it how big a frame is — so on that frame's way out the handles are not
+	 * in the head yet. Looking again costs one read of it, and the frame crosses in
+	 * the mapping until it works. */
+	if (!nr_shm_extmem(&shm, &raw, &answer, &sem, &raw_bytes, &answer_bytes)) {
+		if (++extmem_tries > 1800) {
+			fprintf(stderr, "[nr_layer] the daemon never offered the frame's "
+				"buffer; it crosses in the mapping\n");
+			extmem_state = -1;
+		}
+		return;
+	}
 	if (nrx_open(raw, raw_bytes, answer, answer_bytes, sem) != 0) {
 		fprintf(stderr, "[nr_layer] the frame's buffers could not be imported (%s); "
 			"it crosses in the mapping instead\n",
@@ -307,26 +321,39 @@ static int exchange_send(const void *header, size_t header_size, const void *pay
 	shm_look();
 	extmem_look();
 	{
-		size_t raw_bytes = 0, answer_bytes = 0;
+		uint32_t head[4];
+		memcpy(head, header, header_size < 16 ? header_size : 16);
+		size_t raw_bytes = 0;
 		void *into = extmem_state == 1 ? nrx_raw(&raw_bytes) : NULL;
-		void *back = extmem_state == 1 ? nrx_answer(&answer_bytes) : NULL;
-		if (into && back && payload_size <= raw_bytes && reply_size <= answer_bytes) {
+		/* A masked frame's mask has nowhere to go: the buffer the daemon offered
+		 * holds the colour, and the mask is read out of the slot as it always
+		 * was. Such a frame crosses in the mapping, and no game measured here
+		 * sends one at all. */
+		if (into && head[0] != NR_MAGIC_MASKED && payload_size <= raw_bytes
+		    && shm.usable && reply_size <= shm.colour) {
+			/* The frame itself, written where the daemon reads it. The signal
+			 * comes after: the bytes have to be there before anything is told
+			 * they are. */
+			memcpy(into, payload, payload_size);
 			/* The frame number only ever goes up, which is what a timeline
 			 * semaphore's payload does too: the daemon waits for the value it is
 			 * told here, so an older frame can never satisfy a newer one. */
 			unsigned long long frame = ++extmem_frame;
 			if (nrx_signal(frame) == 0) {
-				uint32_t ext[4];
-				memcpy(ext, header, header_size < 16 ? header_size : 16);
-				ext[0] = ext[0] == NR_MAGIC_MASKED ? NR_MAGIC_EXTMEM_MASKED
-								    : NR_MAGIC_EXTMEM;
-				if (nr_link_write(&link, ext, sizeof ext) != 0) {
+				unsigned slot = shm_turn++ % shm.slots;
+				uint32_t extended[7];
+				memcpy(extended, head, sizeof head);
+				extended[0] = NR_MAGIC_EXTMEM;
+				/* The answer still comes back in a slot, which is the one
+				 * copy of the frame the host still makes. */
+				extended[4] = slot;
+				extended[5] = (uint32_t)(frame & 0xffffffffu);
+				extended[6] = (uint32_t)(frame >> 32);
+				if (nr_link_write(&link, extended, sizeof extended) != 0) {
 					nr_link_close(&link);
 					return -1;
 				}
-				/* -2 rather than a slot: the answer is not in a slot, it is in
-				 * the buffer the daemon writes it in. */
-				shm_track(nr_link_handle(link), -2);
+				shm_track(nr_link_handle(link), (int)slot);
 				return nr_link_handle(link);
 			}
 			/* Nobody was told, so nobody must be left waiting. Give the buffers
@@ -372,24 +399,6 @@ static int exchange_receive(int fd, void *reply, size_t reply_size)
 {
 	nr_link link = nr_link_from_handle(fd);
 	int slot = shm_untrack(fd);
-	if (slot == -2) {
-		/* The pipe carries four bytes — "the answer is in your buffer" — and that is
-		 * also what orders the read: it is written after the answer is. */
-		uint32_t notice = 0;
-		if (nr_link_read(&link, &notice, sizeof notice) != 0) {
-			nr_link_close(&link);
-			return -1;
-		}
-		size_t have = 0;
-		void *from = nrx_answer(&have);
-		if (!from || reply_size > have) {
-			nr_link_close(&link);
-			return -1;
-		}
-		memcpy(reply, from, reply_size);
-		nr_link_close(&link);
-		return 0;
-	}
 	if (slot >= 0) {
 		uint32_t notice = 0;
 		if (nr_link_read(&link, &notice, sizeof notice) != 0) {

@@ -294,36 +294,64 @@ static int import_semaphore(unsigned long long handle)
 
 /* ------------------------------------------------------------------ public ---- */
 
+/* The handles were duplicated into this process by the daemon, which cannot close
+ * them from where it is. Importing does not take them over either, so a caller that
+ * gave up on them has to let them go itself. */
+static void nrx_drop_handles(unsigned long long raw_handle,
+			     unsigned long long answer_handle,
+			     unsigned long long sem_handle)
+{
+	if (raw_handle) CloseHandle((HANDLE)(uintptr_t)raw_handle);
+	if (answer_handle) CloseHandle((HANDLE)(uintptr_t)answer_handle);
+	if (sem_handle) CloseHandle((HANDLE)(uintptr_t)sem_handle);
+}
+
+/* `answer_handle` may be 0: the answer still crosses in a slot in the file mapping,
+ * and Phase 2's first half — the frame going into the daemon's own buffer instead of
+ * the mapping — needs only the buffer and the semaphore. */
 int nrx_open(unsigned long long raw_handle, unsigned long long raw_bytes,
 	     unsigned long long answer_handle, unsigned long long answer_bytes,
 	     unsigned long long sem_handle)
 {
 	nrx_close();
 	nrx_err = NULL;
-	if (!raw_handle || !answer_handle || !sem_handle || !raw_bytes || !answer_bytes) {
+	if (!raw_handle || !sem_handle || !raw_bytes) {
 		nrx_fail("the daemon gave an incomplete set of handles");
+		nrx_drop_handles(raw_handle, answer_handle, sem_handle);
 		return -1;
 	}
-	if (make_device())
+	if (make_device()) {
+		nrx_drop_handles(raw_handle, answer_handle, sem_handle);
 		return -1;
+	}
 	if (import_buffer((VkDeviceSize)raw_bytes, raw_handle, &nrx_raw_buf, &nrx_raw_mem,
-			  &nrx_raw_p))
+			  &nrx_raw_p)) {
+		nrx_drop_handles(raw_handle, answer_handle, sem_handle);
 		return -1;
+	}
 	nrx_raw_n = (size_t)raw_bytes;
-	if (import_buffer((VkDeviceSize)answer_bytes, answer_handle, &nrx_ans_buf,
-			  &nrx_ans_mem, &nrx_ans_p)) {
+	if (answer_handle && answer_bytes
+	    && import_buffer((VkDeviceSize)answer_bytes, answer_handle, &nrx_ans_buf,
+			     &nrx_ans_mem, &nrx_ans_p)) {
+		nrx_drop_handles(raw_handle, answer_handle, sem_handle);
 		nrx_close();
 		return -1;
 	}
-	nrx_ans_n = (size_t)answer_bytes;
+	nrx_ans_n = answer_handle && answer_bytes ? (size_t)answer_bytes : 0;
 	if (import_semaphore(sem_handle)) {
+		nrx_drop_handles(raw_handle, answer_handle, sem_handle);
 		nrx_close();
 		return -1;
 	}
 	nrx_live = 1;
-	fprintf(stderr, "[nr_layer] the frame goes straight into the daemon's buffers: "
-			"%zu MB raw, %zu MB answer, over a timeline semaphore\n",
-		nrx_raw_n >> 20, nrx_ans_n >> 20);
+	if (nrx_ans_n)
+		fprintf(stderr, "[nr_layer] the frame goes straight into the daemon's "
+				"buffers: %zu MB raw, %zu MB answer, over a timeline "
+				"semaphore\n", nrx_raw_n >> 20, nrx_ans_n >> 20);
+	else
+		fprintf(stderr, "[nr_layer] the frame goes straight into the daemon's "
+				"buffer: %zu MB, over a timeline semaphore; the answer "
+				"still crosses in a slot\n", nrx_raw_n >> 20);
 	return 0;
 }
 
