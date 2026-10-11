@@ -67,7 +67,7 @@ def _library():
         ptr, stride, stride, stride, ptr, stride, stride, stride,
         ptr, stride, stride, stride, ptr, C.c_float, ptr, stride, stride,
         size, size, C.c_float, C.c_float, C.c_float, C.c_float, C.c_float,
-        ptr, ptr, ptr, ptr, size, size, size, C.c_int, ptr, size]
+        ptr, ptr, ptr, ptr, size, size, size, C.c_int, ptr, size, ptr, stride]
     lib.nr_compose_encode.restype = None
     lib.nr_resize_axis.argtypes = [ptr, stride, stride, stride, size, size, size,
                                   C.c_int, ptr, ptr, ptr, ptr]
@@ -268,7 +268,8 @@ def compose_temporal(head, colour, history, previous, gate, mask, *, intensity,
 
 def compose_encode(head, colour, history, previous, mask, encoded, *, top, left, bgra,
                    intensity, blend_scale=0.0, hold=0.0, slope=0.0, table=None,
-                   confidence=1.0, release=0.0, samples=None, grade=None, neural=None):
+                   confidence=1.0, release=0.0, samples=None, grade=None, neural=None,
+                   change_rows=0):
     """`bilinear` of the head to the colour's extent, then `compose_temporal` — or, with
     no history, `compose` — then `encode8` into `encoded` at (`top`, `left`), in one pass.
 
@@ -279,6 +280,11 @@ def compose_encode(head, colour, history, previous, mask, encoded, *, top, left,
     `samples`, a step: the upscaled head on every step-th row and column comes back too,
     as `(composition, samples)` — what `bilinear(head)[::step, ::step]` would hold.
     `grade` and `neural` are `nr_frame.compose`'s; a grade takes the per-pixel loop.
+
+    `change_rows`, a row step: withhold the composition and answer only the mean absolute
+    difference from `colour` over every `change_rows`-th row, metred inside the same pass.
+    The encoded bytes do not change — nothing downstream sees the difference — but this is
+    faster than writing 25 MB whose readers wanted a scalar. The daemon's default.
     """
     lib = library()
     if lib is None:
@@ -315,7 +321,12 @@ def compose_encode(head, colour, history, previous, mask, encoded, *, top, left,
              for axis, count in enumerate((height, width))]
     pointer = lambda array: array.ctypes.data if array is not None else None
     grade, neural = _grade(grade), _neural(neural, colour.shape)
-    output = np.empty(colour.shape, np.float32)
+    # Withhold the composition when a caller asks only to be told the change, which is what
+    # the daemon's log wants and --dump is the only thing wanting the frame. See the note on
+    # nr_compose_encode in nr_image.c: withholding it is most of what this saves, and the
+    # encoded bytes are the same either way.
+    output = None if change_rows else np.empty(colour.shape, np.float32)
+    change = C.c_float(0.0) if change_rows else None
     step = int(samples or 0)
     sampled = (np.empty((-(-height // step), -(-width // step), channels), np.float32)
                if step else None)
@@ -328,9 +339,13 @@ def compose_encode(head, colour, history, previous, mask, encoded, *, top, left,
         pointer(table), confidence,
         pointer(mask), *(_strides(mask)[:2] if mask is not None else (0, 0)),
         height, width, intensity, blend_scale, hold, slope, release,
-        output.ctypes.data, pointer(grade), pointer(neural),
+        output.ctypes.data if output is not None else None,
+        pointer(grade), pointer(neural),
         encoded.ctypes.data, encoded.shape[1], top, left, int(bool(bgra)),
-        pointer(sampled), step)
+        pointer(sampled), step,
+        C.byref(change) if change is not None else None, change_rows)
+    if change_rows:
+        return (float(change.value), sampled) if step else float(change.value)
     return (output, sampled) if step else output
 
 

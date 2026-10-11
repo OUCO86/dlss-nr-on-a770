@@ -782,9 +782,28 @@ static void compose_encode_row(const float *restrict line, int lx,
  *
  * `low_y`/`high_y`/`weight_y` and the `_x` three are `nr_image._axis_plan`'s, NULL for an
  * axis already at the output's extent; `channels` is the head's, 4 with a history and 3
- * without. The composition is still written to `output`, for the history and the log, and
- * the upscaled head itself on every `step`-th row and column into `samples` when given —
- * the values the log's gate figure reads.
+ * without. The upscaled head itself on every `step`-th row and column into `samples` when
+ * given — the values the log's gate figure reads.
+ *
+ * Two trailing arguments turn the composition into its own reader, and exist because that
+ * composition is the largest single thing this pass writes: a 1080p frame of it is 25 MB
+ * whose only consumers down the line were the `change` figure the daemon logs and, with
+ * `--dump`, the picture it saves. Both take far less than the whole frame — `change` is a
+ * mean already taken over every fourth row — so this can answer them from the values it
+ * is holding anyway and leave `output` untouched. Measured: 5.68 -> 3.84 ms here, and
+ * 65.10 -> 62.96 ms round trip (`daemon_stages.py`), for an encoded frame that is byte for
+ * byte the same.
+ *
+ *   `output` NULL     withhold the composition. Nothing is written outside this pass; the
+ *                     bytes `encoded` needs are consumed in the same pixel, so nothing is
+ *                     lost. The row written by the fast path goes into a scratch row this
+ *                     thread owns, which is why metering still works in this mode.
+ *   `change` non-NULL accumulate the mean absolute difference between the composition and
+ *                     `colour` over every `change_rows`-th row - `change` the daemon prints
+ *                     - and write the mean there. The slow path needs no branch beyond the
+ *                     row test, since both terms are already in registers there; the fast
+ *                     path's template is too hot to put a condition inside at all, so it is
+ *                     metred from the scratch row once the row is done.
  */
 void nr_compose_encode(const float *head, ptrdiff_t hy, ptrdiff_t hx, ptrdiff_t hc,
                        ptrdiff_t head_width, ptrdiff_t channels,
@@ -799,18 +818,27 @@ void nr_compose_encode(const float *head, ptrdiff_t hy, ptrdiff_t hx, ptrdiff_t 
                        float scale, float hold, float slope, float release,
                        float *output, const float *grade, float *neural,
                        uint8_t *encoded, size_t frame_width,
-                       size_t top, size_t left, int bgra, float *samples, size_t step)
+                       size_t top, size_t left, int bgra, float *samples, size_t step,
+                       float *change, ptrdiff_t change_rows)
 {
     size_t sampled = samples && step ? (width + step - 1) / step : 0;
     /* nr_compose's blend: below 1 clamped to [0, 1], above it extrapolating */
     float still = intensity > 1.0f ? intensity : unit(intensity);
+    /* Nothing meters a row nobody asked for. Rows this thread will have to read back. */
+    ptrdiff_t metred_rows = 0;
+    for (ptrdiff_t y = 0; change && change_rows > 0 && y < height; y += change_rows)
+        ++metred_rows;
     /* the daemon's layout, which `compose_encode_row` takes with its strides fixed */
     int fast = low_x && sx == 3 && sc == 1 && !mask && channels == (history ? 4u : 3u)
                && (!history || (rx == 3 && rc == 1 && table))
                && (!previous || (px == 3 && pc == 1))
                && width < (1u << 24) && head_width * channels < (1u << 24);
+    /* One sum over the rows that are metred, declared outside the region so OpenMP's
+     * reduction has somewhere to put it. double, not float: a mean over this many values
+     * loses too much of itself summed in float32 to print to five places. */
+    double difference = 0.0;
 #ifdef _OPENMP
-    #pragma omp parallel
+    #pragma omp parallel reduction(+:difference)
 #endif
     {
         /* The casts are for the C++ front end, which the Windows build uses so MSVC's
@@ -820,6 +848,10 @@ void nr_compose_encode(const float *head, ptrdiff_t hy, ptrdiff_t hx, ptrdiff_t 
         float *graded = fast && grade ? (float *)malloc(3 * width * sizeof *graded) : NULL;
         /* where the fast rows put the history when nobody keeps it */
         float *discard = fast && !neural ? (float *)malloc(3 * width * sizeof *discard) : NULL;
+        /* one row of the composition when nobody keeps the whole thing — the fast path has
+         * to write its row somewhere, and this is close enough to measure it back cheaply */
+        float *spare = (!output && (metred_rows || fast))
+                       ? (float *)malloc(3 * width * sizeof *spare) : NULL;
 #ifdef _OPENMP
         #pragma omp for schedule(dynamic, 4)
 #endif
@@ -843,15 +875,28 @@ void nr_compose_encode(const float *head, ptrdiff_t hy, ptrdiff_t hx, ptrdiff_t 
                 lc = hc;
             }
             if (fast && lc == 1) {
+                /* Metered after the row rather than inside it. compose_encode_row is a
+                 * template specialised over five switches, and its caller here is the
+                 * highest-count loop in the pass: another condition inside would cost more
+                 * than the row it measures, which was just written and is still in cache.
+                 * `sc` is 1 whenever `fast` is, so this reads the colour as the row does. */
+                int metred = change && change_rows > 0 && y % change_rows == 0;
+                float *to_row = output ? output + y * width * 3 : spare;
                 compose_encode_row(line, (int)lx, low_x, high_x, weight_x,
                                    colour + (ptrdiff_t)y * sy,
                                    history ? history + (ptrdiff_t)y * ry : NULL,
                                    previous ? previous + (ptrdiff_t)y * py : NULL,
                                    table, confidence, intensity, still, scale, hold, slope,
                                    release, grade, (int)width, rows, graded,
-                                   output + y * width * 3,
+                                   to_row,
                                    neural ? neural + y * width * 3 : discard,
                                    encoded + ((top + y) * frame_width + left) * 4, bgra);
+                if (metred) {
+                    const float *rgb = colour + (ptrdiff_t)y * sy;
+                    for (ptrdiff_t x = 0; x < width; ++x)
+                        for (int c = 0; c < 3; ++c)
+                            difference += fabsf(to_row[3 * x + c] - rgb[3 * x + c]);
+                }
                 if (sampled && y % step == 0) {
                     for (ptrdiff_t x = 0; x < width; x += step) {
                         float w = weight_x[x], other = 1.0f - w;
@@ -878,8 +923,13 @@ void nr_compose_encode(const float *head, ptrdiff_t hy, ptrdiff_t hx, ptrdiff_t 
                 if (sampled && y % step == 0 && x % step == 0)
                     memcpy(samples + ((y / step) * sampled + x / step) * channels, h,
                            channels * sizeof *h);
+                /* Both terms are in registers here, so metering costs nothing but adds.
+                 * Metred before `unit`, which is what NumPy compared: `composed` held the
+                 * composition unclamped and the clamp belongs to the codec alone. */
+                int metred = change && change_rows > 0 && y % change_rows == 0;
                 const float *rgb = colour + (ptrdiff_t)y * sy + (ptrdiff_t)x * sx;
-                float *out = output + (y * width + x) * 3;
+                float memory[3];
+                float *out = output ? output + (y * width + x) * 3 : memory;
                 if (history) {
                     temporal_pixel(h, 1, rgb, sc,
                                    history + (ptrdiff_t)y * ry + (ptrdiff_t)x * rx, rc,
@@ -898,6 +948,7 @@ void nr_compose_encode(const float *head, ptrdiff_t hy, ptrdiff_t hx, ptrdiff_t 
                 }
                 uint8_t *pixel = encoded + ((top + y) * frame_width + left + x) * 4;
                 for (size_t c = 0; c < 3; ++c) {
+                    if (metred) difference += fabsf(out[c] - rgb[(ptrdiff_t)c * sc]);
                     float value = out[c];
                     /* NumPy's byte cast maps NaN to zero; do not cast NaN in C. */
                     value = value == value ? unit(value) : 0.0f;
@@ -905,9 +956,12 @@ void nr_compose_encode(const float *head, ptrdiff_t hy, ptrdiff_t hx, ptrdiff_t 
                 }
             }
         }
+        free(spare);
         free(row);
         free(rows);
         free(graded);
         free(discard);
     }
+    if (change && change_rows > 0 && metred_rows > 0)
+        *change = (float)(difference / ((double)metred_rows * width * 3));
 }

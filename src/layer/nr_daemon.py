@@ -196,6 +196,11 @@ def receive(connection, count, probe_ok=False, keep=None):
 
 SOLID_RADIUS = 3
 
+# The row step both the change figure and its replacement inside the pass are taken over.
+# A quarter of the rows moves the figure by about a part in five hundred and costs a
+# quarter of the time; `--dump` and `--meter` aside, only the figure wants the frame.
+CHANGE_ROWS = 4
+
 
 class Settings:
     """The knobs, re-read from a JSON file whenever it changes.
@@ -1069,20 +1074,35 @@ def stage_finish(frame, backend, args):
     kind = frame.kind
     head = frame.head
     fused = None
+    # Nothing downstream reads the composition unless --dump is saving it or --meter is
+    # differencing it, and neither is on while a game is running; everyone else wanted one
+    # number from it, so meter it inside the pass and withhold the frame.
+    metred = 0
     if (kind in ("bgra8", "rgba8") and live.detail_strength == 1 and live.colour_strength == 1
             and head.shape[0] <= active_height and head.shape[1] <= active_width):
+        if not (args.dump or args.meter is not None):
+            metred = CHANGE_ROWS
         answer = (payload if isinstance(payload, bytearray) and held is None
                   else bytearray(payload))
-        fused = nr_frame.compose_encode(
-            head[..., :channels], colour,
-            np.frombuffer(answer, np.uint8).reshape(height, width, 4),
-            top=top, left=left, bgra=kind == "bgra8", intensity=live.intensity,
-            control_mask=control, history=history_full, history_confidence=live.temporal,
-            history_previous=previous, history_hold=live.hold,
-            history_release=live.release, samples=8, grade=grade, neural=neural)
+    fused = nr_frame.compose_encode(
+        head[..., :channels], colour,
+        np.frombuffer(answer, np.uint8).reshape(height, width, 4),
+        top=top, left=left, bgra=kind == "bgra8", intensity=live.intensity,
+        control_mask=control, history=history_full, history_confidence=live.temporal,
+        history_previous=previous, history_hold=live.hold,
+        history_release=live.release, samples=8, grade=grade, neural=neural,
+        change_rows=metred)
     full = None
+    rows = slice(None, None, CHANGE_ROWS)
+    changed = None
     if fused is not None:
-        composed, samples = fused
+        # With metring the composition never left the pass: `(change, samples)` comes back
+        # instead of `(composition, samples)`. Either way `samples` the gate reads the same.
+        if metred:
+            changed, samples = fused
+            composed = None
+        else:
+            composed, samples = fused
         encoded = answer
     else:
         if head.shape[:2] != colour.shape[:2]:
@@ -1112,10 +1132,8 @@ def stage_finish(frame, backend, args):
     # after the answer has gone where nothing writes into `composed` before then.
     # The rows are taken once and handed to `mean_change` twice below: it writes its
     # difference into a buffer kept for the shape, and both calls want the same shape.
-    rows = slice(None, None, 4)
-    changed = None
     if held is not None:
-        if full is None:
+        if full is None and composed is not None:
             # the restore below writes into the composition itself
             changed = mean_change(composed[rows], colour[rows], "change")
         # The control mask reaches `compose_head`, but `compose_detail` runs *after* it
@@ -1135,9 +1153,10 @@ def stage_finish(frame, backend, args):
         if not in_place:
             encoded = protected.tobytes()
         # so a --dump shows what was actually sent
-        (full[top:bottom, left:right] if full is not None else composed)[held] = colour[held]
+        if composed is not None:
+            (full[top:bottom, left:right] if full is not None else composed)[held] = colour[held]
     connection.sendall(encoded)
-    if changed is None:
+    if changed is None and composed is not None:
         changed = mean_change(composed[rows], colour[rows], "change")
     # What the game was handed at the active region, for the dump below.
     active = full[top:bottom, left:right] if full is not None else composed
