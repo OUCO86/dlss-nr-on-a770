@@ -52,13 +52,18 @@ const uint E4M3 = 0u, GATE = 1u, HALF = 2u, TO_HALF = 3u, SCALE = 4u,
            /* the request's two own passes, which take the frame from the game's bytes
             * to the sixteen channels the graph reads without the host touching a pixel:
             * PRE_INNER decodes and resamples, PRE_FEATURES assembles and narrows. */
-           PRE_INNER = 23u, PRE_FEATURES = 24u, POST_COMPOSE = 25u;
+           PRE_INNER = 23u, PRE_FEATURES = 24u, POST_COMPOSE = 25u, POST_HISTORY = 26u;
 
 /* Flags above the ones the graph's passes share, so nothing here can be read as an
  * epilogue or an operand width. Bit 24 is BGRA byte order, 25 a previous inner to
  * difference against, 26 a history for feature channels 7-9. */
 const uint F_BGRA = 0x1000000u, F_PREVIOUS = 0x2000000u, F_HISTORY = 0x4000000u;
 const uint F_GRADE = 0x8000000u, F_NEURAL = 0x10000000u;
+/* Bit 29: write the composition out as well as the words. Nothing downstream reads
+ * it unless --dump is saving it, and the answer is a HOST_READ buffer — which on a
+ * discrete card is system memory, so 25 MB of composition there is 4.91 ms of the
+ * frame for a picture nobody looks at. */
+const uint F_COMPOSED = 0x20000000u;
 
 shared float partial_sum[256];
 
@@ -277,6 +282,13 @@ void main() {
         uint encoded_at = uint(par.v[scalar_at + 12u]);
         uint partial_at = uint(par.v[scalar_at + 13u]);
         uint neural_at = uint(par.v[scalar_at + 14u]);
+        /* `d` is two of the frame before. The pass reads one of them and writes the
+         * other — the prediction it just made, and the words it was given — so what
+         * the frame after this one steadies against never has to cross the bus, and
+         * `hist_at` / `write_at` are which is which this frame. */
+        uint hist_at = uint(par.v[scalar_at + 18u]);
+        uint write_at = uint(par.v[scalar_at + 19u]);
+        bool do_composed = (flags & F_COMPOSED) != 0u;
         float grade[3] = float[3](par.v[scalar_at + 15u], par.v[scalar_at + 16u],
                                   par.v[scalar_at + 17u]);
 
@@ -328,7 +340,7 @@ void main() {
                 /* The frame before's own bytes, decoded through the table the frame's
                  * own went through: `decode8` of the payload the host kept would give
                  * these three floats exactly. */
-                uint before = U32Buf(uint64_t(pc.d)).v[pc.m * 3u + pixel];
+                uint before = U32Buf(uint64_t(pc.d)).v[hist_at + pc.m * 3u + pixel];
                 for (uint c = 0u; c < 3u; c++) {
                     uint was_shift = bgra ? 16u - 8u * c : 8u * c;
                     float was = par.v[decode_at + ((before >> was_shift) & 0xFFu)];
@@ -351,7 +363,7 @@ void main() {
                 alpha = max(alpha, min(floored, 1.0) * scale);
             }
             for (uint c = 0u; c < 3u; c++)
-                predicted[c] += alpha * (pc.d.v[at * 3u + c] - predicted[c]);
+                predicted[c] += alpha * (pc.d.v[hist_at + at * 3u + c] - predicted[c]);
         }
 
         float composed[3], difference = 0.0;
@@ -359,8 +371,13 @@ void main() {
             if (do_grade || do_neural) {
                 float kept[3];
                 for (uint c = 0u; c < 3u; c++) kept[c] = truncate_half(predicted[c]);
+                /* The prediction the frame after this one steadies against, written
+                 * into `d` rather than into the answer: `d` is two of these, and the
+                 * pass reads whichever is the frame before's while it writes the
+                 * other, so what is carried forward never leaves the card and the
+                 * host never holds 25 MB of float32 it only ever handed back. */
                 if (do_neural)
-                    for (uint c = 0u; c < 3u; c++) answer.v[neural_at + at * 3u + c] = kept[c];
+                    for (uint c = 0u; c < 3u; c++) pc.d.v[write_at + at * 3u + c] = kept[c];
                 if (do_grade) {
                     style_grade(kept, grade[0], grade[1], grade[2]);
                     for (uint c = 0u; c < 3u; c++) predicted[c] = kept[c];
@@ -370,7 +387,7 @@ void main() {
                 /* No clamp on the blend: the vendor's is the one thing our
                  * composition drops, so that intensity above 1 extrapolates. */
                 composed[c] = clamp(rgb[c] + intensity * (predicted[c] - rgb[c]), 0.0, 1.0);
-                answer.v[at * 3u + c] = composed[c];
+                if (do_composed) answer.v[at * 3u + c] = composed[c];
             }
             /* Encoded at its place in the whole frame, with the request's alpha and
              * with everything outside the active region left as it came. */
@@ -387,6 +404,11 @@ void main() {
                 packed |= uint(rounded) << (bgra ? 16u - 8u * c : 8u * c);
             }
             words.v[encoded_at + pixel] = packed;
+            /* The frame's own words, kept where the frame after this one will read
+             * them: one write of four bytes a pixel into a buffer already in the
+             * card's memory, where the host's `History.pixels` was 25 MB of float32
+             * and a resample of it. The host never holds the frame before again. */
+            U32Buf(uint64_t(pc.d)).v[write_at + pc.m * 3u + pixel] = raw.v[pixel];
             if (change_rows > 0u && y % change_rows == 0u)
                 for (uint c = 0u; c < 3u; c++) difference += abs(composed[c] - rgb[c]);
             if (step > 0u && y % step == 0u && x % step == 0u) {

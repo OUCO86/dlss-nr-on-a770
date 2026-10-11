@@ -92,7 +92,8 @@ class Device:
         return [INTENSITY, 1.0, 0.0, 0.0, 0.0, 1.0,          # scale..confidence
                 top, left, self.width, change_rows, STEP,
                 self.at["samples"], self.at["encoded"], self.at["partial"],
-                self.at["neural"], 0.0, 0.0, 0.0]             # the grade's three
+                self.at["neural"], 0.0, 0.0, 0.0,             # the grade's three
+                0.0, 0.0]                                    # which of `d`'s two
 
     def load(self, gate, **kwargs):
         scalars = self.scalars(**kwargs)

@@ -42,6 +42,11 @@ COSINE_PUBLISH, SOFTMAX, VIT_SOFTMAX = 0, 1, 6
 # for an epilogue or an operand width. `resident.comp` is the other half of this.
 F_BGRA, F_PREVIOUS, F_HISTORY = 0x1000000, 0x2000000, 0x4000000
 F_GRADE, F_NEURAL = 0x8000000, 0x10000000
+# Write the composition out as well as the words. Off by default: the answer is a
+# HOST_READ buffer, which on a discrete card is system memory, so the composition
+# costs 4.91 ms of the frame there and nothing downstream reads it unless --dump is
+# saving it. See notes/host-passes-to-gpu.md section 9.
+F_COMPOSED = 0x20000000
 
 # GEMM epilogues, applied to the accumulator on its way out of the kernel
 EPI_NONE, EPI_E4M3, EPI_GATE, EPI_GATE_E4M3, EPI_HALF = 0, 1, 2, 3, 4
@@ -1555,7 +1560,8 @@ class Runtime:
 
     def post_compose(self, raw, head, params, history, answer, *, width, height,
                      source_width, head_width, head_height, channels, with_history=False,
-                     with_previous=False, grade=False, neural=False, bgra=True):
+                     with_previous=False, grade=False, neural=False, bgra=True,
+                     composed=False):
         """The head brought up to the frame, composed against it, and encoded, on the device.
 
         `nr_compose_encode`: both bilinear axes, the temporal gate over the host's
