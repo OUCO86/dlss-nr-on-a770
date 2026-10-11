@@ -295,3 +295,54 @@ workgroup 共 724 MFLOP，1.68 ms → **431 GFLOP/s，峰值约 1.7 %**。
   估 0.3-0.5 ms，但要重做几何和 pad，且共享内存从 16 KB 涨到 24 KB。
 
 → **建议转 B2（int8 内核加 batch，估 3.2 ms）**，比在这里抠这些划算得多。
+
+## 2026-10-11：window_block 是不是并发不够 —— 加指令测出来的答案
+
+上一节结尾说它"延迟受限、并发不足"。**那句说得不准，这里更正。** 用一个能直接
+证伪的实验测了：`window_block.comp` 的 `PROBE_FILL`（0 = 每个 shipping 构建），
+在每个 workgroup 最开头插 `N` 轮四条互不依赖的 vec4 乘加链，种子取自尚未写入的
+共享内存，所以编译器折不掉。
+
+    glslang --target-env vulkan1.3 -DPROBE_FILL=<n> -Isrc/gpu \
+            -o work/_probe_wb0f<n>.spv src/gpu/window_block.comp
+    python src/bench/window_block_probe.py --stop 0 --fill <n>
+
+| fill | 0 | 100 | 200 | 400 | 800 |
+|---|---:|---:|---:|---:|---:|
+| 正序 ms | 6.03 | 6.79 | 7.57 | 9.31 | 12.73 |
+| 倒序 ms | 6.02 | 6.80 | 7.61 | 9.30 | 12.89 |
+
+**从 fill=0 就是直线，没有一点平台期。** 每 100 轮（每 lane 800 条指令）固定
+约 0.78-0.87 ms；倒序复现，差 ≤ 0.16 ms。
+
+一条独立指令都白拿不到，说明一件事：**没有空闲的发射槽可以填。** 如果内核是在
+等自己的依赖链，最先加的那几百条会被气泡吃掉，曲线应该先平一段。它没平。
+
+### 那"并发"到底够不够：把词拆开
+
+| 层 | 数字 | 够不够 |
+|---|---|---|
+| workgroup 数（波数） | level 0 5529 个，128 个/Xe-core-整机 → **43 波**；level 1 1392 个 → 11 波，尾浪费 1.1 % | 够 |
+| 每 Xe-core 驻留 | 硬件页 4096 硬件线程 / 8 = 512 XVE，32 Xe-core → 16 XVE/核，每 XVE 8 线程 × SIMD8 = 64 → **每核 1024 work-items**；256 线程的 workgroup → **4 个，正满** | 满 |
+| 每 Xe-core 的 SLM | 16 KB × 4 = 64 KB，池子 128 KB | 不是限制（线程槽先到） |
+
+所以"再塞更多 workgroup 进去"没有地方塞，槽位是满的。而 fill 实验证明满了也
+还是喂不满发射端口 —— **瓶颈是每周期能发几条指令，不是有多少活排着队。**
+
+### 于是只剩一条路：减指令，或者减同步
+
+按同样的斜率，基线 6.02 ms ≈ 每 lane 7000 条指令的量。**99 % 是逐元素的。**
+剩下还能看的，都是要动数值语义的，每处 1-3 %：
+
+- attention 里 `weights()` 的位 hack（`half_round` → 乘 → 加 → clamp → packHalf2x16
+  → 移位 → 加 → unpack），每 lane 8 次、每次约 10 条；归一化那 8 次
+  `e4m3(half_round(x))` 是双重舍入，去掉会改结果。
+- gather 那 8 次 `e4m3` 在 `image_half=0` 时幂等，可跳过（约 2 %）。
+- **acc → coopMatStore → 读 → weights → 存 → 读 → 归一化 → 存 → coopMatLoad 这条
+  共享内存往返链**：每个 logit 在场内存里过了四趟。lane 间换数据用的是 SLM 加
+  barrier，`subgroupShuffle` 是寄存器内的。这是唯一还有结构的，但要重排布局，
+  且每条都要重验 bit-identical。
+
+❌ 别再试的（都量过）：K/V/Q 存 E4M3（更慢）、FFN 塞进来（0.95x）、B 按列或按 K
+对在 SLM 里（更慢）、**一个 workgroup 做两个窗**（权重加载只有两条指令，摊不出来，
+SLM 反而 16 → 32 KB）。

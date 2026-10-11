@@ -161,11 +161,15 @@ def wall(rt, fixture, copies):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--stop", type=int, choices=(0, 1, 2), default=0)
+    parser.add_argument("--fill", type=int, default=0,
+                        help="rounds of independent arithmetic added to every workgroup; "
+                             "build the same number into the spv with -DPROBE_FILL")
     args = parser.parse_args()
     rt = xmxres.Runtime()
     # The pipeline is built from this path the first time a window block is recorded,
     # and never rebuilt, so one process measures one stop.
-    xmxres.os.environ["XMX_WINDOW_BLOCK_SPV"] = str(ROOT / "work" / f"_probe_wb{args.stop}.spv")
+    name = f"_probe_wb{args.stop}" + (f"f{args.fill}" if args.fill else "")
+    xmxres.os.environ["XMX_WINDOW_BLOCK_SPV"] = str(ROOT / "work" / f"{name}.spv")
     passes = the_passes(rt)
     print(f"stop {args.stop}: {len(passes)} window blocks in one 768x448 frame",
           flush=True)

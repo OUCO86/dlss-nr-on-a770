@@ -89,6 +89,17 @@ const uint WINDOW_BLOCK = 4u; // row-family profile kind: attention.comp owns 0-
 #define PROBE_STOP 0
 #endif
 
+/* How many rounds of independent arithmetic a probe may add to every workgroup, to find
+ * how much of the issue bandwidth the kernel actually uses. It is 0 in every build that
+ * ships. Four chains, no chain depending on another, so what it buys is throughput and
+ * not latency: a kernel that is waiting on its own dependency chains absorbs these for
+ * nothing, and one that is issuing as fast as it can pays for every one of them. The sum
+ * lands in shared memory that the weights overwrite a moment later, so it cannot be
+ * folded away and cannot reach the output. */
+#if !defined(PROBE_FILL)
+#define PROBE_FILL 0
+#endif
+
 bool image_half() { return (operation_flags() & 0x8000u) != 0u; }
 
 /* window_attention.comp's transform, on two adjacent logits of one row, the bias in them */
@@ -112,6 +123,24 @@ vec4 image4(uint at) {
 void main() {
     uint window = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
     if (window >= pc.m) return;                  // uniform across the workgroup
+#if PROBE_FILL > 0
+    {
+        // Seeded from shared memory nothing has written yet, so the compiler cannot know
+        // the values and cannot fold the rounds into a closed form.
+        vec4 seed = vec4(f32[gl_LocalInvocationIndex], f32[gl_LocalInvocationIndex + 256u],
+                         f32[gl_LocalInvocationIndex + 512u],
+                         f32[gl_LocalInvocationIndex + 768u]);
+        vec4 s0 = seed, s1 = seed + 1.0, s2 = seed + 2.0, s3 = seed + 3.0;
+        for (uint i = 1u; i <= PROBE_FILL; i++) {
+            s0 += vec4(float(i)) * 1.000001;
+            s1 += vec4(float(i)) * 1.000002;
+            s2 += vec4(float(i)) * 1.000003;
+            s3 += vec4(float(i)) * 1.000004;
+        }
+        f32[gl_LocalInvocationIndex] = (s0.x + s1.y + s2.z + s3.w
+                                        + float(gl_LocalInvocationIndex));
+    }
+#endif
     uint sub = gl_SubgroupID, local = gl_SubgroupInvocationID;
     uint row = sub * 8u;                         // this subgroup's tokens: row `sub` of the window
     uint scratch = 2048u + 256u * sub;           // its kilobyte, in floats and words
