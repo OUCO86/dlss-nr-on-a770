@@ -104,8 +104,12 @@ buffer 在 daemon 手里，得从**子**进程把 handle 给**父**进程：
 
 ## 5. 验证计划（按顺序，跑完一项再进下一项）
 
-1. **libxmx 导出 → 独立进程导入**：给 `extmem_xproc.exe` 加 `guest` 角色，
-   接收 handle + 期望值，导入后 GPU 读回比对。证明 libxmx 分配出来的 buffer 真能跨进程。
+1. ✅ **libxmx 导出 → 独立进程导入（已过，2026-10-11）**：
+   `src/bench/check_extmem_export.py`，`extmem_xproc.exe guest`。
+   daemon 侧用 `rt.buffer(..., HOST_WRITE, exportable=True)` 建一块 1 MB，写 `0xA5`，
+   `DuplicateHandle` 给 guest，guest 用自己的 VkDevice 读回：**0 / 1048576 字节错**，
+   落在 memory type 3。反向 guest 填 `0x5A`，daemon 这边也读到了。
+   非导出的三条路径（GRAPH / HOST_WRITE / HOST_READ）upload→download 往返照旧逐字节相同。
 2. **离线单帧 bit-identical**：daemon 跑一帧，`raw` 由外部进程按现在的字节填进去，
    answer 与现在**逐字节相同**。
 3. **游戏实测**：`NR_EXTMEM=1` 的 bat，看帧时间（口径照旧：`work\nr_daemon.log`）。

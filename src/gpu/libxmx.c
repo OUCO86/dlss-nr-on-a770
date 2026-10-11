@@ -13,6 +13,14 @@
 #include <string.h>
 #include <stddef.h>
 #include <vulkan/vulkan.h>
+/* Phase 2 needs the win32 handle types, and vulkan_win32.h will not compile without
+ * the platform headers. This file also builds as libxmx.so on Linux (see the
+ * Makefile), so everything win32-shaped here is behind _WIN32. */
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <vulkan/vulkan_win32.h>
+#endif
 
 #include "gpu_pick.h"
 #include "xmx_shape.h"
@@ -127,7 +135,12 @@ static unsigned prof_each_n;
  * is HOST_CACHED, so the host can still write inputs and read outputs in place. */
 #define MAX_RBUF 8192
 struct rbuf { VkBuffer b; VkDeviceMemory m; void *p; VkDeviceAddress addr;
-		 VkDeviceSize size; int live, mapped; };
+		 VkDeviceSize size; int live, mapped;
+		 /* Phase 2: set when the allocation was made exportable, so another
+		  * process can import it. `handle` is the NT handle vkGetMemoryWin32HandleKHR
+		  * gave us; it belongs to us and has to be closed (the specification says the
+		  * application owns handles of this type, unlike an fd). */
+		 int exported; void *handle; };
 static struct rbuf rbufs[MAX_RBUF];
 
 struct push {
@@ -710,7 +723,17 @@ int xmx_init(const char *spv_path)
 	if (g.ready) return 0;
 	VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
 				  .pApplicationName = "libxmx", .apiVersion = VK_API_VERSION_1_3 };
-	VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
+	/* The instance-level half of Phase 2: these only let us ask what a handle can do.
+	 * The device-level ones (see the device extension list) are the ones that let us
+	 * make one. */
+	static const char *iext[] = {
+		VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME,
+		VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME,
+		VK_KHR_EXTERNAL_FENCE_CAPABILITIES_EXTENSION_NAME,
+	};
+	VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+				     .pApplicationInfo = &app,
+				     .enabledExtensionCount = 3, .ppEnabledExtensionNames = iext };
 	VkResult r = vkCreateInstance(&ici, NULL, &g.inst);
 	if (r) FAIL("vkCreateInstance", r);
 
@@ -871,9 +894,20 @@ int xmx_init(const char *spv_path)
 	float prio = 1.0f;
 	VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
 					.queueFamilyIndex = g.qi, .queueCount = 1, .pQueuePriorities = &prio };
+	/* Phase 2: the win32 external-memory and semaphore extensions. Keep
+	 * PIPELINE_EXECUTABLE_PROPERTIES last — the count below drops the final entry
+	 * when the shader-stats path was not asked for. */
+#ifdef _WIN32
+	const char *ext[] = { VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
+			      VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
+			      VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
+			      VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
+			      VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME };
+#else
 	const char *ext[] = { VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
 			      VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
 			      VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME };
+#endif
 	VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f2,
 				   .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
 				   .enabledExtensionCount = sizeof ext / sizeof *ext - (stats ? 0 : 1),
@@ -1165,7 +1199,12 @@ int xmx_res_init(const char *gemm_spv, const char *unary_spv, const char *row_sp
  * unmapped device they are the staging the graph copies through. Kind 0 follows the
  * device: mapped where the host can see the card's memory, device-local and unmapped
  * where it cannot. */
-int xmx_buf_create_kind(unsigned long long bytes, int kind)
+/* `exportable` asks for a buffer another process can import (Phase 2). Nothing else
+ * changes: same memory type, same flags, same device address. It costs nothing when
+ * it is zero, which is why it is a separate entry point rather than a flag on the
+ * existing one — every buffer the daemon makes today would otherwise be exportable
+ * for no reason. */
+static int buf_create(unsigned long long bytes, int kind, int exportable)
 {
 	if (!g.rready) FAIL("resident runtime not initialised", 0);
 	int id = -1;
@@ -1189,8 +1228,18 @@ int xmx_buf_create_kind(unsigned long long bytes, int kind)
 					 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
 					 | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, kind == 1);
 	if (mt == UINT32_MAX) goto failed_kind;
+#ifdef _WIN32
+	VkExportMemoryAllocateInfo emai = {
+		.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+		.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+	};
+#endif
 	VkMemoryAllocateFlagsInfo fl = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
 					 .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT };
+#ifdef _WIN32
+	if (exportable)
+		fl.pNext = &emai;
+#endif
 	VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &fl,
 				    .allocationSize = mr.size, .memoryTypeIndex = mt };
 	failure = "vkAllocateMemory (resident)";
@@ -1202,6 +1251,7 @@ int xmx_buf_create_kind(unsigned long long bytes, int kind)
 		if ((r = vkMapMemory(g.dev, rb->m, 0, VK_WHOLE_SIZE, 0, &rb->p))) goto failed_kind;
 	}
 	rb->mapped = !unmapped;
+	rb->exported = exportable;
 	VkBufferDeviceAddressInfo ai2 = { .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = rb->b };
 	rb->addr = vkGetBufferDeviceAddress(g.dev, &ai2);
 	rb->size = bi.size;
@@ -1213,6 +1263,47 @@ failed_kind:
 	if (rb->m) vkFreeMemory(g.dev, rb->m, NULL);
 	*rb = (struct rbuf){ 0 };
 	FAIL(failure, r);
+}
+
+int xmx_buf_create_kind(unsigned long long bytes, int kind)
+{
+	return buf_create(bytes, kind, 0);
+}
+
+int xmx_buf_create_exportable(unsigned long long bytes, int kind)
+{
+	return buf_create(bytes, kind, 1);
+}
+
+/* The NT handle for a buffer made with xmx_buf_create_exportable, as a number: it is
+ * the daemon's own handle, so a parent process still has to DuplicateHandle it before
+ * it means anything there. Zero on failure. */
+unsigned long long xmx_buf_handle(int id)
+{
+	if (id < 0 || id >= MAX_RBUF || !rbufs[id].live) FAIL("buffer is not live", 0);
+	if (!rbufs[id].exported) FAIL("buffer was not created exportable", 0);
+#ifdef _WIN32
+	if (rbufs[id].handle)
+		return (unsigned long long)(uintptr_t)rbufs[id].handle;
+	PFN_vkGetMemoryWin32HandleKHR get = (PFN_vkGetMemoryWin32HandleKHR)
+		vkGetDeviceProcAddr(g.dev, "vkGetMemoryWin32HandleKHR");
+	if (!get) FAIL("vkGetMemoryWin32HandleKHR absent", 0);
+	VkMemoryGetWin32HandleInfoKHR gi = {
+		.sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR,
+		.memory = rbufs[id].m,
+		.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+	};
+	VkResult r = get(g.dev, &gi, (HANDLE *)&rbufs[id].handle);
+	if (r) FAIL("vkGetMemoryWin32HandleKHR", r);
+	return (unsigned long long)(uintptr_t)rbufs[id].handle;
+#else
+	FAIL("exporting a buffer handle is Windows only", 0);
+#endif
+}
+
+int xmx_buf_exported(int id)
+{
+	return (id >= 0 && id < MAX_RBUF && rbufs[id].live && rbufs[id].exported) ? 1 : 0;
 }
 
 int xmx_buf_create(unsigned long long bytes) { return xmx_buf_create_kind(bytes, 0); }
@@ -1371,6 +1462,11 @@ int xmx_buf_destroy(int id)
 {
 	if (id < 0 || id >= MAX_RBUF || !rbufs[id].live) return 0;
 	if (rbufs[id].mapped) vkUnmapMemory(g.dev, rbufs[id].m);
+	/* ours to close, not the driver's: OPAQUE_WIN32 handles are owned by the
+	 * application, unlike an fd which the import takes over */
+#ifdef _WIN32
+	if (rbufs[id].handle) CloseHandle((HANDLE)rbufs[id].handle);
+#endif
 	vkDestroyBuffer(g.dev, rbufs[id].b, NULL);
 	vkFreeMemory(g.dev, rbufs[id].m, NULL);
 	rbufs[id] = (struct rbuf){ 0 };

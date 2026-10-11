@@ -96,6 +96,9 @@ def _load():
             ("xmx_buf_create", [ctypes.c_ulonglong]),
             ("xmx_buf_create_kind", [ctypes.c_ulonglong, ctypes.c_int]),
             ("xmx_buf_host_visible", [ctypes.c_int]),
+            # Phase 2 (notes/phase2-extmem-design.md): a buffer another process can
+            # import, and the NT handle for it. Both are Windows-only and absent from
+            # an older native build, so they are registered under hasattr guards below.
             ("xmx_buf_zero", [ctypes.c_int]),
             ("xmx_staging_mode", []),
             ("xmx_buf_upload", [ctypes.c_int, ctypes.c_void_p,
@@ -175,6 +178,15 @@ def _load():
         lib.xmx_rec_gemm_window_int8_residual.restype = ctypes.c_int
         lib.xmx_int8_residual_init.argtypes = [ctypes.c_char_p]
         lib.xmx_int8_residual_init.restype = ctypes.c_int
+    # Phase 2: an older native build has neither, and the caller checks `exportable()`
+    # before asking for a handle, so a missing entry point is not an error here.
+    if hasattr(lib, "xmx_buf_create_exportable"):
+        lib.xmx_buf_create_exportable.argtypes = [ctypes.c_ulonglong, ctypes.c_int]
+        lib.xmx_buf_create_exportable.restype = ctypes.c_int
+        lib.xmx_buf_handle.argtypes = [ctypes.c_int]
+        lib.xmx_buf_handle.restype = ctypes.c_ulonglong
+        lib.xmx_buf_exported.argtypes = [ctypes.c_int]
+        lib.xmx_buf_exported.restype = ctypes.c_int
     # The grouped feed-forward's recorder, guarded for the same reason: the daemon holds a
     # native build open, and a build without this symbol must still load. `int8_ffn_groups`
     # reads it back, so a tree running an older library keeps the float grouped GEMM.
@@ -253,15 +265,37 @@ class Buffer:
     says so.
     """
 
-    __slots__ = ("id", "nbytes", "kind", "_lib")
+    __slots__ = ("id", "nbytes", "kind", "exportable", "_lib")
 
-    def __init__(self, nbytes, kind=GRAPH):
+    def __init__(self, nbytes, kind=GRAPH, exportable=False):
         self._lib = _load()
-        self.id = self._lib.xmx_buf_create_kind(int(nbytes), int(kind))
+        # Phase 2: exportable asks the driver for a buffer another process can import.
+        # An older native build has no such entry point, and asking for one is only ever
+        # an optimisation, so fall back to an ordinary buffer rather than refusing.
+        self.exportable = bool(exportable) and hasattr(self._lib,
+                                                       "xmx_buf_create_exportable")
+        if self.exportable:
+            self.id = self._lib.xmx_buf_create_exportable(int(nbytes), int(kind))
+        else:
+            self.id = self._lib.xmx_buf_create_kind(int(nbytes), int(kind))
         if self.id < 0:
             raise failure(self._lib, "xmx_buf_create")
         self.nbytes = int(nbytes)
         self.kind = int(kind)
+
+    def handle(self):
+        """The NT handle another process can import this buffer through, as an int.
+
+        It is *this* process's handle: a parent still has to DuplicateHandle it, and a
+        handle duplicated into a child is a different number. See
+        notes/phase2-extmem-design.md section 3.
+        """
+        if not self.exportable:
+            raise RuntimeError("this buffer was not created exportable")
+        value = int(self._lib.xmx_buf_handle(self.id))
+        if not value:
+            raise failure(self._lib, "xmx_buf_handle")
+        return value
 
     @property
     def mapped(self):
@@ -793,8 +827,9 @@ class Runtime:
         """Whether the graph's buffers are unmapped, so the host reaches them by copies."""
         return bool(self.lib.xmx_staging_mode())
 
-    def buffer(self, count, dtype=np.float32, kind=GRAPH):
-        return Buffer(int(count) * np.dtype(dtype).itemsize, kind=kind)
+    def buffer(self, count, dtype=np.float32, kind=GRAPH, exportable=False):
+        return Buffer(int(count) * np.dtype(dtype).itemsize, kind=kind,
+                      exportable=exportable)
 
     # the same two helpers as methods, for callers outside this package: `src/ref` reaches
     # a runtime through an object, not through an import path

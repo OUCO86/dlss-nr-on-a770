@@ -522,6 +522,141 @@ static int child_main(void)
 #undef SAY
 }
 
+/* ---------------------------------------------------------------- guest ---- */
+
+/* The role the other side plays once libxmx can export: `guest <handle> <expect>`
+ * imports a buffer the caller already exported, reads it back through its own device,
+ * and reports how many bytes are not `expect`. It then writes 0x5A.. over it, so the
+ * caller can check the write back the other way.
+ *
+ * This is the whole point of the exercise: the buffer was allocated by a different
+ * process, on a device this process never saw being created. */
+static int guest_main(const char *handle_hex, const char *expect_hex, const char *size_hex)
+{
+	VkInstance inst = make_instance();
+	if (!inst)
+		return 1;
+	g_pd = pick_intel(inst);
+	if (!g_pd) {
+		printf("guest: no Intel physical device\n");
+		return 1;
+	}
+	struct side b = { 0 };
+	if (make_side(&b))
+		return 1;
+	/* "-" means read the handle from stdin: the caller has to DuplicateHandle it into
+	 * this process first, which it can only do once this process exists. */
+	HANDLE hmem;
+	if (!strcmp(handle_hex, "-")) {
+		char line[64];
+		if (!read_line(GetStdHandle(STD_INPUT_HANDLE), line, sizeof line)) {
+			printf("guest: no handle on stdin\n");
+			return 1;
+		}
+		hmem = h_from_str(line);
+	} else {
+		hmem = h_from_str(handle_hex);
+	}
+	unsigned expect = (unsigned)strtoul(expect_hex, NULL, 16) & 0xff;
+	size_t bytes = strtoull(size_hex, NULL, 0);
+	if (!bytes)
+		bytes = SZ;
+
+	VkBufferCreateInfo ci = {
+		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+		.size = bytes,
+		.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	};
+	VkBuffer bb;
+	if (vkCreateBuffer(b.dev, &ci, NULL, &bb) != VK_SUCCESS) {
+		printf("guest: vkCreateBuffer failed\n");
+		return 1;
+	}
+	VkMemoryRequirements rb;
+	vkGetBufferMemoryRequirements(b.dev, bb, &rb);
+	/* the driver answers 0x0 here (see §15); fall back to what the buffer asks for */
+	uint32_t type = pick_memory(rb, ~0u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+					       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+	if (type == UINT32_MAX)
+		type = pick_memory(rb, ~0u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+	if (type == UINT32_MAX)
+		type = pick_memory(rb, ~0u, 0);
+	VkImportMemoryWin32HandleInfoKHR ihi = {
+		.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR,
+		.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+		.handle = hmem,
+	};
+	VkMemoryAllocateInfo mai = {
+		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &ihi,
+		.allocationSize = rb.size, .memoryTypeIndex = type,
+	};
+	VkDeviceMemory mb;
+	if (vkAllocateMemory(b.dev, &mai, NULL, &mb) != VK_SUCCESS) {
+		printf("guest: vkAllocateMemory (import) failed\n");
+		return 1;
+	}
+	if (vkBindBufferMemory(b.dev, bb, mb, 0) != VK_SUCCESS) {
+		printf("guest: vkBindBufferMemory failed\n");
+		return 1;
+	}
+	printf("guest: imported %llu bytes from handle %s (memory type %u)\n",
+	       (unsigned long long)bytes, handle_hex, type);
+
+	/* read it back: does what the other process wrote look like what it wrote? */
+	VkBufferCreateInfo hci = {
+		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+		.size = bytes, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+	};
+	VkBuffer host;
+	if (vkCreateBuffer(b.dev, &hci, NULL, &host) != VK_SUCCESS) {
+		printf("guest: vkCreateBuffer (host) failed\n");
+		return 1;
+	}
+	VkMemoryRequirements hr;
+	vkGetBufferMemoryRequirements(b.dev, host, &hr);
+	VkMemoryAllocateInfo hmai = {
+		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+		.allocationSize = hr.size, .memoryTypeIndex = b.host_type,
+	};
+	VkDeviceMemory hm;
+	if (vkAllocateMemory(b.dev, &hmai, NULL, &hm) != VK_SUCCESS) {
+		printf("guest: vkAllocateMemory (host) failed\n");
+		return 1;
+	}
+	vkBindBufferMemory(b.dev, host, hm, 0);
+	VkCommandBuffer cb = begin_cmd(&b);
+	VkBufferCopy cp = { .size = bytes };
+	vkCmdCopyBuffer(cb, bb, host, 1, &cp);
+	if (end_cmd(&b, cb, NULL, NULL, 1)) {
+		printf("guest: read-back submit failed\n");
+		return 1;
+	}
+	unsigned char *p;
+	if (vkMapMemory(b.dev, hm, 0, bytes, 0, (void **)&p) != VK_SUCCESS) {
+		printf("guest: vkMapMemory failed\n");
+		return 1;
+	}
+	unsigned wrong = 0;
+	for (size_t i = 0; i < bytes; i++)
+		if (p[i] != expect)
+			wrong++;
+	printf("guest: first bytes %02x %02x %02x %02x (wanted %02x)\n", p[0], p[1], p[2],
+	       p[3], expect);
+	vkUnmapMemory(b.dev, hm);
+	printf("R %u of %llu bytes wrong\n", wrong, (unsigned long long)bytes);
+
+	/* and write something the caller can check */
+	cb = begin_cmd(&b);
+	vkCmdFillBuffer(cb, bb, 0, bytes, P_BB);
+	if (end_cmd(&b, cb, NULL, NULL, 1)) {
+		printf("guest: fill failed\n");
+		return 1;
+	}
+	printf("guest: wrote 0x5A.. back\n");
+	return wrong ? 1 : 0;
+}
+
 /* -------------------------------------------------------------- parent ---- */
 
 static int export_semaphore(struct side *a, VkSemaphore *sem, HANDLE *handle)
@@ -920,5 +1055,11 @@ int main(int argc, char **argv)
 {
 	if (argc >= 2 && !strcmp(argv[1], "child"))
 		return child_main();
+	if (argc >= 4 && !strcmp(argv[1], "guest"))
+		return guest_main(argv[2], argv[3], argc >= 5 ? argv[4] : "0");
+	if (argc >= 2 && strcmp(argv[1], "guest") && strcmp(argv[1], "child")) {
+		printf("usage: %s [guest <handle-hex> <expect-hex> [bytes] | child]\n", argv[0]);
+		return 1;
+	}
 	return parent_main();
 }
