@@ -225,6 +225,12 @@ def _extmem_publish(args, backend):
     if getattr(args, "extmem_published", False):
         return
     args.extmem_published = True
+    # The buffer has to exist before there is a handle to it, and it is the backend
+    # that makes it — sized for the daemon's own pixel limit, so no extent that
+    # arrives later needs a second one.
+    getter = getattr(backend, "extmem_input", None)
+    if getter is None or getter(args.max_pixels) is None:
+        return
     mapping = _mapping(args)
     if mapping is None:
         return
@@ -258,7 +264,6 @@ def _extmem_payload(args, backend, pixels):
     getter = getattr(backend, "extmem_input", None)
     if getter is None or getter(args.max_pixels) is None:
         return None
-    _extmem_publish(args, backend)
     view = getattr(backend, "extmem_view", None)
     return view(pixels * 4) if view is not None else None
 
@@ -1097,6 +1102,10 @@ def stage_prepare(connection, backend, args, pipeline=None):
     busy with the frame before. Returns None when the frame was rejected or answered
     outright and needs no further stage.
     """
+    # Offer the layer the frame's buffer before reading anything: the offer is what
+    # makes the layer write into it, so it cannot wait for a frame that already did.
+    # Tried once and kept — see `_extmem_publish`.
+    _extmem_publish(args, backend)
     header = receive(connection, 16, probe_ok=True)
     if header is None:
         return

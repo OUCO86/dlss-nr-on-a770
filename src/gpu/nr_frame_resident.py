@@ -180,6 +180,12 @@ class ResidentFrame:
         # Off by default, and read once: a buffer is exportable or not from the moment it
         # is allocated, so this cannot be switched on a running frame.
         self.extmem = os.environ.get("NR_EXTMEM", "0") != "0"
+        # Only the way *back* needs the host's own buffers to be exportable: the way in
+        # is the frame's buffer, which is made separately and is the only thing the
+        # layer writes. Exporting the features as well was measured to cost 3.4 ms a
+        # frame in `pass_assemble` on the Arc — the memory is host-visible either way,
+        # but not at the same price — so it waits for the half that wants it.
+        self.extmem_answer = os.environ.get("NR_EXTMEM_ANSWER", "0") != "0"
         self._planned = None      # what the arena was planned for: `_prepare_scratch`
         self._closed = False
         self._head_free = []      # host blocks a returned head was in and nobody holds now
@@ -273,7 +279,8 @@ class ResidentFrame:
             # leaves this device, so a handle for it would buy nothing
             existing = self.rt.buffer(elements, dtype,
                                       kind=self.host_side.get(name, xmxres.GRAPH),
-                                      exportable=self.extmem and name in self.host_side)
+                                      exportable=self.extmem_answer
+                                                and name in self.host_side)
             self._buffers[name] = existing
         return existing
 
