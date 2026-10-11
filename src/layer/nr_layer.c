@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
 #include "nr_transport.h"
@@ -224,8 +225,8 @@ static void shm_look(void)
 	if (want && (!strcmp(want, "0") || !strcmp(want, "off"))) return;
 	if (!socket_path || nr_shm_open(&shm, socket_path) != 0) return;
 	shm_state = 1;
-	fprintf(stderr, "[nr_layer] the frame crosses in a mapping: %u slots, "
-			"%zu MB the colour and %zu MB the mask\n",
+	nr_layer_log("the frame crosses in a mapping: %u slots, "
+			"%zu MB the colour and %zu MB the mask",
 		shm.slots, shm.colour >> 20, shm.mask >> 20);
 }
 
@@ -261,15 +262,15 @@ static void extmem_look(void)
 	 * the mapping until it works. */
 	if (!nr_shm_extmem(&shm, &raw, &answer, &sem, &raw_bytes, &answer_bytes)) {
 		if (++extmem_tries > 1800) {
-			fprintf(stderr, "[nr_layer] the daemon never offered the frame's "
-				"buffer; it crosses in the mapping\n");
+			nr_layer_log("the daemon never offered the frame's "
+				"buffer; it crosses in the mapping");
 			extmem_state = -1;
 		}
 		return;
 	}
 	if (nrx_open(raw, raw_bytes, answer, answer_bytes, sem) != 0) {
-		fprintf(stderr, "[nr_layer] the frame's buffers could not be imported (%s); "
-			"it crosses in the mapping instead\n",
+		nr_layer_log("the frame's buffers could not be imported (%s); "
+			"it crosses in the mapping instead",
 			nrx_error() ? nrx_error() : "for a reason the layer did not record");
 		return;
 	}
@@ -277,8 +278,8 @@ static void extmem_look(void)
 	/* One buffer, one frame: the daemon's input buffer is a single one every frame
 	 * shares, so frames must not be allowed to overlap on it. */
 	if (async_depth > 1) {
-		fprintf(stderr, "[nr_layer] the frame's buffers are shared between frames, so "
-			"they cannot overlap: %d at once was asked for, 1 will be used\n",
+		nr_layer_log("the frame's buffers are shared between frames, so "
+			"they cannot overlap: %d at once was asked for, 1 will be used",
 			async_depth);
 		async_depth = 1;
 	}
@@ -315,7 +316,7 @@ static int exchange_send(const void *header, size_t header_size, const void *pay
 {
 	nr_link link;
 	if (nr_link_connect(&link, socket_path) != 0) {
-		fprintf(stderr, "[nr_layer] no daemon at %s\n", socket_path);
+		nr_layer_log("no daemon at %s", socket_path);
 		return -1;
 	}
 	shm_look();
@@ -358,8 +359,8 @@ static int exchange_send(const void *header, size_t header_size, const void *pay
 			}
 			/* Nobody was told, so nobody must be left waiting. Give the buffers
 			 * back and send this frame the way it has always gone. */
-			fprintf(stderr, "[nr_layer] the frame could not be announced (%s); it "
-				"crosses in the mapping instead\n",
+			nr_layer_log("the frame could not be announced (%s); it "
+				"crosses in the mapping instead",
 				nrx_error() ? nrx_error() : "for a reason the layer did not record");
 			nrx_close();
 			extmem_state = -1;
@@ -566,8 +567,8 @@ static void announce_queues(VkDevice device, VkQueue presenting, uint32_t presen
 	for (int i = 0; i < count && used + 8 < sizeof list; i++)
 		used += (size_t)snprintf(list + used, sizeof list - used, "%s%u",
 					 used ? "," : "", families[i]);
-	fprintf(stderr, "[nr_layer] queues: %d handed out, families {%s}; presenting on "
-		"family %u. %s\n", count, list, present_family,
+	nr_layer_log("queues: %d handed out, families {%s}; presenting on "
+		"family %u. %s", count, list, present_family,
 		others ? "Multiple families: capture waits on the present's semaphores."
 		       : "Capture waits on the present's semaphores; copies finish on private fences.");
 }
@@ -675,6 +676,152 @@ static void nr_default_dir(char *out, size_t size)
 #endif
 }
 
+/* The layer's log, and the only place its half of this has ever been readable.
+ *
+ * Every diagnostic in this file went to stderr, and a game started from a .bat with
+ * `start "" game.exe` has no stderr anyone can read: no console is attached, nothing
+ * is redirected, and the lines are dropped on the floor. So `work/nr_daemon.log` held
+ * the daemon's side and nothing else — and the daemon can only speak about a frame it
+ * was handed. It does not know what the game spent rendering that frame, nor what the
+ * present waited for, and those are most of the number a player actually sees.
+ *
+ * Hence two things here: the layer writes to the same file the daemon does
+ * (NR_LAYER_LOG, appended, flushed, behind a lock because presents and the spawn are
+ * not on one thread), and it times the interval between presents, which is the game's
+ * own frame time measured where the game measures it.
+ *
+ * stderr still gets the line. A console is the one place to look when there is one.
+ *
+ * Not static: nr_extmem.c reports what an imported buffer landed in, and that report
+ * is the one thing that says whether the way back is being paid for. It is not in
+ * nr_layer.def, which names only what the loader looks up. */
+static nr_mutex_t log_lock = NR_MUTEX_INIT;
+static FILE *log_file;
+
+void nr_layer_log(const char *fmt, ...)
+{
+	va_list ap;
+	char line[512];
+	va_start(ap, fmt);
+	vsnprintf(line, sizeof line, fmt, ap);
+	va_end(ap);
+
+	nr_mutex_lock(&log_lock);
+	if (!log_file) {
+		char dir[1024], path[1024 + 32];
+		const char *set = getenv("NR_LAYER_LOG");
+		if (set && *set)
+			snprintf(path, sizeof path, "%s", set);
+		else {
+			nr_default_dir(dir, sizeof dir);
+			snprintf(path, sizeof path, "%s/nr_daemon.log", dir);
+		}
+		log_file = fopen(path, "a");
+	}
+	if (log_file) {
+		fprintf(log_file, "[nr_layer] %s\n", line);
+		fflush(log_file);
+	}
+	nr_mutex_unlock(&log_lock);
+	fprintf(stderr, "[nr_layer] %s\n", line);
+	fflush(stderr);
+}
+
+/* The game's frame time.
+ *
+ * This is the number the daemon cannot produce. Its own log says `in 0.04s`, which is
+ * how long the daemon took over one frame — the whole of the Neural Renderer and
+ * nothing else — and it was read as the frame time more than once here. It is not: a
+ * frame the game spent 20 ms rendering arrives before that 40 ms starts, and the
+ * present that follows it waits on the answer. Both are outside what the daemon sees,
+ * and both are inside the interval between two presents, which is what a frame costs
+ * the player.
+ *
+ * Reported every REPORT_EVERY presents over the last FRAME_WINDOW intervals, so it
+ * survives a stutter without being swamped by one: a median, the quarter points, and
+ * the range. */
+#define FRAME_WINDOW  256
+#define REPORT_EVERY  120
+
+static struct {
+	double intervals[FRAME_WINDOW];
+	int filled;              /* how much of the ring is real, up to FRAME_WINDOW */
+	int next;                /* where the next interval lands */
+	int presented;           /* presents since the last report */
+	int have_last;
+	double last;
+} frame_clock;
+
+static double frame_seconds(void)
+{
+#ifdef _WIN32
+	LARGE_INTEGER tick, rate;
+	if (!QueryPerformanceCounter(&tick) || !QueryPerformanceFrequency(&rate)
+	    || rate.QuadPart <= 0)
+		return 0.0;
+	return (double)tick.QuadPart / (double)rate.QuadPart;
+#else
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	return (double)tv.tv_sec + (double)tv.tv_usec / 1e6;
+#endif
+}
+
+/* Insertion sort, on a copy: 256 doubles every couple of seconds is nothing, and the
+ * alternative is a median that lies. */
+static double frame_percentile(const double *sorted, int n, int tenths)
+{
+	if (n <= 0) return 0.0;
+	int at = (n - 1) * tenths / 100;
+	return sorted[at];
+}
+
+static void frame_report(void)
+{
+	double sorted[FRAME_WINDOW];
+	int n = frame_clock.filled;
+	if (n <= 0) return;
+	memcpy(sorted, frame_clock.intervals, (size_t)n * sizeof sorted[0]);
+	for (int i = 1; i < n; i++) {
+		double v = sorted[i];
+		int j = i - 1;
+		while (j >= 0 && sorted[j] > v) { sorted[j + 1] = sorted[j]; j--; }
+		sorted[j + 1] = v;
+	}
+	double med = frame_percentile(sorted, n, 50);
+	double p25 = frame_percentile(sorted, n, 25);
+	double p75 = frame_percentile(sorted, n, 75);
+	nr_layer_log("frame: %d presented, %.1f ms median (p25 %.1f / p75 %.1f), "
+		     "min %.1f max %.1f  =>  %.1f fps",
+		     frame_clock.presented, med * 1000.0, p25 * 1000.0, p75 * 1000.0,
+		     sorted[0] * 1000.0, sorted[n - 1] * 1000.0,
+		     med > 0.0 ? 1.0 / med : 0.0);
+}
+
+/* Call once per present. The first call only sets the clock; an interval needs two. */
+static void frame_tick(void)
+{
+	double now = frame_seconds();
+	if (frame_clock.have_last) {
+		double dt = now - frame_clock.last;
+		if (dt > 0.0 && dt < 4.0) {          /* a load, or a menu: not a frame */
+			frame_clock.intervals[frame_clock.next] = dt;
+			frame_clock.next = (frame_clock.next + 1) % FRAME_WINDOW;
+			if (frame_clock.filled < FRAME_WINDOW) frame_clock.filled++;
+		}
+		/* Counted and reset here rather than in the report, which can decline to
+		 * print: nothing to sort means nothing resets it, and then every present
+		 * after that is a report. */
+		frame_clock.presented++;
+		if (frame_clock.presented >= REPORT_EVERY) {
+			frame_report();
+			frame_clock.presented = 0;
+		}
+	}
+	frame_clock.last = now;
+	frame_clock.have_last = 1;
+}
+
 /* The interpreter to start the daemon with, when NR_PYTHON does not name one.
  *
  * It cannot be "python3" on both: on Windows that name belongs to the Microsoft Store's
@@ -774,7 +921,7 @@ static void ensure_daemon(void)
 	}
 #endif
 	if (!self[0]) {
-		fprintf(stderr, "[nr_layer] could not locate this layer's path; set NR_DAEMON\n");
+		nr_layer_log("could not locate this layer's path; set NR_DAEMON");
 		return;
 	}
 
@@ -814,8 +961,8 @@ static void ensure_daemon(void)
 			}
 		}
 		if (!daemon) {
-			fprintf(stderr, "[nr_layer] could not find nr_daemon.py next to the "
-				"layer; set NR_DAEMON to its path\n");
+			nr_layer_log("could not find nr_daemon.py next to the "
+				"layer; set NR_DAEMON to its path");
 			return;
 		}
 	}
@@ -856,8 +1003,8 @@ static void ensure_daemon(void)
 			       py, daemon, socket_path, settings, root);
 	if (written < 0 || (size_t)written >= sizeof cmd) {
 		/* a cut command line would start some other program than the daemon */
-		fprintf(stderr, "[nr_layer] the daemon's command line is longer than %zu "
-			"bytes; start the daemon by hand\n", sizeof cmd);
+		nr_layer_log("the daemon's command line is longer than %zu "
+			"bytes; start the daemon by hand", sizeof cmd);
 		return;
 	}
 
@@ -918,8 +1065,8 @@ static void ensure_daemon(void)
 		char *env_block = malloc(need);
 		if (!env_block) {
 			if (env) FreeEnvironmentStringsA(env);
-			fprintf(stderr, "[nr_layer] out of memory building the daemon's "
-				"environment; frame stays as the game drew it\n");
+			nr_layer_log("out of memory building the daemon's "
+				"environment; frame stays as the game drew it");
 			return;
 		}
 		size_t used = 0;
@@ -955,8 +1102,8 @@ static void ensure_daemon(void)
 		    si.hStdInput != NULL) CloseHandle(si.hStdInput);
 		if (si.hStdOutput != INVALID_HANDLE_VALUE) CloseHandle(si.hStdOutput);
 		if (!ok) {
-			fprintf(stderr, "[nr_layer] daemon spawn failed (%lu); frame stays "
-				"as the game drew it\n", GetLastError());
+			nr_layer_log("daemon spawn failed (%lu); frame stays "
+				"as the game drew it", GetLastError());
 			return;
 		}
 		CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
@@ -1004,8 +1151,8 @@ static void ensure_daemon(void)
 
 		pid_t pid;
 		if (posix_spawnp(&pid, py, &fa, NULL, argv, child_env) != 0)
-			fprintf(stderr, "[nr_layer] daemon spawn failed; frame stays as the "
-				"game drew it\n");
+			nr_layer_log("daemon spawn failed; frame stays as the "
+				"game drew it");
 		free(child_env);
 		posix_spawn_file_actions_destroy(&fa);
 	}
@@ -1056,25 +1203,25 @@ VKAPI_ATTR VkResult VKAPI_CALL nr_CreateInstance(const VkInstanceCreateInfo *inf
 		if (live_every <= 0) async_depth = 0;
 		async_live = async_depth > 0;
 		if (async_live)
-			fprintf(stderr, "[nr_layer] async: %d frame%s on its way to the daemon at "
+			nr_layer_log("async: %d frame%s on its way to the daemon at "
 				"once, so a processed present shows the answer that far back and the "
-				"daemon works while the game draws\n",
+				"daemon works while the game draws",
 				async_depth, async_depth == 1 ? "" : "s");
 		if (live_every > 0)
-			fprintf(stderr, "[nr_layer] live: every %ld%s present goes through the "
-				"network, the frames between hold the last result\n",
+			nr_layer_log("live: every %ld%s present goes through the "
+				"network, the frames between hold the last result",
 				live_every, live_every == 1 ? "st" : "th");
 		if (live_every > 0 && getenv("NR_LAYER_TRIGGER"))
-			fprintf(stderr, "[nr_layer] live runs while the trigger exists; "
-				"remove it to hand the game back\n");
-		fprintf(stderr, "[nr_layer] sync: present waits + private fences (readback and writeback)\n");
-		fprintf(stderr, "[nr_layer] active; socket=%s trigger=%s capture=%s every=%ld\n",
+			nr_layer_log("live runs while the trigger exists; "
+				"remove it to hand the game back");
+		nr_layer_log("sync: present waits + private fences (readback and writeback)");
+		nr_layer_log("active; socket=%s trigger=%s capture=%s every=%ld",
 			socket_path ? socket_path : "(none)",
 			trigger_path ? trigger_path : "(none)",
 			capture_path ? capture_path : "(off)", capture_every);
 		if (ui_mask)
-			fprintf(stderr, "[nr_layer] ui mask on: the first present after the "
-				"trigger is kept to find what held still\n");
+			nr_layer_log("ui mask on: the first present after the "
+				"trigger is kept to find what held still");
 	}
 	return r;
 }
@@ -1149,20 +1296,20 @@ VKAPI_ATTR VkResult VKAPI_CALL nr_CreateSwapchainKHR(VkDevice device,
 	}
 	if (r != VK_SUCCESS) return r;
 	if (!copyable) {
-		fprintf(stderr, "[nr_layer] swapchain refused transfer usage; capture off\n");
+		nr_layer_log("swapchain refused transfer usage; capture off");
 		return r;
 	}
 	/* One layer, and not protected: the copy reads a single 2-D image, and protected
 	 * memory cannot reach a host-visible buffer at all. */
 	if (info->imageArrayLayers != 1
 	    || (info->flags & VK_SWAPCHAIN_CREATE_PROTECTED_BIT_KHR)) {
-		fprintf(stderr, "[nr_layer] swapchain is multi-layer or protected; capture off\n");
+		nr_layer_log("swapchain is multi-layer or protected; capture off");
 		return r;
 	}
 
 	if (!format_is_four_bytes(info->imageFormat)) {
-		fprintf(stderr, "[nr_layer] swapchain format %d is not four bytes a pixel; "
-			"leaving it alone\n", info->imageFormat);
+		nr_layer_log("swapchain format %d is not four bytes a pixel; "
+			"leaving it alone", info->imageFormat);
 		return r;
 	}
 	nr_mutex_lock(&lock);
@@ -1170,8 +1317,8 @@ VKAPI_ATTR VkResult VKAPI_CALL nr_CreateSwapchainKHR(VkDevice device,
 	for (int i = 0; i < MAX_SWAPCHAINS; i++)
 		if (!swapchains[i].swapchain) { entry = &swapchains[i]; break; }
 	if (!entry)
-		fprintf(stderr, "[nr_layer] all %d swapchain slots are in use; this one is "
-			"not tracked\n", MAX_SWAPCHAINS);
+		nr_layer_log("all %d swapchain slots are in use; this one is "
+			"not tracked", MAX_SWAPCHAINS);
 	if (entry) {
 		memset(entry, 0, sizeof *entry);
 		entry->swapchain = *swapchain;
@@ -1187,11 +1334,11 @@ VKAPI_ATTR VkResult VKAPI_CALL nr_CreateSwapchainKHR(VkDevice device,
 		if (got != VK_SUCCESS || !entry->image_count) {
 			memset(entry, 0, sizeof *entry);
 			nr_mutex_unlock(&lock);
-			fprintf(stderr, "[nr_layer] swapchain has more than %d images or none; "
-				"capture off\n", MAX_IMAGES);
+			nr_layer_log("swapchain has more than %d images or none; "
+				"capture off", MAX_IMAGES);
 			return r;
 		}
-		fprintf(stderr, "[nr_layer] swapchain %ux%u format %d, %u images\n",
+		nr_layer_log("swapchain %ux%u format %d, %u images",
 			entry->extent.width, entry->extent.height, entry->format,
 			entry->image_count);
 	}
@@ -1478,7 +1625,7 @@ failed:
     if (fence) DestroyFence(data->device, fence, NULL);
     if (commands) FreeCommandBuffers(data->device, data->pool, 1, &commands);
     data->transfer_error = r;
-    fprintf(stderr, "[nr_layer] transfer failed (%d)\n", (int)r);
+    nr_layer_log("transfer failed (%d)", (int)r);
     return -1;
 }
 
@@ -1535,7 +1682,7 @@ static int process_frame(struct device_data *data, struct swapchain_data *chain,
 		uint32_t held = settled(data->mapped, data->earlier, pixels,
 					data->outgoing + needed);
 		masked = mask_worth_sending(held, pixels);
-		fprintf(stderr, "[nr_layer] %u%% of the frame held still; ui mask %s\n",
+		nr_layer_log("%u%% of the frame held still; ui mask %s",
 			100u * held / pixels, masked ? "sent" : "refused");
 	}
 
@@ -1554,21 +1701,21 @@ static int process_frame(struct device_data *data, struct swapchain_data *chain,
 	if (masked) {
 		if (exchange(header, sizeof header, data->outgoing, (size_t)needed + pixels,
 			     data->result, (size_t)needed)) {
-			fprintf(stderr, "[nr_layer] the daemon did not answer; frame unchanged\n");
+			nr_layer_log("the daemon did not answer; frame unchanged");
 			return -1;
 		}
 		memcpy(data->mapped, data->result, (size_t)needed);
-		fprintf(stderr, "[nr_layer] processed %ux%u with a ui mask\n",
+		nr_layer_log("processed %ux%u with a ui mask",
 			chain->extent.width, chain->extent.height);
 		return 0;
 	}
 	if (exchange(header, sizeof header, data->mapped, (size_t)needed, data->result,
 		     (size_t)needed)) {
-		fprintf(stderr, "[nr_layer] the daemon did not answer; frame unchanged\n");
+		nr_layer_log("the daemon did not answer; frame unchanged");
 		return -1;
 	}
 	memcpy(data->mapped, data->result, (size_t)needed);
-	fprintf(stderr, "[nr_layer] processed %ux%u\n", chain->extent.width,
+	nr_layer_log("processed %ux%u", chain->extent.width,
 		chain->extent.height);
 	return 0;
 }
@@ -1610,7 +1757,7 @@ static int process_frame_async(struct device_data *data, struct swapchain_data *
 		}
 		answered = exchange_receive(fd, data->result, (size_t)needed) == 0;
 		if (!answered)
-			fprintf(stderr, "[nr_layer] the daemon did not answer; frame unchanged\n");
+			nr_layer_log("the daemon did not answer; frame unchanged");
 		break;
 	}
 	if (socket_path) {
@@ -1789,6 +1936,10 @@ static VkResult present_locked(VkQueue queue,
 
 VKAPI_ATTR VkResult VKAPI_CALL nr_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *info)
 {
+    /* Timed before anything this function decides, and before the lock: the interval
+     * between presents is the game's frame time whether or not this frame gets handed
+     * to the daemon, and it is the one number here the daemon cannot produce. */
+    frame_tick();
     struct queue_data *owner = find_queue(queue);
     struct device_data *data = owner ? find_device(owner->device) : NULL;
     if (!data) for (int i = 0; i < 8; i++) if (devices[i].device) { data = &devices[i]; break; }

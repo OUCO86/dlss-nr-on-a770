@@ -375,19 +375,25 @@ int nrx_open(unsigned long long raw_handle, unsigned long long raw_bytes,
 	/* The memory type each import landed in goes out with the sizes, because it is
 	 * the one thing that decides what the host's read of the answer costs and it
 	 * cannot be asked for afterwards. Type 2 on this card is cached system memory,
-	 * type 3 is device memory behind the bar; an answer read out of type 3 measures
-	 * 376.77 ms for 7.9 MB against 0.40 ms out of type 2 (check_bar_read.py). If the
-	 * answer's type is not 2, the way back is being paid for and not bought. */
+	 * type 3 is device memory behind the bar.
+	 *
+	 * What that difference is worth on an *imported* buffer is not the 950x that
+	 * check_bar_read.py measured on buffers this device made for itself (376.77 ms
+	 * for 7.9 MB out of type 3, 0.40 ms out of type 2): check_extmem_export.py with
+	 * 8 MB imported three ways — host-visible, device-local, cached — measured 1.83,
+	 * 1.81 and 1.93 ms, which is no difference at all. Which type an import may be
+	 * mapped as is the driver's answer to the handle, and the physical memory behind
+	 * it does not move. So this line is a fact to be read, not a verdict. */
 	if (nrx_ans_n)
-		fprintf(stderr, "[nr_layer] the frame goes straight into the daemon's "
-				"buffers: %zu MB raw in memory type %u, %zu MB answer in "
-				"memory type %u, over a timeline semaphore\n",
-			nrx_raw_n >> 20, raw_type, nrx_ans_n >> 20, answer_type);
+		nr_layer_log("the frame goes straight into the daemon's buffers: "
+			     "%zu MB raw in memory type %u, %zu MB answer in memory "
+			     "type %u, over a timeline semaphore",
+			     nrx_raw_n >> 20, raw_type, nrx_ans_n >> 20, answer_type);
 	else
-		fprintf(stderr, "[nr_layer] the frame goes straight into the daemon's "
-				"buffer: %zu MB in memory type %u, over a timeline "
-				"semaphore; the answer still crosses in a slot\n",
-			nrx_raw_n >> 20, raw_type);
+		nr_layer_log("the frame goes straight into the daemon's buffer: "
+			     "%zu MB in memory type %u, over a timeline semaphore; "
+			     "the answer still crosses in a slot",
+			     nrx_raw_n >> 20, raw_type);
 	return 0;
 }
 

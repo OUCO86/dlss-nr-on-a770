@@ -26,6 +26,11 @@
 
 #include <stddef.h>
 
+/* Where the layer's diagnostics go, defined in nr_layer.c. The layer's stderr is
+ * unreadable — a game started from a .bat with `start` has no console — so this is the
+ * file the daemon writes, appended to. See the comment over `nr_layer_log`. */
+void nr_layer_log(const char *fmt, ...);
+
 #ifdef _WIN32
 
 /* Take over the buffers and the semaphore the daemon duplicated to this process, and
