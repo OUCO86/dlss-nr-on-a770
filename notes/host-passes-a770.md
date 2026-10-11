@@ -61,6 +61,42 @@ the NumPy pairwise sum it replaces — it will not be bit-identical by construct
 own check; and the history downsample is on **`post_send`**, off the frame's path today, so (2)'s
 payoff is throughput, not latency, unless enough of it lands to shorten the daemon's turn.
 
+## done (2026-10-11, `1bbb31f`): a better first step than either
+
+Writing the composition out at all turned out to be the thing to attack, and item (2) above was
+never needed to get it — which the paragraph above got wrong. Nothing reads the composition
+except the `change` figure, `--dump` and `--meter`, and only the first runs during a game. Fold
+that figure into the pass **and** withhold the frame, and the whole 25 MB disappears at once.
+
+`nr_compose_encode` takes two trailing arguments: `output` NULL withholds the composition, and
+`change` with a row step accumulates the figure instead. Both are off by default, so everything
+that wanted the composition still gets it.
+
+| `daemon_stages.py 1920x1080@0.4`, median of 14 | before | after |
+|---|---|---|
+| `compose_encode` | 5.68 | 3.99 |
+| `post_send` | 5.18 | **2.12** — the `mean_change` there has nothing left to read |
+| `total` | 68.35 | **62.23** |
+| `round_trip` | 65.10 | **62.90** |
+
+Notes on how:
+
+- The slow path already holds both operands in registers, so metering is three `fabsf` adds per
+  pixel. The fast path is a template specialised over five switches; putting a condition inside
+  it would have cost more than it saves, and it has only just written its row — so it is metred
+  from the row afterwards, which is still in cache.
+- Metred **before** `unit`, matching NumPy: the composition was never clamped, only the codec
+  clamps. Getting this wrong moves the figure by several parts in a thousand.
+- Summed in `double`. In float32 the mean over this many values loses enough to show five places.
+
+`src/bench/check_compose_change.py` is the check the risk above asked for — one process,
+alternating, both paths: the encoded frame is identical in 11 of 11 turns and the figure agrees
+to 3.7e-09 (slow path) and exactly (fast path). `src/ref/test_native_image.py` still passes,
+which is what covers the composition `--dump` keeps.
+
+To go back without a rebuild: `cp work/libnr_image.dll.backup work/libnr_image.dll` (the old dll,
+kept) and take the commit out.
+
 ## building the library on this machine
 
 > ⚠️ **This section was wrong once and is corrected 2026-10-11 07:3x.** It said "this machine
