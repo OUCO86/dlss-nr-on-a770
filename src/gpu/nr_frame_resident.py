@@ -174,6 +174,12 @@ class ResidentFrame:
         self._scratch, self._blocks, self._buffers, self._edges = {}, {}, {}, {}
         self._graphs = {}
         self._arena = xmxres.ScratchArena(runtime) if os.environ.get("NR_SCRATCH_ARENA", "1") != "0" else None
+        # Phase 2: with this on, the two buffers the host touches are allocated so their
+        # memory can be handed to the layer, which then writes the frame into them and
+        # reads the answer out of them instead of both going through shared memory.
+        # Off by default, and read once: a buffer is exportable or not from the moment it
+        # is allocated, so this cannot be switched on a running frame.
+        self.extmem = os.environ.get("NR_EXTMEM", "0") != "0"
         self._planned = None      # what the arena was planned for: `_prepare_scratch`
         self._closed = False
         self._head_free = []      # host blocks a returned head was in and nobody holds now
@@ -263,10 +269,29 @@ class ResidentFrame:
         if existing is None or existing.nbytes < elements * np.dtype(dtype).itemsize:
             if existing is not None:
                 existing.free()
+            # only the two the host touches are worth exporting: everything else never
+            # leaves this device, so a handle for it would buy nothing
             existing = self.rt.buffer(elements, dtype,
-                                      kind=self.host_side.get(name, xmxres.GRAPH))
+                                      kind=self.host_side.get(name, xmxres.GRAPH),
+                                      exportable=self.extmem and name in self.host_side)
             self._buffers[name] = existing
         return existing
+
+    def host_handles(self):
+        """The frame's exported buffers, by name, as handles this process owns.
+
+        Empty unless NR_EXTMEM is on. A handle is only a number inside the process that
+        holds it, so whoever wants these in the layer has to duplicate them across
+        first; `nr_daemon.py` is where that happens.
+        """
+        if not self.extmem:
+            return {}
+        out = {}
+        for name in self.host_side:
+            buffer = self._buffers.get(name)
+            if buffer is not None and getattr(buffer, "exportable", False):
+                out[name] = buffer.handle()
+        return out
 
     def edge(self, index, kind):
         return self.w.edge(index, kind)
