@@ -225,12 +225,6 @@ def _extmem_publish(args, backend):
     if getattr(args, "extmem_published", False):
         return
     args.extmem_published = True
-    # The buffer has to exist before there is a handle to it, and it is the backend
-    # that makes it — sized for the daemon's own pixel limit, so no extent that
-    # arrives later needs a second one.
-    getter = getattr(backend, "extmem_input", None)
-    if getter is None or getter(args.max_pixels) is None:
-        return
     mapping = _mapping(args)
     if mapping is None:
         return
@@ -240,12 +234,28 @@ def _extmem_publish(args, backend):
               "mapping", flush=True)
         return
     try:
+        import nr_pipe
+        # The buffer has to exist before there is a handle to it, and it is the
+        # backend that makes it — sized for the daemon's own pixel limit, so no
+        # extent that arrives later needs a second one. Inside the try: there is no
+        # reason to make it before knowing it can be offered.
+        getter = getattr(backend, "extmem_input", None)
+        if getter is None or getter(args.max_pixels) is None:
+            return
         args.extmem_sem = backend.runtime.export_semaphore()
         raw_handle, raw_bytes = backend.extmem_handles()
         handles = nr_pipe.duplicate_to(
             pid, (raw_handle, backend.runtime.semaphore_handle(args.extmem_sem)))
-    except (OSError, RuntimeError, AttributeError) as error:
-        print(f"the frame's buffer could not be offered to the layer ({error}); "
+    except Exception as error:
+        # Anything at all. This is the soft-failure path: it exists so that a frame
+        # can cross in the mapping when the buffer cannot be offered, and an
+        # exception that escapes it takes the daemon down instead — the game then
+        # waits on a pipe nobody answers, which is how a missing import turned into
+        # a game that would not load. Named, and the traceback printed: a failure
+        # this swallows must still be one somebody can find.
+        import traceback
+        traceback.print_exc()
+        print(f"the frame's buffer could not be offered to the layer ({error!r}); "
               f"it stays in the mapping", flush=True)
         return
     # No answer handle: the answer still crosses in the slot, which is what the four
