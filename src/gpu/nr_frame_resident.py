@@ -426,6 +426,13 @@ class ResidentFrame:
             ran = _time.perf_counter() - mark
             if submits is not None:
                 submits.append(passes)
+            if self.head_on_device:
+                # The cached graph's way in is the other `replay` branch below, and it
+                # leaves the head where it is; this one is every frame after it, so it
+                # has to agree. Reading that buffer back is a device memory read of
+                # 25 MB, not the mapped one the host path has: 212 ms a frame.
+                self.split = (carried, ran, 0.0)
+                return self.head_buffer(), (4 if rt.compact_head else 16)
             mark = _time.perf_counter()
             out = self.read_head()
             self.split = (carried, ran, _time.perf_counter() - mark)
