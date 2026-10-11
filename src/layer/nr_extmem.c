@@ -170,18 +170,44 @@ static int make_device(void)
 
 /* ------------------------------------------------------------ imported memory -- */
 
-/* A memory type the buffer can live in and the CPU can map. The driver answers
- * vkGetMemoryWin32HandlePropertiesKHR with memoryTypeBits 0x0 on this card, so the
- * buffer's own requirements are what is looked at. */
-static uint32_t pick_type(VkMemoryRequirements *req)
+/* The memory types an imported buffer may ask for, in the order they suit the two
+ * halves of Phase 2. They are opposites, on purpose:
+ *
+ *   RAW_    the daemon's *device* reads it every frame. Device-local is the fast
+ *           place for that, and the host side only ever writes, which is the cheap
+ *           direction through the bar even uncached. This is type 3 here.
+ *   HOST_   the *host* reads it every frame — the answer, in the layer. A read of
+ *           device memory through the bar is uncached and cannot be posted: 7.9 MB
+ *           measures 376.77 ms there against 0.40 ms out of cached system memory
+ *           (check_bar_read.py). HOST_CACHED is what buys that. This is type 2 here,
+ *           and it is the same bit nr_layer.c:1346 asks for first for its own
+ *           staging buffer, which is why the host read on the way in was never slow.
+ *
+ * Picking "the first host-visible type" answers both with type 3, and with it a
+ * frame rate that follows the answer's read down.
+ *
+ * The driver answers vkGetMemoryWin32HandlePropertiesKHR with memoryTypeBits 0x0 on
+ * this card, so the buffer's own requirements are what is looked at. */
+#define WANT_RAW   (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | \
+		    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+#define WANT_HOST  (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | \
+		    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
+
+static uint32_t pick_type(VkMemoryRequirements *req, VkMemoryPropertyFlags want)
 {
 	VkPhysicalDeviceMemoryProperties props;
 	vkGetPhysicalDeviceMemoryProperties(nrx_pd, &props);
-	for (uint32_t i = 0; i < props.memoryTypeCount; i++) {
-		if (!(req->memoryTypeBits & (1u << i)))
-			continue;
-		if (props.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
-			return i;
+	/* The flags wanted, then just host-visible: an import that cannot have what it
+	 * asked for is still better off mapped than refused. */
+	for (int pass = 0; pass < 2; pass++) {
+		VkMemoryPropertyFlags asking = pass == 0 ? want
+					     : VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+		for (uint32_t i = 0; i < props.memoryTypeCount; i++) {
+			if (!(req->memoryTypeBits & (1u << i)))
+				continue;
+			if ((props.memoryTypes[i].propertyFlags & asking) == asking)
+				return i;
+		}
 	}
 	return UINT32_MAX;
 }
@@ -192,8 +218,9 @@ static uint32_t pick_type(VkMemoryRequirements *req)
  * the whole of what may be asked for: vkAllocateMemory's VUID-vkAllocateMemory-
  * pAllocateInfo-01713 caps allocationSize at the heap, and an import has no business
  * asking for more than the export made. */
-static int import_buffer(VkDeviceSize bytes, unsigned long long handle, VkBuffer *out_buf,
-			 VkDeviceMemory *out_mem, void **out_ptr)
+static int import_buffer(VkDeviceSize bytes, unsigned long long handle,
+			 VkMemoryPropertyFlags want, VkBuffer *out_buf,
+			 VkDeviceMemory *out_mem, void **out_ptr, uint32_t *out_type)
 {
 	const VkExternalMemoryHandleTypeFlagBits type =
 		VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
@@ -218,7 +245,9 @@ static int import_buffer(VkDeviceSize bytes, unsigned long long handle, VkBuffer
 	}
 	VkMemoryRequirements req;
 	vkGetBufferMemoryRequirements(nrx_dev, buf, &req);
-	uint32_t mt = pick_type(&req);
+	uint32_t mt = pick_type(&req, want);
+	if (out_type)
+		*out_type = mt;
 	if (mt == UINT32_MAX || req.size > bytes) {
 		vkDestroyBuffer(nrx_dev, buf, NULL);
 		nrx_fail(req.size > bytes ? "the exported buffer is too small"
@@ -324,15 +353,19 @@ int nrx_open(unsigned long long raw_handle, unsigned long long raw_bytes,
 		nrx_drop_handles(raw_handle, answer_handle, sem_handle);
 		return -1;
 	}
-	if (import_buffer((VkDeviceSize)raw_bytes, raw_handle, &nrx_raw_buf, &nrx_raw_mem,
-			  &nrx_raw_p)) {
+	uint32_t raw_type = UINT32_MAX, answer_type = UINT32_MAX;
+	/* The daemon's device reads this one every frame; the host only writes it. */
+	if (import_buffer((VkDeviceSize)raw_bytes, raw_handle, WANT_RAW, &nrx_raw_buf,
+			  &nrx_raw_mem, &nrx_raw_p, &raw_type)) {
 		nrx_drop_handles(raw_handle, answer_handle, sem_handle);
 		return -1;
 	}
 	nrx_raw_n = (size_t)raw_bytes;
 	if (answer_handle && answer_bytes
-	    && import_buffer((VkDeviceSize)answer_bytes, answer_handle, &nrx_ans_buf,
-			     &nrx_ans_mem, &nrx_ans_p)) {
+	    /* The host reads this one every frame — this is the answer, and it is the
+	     * read that decides whether the way back is worth having. */
+	    && import_buffer((VkDeviceSize)answer_bytes, answer_handle, WANT_HOST,
+			     &nrx_ans_buf, &nrx_ans_mem, &nrx_ans_p, &answer_type)) {
 		nrx_drop_handles(raw_handle, answer_handle, sem_handle);
 		nrx_close();
 		return -1;
@@ -344,14 +377,22 @@ int nrx_open(unsigned long long raw_handle, unsigned long long raw_bytes,
 		return -1;
 	}
 	nrx_live = 1;
+	/* The memory type each import landed in goes out with the sizes, because it is
+	 * the one thing that decides what the host's read of the answer costs and it
+	 * cannot be asked for afterwards. Type 2 on this card is cached system memory,
+	 * type 3 is device memory behind the bar; an answer read out of type 3 measures
+	 * 376.77 ms for 7.9 MB against 0.40 ms out of type 2 (check_bar_read.py). If the
+	 * answer's type is not 2, the way back is being paid for and not bought. */
 	if (nrx_ans_n)
 		fprintf(stderr, "[nr_layer] the frame goes straight into the daemon's "
-				"buffers: %zu MB raw, %zu MB answer, over a timeline "
-				"semaphore\n", nrx_raw_n >> 20, nrx_ans_n >> 20);
+				"buffers: %zu MB raw in memory type %u, %zu MB answer in "
+				"memory type %u, over a timeline semaphore\n",
+			nrx_raw_n >> 20, raw_type, nrx_ans_n >> 20, answer_type);
 	else
 		fprintf(stderr, "[nr_layer] the frame goes straight into the daemon's "
-				"buffer: %zu MB, over a timeline semaphore; the answer "
-				"still crosses in a slot\n", nrx_raw_n >> 20);
+				"buffer: %zu MB in memory type %u, over a timeline "
+				"semaphore; the answer still crosses in a slot\n",
+			nrx_raw_n >> 20, raw_type);
 	return 0;
 }
 
