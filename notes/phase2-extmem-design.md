@@ -114,7 +114,61 @@ buffer 在 daemon 手里，得从**子**进程把 handle 给**父**进程：
    answer 与现在**逐字节相同**。
 3. **游戏实测**：`NR_EXTMEM=1` 的 bat，看帧时间（口径照旧：`work\nr_daemon.log`）。
 
-## 6. 风险
+## 6. ⚠ 跨进程 semaphore 在这张卡上不排序（2026-10-11 实测）
+
+设计里「帧开始靠 layer 给 daemon 的 semaphore」**不成立**。证据在
+`src/bench/check_extmem_sem.py`（`extmem_xproc.exe semhost <pid>` 提供延迟 signal）。
+
+| 阶段 | 谁等谁 | 结果 |
+|---|---|---|
+| 1. 同进程 | 一个 submit 等一个还没人 signal 的 semaphore | **1201 ms**（signal 在 1200 ms 之后才发）→ wait 是真的 |
+| 2. 跨进程 | 同一个 driver，semaphore 由另一进程 `DuplicateHandle` 过来 | **0.4 ms**，第二次 **0.2 ms** → 一次都没拦住 |
+
+排除掉的几种解释：
+
+- **不是参数没传进去**：`XMX_EXTMEM_TRACE=1` 会打印
+  `libxmx: submit <cb> waits on semaphore <sem>`，两行都打了，
+  `xmx_extmem_wait_pending` 也从 True 变 False。wait 确实进了 `vkQueueSubmit`。
+- **不是"导入时已经是 signaled"**：那种情况第一次会放过去、第二次应该拦住。
+  两次都放行，所以是**每一次 wait 都失效**。
+- **不是导入写法的问题**：创建后 `vkImportSemaphoreWin32HandleKHR` 和创建时
+  `pNext = VkImportSemaphoreWin32HandleInfoKHR` 都试过，一样。
+- **不是跨进程共享本身有问题**：buffer 那一路（`check_extmem_export.py`）是好的，
+  0/1048576 错。坏的只有 semaphore 的 wait。
+
+另外：`vkWaitSemaphores` 查导入 semaphore 的状态会**让驱动崩**（读 0 地址，
+整个 Python 进程就没了）。所以连"它现在是什么状态"都问不出来。这个函数已经删掉。
+
+### 这条发现的连带影响：probe §15 那几项要打折
+
+`host-passes-to-gpu.md` §15 的第 4/6/7 项用的正是这条路径（父导出 semaphore、
+子导入并 wait）。wait 既然可能是空转的，那几个 **0 错就不能当成"同步有效"的证据**——
+它们只说明**数据能共享**，排序是时间上凑巧（1 MB、GPU 很快）。
+
+第 8/9 项（父 CPU 写 BAR → 子 GPU 读）不受这条影响：那两趟本来就没有 GPU 写方，
+写是 CPU 做的，靠的是"写在读之前发生"。**共享与可见性仍然成立，只有排序没保证。**
+
+### 替代方案：排序改用 layer 自己的 fence
+
+既然跨进程的 wait 靠不住，而 layer 反正要在 A770 上建一个 VkDevice（要 `vkMapMemory`
+才能读 answer），就让它自己收尾：
+
+| 时刻 | 谁 | 做什么 |
+|---|---|---|
+| 帧开始 | layer | CPU 写 raw（BAR）→ **自己的 queue 提交一个空 batch** → 等**自己的 fence** → 再发管道通知 |
+|  | daemon | 收到通知就跑，不 wait 任何东西 |
+| 帧结束 | daemon | GPU 写 answer（VRAM），最后一次 submit 的 fence 照旧等 |
+|  | layer | 收到管道 notice 后直接 CPU 读 BAR |
+
+- `vkQueueSubmit` 之前完成的 host 写，对该 submit 可见（规范 host write ordering），
+  空 batch 的 fence 等到手，写就一定到了 VRAM。
+- **daemon 侧零改动**，不需要 `xmx_sem_import` / `xmx_extmem_wait`（已加，但别用）。
+- 代价：layer 每帧多一次空 submit + fence wait，量级 0.1–0.3 ms，**待实测**。
+- 残留风险：daemon 的 GPU 读会不会命中陈旧的 L2。probe §15 第 8/9 项给了旁证——
+  同一块 BAR 被 CPU 写过两轮不同的值（0x0F、0xF0），子的 GPU 两次都读到新值，
+  没有读到上一轮的陈值。但那不是专门的 cache 测试，接进去之后要看画质。
+
+## 7. 风险
 
 - **layer 进程里多一个 VkDevice**：游戏进程里同时有 AMD 和 Intel 两个 device，
   驱动稳定性未知。这是本方案最大的未知项。
@@ -122,3 +176,6 @@ buffer 在 daemon 手里，得从**子**进程把 handle 给**父**进程：
 - **daemon 不随游戏退出**（已知坑，见 MEMORY.md）：Phase 2 之后更麻烦——
   新游戏连上旧 daemon，拿到的 handle 属于已经不存在的 buffer。
   换开关前必须：关游戏 → 杀 daemon → 再启动。
+- **排序只有 fence + 时序保证，没有跨进程原语兜底**（§6）。真出问题表现为
+  **偶发**画质错（某一帧读到了上一帧的字节），不会稳定复现，很难定位。
+  接进去之后必须跑够帧数看 `change` / `cut` 有没有毛刺。

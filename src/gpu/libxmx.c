@@ -34,6 +34,10 @@
 
 struct buf { VkBuffer b; VkDeviceMemory m; void *p; VkDeviceSize cap; };
 
+#ifdef _WIN32
+#define MAX_XSEM 8
+#endif
+
 static struct {
 	VkInstance inst; VkPhysicalDevice pd; VkDevice dev; VkQueue q; uint32_t qi;
 	VkDescriptorSetLayout dsl; VkPipelineLayout pl; VkPipeline pipe;
@@ -103,6 +107,14 @@ static struct {
 	PFN_vkGetPipelineExecutableInternalRepresentationsKHR stats_ir;
 	const char *ir_dir;       /* XMX_PIPELINE_IR: a folder for the compiled code, with the stats */
 	struct buf stage;
+#ifdef _WIN32
+	/* Phase 2: a semaphore the layer signalled after writing the frame into a buffer
+	 * this process exported. It is consumed by the next submit and then forgotten, so
+	 * a frame whose work starts later than expected cannot silently swallow the next
+	 * frame's dependency. */
+	VkSemaphore wait_sem;
+	VkSemaphore xsems[MAX_XSEM];
+#endif
 } g;
 
 #define MAX_SPECIALIZED 256
@@ -1304,6 +1316,87 @@ unsigned long long xmx_buf_handle(int id)
 int xmx_buf_exported(int id)
 {
 	return (id >= 0 && id < MAX_RBUF && rbufs[id].live && rbufs[id].exported) ? 1 : 0;
+}
+
+/* Take over an OPAQUE_WIN32 semaphore handle that came from the layer. The handle is
+ * ours to close afterwards: importing one does not hand it to the driver. The id is
+ * what xmx_extmem_wait takes. Negative on failure.
+ *
+ * ⚠ Nothing here orders anything on the A770. `src/bench/check_extmem_sem.py` asks a
+ * submit to wait on one of these while the other process signals it a second and a
+ * half later, and the submit is not held back at all — not once, which would be a
+ * semaphore arriving already signalled, but twice in a row. `XMX_EXTMEM_TRACE=1`
+ * shows the handle does reach vkQueueSubmit, and the same test's first stage shows the
+ * driver honouring a wait that never crossed a process boundary. So the wait is lost
+ * at the import, and a frame cannot be ordered this way. The importer's host-side
+ * query is no help either: `vkWaitSemaphores` on one of these faults in the driver.
+ * Kept because it is how the finding was made, and because the shape is right if a
+ * future driver fixes it. See notes/phase2-extmem-design.md section 6. */
+int xmx_sem_import(unsigned long long handle)
+{
+#ifdef _WIN32
+	if (!g.rready) FAIL("resident runtime not initialised", 0);
+	if (!handle) FAIL("no semaphore handle given", 0);
+	int id;
+	for (id = 0; id < MAX_XSEM && g.xsems[id]; id++);
+	if (id == MAX_XSEM) FAIL("out of external semaphore slots", 0);
+	/* Import at creation time, which is the shape the cross-process probe uses: the
+	 * handle hangs off VkSemaphoreCreateInfo rather than being fed to a live semaphore
+	 * afterwards. Both spellings are legal, but only this one is known to matter on
+	 * this driver — see notes/phase2-extmem-design.md section 6. */
+	VkImportSemaphoreWin32HandleInfoKHR ii = {
+		.sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR,
+		.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+		.handle = (HANDLE)(uintptr_t)handle,
+	};
+	VkSemaphoreCreateInfo sci = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &ii,
+	};
+	VkSemaphore sem;
+	if (vkCreateSemaphore(g.dev, &sci, NULL, &sem) != VK_SUCCESS)
+		FAIL("vkCreateSemaphore (import)", 0);
+	g.xsems[id] = sem;
+	return id;
+#else
+	(void)handle;
+	FAIL("importing a semaphore is Windows only", 0);
+#endif
+}
+
+/* The next submit waits on this semaphore before running anything. That is how the
+ * layer says "the frame is in the buffer" without a copy: it writes the bytes on its
+ * own CPU and then signals. One submit consumes it. */
+int xmx_extmem_wait(int id)
+{
+#ifdef _WIN32
+	if (id < 0 || id >= MAX_XSEM || !g.xsems[id]) FAIL("external semaphore is not live", 0);
+	g.wait_sem = g.xsems[id];
+	return 0;
+#else
+	(void)id;
+	FAIL("external memory is Windows only", 0);
+#endif
+}
+
+/* Drop a pending wait that no submit came along to use. Without this it would sit
+ * there and be swallowed by the next frame's first submit instead. */
+int xmx_extmem_wait_clear(void)
+{
+#ifdef _WIN32
+	g.wait_sem = VK_NULL_HANDLE;
+#endif
+	return 0;
+}
+
+/* Whether a wait is still pending. A submit whose wait never arrived looks exactly
+ * like one that never had to wait, so this is how the two are told apart. */
+int xmx_extmem_wait_pending(void)
+{
+#ifdef _WIN32
+	return g.wait_sem ? 1 : 0;
+#else
+	return 0;
+#endif
 }
 
 int xmx_buf_create(unsigned long long bytes) { return xmx_buf_create_kind(bytes, 0); }
@@ -2662,6 +2755,22 @@ static int submit_commands(VkCommandBuffer commands, int passes)
 	if (r) FAIL("reset resident fence", r);
 	VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
 			    .pCommandBuffers = &commands };
+#ifdef _WIN32
+	/* The layer's semaphore says the frame bytes are in the buffer. It belongs to the
+	 * first submit of the frame and to no other: every later one is ordered by the
+	 * fence this function waits on anyway. */
+	VkSemaphore wait = g.wait_sem;
+	VkPipelineStageFlags wstage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+	g.wait_sem = VK_NULL_HANDLE;
+	if (wait) {
+		si.waitSemaphoreCount = 1;
+		si.pWaitSemaphores = &wait;
+		si.pWaitDstStageMask = &wstage;
+		if (getenv("XMX_EXTMEM_TRACE"))
+			fprintf(stderr, "libxmx: submit %p waits on semaphore %p\n",
+				(void *)commands, (void *)wait);
+	}
+#endif
 	if ((r = vkQueueSubmit(g.q, 1, &si, g.rfence))) FAIL("resident submit", r);
 	if ((r = vkWaitForFences(g.dev, 1, &g.rfence, VK_TRUE, 60ull * 1000000000ull)))
 		FAIL("resident fence wait", r);

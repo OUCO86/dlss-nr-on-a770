@@ -187,6 +187,17 @@ def _load():
         lib.xmx_buf_handle.restype = ctypes.c_ulonglong
         lib.xmx_buf_exported.argtypes = [ctypes.c_int]
         lib.xmx_buf_exported.restype = ctypes.c_int
+    if hasattr(lib, "xmx_sem_import"):
+        # Phase 2: the layer's "frame is in the buffer" semaphore, and the one submit
+        # that waits on it. Windows only; the dll built elsewhere does not have them.
+        lib.xmx_sem_import.argtypes = [ctypes.c_ulonglong]
+        lib.xmx_sem_import.restype = ctypes.c_int
+        lib.xmx_extmem_wait.argtypes = [ctypes.c_int]
+        lib.xmx_extmem_wait.restype = ctypes.c_int
+        lib.xmx_extmem_wait_clear.argtypes = []
+        lib.xmx_extmem_wait_clear.restype = ctypes.c_int
+        lib.xmx_extmem_wait_pending.argtypes = []
+        lib.xmx_extmem_wait_pending.restype = ctypes.c_int
     # The grouped feed-forward's recorder, guarded for the same reason: the daemon holds a
     # native build open, and a build without this symbol must still load. `int8_ffn_groups`
     # reads it back, so a tree running an older library keeps the float grouped GEMM.
@@ -1969,6 +1980,42 @@ class Runtime:
         if count < 0:
             raise RuntimeError("xmx_submit: " + self.lib.xmx_error().decode())
         return count
+
+    # --- Phase 2: sharing the frame buffer with the layer across processes -------
+    # Present only in a Windows build; every entry point says so instead of blowing
+    # up, because the same source builds a .so elsewhere.
+
+    @staticmethod
+    def extmem_available():
+        lib = _load()
+        return hasattr(lib, "xmx_sem_import") and hasattr(lib, "xmx_buf_handle")
+
+    def import_semaphore(self, handle):
+        """Take over an OPAQUE_WIN32 semaphore handle the layer duplicated to us."""
+        if not hasattr(self.lib, "xmx_sem_import"):
+            raise RuntimeError("this libxmx build cannot import a semaphore")
+        sid = self.lib.xmx_sem_import(int(handle))
+        if sid < 0:
+            raise failure(self.lib, "xmx_sem_import")
+        return sid
+
+    def extmem_wait(self, sem_id):
+        """The next submit waits on `sem_id`: that is where the frame's bytes arrive."""
+        if not hasattr(self.lib, "xmx_extmem_wait"):
+            raise RuntimeError("this libxmx build cannot wait on an external semaphore")
+        if self.lib.xmx_extmem_wait(int(sem_id)) < 0:
+            raise failure(self.lib, "xmx_extmem_wait")
+
+    def extmem_wait_clear(self):
+        """Forget a wait no submit came along to use, so it cannot eat the next frame's."""
+        if hasattr(self.lib, "xmx_extmem_wait_clear"):
+            self.lib.xmx_extmem_wait_clear()
+
+    def extmem_wait_pending(self):
+        """Whether a wait is still queued: it should be gone once a submit ran."""
+        if not hasattr(self.lib, "xmx_extmem_wait_pending"):
+            return False
+        return self.lib.xmx_extmem_wait_pending() != 0
 
 
 class _Independent:

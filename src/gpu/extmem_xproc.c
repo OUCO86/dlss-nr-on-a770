@@ -59,6 +59,7 @@
 #define P_BB 0x5A5A5A5Au /* child -> parent, with semaphore */
 #define P_CC 0x0F0F0F0Fu /* parent's CPU writes the BAR, child's GPU reads */
 #define P_DD 0xF0F0F0F0u /* same, with vkFlushMappedMemoryRanges first */
+#define P_EE 0x69696969u /* child's GPU writes the BAR, parent's CPU reads it */
 
 static int failures;
 static VkPhysicalDevice g_pd;
@@ -507,6 +508,18 @@ static int child_main(void)
 		} else if (!strcmp(line, "read dd cpu-flush")) {
 			wrong = read_back(&b, bb2, P_DD, wait_a2b);
 			SAY("R %u child read 0xF0.. written by the parent's CPU, flushed", wrong);
+		} else if (!strcmp(line, "write bar")) {
+			/* the return leg: the daemon's GPU produces the answer, the layer's CPU
+			 * reads it. Nothing here waits on anything on the reading side. */
+			if (!bb2) {
+				SAY("R 999 child has no host-visible buffer to write");
+				continue;
+			}
+			if (fill(&b, bb2, P_EE, VK_NULL_HANDLE, sig_b2a, 1)) {
+				SAY("R 999 child fill (BAR) failed");
+				continue;
+			}
+			SAY("R 0 child wrote 0x69.. into the shared BAR and signalled B->A");
 		} else if (!strcmp(line, "write bb sem")) {
 			if (fill(&b, bb, P_BB, VK_NULL_HANDLE, sig_b2a, 1)) {
 				SAY("R 999 child fill failed");
@@ -682,6 +695,163 @@ static int export_semaphore(struct side *a, VkSemaphore *sem, HANDLE *handle)
 	};
 	TRY("vkGetSemaphoreWin32HandleKHR", get(a->dev, &ghi, handle));
 	return 0;
+}
+
+/* Does a wait on a semaphore actually hold a submit back on this card?
+ *
+ * Two batches go in, in this order: the first waits on a semaphore nobody has signalled
+ * yet, the second signals it — but only after `ms`. If the wait is real, the first
+ * cannot run until the second has gone in, so (a) waiting for it takes at least `ms`
+ * and (b) the buffer ends up holding the first batch's pattern, because the second
+ * ran first. If the wait is ignored, both are immediate and the second wins.
+ *
+ * Nothing here crosses a process boundary, so whatever it says is about the driver. */
+static int waittest(struct side *s, unsigned long ms)
+{
+	VkExportSemaphoreCreateInfo esci = {
+		.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+		.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+	};
+	VkSemaphoreCreateInfo sci = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &esci,
+	};
+	VkSemaphore sem;
+	TRY("vkCreateSemaphore", vkCreateSemaphore(s->dev, &sci, NULL, &sem));
+
+	VkBufferCreateInfo ci = {
+		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = SZ,
+		.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	};
+	VkBuffer buf;
+	TRY("vkCreateBuffer", vkCreateBuffer(s->dev, &ci, NULL, &buf));
+	VkMemoryRequirements r;
+	vkGetBufferMemoryRequirements(s->dev, buf, &r);
+	uint32_t mt = pick_memory(r, r.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+	VkMemoryAllocateInfo mai = {
+		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = r.size,
+		.memoryTypeIndex = mt,
+	};
+	VkDeviceMemory mem;
+	TRY("vkAllocateMemory", vkAllocateMemory(s->dev, &mai, NULL, &mem));
+	vkBindBufferMemory(s->dev, buf, mem, 0);
+
+	VkCommandBuffer cb1 = begin_cmd(s);
+	vkCmdFillBuffer(cb1, buf, 0, SZ, P_EE);
+	vkEndCommandBuffer(cb1);
+	VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+	VkFence f1, f2;
+	vkCreateFence(s->dev, &fci, NULL, &f1);
+	vkCreateFence(s->dev, &fci, NULL, &f2);
+	VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+	VkSubmitInfo si1 = {
+		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
+		.pCommandBuffers = &cb1, .waitSemaphoreCount = 1, .pWaitSemaphores = &sem,
+		.pWaitDstStageMask = &stage,
+	};
+	LARGE_INTEGER t0, t1, freq;
+	QueryPerformanceFrequency(&freq);
+	QueryPerformanceCounter(&t0);
+	TRY("vkQueueSubmit (waited)", vkQueueSubmit(s->queue, 1, &si1, f1));
+	Sleep(ms);
+	VkCommandBuffer cb2 = begin_cmd(s);
+	vkCmdFillBuffer(cb2, buf, 0, SZ, P_AA);
+	vkEndCommandBuffer(cb2);
+	VkSubmitInfo si2 = {
+		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
+		.pCommandBuffers = &cb2, .signalSemaphoreCount = 1, .pSignalSemaphores = &sem,
+	};
+	TRY("vkQueueSubmit (signalling)", vkQueueSubmit(s->queue, 1, &si2, f2));
+	VkResult w = vkWaitForFences(s->dev, 1, &f1, VK_TRUE, ~(uint64_t)0);
+	QueryPerformanceCounter(&t1);
+	double elapsed = (double)(t1.QuadPart - t0.QuadPart) / (double)freq.QuadPart * 1000.0;
+	vkWaitForFences(s->dev, 1, &f2, VK_TRUE, ~(uint64_t)0);
+	if (w != VK_SUCCESS) {
+		printf("R 999 waited submit never finished: %d\n", (int)w);
+		return 1;
+	}
+	/* Both batches go to one queue, so they run in the order they were submitted: the
+	 * waited one first, once the semaphore lets it. Being held back does not reorder
+	 * them, so the pattern left behind is the second batch's either way — it is here
+	 * to show both really ran, while the elapsed time is what decides the question. */
+	unsigned after_aa = read_back(s, buf, P_AA, VK_NULL_HANDLE);
+	printf("R 0 waited submit finished %.1f ms in (signalled after %lu ms); buffer "
+	       "holds the second batch's pattern, %u bytes differ\n",
+	       elapsed, ms, after_aa);
+	vkDestroyFence(s->dev, f1, NULL);
+	vkDestroyFence(s->dev, f2, NULL);
+	vkDestroySemaphore(s->dev, sem, NULL);
+	vkFreeMemory(s->dev, mem, NULL);
+	vkDestroyBuffer(s->dev, buf, NULL);
+	return (elapsed >= 0.8 * (double)ms && after_aa == 0) ? 0 : 1;
+}
+
+/* The layer's half of Phase 2, standing on its own: make a semaphore somebody else can
+ * wait on, hand it to the process whose pid we are given, and signal it only after a
+ * delay. A submit that really waits on it cannot finish before the delay is up, and one
+ * that ignores it finishes at once — that difference is the whole point of this role.
+ *
+ * `semhost <parent-pid>`; it prints `S <handle>` and then takes `signal-after <ms>`. */
+static int semhost_main(unsigned long parent_pid)
+{
+	setvbuf(stdout, NULL, _IONBF, 0);
+	VkInstance inst = make_instance();
+	if (!inst)
+		return 1;
+	g_pd = pick_intel(inst);
+	if (!g_pd) {
+		printf("semhost: no Intel physical device\n");
+		return 1;
+	}
+	struct side b = { 0 };
+	if (make_side(&b))
+		return 1;
+	VkSemaphore sem = VK_NULL_HANDLE;
+	HANDLE hsem = NULL;
+	if (export_semaphore(&b, &sem, &hsem)) {
+		printf("semhost: could not export a semaphore\n");
+		return 1;
+	}
+	HANDLE parent = OpenProcess(PROCESS_DUP_HANDLE, FALSE, (DWORD)parent_pid);
+	if (!parent) {
+		printf("semhost: OpenProcess(%lu) failed: %lu\n", parent_pid, GetLastError());
+		return 1;
+	}
+	HANDLE dup = NULL;
+	if (!DuplicateHandle(GetCurrentProcess(), hsem, parent, &dup, 0, FALSE,
+			     DUPLICATE_SAME_ACCESS)) {
+		printf("semhost: DuplicateHandle failed: %lu\n", GetLastError());
+		CloseHandle(parent);
+		return 1;
+	}
+	CloseHandle(parent);
+	printf("S %llx\n", (unsigned long long)(uintptr_t)dup);
+	fflush(stdout);
+
+	HANDLE hin = GetStdHandle(STD_INPUT_HANDLE);
+	char line[256];
+	while (read_line(hin, line, sizeof line)) {
+		unsigned long ms = 0;
+		if (!strcmp(line, "quit")) {
+			printf("R 0 semhost done\n");
+			break;
+		} else if (sscanf(line, "waittest %lu", &ms) == 1) {
+			return waittest(&b, ms);
+		} else if (sscanf(line, "signal-after %lu", &ms) == 1) {
+			Sleep(ms);
+			VkCommandBuffer cb = begin_cmd(&b);
+			if (!cb || end_cmd(&b, cb, VK_NULL_HANDLE, sem, 1)) {
+				printf("R 999 semhost signal failed\n");
+				continue;
+			}
+			printf("R 0 signalled after %lu ms\n", ms);
+		} else {
+			printf("semhost: unknown command '%s'\n", line);
+		}
+		fflush(stdout);
+	}
+	CloseHandle(hsem);
+	return failures ? 1 : 0;
 }
 
 /* Read from the child until a result line arrives, echoing whatever else it says.
@@ -1026,6 +1196,30 @@ static int parent_main(void)
 		}
 		write_line(in_wr, "read dd cpu-flush");
 		collect(out_rd, &wrong, &bad, NULL);
+
+		/* The return leg, which is how the answer would come back: the daemon's GPU
+		 * writes it, and the layer's CPU reads the very same bytes with no semaphore
+		 * wait and no invalidate — only the pipe says the work is done. */
+		printf("\n[10] the child's GPU writes the BAR; the parent's CPU reads it\n");
+		write_line(in_wr, "write bar");
+		collect(out_rd, &wrong, &bad, NULL);
+		void *p2 = NULL;
+		if (vkMapMemory(a.dev, ma2, 0, SZ, 0, &p2) != VK_SUCCESS) {
+			printf("  FAIL vkMapMemory\n");
+			return 1;
+		}
+		const unsigned char *q = p2;
+		unsigned char want = (unsigned char)(P_EE & 0xff);
+		unsigned w = 0;
+		for (unsigned i = 0; i < SZ; i++)
+			if (q[i] != want)
+				w++;
+		printf("      first bytes: %02x %02x %02x %02x (wanted %02x)\n", q[0], q[1],
+		       q[2], q[3], want);
+		printf("  R %u parent CPU read 0x69.. the child's GPU wrote, no wait at all\n",
+		       w);
+		wrong += w;
+		vkUnmapMemory(a.dev, ma2);
 	}
 
 	write_line(in_wr, "quit");
@@ -1055,6 +1249,8 @@ int main(int argc, char **argv)
 {
 	if (argc >= 2 && !strcmp(argv[1], "child"))
 		return child_main();
+	if (argc >= 3 && !strcmp(argv[1], "semhost"))
+		return semhost_main(strtoul(argv[2], NULL, 10));
 	if (argc >= 4 && !strcmp(argv[1], "guest"))
 		return guest_main(argv[2], argv[3], argc >= 5 ? argv[4] : "0");
 	if (argc >= 2 && strcmp(argv[1], "guest") && strcmp(argv[1], "child")) {
