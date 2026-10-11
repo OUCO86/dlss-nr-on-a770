@@ -209,10 +209,11 @@ static uint32_t pick_type(VkMemoryRequirements *req, VkMemoryPropertyFlags want)
 
 /* Bring in one exported buffer and map it. Returns 0, or -1 with nrx_err set.
  *
- * `bytes` is the size the daemon allocated, which is what the payload is and therefore
- * the whole of what may be asked for: vkAllocateMemory's VUID-vkAllocateMemory-
- * pAllocateInfo-01713 caps allocationSize at the heap, and an import has no business
- * asking for more than the export made. */
+ * `bytes` is the count the daemon announced, which is what it was asked for and not
+ * what it allocated: libxmx's buf_create sets `.allocationSize = mr.size`, so the
+ * payload behind the handle is that count rounded up to a whole number of alignment
+ * units. The two are the same number only while the count happens to be one. See the
+ * check below, which is where the way back used to stop. */
 static int import_buffer(VkDeviceSize bytes, unsigned long long handle,
 			 VkMemoryPropertyFlags want, VkBuffer *out_buf,
 			 VkDeviceMemory *out_mem, void **out_ptr, uint32_t *out_type)
@@ -243,12 +244,54 @@ static int import_buffer(VkDeviceSize bytes, unsigned long long handle,
 	uint32_t mt = pick_type(&req, want);
 	if (out_type)
 		*out_type = mt;
-	if (mt == UINT32_MAX || req.size > bytes) {
+	if (mt == UINT32_MAX) {
 		vkDestroyBuffer(nrx_dev, buf, NULL);
-		nrx_fail(req.size > bytes ? "the exported buffer is too small"
-					  : "no host-visible memory type for the import");
+		nrx_fail("no host-visible memory type for the import");
 		return -1;
 	}
+	/* What may be asked for is what the payload is, and the payload is the announced
+	 * count rounded up to a whole number of alignment units — because that is what
+	 * the daemon allocated (libxmx.c, buf_create: `.allocationSize = mr.size`).
+	 * The count it announces is the one it was asked for, unrounded, so the two
+	 * differ by however much the rounding adds, and the import has to ask for the
+	 * rounded one.
+	 *
+	 * Measured in the game on 2026-10-12, the way back's own announcement:
+	 *
+	 *     the daemon announced 18471320 bytes and the import is 18471360 of them
+	 *     - the payload, rounded up to an alignment of 64
+	 *
+	 * 18,471,320 is `(pixels * 11 // 10 + 4096) * 4` at the daemon's own limit, and
+	 * 40 bytes is all the rounding comes to — the alignment is 64 here, not 4096,
+	 * and 40 bytes is short of nothing at all. The test that used to stand here
+	 * asked whether `req.size > bytes` and read that as "the exported buffer is too
+	 * small", and refused the way back on those 40 bytes. The frame's count is
+	 * `pixels * 4`, 16,777,216, which 64 divides exactly, so `req.size` and `bytes`
+	 * are one and the same number for the way in — which is the whole of why the
+	 * way in never once failed while the way back failed every time.
+	 *
+	 * Do not put a number here that has not been read off the log: an earlier draft
+	 * of this comment said 4096 and 1,640 bytes, both of them guessed, and the
+	 * guess was wrong by a factor of forty.
+	 *
+	 * vkAllocateMemory asks nothing in particular of an import's allocationSize.
+	 * VUID-VkMemoryAllocateInfo-allocationSize-07897 excuses an import from the
+	 * rule that it be greater than 0, the payload's size being the payload's. */
+	VkDeviceSize cap = ((bytes + req.alignment - 1) / req.alignment) * req.alignment;
+	if (req.size > cap) {
+		vkDestroyBuffer(nrx_dev, buf, NULL);
+		nrx_fail("the import needs more than the daemon can have exported");
+		nr_layer_log("an import needs %llu bytes, the daemon announced %llu, "
+			     "which is %llu at an alignment of %llu",
+			     (unsigned long long)req.size, (unsigned long long)bytes,
+			     (unsigned long long)cap, (unsigned long long)req.alignment);
+		return -1;
+	}
+	if (req.size != bytes)
+		nr_layer_log("the daemon announced %llu bytes and the import is %llu of "
+			     "them - the payload, rounded up to an alignment of %llu",
+			     (unsigned long long)bytes, (unsigned long long)req.size,
+			     (unsigned long long)req.alignment);
 	VkImportMemoryWin32HandleInfoKHR ihi = {
 		.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR,
 		.handleType = type,
@@ -256,7 +299,7 @@ static int import_buffer(VkDeviceSize bytes, unsigned long long handle,
 	};
 	VkMemoryAllocateInfo mai = {
 		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &ihi,
-		.allocationSize = bytes, .memoryTypeIndex = mt,
+		.allocationSize = req.size, .memoryTypeIndex = mt,
 	};
 	VkDeviceMemory mem;
 	if (vkAllocateMemory(nrx_dev, &mai, NULL, &mem) != VK_SUCCESS) {
