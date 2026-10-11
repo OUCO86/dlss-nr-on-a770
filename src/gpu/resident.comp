@@ -52,12 +52,13 @@ const uint E4M3 = 0u, GATE = 1u, HALF = 2u, TO_HALF = 3u, SCALE = 4u,
            /* the request's two own passes, which take the frame from the game's bytes
             * to the sixteen channels the graph reads without the host touching a pixel:
             * PRE_INNER decodes and resamples, PRE_FEATURES assembles and narrows. */
-           PRE_INNER = 23u, PRE_FEATURES = 24u;
+           PRE_INNER = 23u, PRE_FEATURES = 24u, POST_COMPOSE = 25u;
 
 /* Flags above the ones the graph's passes share, so nothing here can be read as an
  * epilogue or an operand width. Bit 24 is BGRA byte order, 25 a previous inner to
  * difference against, 26 a history for feature channels 7-9. */
 const uint F_BGRA = 0x1000000u, F_PREVIOUS = 0x2000000u, F_HISTORY = 0x4000000u;
+const uint F_GRADE = 0x8000000u, F_NEURAL = 0x10000000u;
 
 shared float partial_sum[256];
 
@@ -85,6 +86,69 @@ void store(uint index, float value) {
     if (epilogue == 4u) value = half_round(value);
     if ((operation_flags() & 0x1000u) != 0u) HalfBuf(uint64_t(pc.c)).v[index] = float16_t(value);
     else                            pc.c.v[index] = value;
+}
+
+/* Toward zero onto the half grid, which is what the vendor's RGBA16F history keeps of
+ * the prediction (`nr_frame.truncate_half`). This is bit manipulation, *not* a
+ * rounding: a normal half keeps ten mantissa bits, a subnormal one is a multiple of
+ * 2^-24. `float16_t(x)` would round to nearest-even and give a different answer. */
+float truncate_half(float x) {
+    uint f = floatBitsToUint(x);
+    float kept = uintBitsToFloat(f & 0xffffe000u);
+    float small = floor(abs(x) * 16777216.0) * exp2(-24.0);
+    small = x < 0.0 ? -small : small;
+    return (f & 0x7fffffffu) >= 0x38800000u ? kept : small;
+}
+
+float grade_unit(float value) {
+    value = value < 0.0 ? 0.0 : value;
+    return value > 1.0 ? 1.0 : value;
+}
+
+float hue_channel(float p, float q, float t) {
+    float up = t + 1.0;
+    t = t < 0.0 ? up : t;
+    float down = t - 1.0;
+    t = t > 1.0 ? down : t;
+    float rising = p + t * ((q - p) * 6.0);
+    float falling = p + (2.0 / 3.0 - t) * (q - p) * 6.0;
+    return t < 1.0 / 6.0 ? rising : t < 0.5 ? q : t < 2.0 / 3.0 ? falling : p;
+}
+
+/* The vendor's colour grade for a style on one pixel, `nr_frame.style_grade`
+ * operation for operation: an exposure and a smoothstep contrast per channel, then a
+ * saturation multiplier in HSL. Every branch is a select, as NumPy's `where` computes
+ * both sides — the unused one on a stand-in divisor — so the fused rows vectorise it,
+ * and so must this. */
+void style_grade(inout float c[3], float exposure, float contrast, float saturation) {
+    for (int i = 0; i < 3; ++i) {
+        float v = grade_unit(grade_unit(c[i]) * exposure);
+        c[i] = grade_unit(v + contrast * (v * v * (3.0 - (v + v)) - v));
+    }
+    float r = c[0], g = c[1], b = c[2];
+    float high = r > g ? r : g, low = r < g ? r : g;
+    high = high > b ? high : b;
+    low = low < b ? low : b;
+    float light = (high + low) * 0.5;
+    float delta = high - low;
+    bool grey = !(high > low);
+    float spread = grey ? 1.0 : delta;
+    float bright = (2.0 - high) - low, dark = high + low;
+    float by_bright = delta / (grey ? 1.0 : bright), by_dark = delta / (grey ? 1.0 : dark);
+    float chroma = light > 0.5 ? by_bright : by_dark;
+    float from_r = ((g - b) / spread + (g < b ? 6.0 : 0.0)) / 6.0;
+    float from_g = ((b - r) / spread + 2.0) / 6.0;
+    float from_b = ((r - g) / spread + 4.0) / 6.0;
+    float hue = grey ? 0.0 : high == r ? from_r : high == g ? from_g : from_b;
+    chroma = grade_unit((grey ? 0.0 : chroma) * saturation);
+    float q_dark = light * (chroma + 1.0), q_bright = (light + chroma) - light * chroma;
+    float q = light < 0.5 ? q_dark : q_bright;
+    float p = (light + light) - q;
+    bool drained = chroma <= 0.0;
+    float lit = grade_unit(light);
+    c[0] = drained ? lit : grade_unit(hue_channel(p, q, hue + 1.0 / 3.0));
+    c[1] = drained ? lit : grade_unit(hue_channel(p, q, hue));
+    c[2] = drained ? lit : grade_unit(hue_channel(p, q, hue - 1.0 / 3.0));
 }
 
 void main() {
@@ -180,6 +244,156 @@ void main() {
         HalfBuf target = HalfBuf(uint64_t(pc.c));
         for (uint c = 0u; c < 16u; c++)
             target.v[index * 16u + c] = float16_t(values[c]);
+        return;
+    }
+    if (kind == POST_COMPOSE) {
+        /* The answer: the head brought up to the frame and composed against it, then
+         * encoded into the bytes the game is handed back. `a` is the request's own
+         * words, which is where the colour comes from — no decode ever reaches the
+         * host. `b` is the head, `c` one block holding the two gather tables, the
+         * 256 byte values, the 65536-entry gate table and the scalars, `d` the frame
+         * before's composition followed by its pixels, and `second` one block taking
+         * the composition, the neural prediction, the change's partial sums, the head
+         * samples and the encoded words. Read before the extent test: it ends in a
+         * workgroup reduction whose barriers every invocation must reach. */
+        uint width = pc.sa, height = pc.sb, source_w = pc.sc;
+        uint head_w = pc.k, head_h = pc.batch, channels = pc.n;
+        uint x = index % width, y = index / width, at = y * width + x;
+        uint x_at = 3u * height, decode_at = x_at + 3u * width;
+        uint gate_at = decode_at + 256u, scalar_at = gate_at + 65536u;
+        uint flags = operation_flags();
+        bool held = (flags & F_HISTORY) != 0u, moved_before = (flags & F_PREVIOUS) != 0u;
+        bool do_grade = (flags & F_GRADE) != 0u, do_neural = (flags & F_NEURAL) != 0u;
+        bool bgra = (flags & F_BGRA) != 0u;
+        FloatBuf par = pc.c, answer = FloatBuf(uint64_t(pc.second));
+        U32Buf raw = U32Buf(pc.a), words = U32Buf(uint64_t(pc.second));
+        float intensity = par.v[scalar_at], scale = par.v[scalar_at + 1u];
+        float hold = par.v[scalar_at + 2u], slope = par.v[scalar_at + 3u];
+        float release = par.v[scalar_at + 4u], confidence = par.v[scalar_at + 5u];
+        uint top = uint(par.v[scalar_at + 6u]), left = uint(par.v[scalar_at + 7u]);
+        uint frame_w = uint(par.v[scalar_at + 8u]);
+        uint change_rows = uint(par.v[scalar_at + 9u]), step = uint(par.v[scalar_at + 10u]);
+        uint samples_at = uint(par.v[scalar_at + 11u]);
+        uint encoded_at = uint(par.v[scalar_at + 12u]);
+        uint partial_at = uint(par.v[scalar_at + 13u]);
+        uint neural_at = uint(par.v[scalar_at + 14u]);
+        float grade[3] = float[3](par.v[scalar_at + 15u], par.v[scalar_at + 16u],
+                                  par.v[scalar_at + 17u]);
+
+        /* The head up, both axes: the row pair first and the column pair over those
+         * two, which is `nr_resize_axis` twice and is not associative. */
+        int row_low = floatBitsToInt(par.v[y]), row_high = floatBitsToInt(par.v[height + y]);
+        float row_w = par.v[2u * height + y];
+        int col_low = floatBitsToInt(par.v[x_at + x]);
+        int col_high = floatBitsToInt(par.v[x_at + width + x]);
+        float col_w = par.v[x_at + 2u * width + x];
+        float h[4] = float[4](0.0, 0.0, 0.0, 0.0);
+        if (index < pc.m) {
+            for (uint c = 0u; c < channels; c++) {
+                float a0 = pc.b.v[(uint(row_low) * head_w + uint(col_low)) * channels + c];
+                float a1 = pc.b.v[(uint(row_high) * head_w + uint(col_low)) * channels + c];
+                float a2 = pc.b.v[(uint(row_low) * head_w + uint(col_high)) * channels + c];
+                float a3 = pc.b.v[(uint(row_high) * head_w + uint(col_high)) * channels + c];
+                precise float low = a0 * (1.0 - row_w) + a1 * row_w;
+                precise float high = a2 * (1.0 - row_w) + a3 * row_w;
+                h[c] = low * (1.0 - col_w) + high * col_w;
+            }
+        }
+
+        /* The colour: the request's own bytes, through the host's 256 values. */
+        uint pixel = (top + y) * frame_w + left + x;
+        uint word = index < pc.m ? raw.v[pixel] : 0u;
+        float rgb[3], predicted[3];
+        for (uint c = 0u; c < 3u; c++) {
+            uint shift = bgra ? 16u - 8u * c : 8u * c;
+            rgb[c] = par.v[decode_at + ((word >> shift) & 0xFFu)];
+            /* The prediction, and the half the vendor rounds the head to before the
+             * quarter it is scaled by. Round-to-nearest-even, unlike the truncation
+             * `finish_pixel` does later. */
+            predicted[c] = clamp(rgb[c] + float(float16_t(h[c])) * 0.25, 0.0, 1.0);
+        }
+
+        float alpha = 0.0;
+        if (held && index < pc.m) {
+            /* How far the game moved this pixel: the largest step of the three. The
+             * release and the floor both read it. */
+            float moved = 0.0;
+            if (moved_before) {
+                for (uint c = 0u; c < 3u; c++) {
+                    float d = rgb[c] - pc.d.v[at * 3u + c];
+                    moved = max(moved, abs(d));
+                }
+            }
+            /* The gate, looked up rather than recomputed: the logit's sixteen bits,
+             * which is why the exponential can stay in the host's table. */
+            uint bits = packHalf2x16(vec2(float16_t(h[3]), float16_t(0.0))) & 0xFFFFu;
+            alpha = par.v[gate_at + bits];
+            if (confidence != 1.0) alpha *= confidence;
+            if (moved_before && release != 0.0)
+                alpha *= clamp(moved * release + 1.0, 0.0, 1.0);
+            if (moved_before) {
+                /* `moved * slope + hold` clamped to [0, hold] and to 1, then scaled:
+                 * `clip(1 - moved * 255 / ramp, 0, 1) * hold` is the same by algebra
+                 * and a different float32, so the folded slope is what arrives. */
+                float floored = clamp(moved * slope + hold, 0.0, hold);
+                alpha = max(alpha, min(floored, 1.0) * scale);
+            }
+            for (uint c = 0u; c < 3u; c++)
+                predicted[c] += alpha * (pc.d.v[at * 3u + c] - predicted[c]);
+        }
+
+        float composed[3], difference = 0.0;
+        if (index < pc.m) {
+            if (do_grade || do_neural) {
+                float kept[3];
+                for (uint c = 0u; c < 3u; c++) kept[c] = truncate_half(predicted[c]);
+                if (do_neural)
+                    for (uint c = 0u; c < 3u; c++) answer.v[neural_at + at * 3u + c] = kept[c];
+                if (do_grade) {
+                    style_grade(kept, grade[0], grade[1], grade[2]);
+                    for (uint c = 0u; c < 3u; c++) predicted[c] = kept[c];
+                }
+            }
+            for (uint c = 0u; c < 3u; c++) {
+                /* No clamp on the blend: the vendor's is the one thing our
+                 * composition drops, so that intensity above 1 extrapolates. */
+                composed[c] = clamp(rgb[c] + intensity * (predicted[c] - rgb[c]), 0.0, 1.0);
+                answer.v[at * 3u + c] = composed[c];
+            }
+            /* Encoded at its place in the whole frame, with the request's alpha and
+             * with everything outside the active region left as it came. */
+            uint packed = raw.v[pixel] & 0xFF000000u;
+            for (uint c = 0u; c < 3u; c++) {
+                float value = composed[c];
+                /* NumPy's byte cast maps NaN to zero; do not cast NaN. */
+                value = value == value ? clamp(value, 0.0, 1.0) : 0.0;
+                /* `precise` because this is the one place a contraction shows: the
+                 * host computes the product and the sum in two steps, and an FMA
+                 * lands a different side of a .5 on about five bytes in eight
+                 * million. The byte is the only thing the game ever sees. */
+                precise float rounded = value * 255.0 + 0.5;
+                packed |= uint(rounded) << (bgra ? 16u - 8u * c : 8u * c);
+            }
+            words.v[encoded_at + pixel] = packed;
+            if (change_rows > 0u && y % change_rows == 0u)
+                for (uint c = 0u; c < 3u; c++) difference += abs(composed[c] - rgb[c]);
+            if (step > 0u && y % step == 0u && x % step == 0u) {
+                uint sampled = (width + step - 1u) / step;
+                uint to = samples_at + ((y / step) * sampled + x / step) * channels;
+                for (uint c = 0u; c < channels; c++) answer.v[to + c] = h[c];
+            }
+        }
+        if (change_rows > 0u) {
+            partial_sum[gl_LocalInvocationID.x] = difference;
+            barrier();
+            for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+                if (gl_LocalInvocationID.x < stride)
+                    partial_sum[gl_LocalInvocationID.x] += partial_sum[gl_LocalInvocationID.x + stride];
+                barrier();
+            }
+            if (gl_LocalInvocationID.x == 0u)
+                answer.v[partial_at + gl_WorkGroupID.x] = partial_sum[0];
+        }
         return;
     }
     if (index >= pc.m) return;

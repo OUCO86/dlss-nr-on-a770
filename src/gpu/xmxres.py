@@ -35,12 +35,13 @@ TM, TN, TK = 8, 16, 16
 (E4M3, GATE, HALF, TO_HALF, SCALE, RESIDUAL, FROM_HALF, PARTITION, REVERSE, ADD_BIAS,
  SPLIT_HEADS, MERGE_HEADS, POOL2, UPSAMPLE2, SCALE_CHANNEL, ADD, PAD_END,
  GATE_E4M3_HALF, E4M3_HALF, GATE_HALF, UPSAMPLE_MERGE, UPSAMPLE_ADD, POOL2_SKIP,
- PRE_INNER, PRE_FEATURES) = range(25)
+ PRE_INNER, PRE_FEATURES, POST_COMPOSE) = range(26)
 COSINE_PUBLISH, SOFTMAX, VIT_SOFTMAX = 0, 1, 6
 
 # Flags above every bit the graph's own passes read, so none of them can be mistaken
 # for an epilogue or an operand width. `resident.comp` is the other half of this.
 F_BGRA, F_PREVIOUS, F_HISTORY = 0x1000000, 0x2000000, 0x4000000
+F_GRADE, F_NEURAL = 0x8000000, 0x10000000
 
 # GEMM epilogues, applied to the accumulator on its way out of the kernel
 EPI_NONE, EPI_E4M3, EPI_GATE, EPI_GATE_E4M3, EPI_HALF = 0, 1, 2, 3, 4
@@ -1551,6 +1552,32 @@ class Runtime:
                           _dims=(int(controls_at), int(width), int(inner_width),
                                  int(columns_at)),
                           _pad=int(noise_at))
+
+    def post_compose(self, raw, head, params, history, answer, *, width, height,
+                     source_width, head_width, head_height, channels, with_history=False,
+                     with_previous=False, grade=False, neural=False, bgra=True):
+        """The head brought up to the frame, composed against it, and encoded, on the device.
+
+        `nr_compose_encode`: both bilinear axes, the temporal gate over the host's
+        65536-entry table, the truncation onto the half grid, the grade, and the byte
+        encoding. `params` is one block — the two gather tables, the 256 byte values,
+        the gate table and the scalars — and `answer` one block taking the composition,
+        the neural prediction, the change's partial sums, the head samples and the
+        encoded words. `history` carries the frame before's composition and, at
+        `width * height * 3`, its pixels.
+        """
+        flags = POST_COMPOSE | (F_BGRA if bgra else 0)
+        flags |= F_HISTORY if with_history else 0
+        flags |= F_PREVIOUS if with_previous else 0
+        flags |= F_GRADE if grade else 0
+        flags |= F_NEURAL if neural else 0
+        if self.lib.xmx_rec_unary2(flags, raw.id, head.id, params.id, history.id,
+                                   answer.id, int(width * height), int(channels), 0.0,
+                                   int(head_height), int(width), int(height),
+                                   int(source_width), int(head_width)) != 0:
+            raise RuntimeError("xmx_rec_unary2: " + self.lib.xmx_error().decode())
+        self.recorded += 1
+        return self
 
     def from_half(self, source, target, count, scale=1.0):
         return self.unary(FROM_HALF, source, target, count, scale=scale)
