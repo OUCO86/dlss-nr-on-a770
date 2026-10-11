@@ -164,11 +164,15 @@ def main():
     parser.add_argument("--fill", type=int, default=0,
                         help="rounds of independent arithmetic added to every workgroup; "
                              "build the same number into the spv with -DPROBE_FILL")
+    parser.add_argument("--spread", action="store_true",
+                        help="the rounds land at four points in the kernel instead of one; "
+                             "build with -DPROBE_SPREAD=1 and a quarter of the rounds")
     args = parser.parse_args()
     rt = xmxres.Runtime()
     # The pipeline is built from this path the first time a window block is recorded,
     # and never rebuilt, so one process measures one stop.
-    name = f"_probe_wb{args.stop}" + (f"f{args.fill}" if args.fill else "")
+    name = f"_probe_wb{args.stop}" + (
+        f"s{args.fill}" if args.spread else (f"f{args.fill}" if args.fill else ""))
     xmxres.os.environ["XMX_WINDOW_BLOCK_SPV"] = str(ROOT / "work" / f"{name}.spv")
     passes = the_passes(rt)
     print(f"stop {args.stop}: {len(passes)} window blocks in one 768x448 frame",

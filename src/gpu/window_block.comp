@@ -99,6 +99,38 @@ const uint WINDOW_BLOCK = 4u; // row-family profile kind: attention.comp owns 0-
 #if !defined(PROBE_FILL)
 #define PROBE_FILL 0
 #endif
+#if !defined(PROBE_SPREAD)
+#define PROBE_SPREAD 0
+#endif
+
+#if PROBE_FILL > 0
+/* `PROBE_FILL` rounds of four independent vec4 chains, at one point in the kernel or at
+ * four, to see whether the cost of extra instructions depends on where they land. Seeded
+ * from shared memory so the compiler cannot fold it; the store is guarded by a window
+ * index no dispatch ever reaches, so it costs issue slots and changes nothing. */
+#define PROBE_CHAIN(N) {                                                            \
+        vec4 seed = vec4(f32[gl_LocalInvocationIndex],                              \
+                         f32[gl_LocalInvocationIndex + 256u],                        \
+                         f32[gl_LocalInvocationIndex + 512u],                        \
+                         f32[gl_LocalInvocationIndex + 768u]);                       \
+        vec4 s0 = seed, s1 = seed + 1.0, s2 = seed + 2.0, s3 = seed + 3.0;          \
+        for (uint i = 1u; i <= (N); i++) {                                          \
+            s0 += vec4(float(i)) * 1.000001;                                        \
+            s1 += vec4(float(i)) * 1.000002;                                        \
+            s2 += vec4(float(i)) * 1.000003;                                        \
+            s3 += vec4(float(i)) * 1.000004;                                        \
+        }                                                                           \
+        if (window == 0xffffffffu)                                                  \
+            f32[gl_LocalInvocationIndex] = s0.x + s1.y + s2.z + s3.w;               \
+    }
+#else
+#define PROBE_CHAIN(N)
+#endif
+#if PROBE_SPREAD
+#define PROBE_MID(N) PROBE_CHAIN(N)
+#else
+#define PROBE_MID(N)
+#endif
 
 bool image_half() { return (operation_flags() & 0x8000u) != 0u; }
 
@@ -123,24 +155,7 @@ vec4 image4(uint at) {
 void main() {
     uint window = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
     if (window >= pc.m) return;                  // uniform across the workgroup
-#if PROBE_FILL > 0
-    {
-        // Seeded from shared memory nothing has written yet, so the compiler cannot know
-        // the values and cannot fold the rounds into a closed form.
-        vec4 seed = vec4(f32[gl_LocalInvocationIndex], f32[gl_LocalInvocationIndex + 256u],
-                         f32[gl_LocalInvocationIndex + 512u],
-                         f32[gl_LocalInvocationIndex + 768u]);
-        vec4 s0 = seed, s1 = seed + 1.0, s2 = seed + 2.0, s3 = seed + 3.0;
-        for (uint i = 1u; i <= PROBE_FILL; i++) {
-            s0 += vec4(float(i)) * 1.000001;
-            s1 += vec4(float(i)) * 1.000002;
-            s2 += vec4(float(i)) * 1.000003;
-            s3 += vec4(float(i)) * 1.000004;
-        }
-        f32[gl_LocalInvocationIndex] = (s0.x + s1.y + s2.z + s3.w
-                                        + float(gl_LocalInvocationIndex));
-    }
-#endif
+    PROBE_CHAIN(PROBE_FILL)
     uint sub = gl_SubgroupID, local = gl_SubgroupInvocationID;
     uint row = sub * 8u;                         // this subgroup's tokens: row `sub` of the window
     uint scratch = 2048u + 256u * sub;           // its kilobyte, in floats and words
@@ -175,6 +190,7 @@ void main() {
         h4[((scratch * 2u + t * 32u + c0) >> 2) + 1u] = f16vec4(hi);
     }
     barrier();                                   // the weights, and this subgroup's row
+    PROBE_MID(PROBE_FILL)
     coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseA> rows[2];
     for (uint kk = 0u; kk < 2u; kk++)
         coopMatLoad(rows[kk], h16, scratch * 2u + kk * 16u, 32u,
@@ -263,6 +279,7 @@ void main() {
         u32[(VALUES + (row + r) * 32u + g * 8u + 2u * l) / 2u] = values[g];
     }
     barrier();                                   // every row's K and V in place
+    PROBE_MID(PROBE_FILL)
 #if PROBE_STOP == 1
     return;                                      // the projection, and nothing after it
 #endif
@@ -329,6 +346,7 @@ void main() {
         f32[r] = half_round(1.0 / half_round(total));
     }
     barrier();
+    PROBE_MID(PROBE_FILL)
     for (uint at = local * 2u; at < 8u * 64u; at += 64u) {
         float scale = f32[row + at / 64u];
         vec2 pair = unpackHalf2x16(u32[scratch + at / 2u]);
