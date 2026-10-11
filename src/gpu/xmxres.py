@@ -190,14 +190,17 @@ def _load():
     if hasattr(lib, "xmx_sem_import"):
         # Phase 2: the layer's "frame is in the buffer" semaphore, and the one submit
         # that waits on it. Windows only; the dll built elsewhere does not have them.
-        lib.xmx_sem_import.argtypes = [ctypes.c_ulonglong]
+        lib.xmx_sem_import.argtypes = [ctypes.c_ulonglong, ctypes.c_int]
         lib.xmx_sem_import.restype = ctypes.c_int
-        lib.xmx_extmem_wait.argtypes = [ctypes.c_int]
+        lib.xmx_extmem_wait.argtypes = [ctypes.c_int, ctypes.c_ulonglong]
         lib.xmx_extmem_wait.restype = ctypes.c_int
         lib.xmx_extmem_wait_clear.argtypes = []
         lib.xmx_extmem_wait_clear.restype = ctypes.c_int
         lib.xmx_extmem_wait_pending.argtypes = []
         lib.xmx_extmem_wait_pending.restype = ctypes.c_int
+        if hasattr(lib, "xmx_sem_value"):
+            lib.xmx_sem_value.argtypes = [ctypes.c_int]
+            lib.xmx_sem_value.restype = ctypes.c_ulonglong
     # The grouped feed-forward's recorder, guarded for the same reason: the daemon holds a
     # native build open, and a build without this symbol must still load. `int8_ffn_groups`
     # reads it back, so a tree running an older library keeps the float grouped GEMM.
@@ -1990,21 +1993,37 @@ class Runtime:
         lib = _load()
         return hasattr(lib, "xmx_sem_import") and hasattr(lib, "xmx_buf_handle")
 
-    def import_semaphore(self, handle):
-        """Take over an OPAQUE_WIN32 semaphore handle the layer duplicated to us."""
+    def import_semaphore(self, handle, timeline=False):
+        """Take over an OPAQUE_WIN32 semaphore handle the layer duplicated to us.
+
+        `timeline` must match how the other side created it. A binary one may only be
+        waited on once it is signalled or has a signal already submitted — waiting on it
+        before the other process has submitted anything is outside the rules, and a
+        driver may then run the wait as though it had succeeded. A timeline one has no
+        such restriction and carries a counter, so prefer it across a process boundary.
+        """
         if not hasattr(self.lib, "xmx_sem_import"):
             raise RuntimeError("this libxmx build cannot import a semaphore")
-        sid = self.lib.xmx_sem_import(int(handle))
+        sid = self.lib.xmx_sem_import(int(handle), 1 if timeline else 0)
         if sid < 0:
             raise failure(self.lib, "xmx_sem_import")
         return sid
 
-    def extmem_wait(self, sem_id):
-        """The next submit waits on `sem_id`: that is where the frame's bytes arrive."""
+    def extmem_wait(self, sem_id, value=0):
+        """The next submit waits on `sem_id`: that is where the frame's bytes arrive.
+
+        `value` is the counter a timeline semaphore must reach, ignored for a binary one.
+        """
         if not hasattr(self.lib, "xmx_extmem_wait"):
             raise RuntimeError("this libxmx build cannot wait on an external semaphore")
-        if self.lib.xmx_extmem_wait(int(sem_id)) < 0:
+        if self.lib.xmx_extmem_wait(int(sem_id), int(value)) < 0:
             raise failure(self.lib, "xmx_extmem_wait")
+
+    def semaphore_value(self, sem_id):
+        """The counter an imported timeline semaphore has reached; 0 for a binary one."""
+        if not hasattr(self.lib, "xmx_sem_value"):
+            return None
+        return self.lib.xmx_sem_value(int(sem_id))
 
     def extmem_wait_clear(self):
         """Forget a wait no submit came along to use, so it cannot eat the next frame's."""

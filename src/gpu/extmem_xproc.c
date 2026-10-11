@@ -140,8 +140,16 @@ static VkInstance make_instance(void)
 		VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME,
 		VK_KHR_EXTERNAL_FENCE_CAPABILITIES_EXTENSION_NAME,
 	};
+	/* apiVersion 0 is what an instance gets by default, and with it the loader treats
+	 * the device as 1.0: vkGetDeviceProcAddr then has no vkSignalSemaphore to hand
+	 * back, which is a confusing way to discover that timeline semaphores are missing.
+	 * They are 1.2 core, so say so. */
+	VkApplicationInfo app = {
+		.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+		.pApplicationName = "extmem_xproc", .apiVersion = VK_API_VERSION_1_3,
+	};
 	VkInstanceCreateInfo ici = {
-		.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+		.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
 		.enabledExtensionCount = 3, .ppEnabledExtensionNames = iext,
 	};
 	VkInstance inst;
@@ -169,8 +177,21 @@ static int make_side(struct side *s)
 		.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
 		.queueFamilyIndex = s->family, .queueCount = 1, .pQueuePriorities = &prio,
 	};
+	/* Timeline semaphores are core in 1.2 but not on by default, and a wait on one is
+	 * only legal if the device was created asking for them. */
+	VkPhysicalDeviceVulkan12Features v12 = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+		.timelineSemaphore = VK_TRUE,
+	};
+	/* VkDeviceCreateInfo::pNext takes VkPhysicalDeviceFeatures2, and the 1.2 block
+	 * hangs off *that* — chaining it straight onto the device is not a spelling the
+	 * specification offers, and asking for a feature that way is silently dropped
+	 * rather than reported. */
+	VkPhysicalDeviceFeatures2 f2 = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &v12,
+	};
 	VkDeviceCreateInfo dci = {
-		.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+		.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f2,
 		.queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
 		.enabledExtensionCount = 3, .ppEnabledExtensionNames = ext,
 	};
@@ -670,16 +691,102 @@ static int guest_main(const char *handle_hex, const char *expect_hex, const char
 	return wrong ? 1 : 0;
 }
 
+/* What this card actually offers, read back rather than assumed.
+ *
+ * The point of printing it as a table is that binary and timeline semaphores report
+ * separately — VK_KHR_timeline_semaphore resolves "Do we want to support external
+ * sharing of the new synchronization primitive type?" with yes, and says the two may
+ * have different handle types. They are also governed by different rules once shared:
+ * a binary semaphore may only be waited on if it is signalled or has a signal already
+ * submitted, whereas a timeline one may be waited on before anything signals it. So
+ * which of the two this card can share decides what Phase 2 is allowed to do. */
+static int caps_main(void)
+{
+	setvbuf(stdout, NULL, _IONBF, 0);
+	VkInstance inst = make_instance();
+	if (!inst)
+		return 1;
+	g_pd = pick_intel(inst);
+	if (!g_pd) {
+		printf("no Intel physical device\n");
+		return 1;
+	}
+	struct {
+		const char *name;
+		VkExternalSemaphoreHandleTypeFlagBits type;
+	} st[] = {
+		{ "opaque_win32", VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT },
+		{ "opaque_win32_kmt", VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT },
+		{ "d3d12_fence", VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT },
+	};
+	VkSemaphoreTypeCreateInfo tl = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+		.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+		.initialValue = 0,
+	};
+	VkSemaphoreTypeCreateInfo bin = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+		.semaphoreType = VK_SEMAPHORE_TYPE_BINARY,
+	};
+	printf("external semaphore, as reported by the driver\n");
+	printf("%-18s %-9s %-6s %-6s\n", "handle type", "sem type", "export", "import");
+	for (size_t i = 0; i < sizeof st / sizeof st[0]; i++)
+		for (int t = 0; t < 2; t++) {
+			VkSemaphoreTypeCreateInfo *stci = t ? &tl : &bin;
+			VkPhysicalDeviceExternalSemaphoreInfo esi = {
+				.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO,
+				.pNext = stci,
+				.handleType = st[i].type,
+			};
+			VkExternalSemaphoreProperties esp = {
+				.sType = VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES,
+			};
+			vkGetPhysicalDeviceExternalSemaphoreProperties(g_pd, &esi, &esp);
+			VkExternalSemaphoreFeatureFlags f = esp.externalSemaphoreFeatures;
+			printf("%-18s %-9s %-6d %-6d\n", st[i].name, t ? "timeline" : "binary",
+			       !!(f & VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT),
+			       !!(f & VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT));
+		}
+	struct {
+		const char *name;
+		VkExternalFenceHandleTypeFlagBits type;
+	} ft[] = {
+		{ "opaque_win32", VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_WIN32_BIT },
+		{ "opaque_win32_kmt", VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT },
+	};
+	printf("\nexternal fence\n");
+	printf("%-18s %-6s %-6s\n", "handle type", "export", "import");
+	for (size_t i = 0; i < sizeof ft / sizeof ft[0]; i++) {
+		VkPhysicalDeviceExternalFenceInfo efi = {
+			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_FENCE_INFO,
+			.handleType = ft[i].type,
+		};
+		VkExternalFenceProperties efp = {
+			.sType = VK_STRUCTURE_TYPE_EXTERNAL_FENCE_PROPERTIES,
+		};
+		vkGetPhysicalDeviceExternalFenceProperties(g_pd, &efi, &efp);
+		VkExternalFenceFeatureFlags f = efp.externalFenceFeatures;
+		printf("%-18s %-6d %-6d\n", ft[i].name,
+		       !!(f & VK_EXTERNAL_FENCE_FEATURE_EXPORTABLE_BIT),
+		       !!(f & VK_EXTERNAL_FENCE_FEATURE_IMPORTABLE_BIT));
+	}
+	return 0;
+}
+
 /* -------------------------------------------------------------- parent ---- */
 
-static int export_semaphore(struct side *a, VkSemaphore *sem, HANDLE *handle)
+static int export_semaphore(struct side *a, VkSemaphore *sem, HANDLE *handle, int timeline)
 {
 	VkExportSemaphoreCreateInfo esci = {
 		.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
 		.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT,
 	};
+	VkSemaphoreTypeCreateInfo stci = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, .pNext = &esci,
+		.semaphoreType = timeline ? VK_SEMAPHORE_TYPE_TIMELINE : VK_SEMAPHORE_TYPE_BINARY,
+	};
 	VkSemaphoreCreateInfo sci = {
-		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &esci,
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &stci,
 	};
 	TRY("vkCreateSemaphore (export)", vkCreateSemaphore(a->dev, &sci, NULL, sem));
 	PFN_vkGetSemaphoreWin32HandleKHR get = (PFN_vkGetSemaphoreWin32HandleKHR)
@@ -792,7 +899,7 @@ static int waittest(struct side *s, unsigned long ms)
  * that ignores it finishes at once — that difference is the whole point of this role.
  *
  * `semhost <parent-pid>`; it prints `S <handle>` and then takes `signal-after <ms>`. */
-static int semhost_main(unsigned long parent_pid)
+static int semhost_main(unsigned long parent_pid, int timeline)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
 	VkInstance inst = make_instance();
@@ -808,7 +915,7 @@ static int semhost_main(unsigned long parent_pid)
 		return 1;
 	VkSemaphore sem = VK_NULL_HANDLE;
 	HANDLE hsem = NULL;
-	if (export_semaphore(&b, &sem, &hsem)) {
+	if (export_semaphore(&b, &sem, &hsem, timeline)) {
 		printf("semhost: could not export a semaphore\n");
 		return 1;
 	}
@@ -839,10 +946,31 @@ static int semhost_main(unsigned long parent_pid)
 			return waittest(&b, ms);
 		} else if (sscanf(line, "signal-after %lu", &ms) == 1) {
 			Sleep(ms);
-			VkCommandBuffer cb = begin_cmd(&b);
-			if (!cb || end_cmd(&b, cb, VK_NULL_HANDLE, sem, 1)) {
-				printf("R 999 semhost signal failed\n");
-				continue;
+			if (timeline) {
+				/* The host can advance a timeline semaphore directly, with no GPU
+				 * work of its own — which is the whole reason the layer can say
+				 * "the bytes are there" without submitting anything. */
+				PFN_vkSignalSemaphore sig = (PFN_vkSignalSemaphore)
+					vkGetDeviceProcAddr(b.dev, "vkSignalSemaphore");
+				if (!sig) {
+					printf("R 999 vkSignalSemaphore absent\n");
+					continue;
+				}
+				VkSemaphoreSignalInfo ssi = {
+					.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
+					.semaphore = sem, .value = 1,
+				};
+				VkResult sr = sig(b.dev, &ssi);
+				if (sr) {
+					printf("R 999 vkSignalSemaphore failed (%d)\n", sr);
+					continue;
+				}
+			} else {
+				VkCommandBuffer cb = begin_cmd(&b);
+				if (!cb || end_cmd(&b, cb, VK_NULL_HANDLE, sem, 1)) {
+					printf("R 999 semhost signal failed\n");
+					continue;
+				}
 			}
 			printf("R 0 signalled after %lu ms\n", ms);
 		} else {
@@ -999,7 +1127,7 @@ static int parent_main(void)
 	TRY("vkGetMemoryWin32HandleKHR", get_handle(a.dev, &ghi, &hmem));
 	VkSemaphore a2b, b2a;
 	HANDLE ha2b = NULL, hb2a = NULL;
-	if (export_semaphore(&a, &a2b, &ha2b) || export_semaphore(&a, &b2a, &hb2a))
+	if (export_semaphore(&a, &a2b, &ha2b, 0) || export_semaphore(&a, &b2a, &hb2a, 0))
 		return 1;
 	printf("  memory handle %p (%llu bytes), semaphores %p and %p\n", (void *)hmem,
 	       (unsigned long long)ra.size, (void *)ha2b, (void *)hb2a);
@@ -1247,10 +1375,15 @@ static int parent_main(void)
 
 int main(int argc, char **argv)
 {
+	if (argc >= 2 && !strcmp(argv[1], "caps"))
+		return caps_main();
 	if (argc >= 2 && !strcmp(argv[1], "child"))
 		return child_main();
 	if (argc >= 3 && !strcmp(argv[1], "semhost"))
-		return semhost_main(strtoul(argv[2], NULL, 10));
+		/* `semhost <parent-pid> [timeline]` — a timeline semaphore is signalled from
+		 * the host rather than by a submitted batch. */
+		return semhost_main(strtoul(argv[2], NULL, 10),
+				   argc >= 4 && !strcmp(argv[3], "timeline"));
 	if (argc >= 4 && !strcmp(argv[1], "guest"))
 		return guest_main(argv[2], argv[3], argc >= 5 ? argv[4] : "0");
 	if (argc >= 2 && strcmp(argv[1], "guest") && strcmp(argv[1], "child")) {

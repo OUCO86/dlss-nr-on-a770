@@ -114,6 +114,11 @@ static struct {
 	 * frame's dependency. */
 	VkSemaphore wait_sem;
 	VkSemaphore xsems[MAX_XSEM];
+	int xsems_timeline[MAX_XSEM];
+	/* The value a timeline wait is for. Binary semaphores have no value; a timeline
+	 * one is waited on at a value and signalled to a value, and the wait only lets go
+	 * once the counter has reached it. */
+	unsigned long long wait_value;
 #endif
 } g;
 
@@ -871,7 +876,12 @@ int xmx_init(const char *spv_path)
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &wm,
 		.vulkanMemoryModel = VK_TRUE, .vulkanMemoryModelDeviceScope = VK_TRUE, .shaderFloat16 = VK_TRUE,
 		.bufferDeviceAddress = VK_TRUE, .scalarBlockLayout = VK_TRUE,
-		.storageBuffer8BitAccess = VK_TRUE, .shaderInt8 = VK_TRUE };
+		.storageBuffer8BitAccess = VK_TRUE, .shaderInt8 = VK_TRUE,
+		/* Phase 2 orders a frame with a timeline semaphore shared across the process
+		 * boundary. Unlike a binary one it may be waited on before anything signals it,
+		 * and the host can signal it, so the layer needs no GPU work of its own to say
+		 * the bytes are there. Off by default in 1.2, so it has to be asked for. */
+		.timelineSemaphore = VK_TRUE };
 	VkPhysicalDeviceVulkan11Features v11 = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .pNext = &v12,
 		.storageBuffer16BitAccess = VK_TRUE };
@@ -1322,17 +1332,14 @@ int xmx_buf_exported(int id)
  * ours to close afterwards: importing one does not hand it to the driver. The id is
  * what xmx_extmem_wait takes. Negative on failure.
  *
- * ⚠ Nothing here orders anything on the A770. `src/bench/check_extmem_sem.py` asks a
- * submit to wait on one of these while the other process signals it a second and a
- * half later, and the submit is not held back at all — not once, which would be a
- * semaphore arriving already signalled, but twice in a row. `XMX_EXTMEM_TRACE=1`
- * shows the handle does reach vkQueueSubmit, and the same test's first stage shows the
- * driver honouring a wait that never crossed a process boundary. So the wait is lost
- * at the import, and a frame cannot be ordered this way. The importer's host-side
- * query is no help either: `vkWaitSemaphores` on one of these faults in the driver.
- * Kept because it is how the finding was made, and because the shape is right if a
- * future driver fixes it. See notes/phase2-extmem-design.md section 6. */
-int xmx_sem_import(unsigned long long handle)
+ * `timeline` picks which kind of semaphore the payload belongs to, and it has to match
+ * what the other side exported — VUID-VkImportSemaphoreWin32HandleInfoKHR-handleType-03262.
+ * The two are not interchangeable: a binary one may only be waited on once it is
+ * signalled or has a signal already submitted, so waiting on it before the other
+ * process has submitted anything is outside the rules, and a driver is then allowed to
+ * run the wait as though it had succeeded. A timeline one has no such rule and carries
+ * a counter instead, which is what makes it usable here. */
+int xmx_sem_import(unsigned long long handle, int timeline)
 {
 #ifdef _WIN32
 	if (!g.rready) FAIL("resident runtime not initialised", 0);
@@ -1340,40 +1347,61 @@ int xmx_sem_import(unsigned long long handle)
 	int id;
 	for (id = 0; id < MAX_XSEM && g.xsems[id]; id++);
 	if (id == MAX_XSEM) FAIL("out of external semaphore slots", 0);
-	/* Import at creation time, which is the shape the cross-process probe uses: the
-	 * handle hangs off VkSemaphoreCreateInfo rather than being fed to a live semaphore
-	 * afterwards. Both spellings are legal, but only this one is known to matter on
-	 * this driver — see notes/phase2-extmem-design.md section 6. */
-	VkImportSemaphoreWin32HandleInfoKHR ii = {
-		.sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR,
-		.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT,
-		.handle = (HANDLE)(uintptr_t)handle,
+	VkSemaphoreTypeCreateInfo stci = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+		.semaphoreType = timeline ? VK_SEMAPHORE_TYPE_TIMELINE : VK_SEMAPHORE_TYPE_BINARY,
 	};
 	VkSemaphoreCreateInfo sci = {
-		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &ii,
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &stci,
 	};
 	VkSemaphore sem;
 	if (vkCreateSemaphore(g.dev, &sci, NULL, &sem) != VK_SUCCESS)
 		FAIL("vkCreateSemaphore (import)", 0);
+	/* A device extension, so it has to be fetched: the import table only carries what
+	 * was enabled, and this one is not in the core loader's static list. */
+	PFN_vkImportSemaphoreWin32HandleKHR import = (PFN_vkImportSemaphoreWin32HandleKHR)
+		vkGetDeviceProcAddr(g.dev, "vkImportSemaphoreWin32HandleKHR");
+	if (!import) {
+		vkDestroySemaphore(g.dev, sem, NULL);
+		FAIL("vkImportSemaphoreWin32HandleKHR absent", 0);
+	}
+	VkImportSemaphoreWin32HandleInfoKHR ii = {
+		.sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR,
+		.semaphore = sem,
+		.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+		.handle = (HANDLE)(uintptr_t)handle,
+	};
+	VkResult r = import(g.dev, &ii);
+	if (r) {
+		vkDestroySemaphore(g.dev, sem, NULL);
+		FAIL("vkImportSemaphoreWin32HandleKHR", r);
+	}
 	g.xsems[id] = sem;
+	g.xsems_timeline[id] = timeline ? 1 : 0;
 	return id;
 #else
 	(void)handle;
+	(void)timeline;
 	FAIL("importing a semaphore is Windows only", 0);
 #endif
 }
 
 /* The next submit waits on this semaphore before running anything. That is how the
  * layer says "the frame is in the buffer" without a copy: it writes the bytes on its
- * own CPU and then signals. One submit consumes it. */
-int xmx_extmem_wait(int id)
+ * own CPU and then signals. One submit consumes it.
+ *
+ * `value` is the counter a timeline semaphore has to reach, and is ignored for a
+ * binary one. */
+int xmx_extmem_wait(int id, unsigned long long value)
 {
 #ifdef _WIN32
 	if (id < 0 || id >= MAX_XSEM || !g.xsems[id]) FAIL("external semaphore is not live", 0);
 	g.wait_sem = g.xsems[id];
+	g.wait_value = g.xsems_timeline[id] ? value : 0;
 	return 0;
 #else
 	(void)id;
+	(void)value;
 	FAIL("external memory is Windows only", 0);
 #endif
 }
@@ -1384,6 +1412,7 @@ int xmx_extmem_wait_clear(void)
 {
 #ifdef _WIN32
 	g.wait_sem = VK_NULL_HANDLE;
+	g.wait_value = 0;
 #endif
 	return 0;
 }
@@ -1395,6 +1424,26 @@ int xmx_extmem_wait_pending(void)
 #ifdef _WIN32
 	return g.wait_sem ? 1 : 0;
 #else
+	return 0;
+#endif
+}
+
+/* The counter an imported timeline semaphore has reached, or 0 for a binary one.
+ * Legal only for timeline semaphores — asking a binary one is outside the rules, and
+ * on this driver it faults inside the import path rather than reporting anything. */
+unsigned long long xmx_sem_value(int id)
+{
+#ifdef _WIN32
+	if (id < 0 || id >= MAX_XSEM || !g.xsems[id] || !g.xsems_timeline[id])
+		return 0;
+	PFN_vkGetSemaphoreCounterValue get = (PFN_vkGetSemaphoreCounterValue)
+		vkGetDeviceProcAddr(g.dev, "vkGetSemaphoreCounterValue");
+	if (!get) return 0;
+	unsigned long long v = 0;
+	if (get(g.dev, g.xsems[id], &v) != VK_SUCCESS) return 0;
+	return v;
+#else
+	(void)id;
 	return 0;
 #endif
 }
@@ -2760,15 +2809,25 @@ static int submit_commands(VkCommandBuffer commands, int passes)
 	 * first submit of the frame and to no other: every later one is ordered by the
 	 * fence this function waits on anyway. */
 	VkSemaphore wait = g.wait_sem;
+	unsigned long long wait_value = g.wait_value;
 	VkPipelineStageFlags wstage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+	/* A timeline wait has to carry the value it is waiting for; a binary wait must
+	 * not, and attaching one anyway makes the submit invalid. */
+	VkTimelineSemaphoreSubmitInfo tsi = {
+		.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+		.waitSemaphoreValueCount = 1, .pWaitSemaphoreValues = &wait_value,
+	};
 	g.wait_sem = VK_NULL_HANDLE;
+	g.wait_value = 0;
 	if (wait) {
 		si.waitSemaphoreCount = 1;
 		si.pWaitSemaphores = &wait;
 		si.pWaitDstStageMask = &wstage;
+		if (wait_value) si.pNext = &tsi;
 		if (getenv("XMX_EXTMEM_TRACE"))
-			fprintf(stderr, "libxmx: submit %p waits on semaphore %p\n",
-				(void *)commands, (void *)wait);
+			fprintf(stderr, "libxmx: submit %p waits on semaphore %p%s value %llu\n",
+				(void *)commands, (void *)wait, wait_value ? " (timeline)" : "",
+				wait_value);
 	}
 #endif
 	if ((r = vkQueueSubmit(g.q, 1, &si, g.rfence))) FAIL("resident submit", r);
