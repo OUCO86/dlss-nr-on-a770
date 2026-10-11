@@ -232,3 +232,77 @@ cut 的分组和与宿主的差 6e-08（浮点求和顺序，非误差）。
 **这是本轮第二次因为没查而栽（第一次是误判"本机没有 MSVC"）。下同：**
 改任何模块前，先把 `code-map.md` 里对应章节 + 该模块自己的 docstring 读完，
 不能只 grep 标题。
+
+## 9. 这三趟还能不能再降精度（fp16 / int8）—— 量过了，答案是别动精度，动位置
+
+用户问：前后段现在跑的是 fp32 吗？挪到 GPU 了不能改 fp16 或干脆 int8 吗？
+
+**是 fp32**（`resident.comp` 的 23/24/25 三个 kind，累加器、输入输出全 `float`；
+只有 `PRE_FEATURES` 的**输出**是 fp16，因为图的输入本来就是 half；
+`POST_COMPOSE` 内部把 head 先 `float16_t()` 再乘 0.25）。但精度不是它们的成本所在。
+
+### 实测（`src/bench/prec_traffic.py`，1920x1080，15 次中位，纯 submit+wait）
+
+| 趟 | 设备 ms | 说明 |
+|---|---|---|
+| `PRE_INNER` | **0.16** | 8.3 MB 读 + 4.1 MB 写 |
+| `PRE_FEATURES` | **0.20** | 8.3 MB 读 + 11.0 MB 写（fp16） |
+| `POST_COMPOSE`（answer 在**显存**） | **0.34** | 96.8 MB / 284 GB/s |
+| `POST_COMPOSE`（answer 在**系统内存**） | **6.66** | 同一个 pass，慢 20 倍 |
+
+三趟合计 **0.70 ms**。宿主原来这一段是 10–13 ms —— 已经赢了 15 倍以上。
+
+### 结论 1：int8 在这里收益是 0，不是"小"
+
+int8 在 A770 上的唯一好处是 XMX 的 DPAS 一次乘加覆盖 K=32（fp16 只 16），指令数减半
+（`improve-int8-a770.md`）。**这三趟一条乘加都没有**，压根不碰 XMX。
+int8 只剩"字节更小"，却要付量化/反量化的指令 —— 净亏。不用考虑。
+
+### 结论 2：fp16 省不到 0.1 ms
+
+它们是带宽受限：0.34 ms 动 96.8 MB ≈ **284 GB/s**（对照 `ew_rate.py` 同批 175–340 GB/s）。
+把 fp32 的 `history`/`previous`/`composed` 换成 fp16 → 流量 96.8 → 59.5 MB → 省 **约 0.09 ms**。
+**60 ms 的帧里 0.09 ms，不值得动**，还赔上 bit-identical 判据。
+
+### 结论 3（真正的发现）：`HOST_READ` 在这张卡上是**系统内存**，6.32 ms 是过 PCIe
+
+daemon 日志第一行就写着：
+
+    buffers in card memory: type 3, heap 15.9 GiB, DEVICE_LOCAL HOST_VISIBLE HOST_COHERENT
+    readback cached:        type 2, heap 40.0 GiB, HOST_VISIBLE HOST_COHERENT HOST_CACHED
+
+`HOST_READ` 的 buffer（`libxmx.c` 里 `host_read` 优先 `HOST_CACHED`）落在 type 2 = **40 GiB
+系统内存**。设备往那儿写是 **0.197 ms/MB ≈ 5.1 GB/s**：
+
+- `+neural`（多写 24.9 MB）→ **+4.91 ms**；
+- 同一趟写进 VRAM：多写 24.9 MB → **+0.03 ms**；
+- 整个 answer 走 PCIe 的代价：**6.66 中的 6.32 ms**。
+
+⚠️ 所以接线 `stage_finish` 时的三条硬约束：
+
+1. `composed` / `neural` / `partial` / `samples` 一律 **GRAPH（VRAM）**；
+   只有 `encoded words`（8.3 MB）允许 `HOST_READ`，代价 1.63 ms。
+2. `head` 现在也是 `HOST_READ`（`nr_frame_resident.py:216`）→ 图最后一趟写它过一次
+   PCIe（1.08 ms），`POST_COMPOSE` 读它再过一次（1.08 ms），宿主还读回 0.54 ms。
+   接线后宿主不再需要 head（`samples` 由 pass 自己写），改成 GRAPH 三趟一起省。
+3. 历史/上一帧像素（`d`）保持 `HOST_WRITE`（= VRAM + BAR 映射），常驻，不回宿主。
+   `xmxres.py:228` 的 `GRAPH, HOST_READ, HOST_WRITE = 0, 1, 2`，别选错。
+
+### 结论 4：fp16 什么时候才真的值钱 —— 只在"这份数据必须过 PCIe"的时候
+
+| 过 PCIe 的东西 | fp32 | fp16（一半字节） | 省 |
+|---|---|---|---|
+| 上传 history+previous（过渡态） | 8.98 ms | 2.23 ms | **6.75 ms** |
+| 写 composed+words 到 HOST_READ | 6.5 ms | 3.2 ms | 3.3 ms |
+
+但这两笔都属于「**residency 做完就消失的成本**」—— 常驻之后上传是 0、composed 根本不出显存。
+所以 fp16 是**退路**（万一 residency 做不成），不是主线。
+
+### 精度代价（万一真要走 fp16）
+
+`composed` / `history` / `previous` 都 clamp 在 [0,1]：fp16 在 1.0 附近步长 2^-11，
+字节步长 1/255 ≈ 2^-8，**差 8 倍** → 只有正好压在 `.5` 边界上的像素会翻 1 个 LSB，肉眼无差别。
+但 bit-identical 判据会破，验证脚本要改容差。
+
+另：`inner` 存成 fp16 对 `PRE_FEATURES` 是**零代价**（它第一件事就是 `half_round(x)`，
+x 已经是 half 就是恒等），但会轻微扰动 `cut`（0.0049，相对扰动约 1e-4）——可接受，仍非必要。

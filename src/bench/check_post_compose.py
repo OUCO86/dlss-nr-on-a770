@@ -70,7 +70,10 @@ class Device:
         self.raw = self.runtime.buffer(self.pixels, np.uint32, xmxres.HOST_WRITE)
         self.head = self.runtime.buffer(HEAD_HEIGHT * HEAD_WIDTH * channels,
                                         np.float32, xmxres.GRAPH)
-        self.history = self.runtime.buffer(2 * self.pixels * 3, np.float32,
+        # The frame before: its composition as float32 triples, then — at `3 * pixels`
+        # — its own words, four bytes a pixel. Decoded in the pass, so the host never
+        # holds 25 MB of float32 pixels it only ever differences against.
+        self.history = self.runtime.buffer(4 * self.pixels, np.float32,
                                            xmxres.HOST_WRITE)
         composed = self.pixels * 3
         neural = composed
@@ -99,16 +102,17 @@ class Device:
         xmxres.host_write(self.params, block)
         return block
 
-    def run(self, payload, head, history=None, previous=None, gate=None, **kwargs):
+    def run(self, payload, head, history=None, previous=None, previous_words=None,
+            gate=None, **kwargs):
         self.load(gate, **kwargs)
         xmxres.host_write(self.raw, np.frombuffer(payload, np.uint32))
         xmxres.host_write(self.head, np.ascontiguousarray(head.reshape(-1), np.float32))
         if history is not None:
             flat = np.ascontiguousarray(history.reshape(-1), np.float32)
-            block = np.zeros(2 * self.pixels * 3, np.float32)
+            block = np.zeros(4 * self.pixels, np.float32)
             block[:flat.size] = flat
-            if previous is not None:
-                block[flat.size:] = np.ascontiguousarray(previous.reshape(-1), np.float32)
+            if previous_words is not None:
+                block.view(np.uint32)[3 * self.pixels:] = previous_words
             xmxres.host_write(self.history, block)
         self.runtime.begin()
         self.runtime.post_compose(
@@ -138,10 +142,15 @@ def main():
     for frame in range(frames):
         payload = rng.integers(0, 256, size=HEIGHT * WIDTH * 4, dtype=np.uint8).tobytes()
         head = rng.random((HEAD_HEIGHT, HEAD_WIDTH, channels)).astype(np.float32)
-        history = previous = None
+        history = previous = previous_words = None
         if temporal:
             history = rng.random((HEIGHT, WIDTH, 3)).astype(np.float32)
-            previous = rng.random((HEIGHT, WIDTH, 3)).astype(np.float32)
+            # The frame before's pixels reach the device as the bytes the game sent
+            # rather than as float32: the pass decodes them through the same 256
+            # values, and the host decodes the same bytes for its own side.
+            before = rng.integers(0, 256, size=HEIGHT * WIDTH * 4, dtype=np.uint8).tobytes()
+            previous = nr_image.decode8(before, WIDTH, HEIGHT, True)
+            previous_words = np.frombuffer(before, np.uint32)
 
         started = time.perf_counter()
         colour = nr_image.decode8(payload, WIDTH, HEIGHT, True)
@@ -154,7 +163,7 @@ def main():
         host_ms.append((time.perf_counter() - started) * 1e3)
 
         started = time.perf_counter()
-        got = device.run(payload, head, history, previous, gate=gate)
+        got = device.run(payload, head, history, previous, previous_words, gate=gate)
         device_ms.append((time.perf_counter() - started) * 1e3)
 
         if bytes(got) != bytes(encoded_host):

@@ -280,6 +280,12 @@ void main() {
         float grade[3] = float[3](par.v[scalar_at + 15u], par.v[scalar_at + 16u],
                                   par.v[scalar_at + 17u]);
 
+        /* `d` is the frame before: its composition at `at * 3`, in float32, and then
+         * at `pc.m * 3` the *words it was given*, four bytes a pixel rather than the
+         * twelve a decoded float32 triple would take. They are decoded here through
+         * the same 256 values the frame's own bytes go through, so the answer is the
+         * one `decode8` would have given — and 8.3 MB crosses the bus instead of 25,
+         * in a buffer the request had already uploaded anyway. */
         /* The head up, both axes: the row pair first and the column pair over those
          * two, which is `nr_resize_axis` twice and is not associative. */
         int row_low = floatBitsToInt(par.v[y]), row_high = floatBitsToInt(par.v[height + y]);
@@ -319,8 +325,14 @@ void main() {
              * release and the floor both read it. */
             float moved = 0.0;
             if (moved_before) {
+                /* The frame before's own bytes, decoded through the table the frame's
+                 * own went through: `decode8` of the payload the host kept would give
+                 * these three floats exactly. */
+                uint before = U32Buf(uint64_t(pc.d)).v[pc.m * 3u + pixel];
                 for (uint c = 0u; c < 3u; c++) {
-                    float d = rgb[c] - pc.d.v[at * 3u + c];
+                    uint was_shift = bgra ? 16u - 8u * c : 8u * c;
+                    float was = par.v[decode_at + ((before >> was_shift) & 0xFFu)];
+                    float d = rgb[c] - was;
                     moved = max(moved, abs(d));
                 }
             }

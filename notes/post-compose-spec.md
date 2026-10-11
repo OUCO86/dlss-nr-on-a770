@@ -157,3 +157,57 @@ history 与 previous 则是**上一帧这一趟自己的输出**，本来就在�
 ⚠️ 反过来的顺序（先上 compose，history 仍走 CPU）是**净亏**：
 history 全分辨率 fp32 是 25 MB，上传一次约 5 ms，比省下的 5.8 ms 还贵。
 所以 §1 与 history 常驻必须一起做。
+
+## 6. 接线设计（任务 36，2026-10-11 定稿）
+
+### 6.1 `previous` 不再传 fp32 —— 传上一帧的原始字节（**已落地，3/3 + 3/3 逐字节相同**）
+
+宿主原来的 `History.pixels` 是全分辨率 fp32（25 MB）。改成**上传时那份 u32 字节**（8.3 MB），
+由 `POST_COMPOSE` 用同一张 256 项表解码。与宿主的 `decode8` 逐位相同（表是同一张）。
+
+`d` 的新布局（每个，两份 ping-pong）：
+
+    [0,        3*P)   上一帧 neural，fp32      —— 本趟的 neural 输出就写在这里
+    [3*P,      4*P)   上一帧的原始字节，u32    —— request 上传的那份，不覆盖
+
+P = 全帧像素数。**33.3 MB @1080p，比原来的 50 MB 少，而且零上传**（字节本来就在显存）。
+
+### 6.2 `answer` 的布局 —— 只有 words 允许 `HOST_READ`
+
+| 区 | 内容 | 落处 | 理由 |
+|---|---|---|---|
+| composed | 3*P fp32 | GRAPH，或加 flag 跳过 | 日常只要 `change`，那个数 pass 自己算 |
+| partial | groups fp32 | GRAPH | change 的分组和 |
+| samples | sampled×C fp32 | GRAPH（0.5 MB，读回很便宜） | 门控图读它 |
+| **words** | P u32 | **HOST_READ** | 唯一必须回宿主的东西，1.63 ms |
+
+⚠️ `composed` / `neural` / `partial` / `samples` 一律 **GRAPH**。
+`HOST_READ` 在这张卡上是**系统内存**（type 2 / heap 40 GiB），设备往那儿写 0.197 ms/MB：
+整个 answer 都放那儿 = **6.32 ms 白付**（`notes/host-passes-to-gpu.md` §9 实测）。
+
+### 6.3 要改的六处
+
+1. `RequestPass`：`raw` 改**双份**（本帧 / 上一帧交替）；新增 `d[2]`、`answer`、`params`。
+2. `History`：`output` / `pixels` 不再持有全分辨率 numpy 数组，改持设备 buffer 的引用；
+   标量（`key` / `frames` / `cut` / `source_shape`）仍在宿主。
+3. `stage_network`：`head` 不再 crop 回宿主（`nr_frame_resident.py:216` 的 `head: HOST_READ`
+   改成 GRAPH）—— 省设备写 1.08 + 设备读 1.08 + 宿主读回 0.54 ms。`samples` 由 pass 写出。
+4. `stage_finish`：快路径走 `POST_COMPOSE`，见 6.4。
+5. 日志的 `held %` / `released %`：宿主拿上一帧 payload 的字节，只在 8×8 采样点
+   （32400×3 个值）上查 256 项表解码。**别 `decode8` 全帧**（1.9 ms 只为两个数）。
+6. `interface` 恢复不变：设备写 words 之后，宿主在 mapped buffer 上按 `held` 覆盖回 payload 原字节。
+
+### 6.4 仍走宿主的条件（不满足就回退，别硬上）
+
+- `a2b10g10r10`（按字节解通道，10-bit 不是字节）—— 与 `NR_PREPASS` 的回退条件一致。
+- **`held is not None`（有 interface mask）**：`compose_encode` 的 `control_mask` 逐像素改
+  intensity，**着色器里没有**。要么给它加一个 flag + 一块 fp32 mask，要么先回退。
+  （DOOM 有没有 interface mask 要先看日志；没有就这条不挡路。）
+- `--dump` / `--meter` 要 `composed` —— 给 `POST_COMPOSE` 加一个"也写 composed"的 flag，
+  或这两个模式直接回退宿主。
+- extent 变化（letterbox 进出）：已有 key 机制重建 pass，**key 必须在所有 `return None` 之前算**。
+
+### 6.5 预期
+
+省：宿主 `compose_encode` 3.99 + `post_send` 里的一部分 + history 下采样 2.08 + head 读回 0.54。
+付：设备 0.34 + words 回宿主 1.63。整帧 60 → 约 52 ms。设备侧 38 ms 是硬下限。
