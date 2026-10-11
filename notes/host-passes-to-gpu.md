@@ -170,3 +170,65 @@ cut 的分组和与宿主的差 6e-08（浮点求和顺序，非误差）。
 - `decode8`（1.7 ms）：后处理要用全分辨率解码帧，除非把 `compose_encode` 也搬上卡。
 - `compose_encode`（3.8–5.5 ms）和 `history.keep` 的那次 resample（~2 ms）：Phase 1 的后半。
 - 那条 `CopyImageToBuffer → 管道 8.3 MB → 宿主` 的来路：要等 Phase 2 的 external memory。
+
+
+## 8. 八秒一帧：持有了一个已被关闭的 frame（2026-10-11，上线当天实测撞到）
+
+上线第一局，开头 60 ms，第 134 帧之后变成 **8.2 秒一帧**，`gpu 8189+39+1ms` ——
+第一段（宿主往图的输入写）暴涨，中间段（跑图）还是正常的 38 ms，**显卡空转**。
+触发点是紧前面那一帧 **letterbox**（`network 448x448`，之后回到 768x448）。
+
+### 根因
+
+`ResidentBackend`（`src/ref/nr_frame.py`）默认 `max_cached_frames=1`：
+
+    Retains the most recently used extents, one by default. Evicted frames are closed,
+    releasing their GPU allocations and captured commands. A caller must not keep using
+    a frame after asking this backend for a different extent.
+
+**这句警告就写在它的 docstring 里，我动手前没读到。**
+
+- letterbox 帧是另一个 extent → `backend.frame(448,448)` → 768x448 那张图被 **evict 并 close()**；
+- `RequestPass` 构造时抓的是 `backend.frame(...)` 的返回值，于是手里攥着一个已释放的图；
+- 更糟：`_request_pass` 在 `boxed` 时**直接 return None 但没更新 `request_key`**，
+  所以下一帧 key 没变、**不重建**，继续用那个攥着已释放 frame 的 pass；
+- `assemble()` 返回已关闭图的 `input_view()`，`ResidentFrame.run` 拿的是新图，
+  两者指针不同 → 走 `host_write` → **从一块已经 close 的设备 buffer 读 8.3 MB**。
+
+### 为什么画质没坏
+
+从已释放显存读出来的字节**碰巧还没被覆盖**，head 仍然 byte-identical。
+所以唯一症状就是帧率 —— 这正是最难自查的一类：数据是对的，只是慢了 300 倍。
+
+### 修法
+
+1. `RequestPass` 改持 **backend**，在 `assemble()` 里现取 `backend.frame(*extent)` ——
+   从根上不可能攥住一个已关闭的 frame。
+2. `RequestPass.close()` 显式 free 那一批 buffer，不等 GC。
+3. `_request_pass`：把 key 的计算提到所有 `return None` **之前**，
+   任何回退路径都顺带清掉 `args.request`。
+
+### 回归测试
+
+`src/bench/check_request_switch.py`：跑帧 → 要一次 letterbox extent → **不重建 pass**，
+继续用同一个对象跑帧。这是最严苛的形式（复现"key 没变所以不重建"那条路径）。
+
+| | 切换后 `carried` | head |
+|---|---|---|
+| 修复前 | **10163.02 ms** | 4/4 逐字节相同（！） |
+| 修复后 | **0.03 ms** | 6/6 逐字节相同 |
+
+⚠️ 教训：**正确性判据抓不到这类 bug**。byte-identical 全过，只有帧率能显示它。
+凡是"把活搬到设备"的改动，除了比对输出，**必须有一条"什么都没拷贝"的时间断言**。
+
+### 另一个教训：动手前要把参考文案读完
+
+`docs/a770-port/code-map.md` 我只 grep 了章节标题。P3 和 P4 两节正是这次动的东西，没读：
+
+- P3：⚠️ **权重每次 extent 变化要跨 PCIe 重传 ~292 MB**（`notes/phase63:150-155`）。
+  即 extent 切换本身就很贵，letterbox 越多越亏。
+- P4：宿主通道的 OpenMP 分块是按 8 核 Lunar Lake 调的，换 CPU 要重测。
+
+**这是本轮第二次因为没查而栽（第一次是误判"本机没有 MSVC"）。下同：**
+改任何模块前，先把 `code-map.md` 里对应章节 + 该模块自己的 docstring 读完，
+不能只 grep 标题。
