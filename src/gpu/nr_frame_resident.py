@@ -180,12 +180,18 @@ class ResidentFrame:
         # Off by default, and read once: a buffer is exportable or not from the moment it
         # is allocated, so this cannot be switched on a running frame.
         self.extmem = os.environ.get("NR_EXTMEM", "0") != "0"
-        # Only the way *back* needs the host's own buffers to be exportable: the way in
-        # is the frame's buffer, which is made separately and is the only thing the
-        # layer writes. Exporting the features as well was measured to cost 3.4 ms a
-        # frame in `pass_assemble` on the Arc — the memory is host-visible either way,
-        # but not at the same price — so it waits for the half that wants it.
-        self.extmem_answer = os.environ.get("NR_EXTMEM_ANSWER", "0") != "0"
+        # An earlier shape of the way back had the layer read the answer out of these
+        # very buffers, exported like the frame's is. Two things changed that:
+        #   * exporting the features was measured to cost 3.4 ms a frame in
+        #     `pass_assemble` on the Arc — the memory is host-visible either way, but
+        #     not at the same price — so an exportable buffer is not free here;
+        #   * the way back does not need them anyway. It has a buffer of its own now,
+        #     `ResidentBackend.extmem_answer_buffer`, one buffer and one handle for the
+        #     life of the daemon, which is where the words are written and where the
+        #     layer reads them.
+        # Nothing here is exported any more. `host_handles` therefore answers empty, and
+        # nothing asks it for anything.
+        self.export_host_buffers = False
         self._planned = None      # what the arena was planned for: `_prepare_scratch`
         self._closed = False
         self._head_free = []      # host blocks a returned head was in and nobody holds now
@@ -275,12 +281,10 @@ class ResidentFrame:
         if existing is None or existing.nbytes < elements * np.dtype(dtype).itemsize:
             if existing is not None:
                 existing.free()
-            # only the two the host touches are worth exporting: everything else never
-            # leaves this device, so a handle for it would buy nothing
+            # Nothing the graph builds is exported: see `export_host_buffers` above.
             existing = self.rt.buffer(elements, dtype,
                                       kind=self.host_side.get(name, xmxres.GRAPH),
-                                      exportable=self.extmem_answer
-                                                and name in self.host_side)
+                                      exportable=False)
             self._buffers[name] = existing
         return existing
 
@@ -803,7 +807,7 @@ class RequestPass:
     """
 
     def __init__(self, runtime, backend, geometry, *, source, inner, noise, controls,
-                 bgra=True, raw=None):
+                 bgra=True, raw=None, answer=None):
         if nr_image is None:
             raise RuntimeError("the request passes need the host library for their tables")
         self.rt = runtime
@@ -866,7 +870,23 @@ class RequestPass:
         # Only the words have to reach the host, and they are what makes this a
         # HOST_READ buffer: 8.3 MB of it, against 24.9 more for a composition nothing
         # reads.
-        self.answer = runtime.buffer(self.answer_size, np.float32, xmxres.HOST_READ)
+        #
+        # Phase 2, the way back: with `NR_EXTMEM_ANSWER` the backend hands this pass
+        # one buffer of its own to write them into, and the layer reads them there
+        # instead of out of a slot. Same bargain as `raw` above — the pass is rebuilt
+        # whenever the extent moves, so a buffer that came and went with it would leave
+        # the layer reading through a handle that no longer exists. A pass given one
+        # does not own it and must not free it; a pass whose extent outgrew it makes
+        # its own and carries on, which costs the copy and nothing else.
+        self._answer_owned = answer is None or answer.nbytes < self.answer_size * 4
+        self.answer = (runtime.buffer(self.answer_size, np.float32, xmxres.HOST_READ)
+                       if self._answer_owned else answer)
+        # "The words are in a buffer the layer imports", which is what the daemon has
+        # to know before it can tell the layer to read them there. Not the switch
+        # being on — a pass whose extent outgrew the backend's buffer makes its own,
+        # and its words are nowhere the layer can see. Telling the layer where to look
+        # anyway would hand it the frame before's.
+        self.answer_external = not self._answer_owned
         self.params = None
         self._params_view = None
         self._plan_size = 0
@@ -883,8 +903,8 @@ class RequestPass:
         # `self.raw` is only freed when this pass made it: a shared one belongs to the
         # backend, which goes on handing it to the passes it builds after this one.
         for buffer in ((self.raw,) if self._raw_owned else ()) + (
-                self.history, self.partial, self.plan_inner,
-                self.plan_features, self.before, self.answer,
+                self.history, self.partial, self.plan_inner, self.plan_features,
+                self.before, *((self.answer,) if self._answer_owned else ()),
                 self.inner_gather, *self.inner):
             buffer.free()
         if self.params is not None:

@@ -38,6 +38,10 @@ os.environ["NR_LAYER_PID"] = str(os.getpid())
 # device and the host never holds the composed frame. Off, the daemon takes the
 # host's path and the two do not share a line of the code that can fail.
 os.environ["NR_POSTPASS"] = os.environ.get("NR_POSTPASS", "1")
+# Phase 2's second half, the way back: the answer crosses in a buffer of the
+# daemon's own instead of a slot. NR_EXTMEM_ANSWER=0 keeps it in the slot, which is
+# the way to tell the two apart.
+os.environ["NR_EXTMEM_ANSWER"] = os.environ.get("NR_EXTMEM_ANSWER", "1")
 
 import numpy as np                                           # noqa: E402
 import live_rates                                            # noqa: E402
@@ -120,6 +124,19 @@ def drive(endpoint, frames, mode):
 
         def from_slot(header, slot, extra=b""):
             told = struct.unpack("<I", round_trip(endpoint, header + extra, 4))[0]
+            if told & 0x80000000:
+                # The way back, Phase 2's second half: the words are in the daemon's
+                # own buffer and the slot says where. Played here the way the layer
+                # plays it in `nr_layer.c`: eight bytes out of the slot, then a read
+                # of the imported buffer at that offset.
+                at, count = struct.unpack_from("<II", mapping.answer(slot, 8), 0)
+                buffer = box["backend"]._extmem_answer
+                if at + count > buffer.nbytes:
+                    raise RuntimeError(f"the answer is at {at} + {count}, past the "
+                                       f"buffer's {buffer.nbytes}")
+                whole = xmxres.host_view(buffer, dtype=np.uint8,
+                                         shape=(int(buffer.nbytes),))
+                return bytes(np.ascontiguousarray(whole[at:at + count]))
             if told != ANSWER:
                 raise RuntimeError(f"the slot promises {told} bytes, not {ANSWER}")
             return bytes(mapping.answer(slot, told))

@@ -242,10 +242,23 @@ def _extmem_publish(args, backend):
         getter = getattr(backend, "extmem_input", None)
         if getter is None or getter(args.max_pixels) is None:
             return
+        # The answer's buffer, when the way back is on. Made here for the same reason
+        # the frame's is: it is the backend's to make and the daemon's to offer, and
+        # there is no point in having it before knowing it can be offered.
+        answer_getter = getattr(backend, "extmem_answer_buffer", None)
+        answer_buffer = answer_getter(args.max_pixels) if answer_getter else None
         args.extmem_sem = backend.runtime.export_semaphore()
         raw_handle, raw_bytes = backend.extmem_handles()
-        handles = nr_pipe.duplicate_to(
-            pid, (raw_handle, backend.runtime.semaphore_handle(args.extmem_sem)))
+        answer_handle, answer_bytes = (backend.extmem_answer_handles()
+                                       if answer_buffer is not None else (0, 0))
+        args.extmem_answer = answer_buffer
+        offered = [raw_handle, answer_handle,
+                   backend.runtime.semaphore_handle(args.extmem_sem)]
+        # Only a handle that was made can be duplicated: DuplicateHandle on 0 fails,
+        # and the answer is 0 whenever the way back is off. Put the zeros back where
+        # they were, so what the layer reads is what was offered.
+        copied = iter(nr_pipe.duplicate_to(pid, [h for h in offered if h]))
+        handles = [next(copied) if h else 0 for h in offered]
     except Exception as error:
         # Anything at all. This is the soft-failure path: it exists so that a frame
         # can cross in the mapping when the buffer cannot be offered, and an
@@ -258,11 +271,14 @@ def _extmem_publish(args, backend):
         print(f"the frame's buffer could not be offered to the layer ({error!r}); "
               f"it stays in the mapping", flush=True)
         return
-    # No answer handle: the answer still crosses in the slot, which is what the four
-    # bytes on the pipe are for.
-    mapping.publish_extmem(handles[0], 0, handles[1], raw_bytes, 0)
+    # The answer's handle is 0 when the way back is off, and then the answer still
+    # crosses in the slot, which is what the four bytes on the pipe are for.
+    mapping.publish_extmem(handles[0], handles[1], handles[2], raw_bytes, answer_bytes)
     print(f"the frame goes into a buffer of the daemon's own: {raw_bytes >> 20} MB, "
-          f"announced on a timeline semaphore", flush=True)
+          f"announced on a timeline semaphore"
+          + (f"; so does the answer, {answer_bytes >> 20} MB"
+             if answer_bytes else "; the answer still crosses in a slot"),
+          flush=True)
 
 
 def _extmem_payload(args, backend, pixels):
@@ -288,7 +304,12 @@ def _mapping(args):
     return getattr(args, "mapping", None)
 
 
-def send_answer(connection, mapping, slot, words):
+# The top bit of the four bytes the pipe carries back: the answer is in the buffer the
+# layer imports, not in the slot. See `send_answer`.
+ANSWER_EXTERNAL = 0x80000000
+
+
+def send_answer(connection, mapping, slot, words, at=None):
     """The answer on its way back to the layer.
 
     Through the mapping when the frame came in one: the bytes are copied into the frame's
@@ -296,13 +317,29 @@ def send_answer(connection, mapping, slot, words):
     not have to copy twice. Through the pipe when that is where the frame came from, and
     whenever the answer is too large for a slot — a larger extent than the mapping was
     made for, which the layer itself refuses to put in one, so this is only a guard.
+
+    `at`, a byte offset: the words are already in a buffer the layer imports itself
+    (Phase 2, the way back), so the frame is not copied at all. What goes in the slot
+    is eight bytes — where to look in that buffer, and how much — against 8.3 MB, and
+    the four on the pipe say the answer is there just as they always have.
     """
     raw = memoryview(words).cast("B")
-    if slot is None or mapping is None or len(raw) > mapping.colour:
+    if slot is None or mapping is None:
         connection.sendall(words)
         return
-    mapping.answer(slot, len(raw))[:] = raw
-    connection.sendall(struct.pack("<I", len(raw)))
+    if at is None:
+        if len(raw) > mapping.colour:
+            connection.sendall(words)
+            return
+        mapping.answer(slot, len(raw))[:] = raw
+        connection.sendall(struct.pack("<I", len(raw)))
+        return
+    struct.pack_into("<II", mapping.answer(slot, 8), 0, int(at), len(raw))
+    # The top bit says which: a frame handed back untouched — an unsupported format,
+    # an interface mask — is still in the slot, and the layer would look in the
+    # buffer and find the frame before's words there. No length this size has that
+    # bit, an answer being a frame's own pixels and a frame being under 2^31 of them.
+    connection.sendall(struct.pack("<I", len(raw) | ANSWER_EXTERNAL))
 
 
 SOLID_RADIUS = 3
@@ -1583,7 +1620,18 @@ def stage_finish(frame, backend, args):
         # so a --dump shows what was actually sent
         if composed is not None:
             (full[top:bottom, left:right] if full is not None else composed)[held] = colour[held]
-    send_answer(connection, _mapping(args), frame.shm, encoded)
+    # The way back: with the answer in a buffer of ours, the layer reads it there.
+    # It needs to be told where in that buffer — the words are the frame's bytes and
+    # they sit behind the cut's groups and the gate's samples, at an offset that moves
+    # with the extent. Eight bytes in the slot say where and how much.
+    # `answer_external` rather than the switch: a pass that made its own answer
+    # buffer — its extent outgrew the backend's — has its words somewhere the layer
+    # cannot see, and telling the layer where to look anyway hands it the frame
+    # before's. `encoded_at` moves with the extent, so the offset is this frame's.
+    send_answer(connection, _mapping(args), frame.shm, encoded,
+                at=frame.request.encoded_at * 4
+                   if frame.request is not None
+                   and getattr(frame.request, "answer_external", False) else None)
     if changed is None and composed is not None:
         changed = mean_change(composed[rows], colour[rows], "change")
     # What the game was handed at the active region, for the dump below.

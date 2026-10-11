@@ -507,6 +507,12 @@ class ResidentBackend:
         # buffer, one handle, for the life of the daemon.
         self.extmem = os.environ.get("NR_EXTMEM", "0") != "0"
         self._extmem_raw = None
+        # Phase 2, the way back: the answer crosses in a buffer of ours too, and the
+        # layer reads it where the device left it instead of out of a slot. Its own
+        # switch, because the two halves are not the same risk: the way in has been
+        # measured in the game, this has not.
+        self.extmem_answer = os.environ.get("NR_EXTMEM_ANSWER", "0") != "0"
+        self._extmem_answer = None
 
     def extmem_input(self, pixels):
         """The buffer the layer is to write the game's own bytes into, or None.
@@ -536,6 +542,41 @@ class ResidentBackend:
                                                    self._module.xmxres.HOST_WRITE,
                                                    exportable=True)
         return self._extmem_raw
+
+    def extmem_answer_buffer(self, pixels):
+        """The buffer the device writes the answer into, for the layer to read, or None.
+
+        The same shape of decision as `extmem_input`, for the same reason: the pass is
+        rebuilt whenever the extent moves, and a buffer that came and went with it would
+        leave the layer reading through a handle that no longer exists. One buffer, one
+        handle, for the life of the daemon.
+
+        HOST_WRITE, not HOST_READ — which is the whole point of the way back
+        (`notes/phase2-extmem-design.md` section 2): the device writing into system
+        memory measured 1.84 ms, and writing into its own memory behind the bar is
+        what that column becomes when the layer reads it over the bar instead of out
+        of a slot. Type 3 is HOST_COHERENT, so on the host side nothing has to be
+        invalidated — see `refs/vulkan-sync/host-write-visibility.md`.
+
+        Sized for the daemon's own pixel limit. The answer is the encoded words plus
+        the cut's groups and the gate's samples, which is a little over one float a
+        pixel: `pixels * 11 // 10` covers it at every extent the limit admits.
+        """
+        if not self.extmem_answer:
+            return None
+        want = pixels * 11 // 10 + 4096
+        if self._extmem_answer is None or self._extmem_answer.nbytes < want * 4:
+            if self._extmem_answer is not None:
+                self._extmem_answer.free()
+            self._extmem_answer = self.runtime.buffer(
+                want, np.float32, self._module.xmxres.HOST_WRITE, exportable=True)
+        return self._extmem_answer
+
+    def extmem_answer_handles(self):
+        """`(handle, bytes)` for the answer buffer, or None when there is not one."""
+        if self._extmem_answer is None:
+            return None
+        return (self._extmem_answer.handle(), self._extmem_answer.nbytes)
 
     def extmem_handles(self):
         """`(raw_handle, raw_bytes)` for the layer, or None when there is no buffer.
@@ -668,7 +709,8 @@ class ResidentBackend:
         # device memory the moment a letterboxed frame asked for a different extent.
         return self._module.RequestPass(
             self.runtime, self, geometry, source=source, inner=inner, noise=noise,
-            controls=controls, bgra=bgra, raw=self._extmem_raw)
+            controls=controls, bgra=bgra, raw=self._extmem_raw,
+            answer=self._extmem_answer)
 
 
 def run_head(model, color, *, profile="standard", frame_index=0, style_index=None,

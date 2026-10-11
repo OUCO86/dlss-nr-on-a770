@@ -405,6 +405,30 @@ static int exchange_receive(int fd, void *reply, size_t reply_size)
 			nr_link_close(&link);
 			return -1;
 		}
+		if (notice & 0x80000000u) {
+			/* Phase 2, the way back. The words are already in the daemon's own
+			 * buffer, which this process mapped when it imported it; the slot
+			 * holds eight bytes saying where in that buffer and how much. That
+			 * is the copy this saves — 8.3 MB out of the mapping, every frame.
+			 *
+			 * The daemon waits for the frame's last submission before it sends
+			 * the notice, and the buffer is HOST_COHERENT, so nothing here has
+			 * to be invalidated: see refs/vulkan-sync/. One frame is in flight
+			 * at a time and this reads before the next one is sent, so the
+			 * daemon cannot have written over it yet. */
+			uint32_t where[2] = { 0, 0 };
+			memcpy(where, nr_shm_answer(&shm, slot), sizeof where);
+			size_t at = (size_t)where[0], bytes = (size_t)where[1];
+			size_t have = 0;
+			void *answer = nrx_answer(&have);
+			if (!answer || bytes < reply_size || at + reply_size > have) {
+				nr_link_close(&link);
+				return -1;
+			}
+			memcpy(reply, (const char *)answer + at, reply_size);
+			nr_link_close(&link);
+			return 0;
+		}
 		memcpy(reply, nr_shm_answer(&shm, slot), reply_size);
 		nr_link_close(&link);
 		return 0;
