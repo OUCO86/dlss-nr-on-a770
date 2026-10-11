@@ -1075,6 +1075,12 @@ def stage_prepare(connection, backend, args, pipeline=None):
     if backend.set_int8(live.int8):
         print(f"settings: integer projections "
               f"{'on' if live.int8 else 'off'}; rebuilding the graph", flush=True)
+        # What the projections actually did to the grouped feed-forward switch. It is read
+        # once at construction and not re-read here, so this line is the only way to tell
+        # a graph that took the integer path from one that silently kept the float one.
+        print(f"settings: grouped feed-forward on the integer grid: "
+              f"{'on' if getattr(getattr(backend, 'runtime', None), 'int8_ffn_groups', False) else 'off'}",
+              flush=True)
     # Same shape of knob, cheaper to move: the weights are unchanged, only which pass
     # reads the window rows is, so this is the one that can be measured in place.
     if backend.set_window_fuse(live.int8_window_fuse):
@@ -1737,7 +1743,18 @@ def main():
             ("NR_FUSE_POOL", "fuse_pool"), ("NR_FUSE_WINDOW_BLOCK", "fuse_window_block"),
             ("NR_FUSE_HEAD", "fuse_head"),
             ("NR_FUSE_GLOBAL_ATTENTION", "fuse_global_attention"),
-            ("NR_INT8_PROJECT", "int8_project"))),
+            ("NR_INT8_PROJECT", "int8_project"),
+            ("NR_INT8_FFN_GROUPS", "int8_ffn_groups"))),
+          flush=True)
+    # Self-proof for the grouped feed-forward switch, which the line above cannot give on
+    # its own: it is decided once when the runtime is built, from the environment *and*
+    # from the integer projections, and the projections are off at that moment - only
+    # nr_settings.json turns them on, a frame later. So the log has to carry both halves,
+    # or a run where the switch never engaged reads exactly like one where it did.
+    print(f"grouped feed-forward: NR_INT8_FFN_GROUPS="
+          f"{os.environ.get('NR_INT8_FFN_GROUPS', '0')} in the environment, switch "
+          f"{'on' if rt.int8_ffn_groups else 'off'}"
+          f" (integer projections {'on' if rt.int8_project else 'off'} at startup)",
           flush=True)
 
     if os.name == "nt":

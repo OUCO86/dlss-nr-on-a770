@@ -723,9 +723,30 @@ class Runtime:
         # Off until the picture has been looked at: every other integer projection in the
         # graph paid for its speed with some of the network's own effect, and this is the
         # largest group of them yet. `NR_INT8_FFN_GROUPS=1` turns it on.
-        self.int8_ffn_groups = (self.int8_project
-                                and os.environ.get("NR_INT8_FFN_GROUPS", "0") != "0"
-                                and hasattr(self.lib, "xmx_rec_gemm_int8_batched"))
+        # `int8_project` here is only what it was at construction, and in the game that is
+        # off: `NR_INT8_PROJECT` defaults to 0 and it is `nr_settings.json`, read a moment
+        # later, that carries what the panel asked for. A benchmark sets the variable
+        # itself and so never sees this, which is why the switch measured as working while
+        # doing nothing at all in a real run. Keep the half that does not depend on
+        # `int8_project` apart, and let `set_int8` combine them.
+        self._ffn_groups_wanted = (os.environ.get("NR_INT8_FFN_GROUPS", "0") != "0"
+                                   and hasattr(self.lib, "xmx_rec_gemm_int8_batched"))
+        self.int8_ffn_groups = self.int8_project and self._ffn_groups_wanted
+
+    def set_int8(self, on):
+        """Turn the integer graph on or off, the way `nr_settings.json` asks for it.
+
+        The grouped feed-forward switch is gated on this one, so it has to move with it.
+        It used to be decided once at construction, against an `int8_project` the daemon
+        had not applied yet, which left it off for the whole of every run in the game.
+        Returns whether anything changed.
+        """
+        on = bool(on)
+        if on == bool(self.int8_project):
+            return False
+        self.int8_project = on
+        self.int8_ffn_groups = on and self._ffn_groups_wanted
+        return True
 
     def graph_key(self):
         return (self.lib.xmx_specialization() | (int(self.fuse_qk) << 3)

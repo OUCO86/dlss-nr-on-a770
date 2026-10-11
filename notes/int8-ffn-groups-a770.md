@@ -126,3 +126,39 @@ silence this project has been bitten by before.
 largest single win in the frame at -63.6 us each and is **not** grouped: it takes the
 integer GEMM as it always was, with no batch. It is part of this switch and accounted
 above.
+
+## 🚩 未修 bug：游戏里这个开关根本不会打开（2026-10-11 发现，用户要求先只加日志）
+
+`xmxres.Runtime.__init__`：
+
+```python
+self.int8_ffn_groups = (self.int8_project
+                        and os.environ.get("NR_INT8_FFN_GROUPS", "0") != "0"
+                        and hasattr(self.lib, "xmx_rec_gemm_int8_batched"))
+```
+
+`int8_project` 在构造时是 **False** —— `NR_INT8_PROJECT` 代码默认 `"0"`，游戏里是 daemon
+读 `nr_settings.json` 的 `int8=1.0` 之后才打开，走 `nr_frame.py:526` 的
+`self.runtime.int8_project = on`，**只赋这一个字段，`int8_ffn_groups` 不重算**。
+
+→ 离线基准能生效（`frame_ledger` 自带 `NR_INT8_PROJECT=1`，构造时就是 True，所以
+34.75 → 32.83 ms 是真的），**游戏里永远 False**。
+2026-10-11 18:3x 那一局因此跑的还是老图：`gpu 0+38+0`、帧时间 40 ms，与基线一字不差；
+用户"感觉可以" = 基线的观感，不含这个开关。
+
+教训：离线基准自己设了 `NR_INT8_PROJECT=1`，而游戏靠 `nr_settings.json`，
+**两条路的开关时序不同** —— 凡"由另一个开关门住"的开关都要检查这个。
+
+### 修复（改天，别现在动）
+1. `xmxres.Runtime.__init__`：把不依赖 `int8_project` 的那半单独存
+   `self._ffn_groups_wanted = env != "0" and hasattr(lib, "xmx_rec_gemm_int8_batched")`；
+   `self.int8_ffn_groups = self.int8_project and self._ffn_groups_wanted`。
+2. 加 `Runtime.set_int8(on)`：同时更新两个字段，返回是否变化。
+3. `nr_frame.py:526` 改调 `self.runtime.set_int8(on)`，别直接赋值。
+
+### 已加的日志（2026-10-11，仅观测，不改行为，commit 待做）
+- daemon 启动：`runtime options` 末尾多 `NR_INT8_FFN_GROUPS=<0|1>`，紧跟一行
+  `grouped feed-forward: NR_INT8_FFN_GROUPS=<env> in the environment, switch on|off (integer projections on|off at startup)`
+- 首帧 int8 打开后：`settings: grouped feed-forward on the integer grid: on|off`
+
+修 bug 前这两行会显示 **env=1 但 switch=off**，那就是 bug 本身的证据。

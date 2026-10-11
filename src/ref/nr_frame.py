@@ -520,10 +520,11 @@ class ResidentBackend:
         the upload again. That is a frame or two of hitch on the switch and nothing
         after it. Returns whether anything actually changed.
         """
-        on = bool(on)
-        if on == bool(getattr(self.runtime, "int8_project", False)):
+        # Through the runtime, not by assigning the field: the grouped feed-forward
+        # switch is gated on this one and has to be moved with it. Assigning alone left
+        # that switch at whatever it was at construction, which in the game is off.
+        if not self.runtime.set_int8(on):
             return False
-        self.runtime.int8_project = on
         for frame in self._frames.values():
             frame.close()
         self._frames.clear()
