@@ -9,6 +9,11 @@
  * Build: cc -O2 -shared -fPIC -I<vulkan headers> -o libxmx.so libxmx.c -lvulkan
  */
 #include <stdio.h>
+/* _mm_sfence, for ordering the host's writes to mapped memory. SSE2 is baseline on
+ * everything this runs on; MSVC provides the intrinsic through <intrin.h>. */
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
@@ -161,7 +166,11 @@ struct rbuf { VkBuffer b; VkDeviceMemory m; void *p; VkDeviceAddress addr;
 		  * process can import it. `handle` is the NT handle vkGetMemoryWin32HandleKHR
 		  * gave us; it belongs to us and has to be closed (the specification says the
 		  * application owns handles of this type, unlike an fd). */
-		 int exported; void *handle; };
+		 int exported; void *handle;
+		 /* Which memory type it landed in, and how it is mapped. Kept because the
+		  * two are the whole answer to "did the device see what the host wrote",
+		  * and neither can be asked for afterwards. */
+		 unsigned mt; int coherent; };
 static struct rbuf rbufs[MAX_RBUF];
 
 struct push {
@@ -1238,10 +1247,28 @@ static int buf_create(unsigned long long bytes, int kind, int exportable)
 		if (!rbufs[i].live) { id = i; break; }
 	if (id < 0) FAIL("out of buffer slots", 0);
 	struct rbuf *rb = &rbufs[id];
+	/* The buffer says it is to be exported too, not only the memory it is given.
+	 * The memory's export info alone leaves the two disagreeing about what this
+	 * buffer is for, and the same pair is required on the way in, where a buffer
+	 * bound to imported memory has to carry the handle type as well.
+	 *
+	 * It is not a fix for anything measured. It was added while 2024 bytes a frame
+	 * were being chased, and those bytes were the test's own - see `xmx_buf_flush`
+	 * and `notes/extmem-outbound.md`. It is kept because the two sides should
+	 * agree, not because it was ever shown to matter here. */
+#ifdef _WIN32
+	VkExternalMemoryBufferCreateInfo embi = {
+		.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+		.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+	};
+#endif
 	VkBufferCreateInfo bi = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = bytes ? bytes : 4,
 				  .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
 					   | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
 					   | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT };
+#ifdef _WIN32
+	if (exportable) bi.pNext = &embi;
+#endif
 	VkResult r = vkCreateBuffer(g.dev, &bi, NULL, &rb->b);
 	if (r) FAIL("vkCreateBuffer (resident)", r);
 	VkMemoryRequirements mr;
@@ -1278,6 +1305,13 @@ static int buf_create(unsigned long long bytes, int kind, int exportable)
 	}
 	rb->mapped = !unmapped;
 	rb->exported = exportable;
+	rb->mt = mt;
+	{
+		VkPhysicalDeviceMemoryProperties mp;
+		vkGetPhysicalDeviceMemoryProperties(g.pd, &mp);
+		rb->coherent = (mp.memoryTypes[mt].propertyFlags
+				& VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+	}
 	VkBufferDeviceAddressInfo ai2 = { .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = rb->b };
 	rb->addr = vkGetBufferDeviceAddress(g.dev, &ai2);
 	rb->size = bi.size;
@@ -1289,6 +1323,63 @@ failed_kind:
 	if (rb->m) vkFreeMemory(g.dev, rb->m, NULL);
 	*rb = (struct rbuf){ 0 };
 	FAIL(failure, r);
+}
+
+/* Order the host's own writes to mapped memory, past the point of the call.
+ *
+ * Host-coherent memory on a card is not cached on the host: it is write-combining,
+ * and a core combines writes in a buffer of its own before they go anywhere. That
+ * buffer belongs to the core, not to the process — so a write made on one thread
+ * and a submit made on another (which is what a frame arriving from another process
+ * is) can leave the device reading what the first core had not sent yet, while the
+ * host, reading back on the core that wrote, sees the bytes it wrote.
+ *
+ * `_mm_sfence` drains that buffer on the core that calls it, which is why this has
+ * to be called by whoever wrote, not by whoever submits.
+ */
+void xmx_write_fence(void)
+{
+#if defined(_MSC_VER)
+	_mm_sfence();
+#elif defined(__x86_64__) || defined(__i386__)
+	__builtin_ia32_sfence();
+#endif
+}
+
+/* Make what the host wrote visible to the device. Nothing to do for host-coherent
+ * memory, and a thing that has to be done for anything else: the host's writes sit
+ * in its own caches until this is called.
+ *
+ * Whether it is needed is `xmx_buf_place`'s low bit, which is why that one exists:
+ * a mapped buffer the host writes into is always one of the two, and guessing
+ * wrong leaves a frame whose bytes are right on the host and stale on the device. */
+int xmx_buf_flush(int id)
+{
+	if (id < 0 || id >= MAX_RBUF || !rbufs[id].live) FAIL("buffer is not live", 0);
+	if (!rbufs[id].p) FAIL("buffer is not mapped", 0);
+	/* HOST_COHERENT means the writes are already available to the host domain, so
+	 * there is nothing to flush and the call is a no-op by the book. Forced only
+	 * by NR_FLUSH_ANYWAY, which exists because "coherent" was once doubted here
+	 * and is the question to reopen if a frame ever comes back half-written. */
+	if (rbufs[id].coherent && getenv("NR_FLUSH_ANYWAY") == NULL) return 0;
+	VkMappedMemoryRange range = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+				      .memory = rbufs[id].m, .offset = 0,
+				      .size = VK_WHOLE_SIZE };
+	VkResult r = vkFlushMappedMemoryRanges(g.dev, 1, &range);
+	if (r) FAIL("vkFlushMappedMemoryRanges", r);
+	return 0;
+}
+
+/* Where a buffer's bytes are, as `coherent | (memoryType << 1) | (address & 0xffff) << 16`.
+ * For finding out, not for deciding anything: the type is what the allocation chose
+ * and the alignment is what the driver gave, and both are what a frame read back
+ * partly stale is explained by. */
+unsigned long long xmx_buf_place(int id)
+{
+	if (id < 0 || id >= MAX_RBUF || !rbufs[id].live) FAIL("buffer is not live", 0);
+	return (unsigned long long)(rbufs[id].coherent ? 1 : 0)
+		| ((unsigned long long)rbufs[id].mt << 1)
+		| ((unsigned long long)(rbufs[id].addr & 0xffff) << 16);
 }
 
 int xmx_buf_create_kind(unsigned long long bytes, int kind)
@@ -1457,6 +1548,38 @@ int xmx_sem_import(unsigned long long handle, int timeline)
 	(void)handle;
 	(void)timeline;
 	FAIL("importing a semaphore is Windows only", 0);
+#endif
+}
+
+/* Raise a timeline semaphore's counter from the host, the way the layer does after it
+ * has written the frame in. `vkSignalSemaphore` is legal only for a timeline one —
+ * the same call on a binary semaphore is undefined, which is why a binary one has to
+ * be signalled by a submit instead.
+ *
+ * What the layer does with a handle of its own, this does with one of ours, so a
+ * frame's worth of Phase 2 can be driven from this side: a test can play the layer
+ * without a game, and a frame that has to be announced without a submit can be. */
+int xmx_sem_signal(int id, unsigned long long value)
+{
+#ifdef _WIN32
+	if (id < 0 || id >= MAX_XSEM || !g.xsems[id]) FAIL("external semaphore is not live", 0);
+	if (!g.xsems_timeline[id])
+		FAIL("only a timeline semaphore can be signalled by the host", 0);
+	PFN_vkSignalSemaphore signal = (PFN_vkSignalSemaphore)
+		vkGetDeviceProcAddr(g.dev, "vkSignalSemaphore");
+	if (!signal) FAIL("vkSignalSemaphore absent", 0);
+	VkSemaphoreSignalInfo si = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
+		.semaphore = g.xsems[id],
+		.value = value,
+	};
+	VkResult r = signal(g.dev, &si);
+	if (r) FAIL("vkSignalSemaphore", r);
+	return 0;
+#else
+	(void)id;
+	(void)value;
+	FAIL("external memory is Windows only", 0);
 #endif
 }
 
@@ -1718,6 +1841,37 @@ int xmx_begin(void)
 	g.recorded = 0;
 	g.syncing = 1;
 	g.prof_n = 0;
+	/* The frame's bytes were written by a host that is not this one's: another
+	 * process, or this process on a mapping the device does not order against.
+	 *
+	 * Waiting on the semaphore orders *execution* and nothing else; availability
+	 * and visibility are separate in this specification. What covers them here is
+	 * the submit itself: "queue submission commands automatically perform a domain
+	 * operation from host to device for all writes performed before the command
+	 * executes ... In the few circumstances where a submit does not occur between
+	 * the host write and the device read access, writes can be made available by
+	 * using an explicit memory barrier" (chapter 7). A submit does occur here,
+	 * after the wait, so by the book this barrier is not needed.
+	 *
+	 * It is kept anyway, and NR_NO_HOST_BARRIER takes it out. Measured both ways
+	 * at 1920x1080: byte for byte the same frame either way, over the wire, in a
+	 * slot, and across the buffer. So it is belt and braces, not a fix — and the
+	 * first thing to drop if it ever shows up in a profile.
+	 *
+	 * HOST_WRITE in, everything that reads out: the frame's buffer is read by
+	 * compute passes, and a narrower destination than all of them would be a claim
+	 * about which passes there are. */
+	if (g.wait_sem && getenv("NR_NO_HOST_BARRIER") == NULL) {
+		VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+				       .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+				       .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT
+						      | VK_ACCESS_MEMORY_WRITE_BIT
+						      | VK_ACCESS_SHADER_READ_BIT
+						      | VK_ACCESS_SHADER_WRITE_BIT };
+		vkCmdPipelineBarrier(g.rcb, VK_PIPELINE_STAGE_HOST_BIT,
+				     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb,
+				     0, NULL, 0, NULL);
+	}
 	if (g.prof && g.qpool) {
 		vkCmdResetQueryPool(g.rcb, g.qpool, 0, MAX_STAMPS);
 		stamp(PK_START, 0);       /* the zero point every later stamp is measured from */

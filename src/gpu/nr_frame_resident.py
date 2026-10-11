@@ -913,6 +913,13 @@ class RequestPass:
         across a process (Phase 2), and the host write is the whole of what that saved.
         """
         target = self.inner[self.which]
+        if os.environ.get("NR_DEBUG_RAW"):
+            import hashlib
+            seen = np.asarray(self.raw.view(np.uint32)[:self.source_width
+                                                        * self.source_height])
+            print(f"raw in: {hashlib.blake2b(seen.tobytes()).hexdigest()[:16]} "
+                  f"in_raw={in_raw} payload={hashlib.blake2b(np.ascontiguousarray(np.frombuffer(payload, np.uint8)).tobytes()).hexdigest()[:16]}",
+                  flush=True)
         if not in_raw:
             xmxres.host_write(self.raw, np.frombuffer(payload, np.uint32))
         self.rt.begin()

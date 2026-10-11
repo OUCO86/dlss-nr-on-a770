@@ -383,6 +383,47 @@ def host_view(buffer, dtype=np.float32, shape=None, count=None):
     return array if shape is None else array[:int(np.prod(shape))].reshape(shape)
 
 
+def buffer_place(buffer):
+    """Where a buffer's bytes sit, unpacked: `(coherent, memory_type, address & 0xffff)`.
+
+    For finding out, not for deciding. A frame whose bytes are right when the host
+    reads them back and wrong on the device is a question about exactly this.
+    """
+    lib = _load()
+    if not hasattr(lib, "xmx_buf_place"):
+        raise RuntimeError("this libxmx build cannot say where a buffer is")
+    packed = int(lib.xmx_buf_place(int(buffer.id)))
+    return bool(packed & 1), (packed >> 1) & 0x7FFF, (packed >> 16) & 0xFFFF
+
+
+def write_fence():
+    """Order this thread's writes to mapped memory, past the point of the call.
+
+    Host-coherent memory on a card is write-combining, and a core combines writes
+    in a buffer of its own. That buffer belongs to the core, so a write made here
+    and a submit made on another thread or in another process can leave the device
+    reading bytes this core has not sent yet — while this core, reading back, sees
+    exactly what it wrote. Whoever wrote has to call this, not whoever submits.
+    """
+    lib = _load()
+    if hasattr(lib, "xmx_write_fence"):
+        lib.xmx_write_fence()
+
+
+def buffer_flush(buffer):
+    """Make what the host wrote visible to the device.
+
+    Host-coherent memory needs nothing. Anything else holds the host's writes in
+    the host's own caches until this is called, and a frame read back partly stale
+    is what that looks like.
+    """
+    lib = _load()
+    if not hasattr(lib, "xmx_buf_flush"):
+        raise RuntimeError("this libxmx build cannot flush a buffer")
+    if lib.xmx_buf_flush(int(buffer.id)) != 0:
+        raise failure(lib, "xmx_buf_flush")
+
+
 def host_write(buffer, array, rows=None):
     """Put host data into a buffer, addressable or not.
 
@@ -2042,6 +2083,19 @@ class Runtime:
         if sid < 0:
             raise failure(self.lib, "xmx_sem_import")
         return sid
+
+    def semaphore_signal(self, sem_id, value):
+        """Raise a timeline semaphore's counter from the host, as the layer does.
+
+        `vkSignalSemaphore` is legal for a timeline semaphore only: the same call on
+        a binary one is undefined, and a binary one has to be signalled by a submit
+        instead. This is the layer's half of the handshake, done with a semaphore of
+        ours, so a frame can be announced without a game and without a submit.
+        """
+        if not hasattr(self.lib, "xmx_sem_signal"):
+            raise RuntimeError("this libxmx build cannot signal a semaphore")
+        if self.lib.xmx_sem_signal(int(sem_id), int(value)) < 0:
+            raise failure(self.lib, "xmx_sem_signal")
 
     def extmem_wait(self, sem_id, value=0):
         """The next submit waits on `sem_id`: that is where the frame's bytes arrive.
