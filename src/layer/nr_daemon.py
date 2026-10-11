@@ -1588,6 +1588,11 @@ def main():
     print(f"model ready in {time.perf_counter() - started:.1f}s"
           f" on {xmx.device_name()}", flush=True)
     print(f"buffers in {xmx.memory_note()}", flush=True)
+    # Which halves of the frame's work are on the card, so a log can prove it: the
+    # shader the graph was built with is chosen before this point, and a run that
+    # silently fell back to the host looks exactly like a run that did not.
+    print(f"passes on the device: prepare={int(args.prepass)}"
+          f" compose={int(args.postpass)}", flush=True)
     rt = backend.runtime
     print("runtime options " + " ".join(
         f"{name}={int(getattr(rt, attr))}" for name, attr in (
