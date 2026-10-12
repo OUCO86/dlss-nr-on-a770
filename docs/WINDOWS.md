@@ -166,7 +166,7 @@ To run a game with nothing installed or registered, as those tests did:
   - `VK_ADD_IMPLICIT_LAYER_PATH`: that folder;
   - `ENABLE_NR_LAYER=1`;
   - `NR_LAYER_LIVE=2` and `NR_LAYER_ASYNC=1` (every 2nd present goes through the
-    network, and one frame may be on its way to the daemon at once: 26 ms a frame
+    network, and one frame may be on its way to the daemon at once: 30 ms a frame
     in DOOM Eternal against 54.8 ms with every present going through synchronously);
   - `NR_LAYER_SPAWN=1`;
   - `NR_LAYER_SOCKET=\\.\pipe\<name>`;

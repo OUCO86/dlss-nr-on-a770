@@ -218,7 +218,7 @@ set "LAUNCH=%DEPLOY%\launch-nr.bat"
   echo set "ENABLE_NR_LAYER=1"
   echo set "NR_LAYER_SPAWN=1"
   echo rem 2026-10-12: every 2nd present, and one frame behind. Measured in DOOM
-  echo rem Eternal: 26 ms a frame against 54.8 ms with every present going through the
+  echo rem Eternal: 30 ms a frame against 54.8 ms with every present going through the
   echo rem network synchronously, and 52.3 ms with one frame behind but every present
   echo rem still going through. The player switched the effect on and off mid-game and
   echo rem reported no discomfort from the picture refreshing every other frame.
