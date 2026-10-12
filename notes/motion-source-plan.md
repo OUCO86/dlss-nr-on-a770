@@ -68,7 +68,7 @@ The four back ends, in the order they get built:
 |---|---|---|
 | `zero` | identity — today's behaviour | always, and it is the fallback |
 | `global` | one translation for the whole frame, by phase correlation | **today, Vulkan included** |
-| `engine` | the game's own vectors | DX12 only, later |
+| `engine` | the game's own vectors, read where it hands them to its own upscaler | DX12 first; needs a temporal upscaler to intercept — none in DOOM Eternal on this card |
 | `flow` | dense OpenCV DIS | exists, measured not useful — stays off |
 
 ### The rule that keeps today's path
@@ -145,9 +145,13 @@ anybody who wants it. Enabling it changes what a confident frame does and nothin
 a frame whose source has nothing to say is byte-identical to one run without this work at
 all, and that is a test rather than an intention.
 
-The sources are asked in order of trust and the first that answers usefully wins: the
-engine's own vectors when they exist, then `global` when they do not, then identity. That
-ordering is what makes M5 an addition.
+The sources are asked **in the owner's order**, not in order of apparent sophistication:
+
+**our own estimate first, then the game's vectors if the estimate cannot answer, then
+identity.** Section 8 says why that order is right and not merely cautious — the title running
+today has nothing to intercept, so a plan that leads with the vectors would spend its first
+week waiting for something it cannot have. Switching the order later, if measurement ever
+says the released vectors are better, is a one-line change and not a redesign.
 
 **M5 — the `engine` back end, which is the DX12 one.** Separate process or injected DLL,
 delivering over the same transport the extmem path already uses; the daemon cannot tell
@@ -178,3 +182,192 @@ recovered to do.
 
 Order of work: M1, M2, M3. If M3 does not move the 71-79% number, the wrong thing was built
 and we stop there rather than going on to M4 with a story instead of a measurement.
+
+## 6. Three tiers of trust when the vectors are not there
+
+The owner corrected this document's ordering and he is right, and it is worth saying what his
+correction buys rather than only recording it: the plan had put the released vectors first as
+though they were the prize and estimating was making do. That is backwards for the title running
+today, which has nothing to intercept at all — a plan that leads with the vectors spends its first
+week waiting for input it cannot have. **Our own estimate leads. The released vectors are what we
+fall back to when it fails. Identity is the floor.**
+
+Within the leading estimate, do **not assume a transform** and do not simply translate the history
+by `(dx, dy)`. That is exactly the wrong guess, because it trusts the estimate where the estimate
+has earned no trust. Verify it against the history instead:
+
+1. **Search the neighbourhood.** For each pixel try candidate offsets in `±(dx, dy)` and see
+   which one actually finds the current value already present in the history. Multiple hypotheses,
+   best match wins — a match is evidence, an assumption is not.
+2. **Where the search fails, say so.** Several hypotheses returning nothing that matches is a
+   *failure*, not a small value to be used anyway. The failure moves up rather than pretending.
+3. **Fall back to what the pixels can settle on their own.** Reduced to photometric quantities
+   only — no motion — with confidence deliberately middling, `0.6` to `0.8`, honest about being a
+   guess. Better a visible `0.7` than a confident wrong field.
+4. **Identity last**, which is today's behaviour exactly.
+
+The estimate therefore carries its own verification, which is what makes it safe to lead: a field
+that cannot find its own prediction in the history does not get applied.
+
+## 7. Two paths at once means two paths that can each be run alone
+
+The owner's second condition, and it is a design requirement rather than a debugging convenience:
+with two behaviours able to be alive in one frame, not knowing which ran turns every later
+complaint into guesswork. Before M4 puts this on a frame:
+
+- **Each path runs alone.** A source can be forced, so "path A reproduces it and path B does not"
+  is answerable in one run instead of inferred from a diff.
+- **Each stage reports.** Capture, prepare, history, network, compose, temporal, present — each
+  records that it started and finished, per frame, with its time.
+- **A stall names itself.** When a frame hangs, the last stage that *completed* is on record. "It
+  froze" is not a diagnosis; "it froze after `history`, before `compose`" is, and it costs one line
+  per stage to have.
+- **Both paths stay testable independently** even when only one is usable in a given title, so a
+  broken path fails loudly on its own instead of silently degrading.
+
+This one is also why the fork is worth having. Upstream cannot answer "which of your temporal
+behaviours produced this pixel, and where did it stop" — it has one behaviour and no stages named.
+Ours will have two, and observability is what makes carrying two survivable.
+
+## 8. Where released vectors actually are
+
+The owner's reading is the correct one and it corrects a shorthand this repository has been using
+for a year. "`vkQueuePresentKHR` has no motion vectors" was never a law about the frame — it is a
+statement about *one* hook being the last door on a long corridor. Everything the temporal path
+wants is handed over much earlier, **where the game passes its own temporal buffers to its own
+upscaler**: DLSS, FSR 2+ or XeSS each receive render-size colour, depth, motion vectors and jitter,
+by definition, because that is their contract. Intercept *that* call and the vectors are exact and
+free. `notes/phase41-doa6-and-vkd3d.md` already found them named in DOA6's `sl.common.dll` as
+`kBufferTypeHUDLessColor` / depth / motion-vector tags, which is the same door.
+
+So `engine` is not a fantasy and not a rewrite: it is choosing the same interception point everyone
+else already uses — Streamline's tags under Proton, OptiScaler's hooks for NGX/FFX/XeSS on Windows —
+and delivering the result through the same `MotionSource`. What changed with the owner's point is
+not the possibility but the **address**: the upscaler's input, not the swapchain's present.
+
+It is still gated on the title having such an upscaler to intercept. DOOM Eternal exposes none here
+(NVIDIA-only DLSS, no XeSS or FSR 2 path for this card) — which is precisely why estimating leads
+and why the owner's ordering is the right one. DOA5LR is the natural second target precisely because
+the upstream project ran there, and it is the first place the `engine` back end can be checked
+against a title upstream already validated.
+
+### An independent project reached the same map, and published its estimator
+
+`mochizuki0323/DLSSNR-AMD` is NVIDIA's NR network reimplemented as Vulkan compute for an RX 9070 XT,
+and it sorts games into exactly these doors: `optiscaler`, which reads **the engine's own** vectors,
+only where the game has DLSS, FSR or XeSS; and ReShade, whose **"motion is estimated from the
+picture by a ReShade shader"**, everywhere else — **including every native Vulkan title** (README
+"Supported games"). A project built for non-NVIDIA hardware on Vulkan, with no reason to be
+cautious, therefore estimates motion on the one configuration we have.
+
+Better than agreement, it published the estimator: `linux/shaders/passes/motion_estimate.comp`. Its
+header states the contract this plan inherits — `prev_uv = uv + mv * MVecScale`, the vector pointing
+**back** one frame, `history = CatmullRom5(history, prev_uv)` — and two things to copy rather than
+rediscover. It estimates in the *consumer's* domain, because "there is no component swap left to get
+wrong". And where a match cannot be justified it writes exactly zero:
+
+> where the match cannot be justified we write exactly zero, which makes prev_uv == uv, which makes
+> the history sample this pixel's own colour. That is the colour-only behaviour the original itself
+> was shown to fall back to — the degradation target is a verified state, not a guess.
+
+That is this plan's fallback, independently arrived at and called verified. Its rejection is relative
+— `best_sad > reject * contrast`, against the patch's own contrast, never an absolute threshold — and
+candidates that leave the frame are disqualified rather than clamped, because clamping made flat
+edges score better than the correct vector. M2 should be written in that shape.
+
+Its moving-sequence figures against NVIDIA's own DLL (46.3-47.0 dB PSNR at 1080p, ten frames each
+over a still scene, a moving object and a panning camera) are also the standard this work should be
+held to, rather than "the slant got fainter".
+
+Archived with a Chinese summary at `refs/DLSSNR-AMD/`.
+
+### An independent project says the same thing, and sharpens it
+
+`mochizuki0323/DLSSNR-AMD` is what this would look like if somebody else had built it: NVIDIA's NR
+network reimplemented as Vulkan compute, on an RX 9070 XT. Its `ARCHITECTURE.md` splits into the
+same doors — `optiscaler` when the game has DLSS/FSR/XeSS, and ReShade with **estimated** motion
+when it does not — and says outright that the vectors "are the engine's own, not estimated as in the
+ReShade routes". **For a native Vulkan title its route is ReShade as a layer, and the motion is
+estimated.** So a project built for non-NVIDIA cards, on Vulkan, with no reason to be conservative,
+reaches exactly the conclusion this plan reaches: the released vectors exist only where a temporal
+upscaler already receives them.
+
+It also corrects a shorthand I have been using. Its Vulkan route puts ReShade *under the game's own
+Vulkan device*, which sees the depth. Ours sits at `vkQueuePresentKHR`, which sees the finished
+frame. **The API is not the obstacle; how late we are is.** That is the owner's point stated
+precisely: earlier hooks see more. It does not change today's answer for DOOM Eternal — a velocity
+buffer that is never handed to anything cannot be intercepted from any position — but it is worth
+having right, because it is what makes the DX12 move a change of address rather than a change of
+technology.
+
+Two things there are worth taking rather than rebuilding: `shaders/passes/motion_estimate.comp`, a
+screen-space estimator already written as Vulkan compute, whose contract is the same one this plan
+inherits (`prev_uv = uv + mv * MVecScale`, the vector pointing back a frame) and whose unprovable
+matches are written as zero — the same degradation this document promises; and the OptiScaler-NR
+route as the worked example of `engine` on DX12.
+
+And a number to aim at. Against NVIDIA's own DLL on an RTX 5090, that project reports **46.3–47.0 dB
+PSNR and 0.997–0.998 SSIM at 1080p over moving sequences with motion vectors and history** — a still
+scene, a moving object, a panning camera. "The slant is fainter" is not a finish line; that is.
+
+
+## 6. Where vectors can actually come from — and what each one costs
+
+The owner is right that `vkQueuePresentKHR` is not the only door, and worth being precise
+about which door is which, because the honest answer is that they differ enormously in cost.
+
+**The frame at present is the last door, and the worst one.** By then the depth and the
+velocity buffers have usually been released or refilled, the HUD is composited into the
+colour, and the only thing left is the picture. That is why every advisory note in this
+repository says the same thing — `phase53`, `phase54`, `CLAUDE.md` — and why identity
+reprojection was chosen.
+
+**What the game hands to its own temporal upscaler is the good door.** Every game with
+DLSS, FSR 2+ or XeSS has already produced colour, depth, motion vectors and jitter at
+render size and already passes them somewhere. Intercept *that* call and the vectors are
+free and exact. This is what OptiScaler does (`NVNGX` / `FFX` / XeSS hooks) and what
+`sl::kBufferTypeMotionVectors` tags name in Streamline. It is also what
+`phase41-doa6-and-vkd3d.md` found already sitting in DOA6's `sl.common.dll`.
+
+Three things constrain it, and the third is the one to say plainly:
+
+- **The game must have a temporal upscaler to intercept.** No upscaler, no vectors. DOOM
+  Eternal has no XeSS or FSR 2 path on this hardware and DLSS is NVIDIA-only, so for the
+  one title running today there is nothing to intercept. DOA5LR, which the owner is
+  installing, is older still. This route buys the *future* titles — and it is the route the
+  DX12 move is for — but it does not rescue today's frame.
+- **The presentation need not be the interception.** Hooking earlier in the frame, at the
+  game's own passes rather than at the swapchain, is legitimate and in principle richer; but
+  reading a velocity attachment out of someone else's render target descriptors is a
+  per-title reverse-engineering job, and this project's whole argument has been that it is
+  sitting at *one* place that works everywhere. Weighing one title's vectors against that is
+  the decision M5 has to make, later, with its own measurement.
+- **Whatever it feeds has to be `Engine`-shaped.** This matters more than where it came
+  from: between a hook that yields real vectors and anything assumed about their convention
+  lies the failure `check_motion_convention` exists to catch.
+
+So the picture is: today's titles get `global` or identity; tomorrow's get `engine` through
+an interception we do not have to write from scratch. Both arrive at the same field.
+
+## 7. Two paths at once means two paths that can each be inspected
+
+The owner's second condition, and it belongs in the design rather than in the debugging:
+once two behaviours can be alive in the same frame, anything short of *knowing which one ran*
+turns every future complaint into guesswork. Concretely, before M4 ships anything:
+
+- **A path can be forced.** `NR_MOTION=identity` and `NR_MOTION=global` select one outright,
+  and `NR_MOTION=auto` is what production uses. "Which one is running" is answerable in one
+  word, not inferred from a diff.
+- **Every frame says what it did.** Source chosen, whether it answered, the frame's drift in
+  pixels, the confidence it was given. One line, next to the line that already prints `held`
+  and `gpu`. A bad number on that line is the difference between "NR is broken" and "the
+  estimate misses when the scene pans".
+- **Each source is separately testable** — `global` against a synthetic shift whose answer is
+  known, `identity` against today's byte-for-byte output — so a failure names its own path.
+- **And the fallback is visible rather than silent.** When a source declines, the frame runs
+  as today's and the log says it declined. A fallback that nobody sees is how a regression
+  spends a month looking like a mystery.
+
+That is the fork's own argument for existing. Upstream cannot answer "which of your two
+temporal behaviours produced this pixel" because it has one; we will have two, and the cost
+of that is telling the truth about which ran.
