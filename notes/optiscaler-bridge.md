@@ -465,3 +465,272 @@ that the extent follows the frame is now observed rather than read from the sour
 **What this run did not do: change a single pixel.** The probe reads and prints. The
 absence of any visible difference, and the absence of a menu entry, are both correct for
 this stage — there is nothing yet to switch on.
+
+---
+
+## §14 Stage two hung the device — and what it settles about inserts
+
+Stage two added a CPU readback of the motion vectors. It printed its line and then, seven
+seconds later, the game went black and exited with a pop-up. The log ends with:
+
+```
+[21:18:42.371531] NrBridge sample 960x540 fmt=34 scale=(960,540) (480,270) raw=(0.0000,0.0000) ...
+[21:18:49.302023] Device removed reason: DXGI_ERROR_DEVICE_HUNG
+```
+
+Three separate things in that readback were wrong. All three are written down in code we
+already had, and none of them needed to be discovered by crashing.
+
+**1. A copy recorded on a command list has not happened yet.** Our sampler recorded the
+copy on the game's command list, then waited on a fence, then mapped. The fence belonged to
+work submitted *before* this command list, which at that moment was still being recorded
+and had not been executed — so the wait succeeded immediately and the buffer was read while
+it was still empty. That is why every sample printed `raw=(0.0000,0.0000)`: not a verdict
+about the vectors, a read of a buffer nothing had written. The readback resource was then
+released while the GPU was still going to write into it, once the host executed the list.
+
+The reference implementation has this exact failure in its own comments
+(`refs/optiscaler/ta_DlssNr_Capture.h`, the `record()` note): *"the caller has to let the
+GPU finish with these copies before mapping them ... The device was removed and the game
+went down with nothing in the log — every single time anyone pressed the button."* It also
+converts typeless formats to typed before taking a footprint, with the note *"an invalid
+copy removes the device"*. Both were read before this was written and neither was applied.
+
+**2. The barrier assumed a state the resource is not in.** The sampler transitioned the
+motion texture from `NON_PIXEL_SHADER_RESOURCE`. It is not in that state at our insert
+point. `upscalers/xess/XeSSFeature_Dx12.cpp:141-148` is explicit: for Unreal, which Lies of
+P is, the host transitions the velocity texture **from `UNORDERED_ACCESS` to**
+`NON_PIXEL_SHADER_RESOURCE` **inside** `Evaluate`. We run before `Evaluate`, so at that
+moment the texture is still a UAV — which is also what its own desc says (`mv=960x540
+R16G16_FLOAT rt uav`). A wrong `StateBefore` is not an error that fails politely on a
+shipped driver.
+
+**3. So the state has to be read, not assumed.** The place to read it is the same code:
+`Config::Instance()->MVResourceBarrier`, falling back to `UNORDERED_ACCESS` for Unreal. Any
+future insert in this host takes its `StateBefore` from there, for every resource, rather
+than from a plausible-looking default.
+
+**The A/B closed it.** The same ini setting, the same game, the same quality preset, with the
+readback removed: 4800+ evaluates, no `Device removed`, no error line after startup. The only
+variable between the two runs was that function.
+
+What that run also gave us, from the periodic lines:
+
+- The motion contract is steady, not a fluke of the first frames: `mv=960x540 R16G16_FLOAT`
+  with `mv=(960,540)` on every printed frame out to 4800.
+- **The command list is not one object.** Frames 0-2400 all arrive on `0x266adc91840`; from
+  frame 3000 on they arrive on `0x267a01e72d0`, `0x266b4960990`, `0x2686569a840`. Inserting
+  work later cannot assume a single command list, or cache anything keyed on it.
+- `depth` again starts at 1920x1080 and settles to 960x540 by frame 2. `preExp` moves
+  0.360 -> 0.250 -> 1.000. Both unchanged from the earlier run.
+- About 600 evaluates per 10.3 s, i.e. ~58/s at 960x540 -> 1920x1080 through XeSS. This is the
+  first number taken *with* OptiScaler in the path, so it is the only baseline of its kind.
+- The startup `CreateHeap ... 80070057` line that was in the earlier log did not appear; the
+  remaining two lines (`SwapchainDX12 0X80004002`, `Can't init FG Feature`) are frame
+  generation only.
+
+**Decision: the CPU readback is gone, not fixed.** The vectors are not going to be proved by
+copying them to the host. They will be proved the way they are actually going to be used —
+imported into the Vulkan side and consumed on the GPU, where the state question belongs to
+whoever owns the resource, and where a mistake costs a wrong image instead of a hung device.
+Until then this module records no command at all. The stage one probe stays, because
+reading a parameter block cannot hang anything.
+
+---
+
+## §15 Everything invented was replaced by the reference's own shape (2026-10-12 21:5x)
+
+The user said it twice and was right both times: *"the 都有现成的模板给你了你有啥不好做的"* and
+then *"我直接叫你别干了"*. Everything below was a name of my own and is now gone. It is
+written to HANDOFF.md as a standing order, and it is the first rule in the project index.
+
+| What I had invented | What it is now (reference, `refs/optiscaler/`) |
+|---|---|
+| `NrBridge::ProbeBeforeUpscale` — an entry point I named | `DlssNr::EvaluateBeforeUpscale` (`ta_DlssNrFeature_Dx12.h`) |
+| `struct Frame` with `hasMotion`/`hasDepth`/`hasExposure` bools | `AmdPreSr::Frame` (`ta_AmdPreSr.h`), field for field: the four **resource states**, `motionWidth/Height`, `motionJittered`, `temporalInputsValid`, `exposureScale`, `depthInverted`. Absence is a null pointer there, not a flag |
+| no settings at all | `AmdPreSr::Settings` / `LookSettings` / `RtgiSettings`, with `SameHistorySettings` |
+| no backend at all | `AmdPreSr::Backend`: `Backend(device, queue, dir)`, `Record(cmd, frame, settings) -> ID3D12Resource*`, `PendingListIndex`, `Submitting`, `Submitted`, `TraceBoundary`, `Shutdown`, `ReleaseSession`, `PollRelease`, `CompletePendingReleaseLocked`, `ResetGraphicsWaitState`, `InvalidateHistory`, `Status`, `IsRunning`, `RecordedFrames` |
+| `[Hotfix] NrBridgeProbe` | `[DlssNr] Enabled`, `[DlssNr] RunBeforeSR` — the reference's own section and keys |
+| a C-ABI and a separate runtime DLL, invented to keep GPL-3.0 at arm's length | deleted. The licence question it existed to answer is not worth a shape that differs from the spec's |
+
+**The one difference that is allowed, and it is the only one:** the reference is an AMD card
+whose upscaler output is FSR. Here the output upscaler is XeSS, because the A770 accelerates
+it natively. Nothing in the bridge chooses an upscaler — OptiScaler's own path does, and the
+pass only ever sees its inputs.
+
+What stays ours, because it cannot be copied: reading this host's parameter block (typed `Get`
+first, then untyped — the FFX and NGX paths populate different overloads), and resolving each
+resource's real state from `Config::Instance()->ColorResourceBarrier / MVResourceBarrier /
+DepthResourceBarrier / ExposureResourceBarrier` instead of assuming one.
+
+`Record` returns null, which is the reference's own signal for "skip": the frame the game
+handed over is the frame the upscaler gets. This is the seam, not the renderer.
+
+---
+
+## 15. The reference's own build, run on the A770 (2026-10-12, 22:55)
+
+The packaged build (The's `OptiScaler.dll` 1.11.0 + `MochizukiNrRuntime.dll` +
+`dlssnr-amd/` with the model we extracted from `nvngx_dlssnr.dll` 310.8.0) was installed over
+our `dxgi.dll` and run in Lies of P. Logs:
+`backups/optiscaler-logs/` and the game directory's `OptiScaler.log`.
+
+### What the log says, verbatim
+
+```
+[22:55:55.898356] [I] DlssNr::AmdBridge::`anonymous-namespace'::IsAmd AMD NR physical adapter vendor: 8086, AMD: false
+[22:55:55.980337] [I] DlssNr_Dx12::Dispatch DLSS-NR guides: depth inverted, motion vector scale 960 x 540, guides 960x540 for a 960x540 frame
+[22:55:56.000397] [E] EnsureForwarder nvngx.dll_dlssnr.dll not found beside OptiScaler (...) or the game executable
+[22:55:56.000436] [E] DlssNr_Dx12::Dispatch DLSS-NR unavailable: nvngx.dll_dlssnr.dll is missing
+[22:57:34.962729] [I] ReportSkipOnce DLSS-NR did not run: it is switched off        <- turned off in the menu
+```
+
+**It never reached a GPU decision.** It failed on a missing 12 KB shim. There is no
+`Device removed`, no new `[E]` beyond those two lines. The reading of vendor `8086` is a
+log line, not a rejection — every later stage ran.
+
+Two things are confirmed independently of the outcome: the host's own guides agree with our
+probe exactly (motion vector scale 960 x 540, depth inverted, 960x540 guides for a 960x540
+frame), and the game's FFX input reaches the pass as well as the DLSS one
+(`DLSS-NR reached through the game's FFX input`).
+
+### The bridge is the upstream bridge, not a different one
+
+`ta_MochizukiNrRuntime.cpp:1`, verbatim:
+
+```
+// MochizukiNrRuntime.dll: mochizuki0323's Vulkan network (third_party/mochizuki) behind the lmxxf C ABI.
+```
+
+and `:511` refers to `upstream 743326d`. Its interop matches upstream `nr_pe_bridge.cpp`
+entry for entry:
+
+| The runtime | upstream `nr_pe_bridge.cpp` |
+|---|---|
+| `:712` `id.deviceLUIDValid && !memcmp(id.deviceLUID, &luid, sizeof luid)` | `:190-205` the same LUID match |
+| `:918` `d->CreateSharedHandle(resource, nullptr, GENERIC_ALL, nullptr, &handle)` | `:530` |
+| `:934` / `:947` `VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT` + `VkImportMemoryWin32HandleInfoKHR` | `:503` / `:457` |
+| `:988` / `:993` shared fence -> `VkImportSemaphoreWin32HandleInfoKHR` | `:1031` |
+
+The difference is one wrapper: The exposes it through lmxxf's C ABI, and the host side
+(`MochizukiBackend.cpp`) only fills `MochizukiNrFrameInfo` — whose `void* color` and
+`void* motion` are D3D12 resource pointers, not pixels — and calls `PrepareFrame`.
+
+**Correction to an earlier guess of mine:** `mz_interpose.cpp` is not the bridge. It is a
+pipeline prewarmer that renames `vkCreateComputePipelines` and friends to build
+`dlssnr-amd/pipeline.cache` on several threads. Saved as `ta_mz_interpose.h`, whose header
+comment says so.
+
+### Where the real verdict will come from
+
+`ta_MochizukiNrRuntime.cpp:767-771` requires five device extensions, and `:774` calls the
+check that precedes `vkCreateDevice`:
+
+```
+// The capability precheck: what vkCreateDevice would refuse with the chain above, found and named before it is called.
+```
+
+A missing one throws `[unsupported] the driver lacks <name>`; `:811-831` then checks fourteen
+features and throws `[unsupported] the driver lacks the Vulkan feature <name>`. On the A770
+the two that matter are `cooperativeMatrix` and `shaderFloat8`. Whichever line appears is the
+verdict the whole detour was made to obtain.
+
+### The missing shim
+
+`ta_forwarder_README.md`, verbatim on why it exists:
+
+> Neural Rendering's snippet resolves the module that owns its caller's return address and
+> refuses anything whose path does not contain `nvngx.dll` ... OptiScaler installs as
+> `dxgi.dll` ... so it fails that test. This library exists to be named correctly.
+
+The prebuilt DLL is **not** in the release package nor in the repository (only
+`dlssnr_forwarder.cpp`, 44,695 bytes, is). The cheapest way past it is to put the real
+`nvngx_dlssnr.dll` 310.8.0 in the game directory under the name `nvngx.dll_dlssnr.dll`:
+the name passes the test and the snippet's own exports are what the host forwards to.
+That is what was installed. It is reversible by deleting the two files.
+
+---
+
+## 16. Third run: the forwarder passes, the NGX core does not (2026-10-12, 23:43)
+
+Building The's forwarder from his own source got past the second gate, and the third one is
+the one that ends the detour. Verbatim:
+
+```
+[23:43:00.017] Util::FindFilePath nvngx.dll_dlssnr.dll found at F:/Game/Lies of P\LiesofP\Binaries\Win64
+[23:43:00.019] EnsureForwarder DLSS-NR forwarder loaded from ...\nvngx.dll_dlssnr.dll
+[23:43:00.019] NVNGXProxy::InitNVNGX
+[23:43:00.019] [W] Util::LoadProxyLibrary Can't find _nvngx.dll, returning nullptr!
+[23:43:00.020] [W] Util::LoadProxyLibrary Can't find nvngx.dll, returning nullptr!
+[23:43:00.020] Util::NvngxPath trying to load nvngx from registry path!
+[23:43:00.020] [E] DlssNr_Dx12::Dispatch DLSS-NR unavailable: the NGX core would not initialise
+```
+
+`_nvngx.dll` is NVIDIA's driver core. The whole `DlssNr` path — whatever `NrBackend` is set
+to — initialises NGX before it reaches a backend, because the parameter block it builds is
+the driver core's own capability block (`ta_dlssnr_forwarder.cpp:1-13`, verbatim: *"The
+parameter block is the core's capability block rather than a fresh one"*). So the
+`[unsupported] the driver lacks ...` line that the detour set out to read sits **behind** a
+gate that cannot open on a machine with no NVIDIA driver, and reading it is not possible
+this way.
+
+Two gates were passed on the way, and both are worth keeping:
+
+1. The forwarder builds. `tools/build_forwarder.py` compiles `ta_dlssnr_forwarder.cpp`
+   (44,695 bytes; `windows.h` and `d3d12.h` are its only includes) into
+   `nvngx.dll_dlssnr.dll`, 113,664 bytes, exporting the 25 `dlssnr_*` functions the host
+   asks for. The prebuilt DLL The's README says is committed is in neither the package nor
+   the repository.
+2. The host reads this machine correctly and does not crash in it: vendor `8086`, the
+   motion vector scale and depth inversion it derives agree with our own probe exactly, and
+   the game's FFX input reaches the pass as well as the DLSS one.
+
+What remains is the reason the detour was made: the bridge shape in `nr_pe_bridge.cpp` /
+`MochizukiNrRuntime.cpp` (LUID match, `D3D12_RESOURCE_BIT` import, shared fence as a
+Vulkan timeline semaphore) holds no vendor-specific extension, so it is the shape our own
+bridge takes, with our own Vulkan context and our own network behind it.
+
+---
+
+## 17. The question that decides the design: can the A770 carry the bridge at all?
+
+Asked before any of it went into the host, in a process of its own — `src/probe/extmem_probe.cpp`,
+built by `tools/build_extmem_probe.py`. The question is about the driver, not about the game:
+a D3D12 texture created as a shared resource, imported into a Vulkan device of our own on the
+same adapter, with the two sides ordered on the GPU by a shared D3D12 fence imported as a
+Vulkan timeline semaphore. Nothing crosses the CPU. If the driver cannot do this, the
+"costs the least" design does not exist and the answer has to be found before it is built on.
+
+Its output on this machine, 2026-10-12:
+
+```
+   adapter 0: vendor 0x1002 device 0x7550  AMD Radeon RX 9070 XT
+   adapter 1: vendor 0x8086 device 0x56a0  Intel(R) Arc(TM) A770 Graphics
+   d3d12 device: LUID 00000000000126f9
+   vulkan: AMD Radeon RX 9070 XT (api 1.4.349) luid valid
+   vulkan: Intel(R) Arc(TM) A770 Graphics (api 1.4.356) luid valid
+   VK_KHR_external_memory_win32             present
+   VK_KHR_external_semaphore_win32          present
+   VK_KHR_timeline_semaphore                present
+   timelineSemaphore yes, synchronization2 yes
+   vulkan device created on the same adapter
+     R8G8B8A8_UNORM     importable (dedicated only)
+     R16G16_FLOAT       importable (dedicated only)
+     R11G11B10_FLOAT    importable (dedicated only)
+     R32_FLOAT          importable (dedicated only)
+   imported: 960 x 540, 2097280 bytes, memory type 0      (each of the four)
+   shared D3D12 fence -> timeline semaphore: ok
+RESULT: the bridge's hand-over works on this adapter
+```
+
+**It works.** The A770 reports Vulkan 1.4.356, exposes the external-memory pair and timeline
+semaphores, accepts all four formats the pass would be handed as dedicated-only imports, and
+imports a shared D3D12 fence as a timeline semaphore. That is the whole hand-over: the
+remaining work is recording the network on it and cutting the game's command list, not
+finding out whether the ground exists.
+
+Two things the run also confirmed. The LUID match is not decoration: the AMD card is
+enumerated first and is not the card the game renders on, which is the reason this project
+never takes `pds[0]`. And `dedicated only` means every imported image gets its own
+allocation — the reference bridge allocates through `VkMemoryDedicatedAllocateInfo` for the
+same reason, so this is the expected answer rather than a restriction to work around.
