@@ -2133,41 +2133,6 @@ static VkResult present_locked(VkQueue queue,
 	 * The rate this can hold is set by the daemon's `--render-scale`, not by N: the
 	 * network's cost follows the extent it is given (notes/phase37). N only decides how
 	 * many game frames each rendered one covers. */
-	if (live_every > 0) {
-		/* The trigger keeps its meaning — "do the thing" — so the effect can be
-		 * turned on and off mid-game without restarting it. With no trigger
-		 * configured, live mode simply always runs. */
-		int on = !trigger_path || access(trigger_path, F_OK) == 0;
-		if (!on) {
-			data->holding = 0;
-			drop_inflight(data);
-		}
-		for (uint32_t i = 0; on && i < info->swapchainCount; i++) {
-			if (data->device_error || data->transfer_error) return present_now(data, queue, info);
-			struct swapchain_data *chain = find_swapchain(info->pSwapchains[i]);
-			if (!chain || info->pImageIndices[i] >= chain->image_count) continue;
-            if (data->result_chain != chain->swapchain) {
-                data->holding = data->have_earlier = 0;
-                data->result_chain = chain->swapchain;
-                drop_inflight(data);
-            }
-			uint32_t index = info->pImageIndices[i];
-			VkDeviceSize want = (VkDeviceSize)chain->extent.width
-					  * chain->extent.height * 4;
-			if (data->frame_counter % (unsigned long)live_every == 0) {
-				int done = async_live ? process_frame_async(data, chain, queue, index)
-						      : process_frame(data, chain, queue, index);
-				if (done == 0) {
-					data->holding = 1;
-					transfer(data, chain, queue, index, 1);
-				} else data->holding = 0; /* never replay a partially received reply */
-			} else if (data->holding && data->result_size == want) {
-				memcpy(data->mapped, data->result, (size_t)data->result_size);
-				transfer(data, chain, queue, index, 1);
-			}
-		}
-		return present_now(data, queue, info);
-	}
 
 	/* A file is the trigger, not a key: it works the same on X11 and Wayland, needs
 	 * no input hooking inside another process's window, and can be set from a script
@@ -2225,6 +2190,46 @@ static VkResult present_locked(VkQueue queue,
 		wanted = 1;
 	if (!wanted && capture_every > 0)
 		wanted = data->frame_counter % (unsigned long)capture_every == 0;
+	/* Decided before the live branch below it: that one presents for the whole
+	 * swapchain and returns, so a test left after it never runs at all - the
+	 * trigger file would sit there unread while the layer reported every frame.
+	 */
+	if (live_every > 0) {
+		/* The trigger keeps its meaning — "do the thing" — so the effect can be
+		 * turned on and off mid-game without restarting it. With no trigger
+		 * configured, live mode simply always runs. */
+		int on = !trigger_path || access(trigger_path, F_OK) == 0;
+		if (!on) {
+			data->holding = 0;
+			drop_inflight(data);
+		}
+		for (uint32_t i = 0; on && i < info->swapchainCount; i++) {
+			if (data->device_error || data->transfer_error) return present_now(data, queue, info);
+			struct swapchain_data *chain = find_swapchain(info->pSwapchains[i]);
+			if (!chain || info->pImageIndices[i] >= chain->image_count) continue;
+            if (data->result_chain != chain->swapchain) {
+                data->holding = data->have_earlier = 0;
+                data->result_chain = chain->swapchain;
+                drop_inflight(data);
+            }
+			uint32_t index = info->pImageIndices[i];
+			VkDeviceSize want = (VkDeviceSize)chain->extent.width
+					  * chain->extent.height * 4;
+			if (data->frame_counter % (unsigned long)live_every == 0) {
+				int done = async_live ? process_frame_async(data, chain, queue, index)
+						      : process_frame(data, chain, queue, index);
+				if (done == 0) {
+					data->holding = 1;
+					transfer(data, chain, queue, index, 1);
+				} else data->holding = 0; /* never replay a partially received reply */
+			} else if (data->holding && data->result_size == want) {
+				memcpy(data->mapped, data->result, (size_t)data->result_size);
+				transfer(data, chain, queue, index, 1);
+			}
+		}
+		return present_now(data, queue, info);
+	}
+
 
 	for (uint32_t i = 0; i < info->swapchainCount; i++) {
 		if (data->device_error || data->transfer_error) return present_now(data, queue, info);
