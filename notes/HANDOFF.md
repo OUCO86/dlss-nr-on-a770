@@ -1,5 +1,30 @@
 # HANDOFF — read this first
 
+## 🚩 强制条款（最高优先级，违反即停工）：OptiScaler 桥接一律照抄 TheAutomatic 的实现，只有一处例外
+
+用户 2026-10-12 21:44 拍板，原话：**"我说除了要走 xess，还有就是你在叫我发现一次没按照 the 的走。
+我直接叫你别干了。给我写进交接文档里。强制，必须服从这条，别自己瞎编。"**
+
+1. **唯一例外**：输出 upscaler 走 **XeSS**（A770 XMX 原生）。The 是 AMD 卡、输出 FSR。
+   除这一处之外，任何与 The 不同的地方都是错误。
+2. **照抄范围**：接口的每一个名字、每一个字段、每一个方法签名、每一处调用时序，都照
+   `refs/optiscaler/ta_*.h`：
+   - `AmdPreSr::Frame`（含四个资源 state、motionWidth/Height、exposureScale、
+     motionJittered、temporalInputsValid、depthInverted、reset）
+   - `AmdPreSr::Settings` / `LookSettings` / `RtgiSettings`
+   - `AmdPreSr::Backend`：`Backend(device, queue, dir)`、`Record(cmdList, Frame, Settings) ->
+     ID3D12Resource*`、`RecordLayers`、`PendingListIndex`、`Submitting`、`Submitted`、
+     `TraceBoundary`、`Shutdown`、`ReleaseSession`、`PollRelease`、`ResetGraphicsWaitState`、
+     `InvalidateHistory`、`Status`、`IsRunning`、`GraphicsRestartNeeded`
+   - `DlssNr::SrPlacement`（需要 before/after 成对钩子时才用）
+3. **不许自己发明**：不许自己起接口名、不许自己设计结构体或 ABI、不许自己决定调用时序。
+   缺什么先在 `refs/optiscaler/` 找 The 的对应物；**找不到就报给用户，不许自己补**。
+4. 参考位置：`E:\WorkBuddy\2026-10-09-04-20-55\refs\optiscaler\ta_*.h`（在工作区根，不在本仓库下）。
+5. 此前我自作主张做的"C-ABI + 独立 DLL"（出于 GPL-3.0 许可隔离的考虑）**作废**，以本条为准。
+6. 项目内此前"独立 runtime DLL + 单一 C-ABI、宿主不链接"的裁定**被本条覆盖**。
+
+---
+
 State of the DLSS-NR on Intel Xe2 project as of **2026-10-08**. notes/CLAUDE.md holds the
 original brief; **this file overrides it wherever they disagree**, and after
 2026-09-09 they disagree about something foundational.

@@ -43,3 +43,6 @@ __pycache__/
 # The daemon's own log, written beside the tree.
 nr_daemon.log
 *.obj
+
+# Old dlls kept for A/B: 130 MB of binaries, never in the source tree.
+backups/

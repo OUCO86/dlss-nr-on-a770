@@ -782,3 +782,222 @@ or invalid query, predication, enhanced barriers, an open render pass, meta comm
 builds and copies, root or sample overflow. Lies of P is Unreal, and an evaluate inside a
 render pass would be ineligible. That is the next question, and unlike these two it can only
 be asked inside the game.
+
+## §19 Answered in the game: the list can be cut (2026-10-13, 00:2x)
+
+The build with `WrapLists=true` was installed as the game's `dxgi.dll` and the user launched
+into a rendered scene. Nothing was cut — the build only reports. Verbatim from
+`OptiScaler.log`:
+
+```
+[00:24:05.457504] [I] LogFrame NrBridge frame 1 960x540 mv=(960,540) jitter=(0.375,0.056)
+                          preExp=0.360 reset=0 | color=960x540 R11G11B10_FLOAT(26) rt uav
+                          | mv=960x540 R16G16_FLOAT(34) rt uav
+                          | depth=1920x1080 R32G8X24_TYPELESS(19)
+[00:24:05.457532] [I] LogFrame NrBridge contract: motion=true depth=true exposure=false
+                          backend=xess
+[00:24:05.457646] [I] EnsureSubmissionArmed NrBridge: submission hooks armed 0x0 on queue
+                          0x19a9ea4e2f0
+[00:24:36.833624] [I] NrBridge frame 1800: list 0x19c53b19060 proxied,
+                          splitIneligible=false reason=eligible
+[00:24:05.457632] [I] NrBridge frame 0: list 0x19aaf3c4f60 is not one of ours (qi 0x80004002)
+```
+
+Counted over the whole session:
+
+| What | Count |
+|---|---|
+| `proxied, splitIneligible=false reason=eligible` | **24** |
+| `proxied, splitIneligible=true` | **0** |
+| `is not one of ours (qi 0x80004002)` | 12 |
+
+**The answer is yes: every list this game hands us that we wrapped is eligible to be cut.**
+No open render pass, no enhanced barrier, no open query. The Unreal case that was the reason
+for asking does not happen here. `0x0` after `armed` is `S_OK` — the wrapping hook went in.
+
+The twelve that are "not one of ours" are not a second kind of failure. They are two fixed
+addresses, `0x19aaf3c4f60` and `0x19aaf3c2520`, seen from frame 0 onward and reused for the
+whole session. They were created before the hook was armed: the device is created at
+`00:23:52` and the first evaluate — which is when `EnsureSubmissionArmed` runs — is not until
+`00:24:05`. A list the game made in those thirteen seconds was never wrapped, and a plain
+`ID3D12GraphicsCommandList` answers `QueryInterface(ILogicalCommandList)` with
+`E_NOINTERFACE`, which is what `0x80004002` is. It is a coverage gap in when we arm, not a
+refusal by the driver. Moving the arm to the device hook closes it; nothing about the split
+itself has to change.
+
+Two more things the log settles. `reset=0` on every frame logged, so this game does not hand
+us a reset flag through the parameter we read — the temporal reset has to come from somewhere
+else or be inferred. And `exposure=false`: there is no exposure texture, which is the same
+thing the init flags said (`AutoExposure: true`, handled by the host's own XeSS path).
+
+No new error line appeared. The only two `[E]` lines in the whole log are the two already
+known from §8 — `UpdateFfxApiProviderEx for: SwapchainDX12, result: 0X80004002` and
+`XeSSFeature::InitXeSS CreateHeap bufferHeapDesc failed 80070057!` — both in the window before
+the game was switched to FSR. The session ran past frame 15600 without hanging.
+
+## §20 The cut runs, and both halves reach the queue (2026-10-13, 00:5x)
+
+`LmxxfEvaluateCut.h` is the reference's own file, byte for byte, and the cut is made where the
+reference makes it. Nothing is enqueued for the gap, so the only thing this build changes is
+that the list is cut. Verbatim, on the same cadence as the frame line:
+
+```
+[00:56:10.502198] [I] LogFrame NrBridge boundary: eval=3600 cutHr=1 proxyHits=901
+   cutsRecorded=901 rejected=0 unsplitSubmitted=20538 producerSubmitted=901
+   continuationSubmitted=901 submitFailures=0 (counts are NOT GPU completion)
+```
+
+| Field | Value | What it is |
+|---|---|---|
+| `cutsRecorded` | 901 | `TrySplitAtEvaluate` returned `S_OK` |
+| `producerSubmitted` | **901** | the first half was executed |
+| `continuationSubmitted` | **901** | the second half was executed |
+| `submitFailures` | **0** | no `ExecuteOnWithBetween` failed |
+| `rejected` | 0 | no list refused to be cut |
+| `unsplitSubmitted` | 20538 | lists that were never cut, submitted in their original batch |
+
+The three that matter are equal and the failure count is zero: every cut produced two
+executions, in order. The image did not change and the session did not hang. The gap between
+those two executions is where the reference puts its renderer, and it is now open.
+
+`unsplitSubmitted` being large is the intended behaviour, not a shortfall. The reference keeps
+uncut lists in one contiguous `ExecuteCommandLists` because splitting every submission would
+change resource decay on its own; 20538 is the game's other lists going through untouched.
+
+Two things worth keeping. First, `cutHr` alternates between 0 (`S_OK`) and 1 (`S_FALSE`, its
+documented meaning of "not a list we wrapped"), which is the boot-list gap from §19 still
+showing up frame by frame. Second, everything stays at zero until about frame 2400: the title
+and load screens submit boot lists only, so the first NR-capable frames arrive after that.
+
+### A judgment of mine that was wrong, and what replaced it
+
+The first cut build printed the between slot's own counters, and I read `between=0` as the slot
+never running. It was not evidence of anything. The reference's `BetweenThunk` begins
+
+```cpp
+if (!p.targetList || p.targetList != list)
+    return;
+```
+
+which returns before it increments anything, and with no renderer there is no pending enqueue,
+so `targetList` is null and the counters read zero whether or not the slot ran. The check was
+replaced by the reference's own, found as a string in its shipped
+`pkg/ta_v1.11.0/OptiScaler.dll`:
+
+```
+lmxxf boundary: eval={} proxy={} cutHr={:X} proxyHits={} cutsRecorded={} rejected={}
+unsplitSubmitted={} producerSubmitted={} continuationSubmitted={} submitFailures={}
+(counts are NOT GPU completion)
+```
+
+which is why §20's line has the fields it has. The parenthetical is the reference's own warning
+that these are submission counts and not GPU completions.
+
+### Found in the same binary, for the boot-list gap
+
+```
+HookToDevice lmxxf SubmissionHooks::ArmCreate failed: {:X}
+HookToDevice lmxxf early executable proxy: {} (submission hook ready={})
+lmxxf: Split failed hr=%08X reason=%s
+lmxxf: split ineligible: %s (NO NR)
+```
+
+`HookToDevice` settles where the reference arms: at the device, with `ArmCreate`, which needs a
+device and not a queue. That is what makes early wrapping possible at all — a hook armed after
+the game has already built its boot lists cannot reach them. This is the change §19 identified,
+and now it has an original to copy rather than a guess to follow.
+
+## §21 The gap probe: two crashes, then the reference's own shape (2026-10-13, 01:4x)
+
+Both crashed attempts shared one assumption: that the between slot can carry a D3D12 command
+list submission of our own. The diagnostics disproved it in one line each time -- the first
+slot run removed the device within a millisecond:
+
+    01:47:08.451  cut #1: list armed for the slot
+    01:47:08.455  gap run #1: took=2.285ms
+    01:47:08.456  LocalPresent 887A0005 / Device removed reason: INVALID_CALL
+
+What that rules out, with the counts from earlier sessions: nested ExecuteCommandLists through
+the trampoline is fine (the split's producer and continuation halves are nested submissions,
+and they ran 901 times without the probe), and Signal from inside the expansion is fine (the
+reference's own LogicalList::Execute signals its retire fence in the same nesting). What was
+left was the thing the two attempts had in common and the reference never does.
+
+And the reference says so, in its own words, in the passthrough path of its runtime:
+
+    // an ExecuteCommandLists from here would re-enter the game's detoured one
+
+Its between work is: producer->Signal(toVk.fence) on the game's queue, the real work as a
+Vulkan vkQueueSubmit, then producer->Wait(fromVk.fence). No D3D12 list is ever executed in the
+slot. The fence Signal/Wait is the D3D12 half of that shape, and it is the piece our host has
+already proven at that nesting depth.
+
+The probe is now exactly that piece: the slot job calls queue->Signal on a fence we own, once
+per cut, and nothing else. It touches no resource, knows no state, and GetCompletedValue turns
+the same signal into GPU-side proof that the queue reached the gap in order. The earlier
+"decay" diagnosis of the first crash is withdrawn: the diagnostics show the first run dying,
+and decay is a second-run phenomenon. The upload-heap fix was answering a question the session
+never reached.
+
+What the earlier attempts did prove, and stays true: the trampoline handoff, the cut itself,
+and the between slot's CPU path all run. What is new in this build: Gap has a fence and
+counters, nothing else -- no allocators, no lists, no copy.
+
+### §21 result: the slot runs, and the GPU reaches it (2026-10-13, 01:57)
+
+    NrBridge gap: between=1533 enqueue=1533 skipped=0 | runs=1533 submits=1533 failures=0
+    cpu=8.829ms max=0.021ms gpuDone=1533 gapSignalled=1533
+    NrBridge boundary: eval=4800 cutHr=0 cutsRecorded=1533 rejected=0
+    producerSubmitted=1533 continuationSubmitted=1533 submitFailures=0
+
+Every cut reached the slot (between = enqueue = runs = submits = 1533, skipped 0, failures 0),
+and the GPU side agrees: gpuDone caught up to the last value queued from the slot, so the
+signal enqueued between the halves was carried out in order and not merely recorded.
+
+The cost of standing in the gap: 8.829 ms of CPU over 1533 runs, 0.0058 ms each, with a peak of
+0.021 ms. That is the fixed price every frame pays for the bridge, before any Vulkan work is
+put in it, and it is three orders of magnitude below the 30 ms frame this has to fit into.
+
+Two errors in the log, both already known from §8: SwapchainDX12 0x80004002 and XeSS
+CreateHeap 80070057. No new error, no device removal, past frame 4800.
+
+What is left of the probe is now scaffolding: the fence signal is real, the Vulkan work it
+stands in for is not. The next thing in its place is the reference's own order --
+producer->Signal, vkQueueSubmit, producer->Wait.
+
+## §22 The hand-over, measured outside the game: the import, not the wait (2026-10-13, 02:3x)
+
+The stall was reproduced in a process of its own, with no game, no hook and no frame -- a
+console probe that builds a D3D12 device and queue on the A770, a Vulkan device on the same
+adapter, and runs the hand-over both ways across two shared fences. src/probe/handshake_probe.cpp,
+tools/build_handshake_probe.py. Five cases, one variable each:
+
+    case A  two-step import, wait, empty command buffer
+       d3d12 signalled 1; vulkan reads 1
+       vulkan submit finished (the wait was satisfied)
+       vulkan signalled 1 into the other fence; d3d12 reads 1
+
+    case B  import at create, wait, empty command buffer
+       d3d12 signalled 1; vulkan reads 0
+       vulkan submit DID NOT FINISH in 2s (the wait was never satisfied)
+       vulkan signalled 1 into the other fence; d3d12 reads 0
+
+    case C  two-step import, wait, barrier recorded          -- as A
+    case D  two-step import, wait at TOP_OF_PIPE             -- as A
+    case E  two-step import, no wait, signal only            -- finished, d3d12 reads 1
+
+The adapter does the hand-over in both directions. What it does not do is accept the fence
+when the import is chained onto the semaphore's creation: with the import in the create,
+Vulkan reads 0 out of a fence D3D12 had already carried to 1, the submit waits for a value
+that will never arrive, and the value Vulkan signals back never reaches D3D12 either. The
+driver does report the handle type as importable, and it accepted the create without error --
+the failure is silent, which is why it cost 1382 ms of waiting and a frame rate before it cost
+anything legible.
+
+It is also the shape the reference does not use. nr_pe_bridge.cpp Device::import_fence (989)
+creates the semaphore as a timeline and then imports the handle into it, as two calls. And
+VkImportSemaphoreWin32HandleInfoKHR carries an implicit valid usage that pNext must be NULL,
+which the one-call version necessarily breaks by hanging the semaphore type off the import.
+
+Cases C, D and E narrow the rest: an empty command buffer is not the problem, the wait stage
+is not the problem, and the Vulkan to D3D12 direction does not depend on the wait at all.
