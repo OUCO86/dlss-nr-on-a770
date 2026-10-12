@@ -323,7 +323,62 @@ already hold for `confidence=0`.
 session if anything fails, rather than retrying into a crash." Ours says the same thing: one
 failure closes the pass for the frame, and the game keeps the frame it already had.
 
-**Not yet known.** How the solution builds here: which MSVC it wants, whether its submodules
-are needed for the parts we touch, and whether `dxgi.dll` we ship has to be built whole or can
-be built with only our module changed. That is the next thing to find out, by building it, and
-it is not estimated in advance.
+## 11. It builds here, and this is how
+
+Answered by building it, not by estimating it. Upstream v0.9.4 was cloned to
+`src/OptiScaler` and compiled whole; the result is `build_x64/OptiScaler.dll`,
+26,487,808 bytes, exporting `D3D12CreateDevice`, `NVSDK_NGX_D3D12_EvaluateFeature`
+and the rest of the NGX surface. That dll is the same shape as the `dxgi.dll`
+already running in the game, so the build is reproducible and our module can be
+added to it.
+
+**Toolchain.** Visual Studio Community 2026 (18.10) at
+`E:\ProgramData\Microsoft\Microsoft Visual Studio\18\Community`, compiler
+`19.51.36260` under `VC\Tools\MSVC\14.51.36231`, Windows SDK `10.0.26100.0` at
+`E:\Windows Kits\10` — on E, not C, which is why searching only C once produced
+the wrong answer. This is the same toolchain `tools/build_msvc.bat` already uses
+for our own dlls.
+
+Two things the IDE would normally do for us are not available here, and both are
+worked around rather than assumed:
+
+- `vcvarsall.bat` locates the SDK through the registry, and `reg.exe` is blocked,
+  so `INCLUDE` / `LIB` / `PATH` are set by hand — exactly what the project's own
+  `tools/build_msvc.bat` does.
+- The solution's build driver is blocked as a restricted binary, so `cl.exe` is
+  driven directly, with the `Release|x64` settings read out of
+  `OptiScaler.vcxproj` rather than invented. `tools/build_optiscaler.py` does the
+  whole build; `tools/link_optiscaler.py` re-runs only the link, which is what
+  you want after editing one file.
+
+**Submodules are required.** The first clone had eight empty directories under
+`external/` (xess, spdlog, simpleini, FidelityFX-SDK, ...). `git submodule update
+--init --recursive --depth 1` fills them in about three minutes; without them
+there are no headers to compile against.
+
+Five settings that are not in the obvious place and each cost one failed build:
+
+1. `CharacterSet` is `Unicode`, so `/DUNICODE /D_UNICODE` must be passed. Without
+   them `GetModuleHandle` resolves to the `A` entry point and every wide string in
+   the proxy headers fails to convert (`C2664`).
+2. `RuntimeLibrary` is not set in the vcxproj, and VS defaults Release to the dll
+   runtime, so `/MD` must be passed. Without it `cl` picks the static one, which
+   drags in `LIBCMT` and then demands `WinMain`.
+3. `cl`'s switch is `/LD`, not `/DLL`. `/DLL` before `/link` is silently not a
+   cl switch, the image is linked as an executable, and the CRT asks for
+   `WinMain`.
+4. `ucrt.lib` (the dll-import flavour) has to be listed explicitly: the AMD
+   prebuilt `ffx_*` libraries import `__imp_exp2f` from it, and `libucrt.lib`
+   does not provide that symbol. `delayimp.lib` likewise supplies
+   `__delayLoadHelper2` for the `/DELAYLOAD` entries.
+5. Compile the vcxproj's own source list, not everything under the tree. Walking
+   the directory pulls in `imgui.cpp`, `imgui_draw.cpp` and friends, which the
+   project does not compile here and which fail under the shared precompiled
+   header. Files the vcxproj marks `PrecompiledHeader=NotUsing` are built with
+   `/Y-`.
+
+**One warning left standing:** `LNK4098` — a default library `LIBCMT` conflicts
+with the dll runtime. The link succeeds, so at least one of the prebuilt AMD
+libraries was built against the static runtime. Whether mixing the two matters at
+run time is not yet known, and is worth finding out before trusting a run that
+behaves strangely.
