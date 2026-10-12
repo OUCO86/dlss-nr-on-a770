@@ -382,3 +382,43 @@ with the dll runtime. The link succeeds, so at least one of the prebuilt AMD
 libraries was built against the static runtime. Whether mixing the two matters at
 run time is not yet known, and is worth finding out before trusting a run that
 behaves strangely.
+
+## 12. Stage one: a probe that changes nothing
+
+The module is in the fork at `OptiScaler/nrbridge/`, on local branch
+`a770-nr-bridge`. It is one call, one line at the insertion point:
+
+    // inputs/NVNGX_DLSS_Dx12.cpp, immediately before the upscaler runs
+    if (Config::Instance()->NrBridgeProbe.value_or_default())
+        NrBridge::ProbeBeforeUpscale(InCmdList, InParameters);
+
+`ProbeBeforeUpscale` reads Color, Depth, MotionVectors and the exposure texture out
+of the parameter block, reads `MV_Scale_X/Y`, `Jitter_Offset_X/Y`, pre-exposure and
+reset beside them, and prints them. It reads no pixels, copies nothing and records
+no command. The first six frames print in full; after that one line every 600.
+
+Why a probe first, when the answer looks already known: `LowResMV: true` in the log
+is the *host's* claim about init parameters. It is not the same claim as "a
+resource arrived on this frame, at this size, with this scale", and everything
+downstream — the sign of the second component, whether the scale is the frame
+width — is a thing that has to be read, not assumed. `check_motion_convention`
+exists in this repository precisely because that number has been got wrong before.
+So stage one turns the interesting claim into a printed one, and stage two does not
+start until it has been seen.
+
+Two details worth keeping:
+
+- Parameters are read the way the rest of the host reads them — typed `Get` first,
+  then the untyped one — because the FFX path and the NGX path do not populate the
+  same overload, and a single `Get` reads nothing on one of them.
+- `NVSDK_NGX_Parameter_ExposureTexture` is the exposure key. `NVSDK_NGX_Parameter_DLSS_Exposure`
+  does not exist; that was a compile error, not a guess.
+
+Installed at `F:\Game\Lies of P\LiesofP\Binaries\Win64\dxgi.dll`, with `NrBridgeProbe=true`
+in the `[Hotfix]` section. The official build it replaced is at
+`backups/liesofp-20261012-1945/dxgi.dll.official-v094`; copying that back over
+`dxgi.dll` returns to the unmodified host.
+
+**Not yet known:** whether the probe prints motion vectors at all, what size they
+are, and what the scale is. That is the next observation, and nothing is built on
+top of it until it has been made.
