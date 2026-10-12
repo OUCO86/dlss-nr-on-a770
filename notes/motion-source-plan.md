@@ -153,6 +153,12 @@ today has nothing to intercept, so a plan that leads with the vectors would spen
 week waiting for something it cannot have. Switching the order later, if measurement ever
 says the released vectors are better, is a one-line change and not a redesign.
 
+> **Superseded on 2026-10-12 by the owner.** The order above still describes how a *frame*
+> chooses, but the order of *work* changed: the main line is now section 9 — go through
+> OptiScaler, which buys DX12 titles and real vectors in one move, and leave DOOM Eternal
+> (Vulkan, nothing to intercept) until afterwards. M1 is still first, because both routes
+> share the same interface.
+
 **M5 — the `engine` back end, which is the DX12 one.** Separate process or injected DLL,
 delivering over the same transport the extmem path already uses; the daemon cannot tell
 which source answered. This is where the real work is — its own Windows build, its own
@@ -371,3 +377,130 @@ turns every future complaint into guesswork. Concretely, before M4 ships anythin
 That is the fork's own argument for existing. Upstream cannot answer "which of your two
 temporal behaviours produced this pixel" because it has one; we will have two, and the cost
 of that is telling the truth about which ran.
+
+## 9. OptiScaler as the host — the main line from 2026-10-12
+
+**The owner's decision: get DX12 working and get the vectors flowing by going through
+OptiScaler, because that also multiplies the number of titles that can be tested. DOOM Eternal
+is set aside for now.** This section is what changed and what it costs.
+
+### 9.1 The question that prompted it: can Vulkan go through OptiScaler too?
+
+Yes. OptiScaler injects into **DX11, DX12 and Vulkan** alike; under Vulkan the selectable
+back ends are FSR2 2.1.2 / 2.2.1, FSR3.1, DLSS and XeSS 2.x. So DOOM Eternal is not excluded
+*because it is Vulkan*.
+
+The one sentence that says otherwise is stale. `Features.md` in the current repository still
+carries `Supports Vulkan spoofing ... (not working for Doom Eternal)`, a v0.6.1-era note. The
+author himself later gave the working recipe in issue #15, verbatim:
+
+> Could you check with latest version of Doom Eternal. I have a report that it works with
+> latest rev3 update. You need to install OptiScaler as non-nvngx and set `Vulkan=true` and
+> `VulkanExtensionSpoofing=true` under `[Spoofing]` section of `nvngx.ini`
+
+and the reporter answered the next day, verbatim: `Tested and FSR3.1 is working. Noice`.
+
+**That is somebody else's machine (Linux/Steam Deck), not ours.** It is a reason to try, not
+a result. And it does not change the ordering, because it still needs something to intercept.
+
+### 9.2 The condition that does not go away
+
+**OptiScaler replaces an upscaler the game is already calling; it does not add one.** It hooks
+the game's DLSS / XeSS / FSR2 call and takes the colour, depth, motion vectors, jitter and
+exposure that the game was handing to its own upscaler anyway. A title that never calls an
+upscaler has no call to hook and therefore no vectors — installed or not.
+
+So this route does not make every DX12 title a vector source. It makes *the ones that ship a
+temporal upscaler* vector sources, which is a great many more than today's one, and it is
+exactly why the owner's move multiplies the testable set rather than merely changing it.
+
+### 9.3 Somebody already built this shape, and published it
+
+`TheAutomatic/dlss-5-amd-project` is OptiScaler hosting an NR network, with mochizuki0323's
+Vulkan core as one of its selectable back ends — the same two ingredients this project has.
+Its pipeline, verbatim from `docs/architecture/overview.md`:
+
+```
+游戏（DLSS / NVNGX 调用，D3D12）
+  -> OptiScaler 代理（dxgi.dll / winmm.dll / ...）
+       拦截超分调用，取 Color / Depth / MV / 曝光等输入
+  -> pre-SR 神经渲染（[DlssNr] RunBeforeSR=true）
+  -> 超分（FSR / XeSS，由 OptiScaler 原有路径完成）
+  -> Present
+```
+
+Four things there are worth inheriting rather than inventing:
+
+- **NR runs *before* the upscale, on the low-resolution colour.** Our network today eats a
+  1080p present and scales it to 0.4 after the fact. Pre-SR input is smaller to begin with,
+  which is cheaper for the same picture.
+- **The Vulkan network runs on the game's own adapter while the game stays on D3D12**, by
+  native D3D12↔Vulkan interop; their interop and pipeline-prewarming code is adapted from
+  `MatheusFerreiraS/neural-amd-opti`. That is the piece we do not have and should not write
+  from scratch.
+- **The back end is a separate DLL behind a C-ABI** — `LoadLibrary` plus a single export
+  (`LmxxfNrGetApi`). That shape keeps the licence boundary clean: our code is not linked into
+  OptiScaler (GPL-3.0), it is called by it. Whether to accept that boundary is the owner's
+  call, not mine to assume.
+- **Unmodellable command lists fail closed** — "无法建模的列表 … fail closed，本帧不做 NR".
+  That is this document's fallback rule, already written in somebody else's code.
+
+And it confirms the vectors are load-bearing, not decorative. Verbatim from
+`docs/mochizuki.md`: *"Temporal history … Requires supported, unjittered motion vectors;
+unavailable vectors disable history."*
+
+Archived with a Chinese summary at `refs/optiscaler/`.
+
+### 9.4 What changes in this project
+
+| today | hosted by OptiScaler |
+|---|---|
+| we sit on `vkQueuePresentKHR` and take the finished 1080p frame | we are handed render-size colour **before** the upscale |
+| no vectors; identity reprojection (the cause of the slant) | the engine's own vectors, unjittered |
+| Vulkan titles only | DX11 / DX12 / Vulkan |
+| `engine` = write a DX12 interception, estimated at two to three weeks | `engine` = consume inputs somebody else already intercepts |
+| network in a separate daemon process | in-process, D3D12↔Vulkan interop |
+
+The daemon does not stop existing — the network stays where it is, and the interop is how the
+game's buffers reach it. What disappears is the two-week interception.
+
+### 9.5 What must not change
+
+The owner's condition stands word for word: **having vectors must not close the path that
+works without them.** Where there is no upscaler to hook — which includes DOOM Eternal in its
+present state — the frame still runs `global` or identity, `confidence` collapsing to zero
+still means identity plus `hold_floor`, and the bytes still match what ships today. Two routes
+into one `MotionSource`, and a frame that cannot say anything still says nothing.
+
+### 9.6 The new order of work
+
+- **M1** — the interface and `zero`. Unchanged, and now more clearly worth doing first:
+  both routes terminate in it.
+- **M2\* — OptiScaler host.** Pick one DX12 title that ships a temporal upscaler, install
+  OptiScaler, and get *our* network running as a back end behind the C-ABI shape above, with
+  the received vectors printed per frame (magnitude, and the `check_motion_convention` sign
+  check passing on them). Success is: a real frame, real vectors, on a DX12 title.
+- **M3\* — does it stop the slant.** The 60-105 degree share of the dark window falls from
+  71-79% towards the source's 23.8%, now on a title that has vectors. Plus the two gates that
+  already exist: device cost, and quality on real frames with `work/int8_quality.py`.
+- **M2 / M3 as written in section 3** — the `global` estimate — **survive, demoted**: they are
+  the answer for titles with nothing to intercept, not the critical path.
+- **M5** is rewritten: not "build a DX12 interception" but "consume OptiScaler's inputs",
+  which is a transport and a convention, not a reverse-engineering job.
+- **DOOM Eternal afterwards**, as the Vulkan case of the same host — with the two spoofing
+  keys from 9.1 if we ever want it, and on the owner's own machine and his own double-click.
+
+### 9.7 Risks, each with its own measurement
+
+- **The picture's baseline moves.** Once OptiScaler is in, what we compare against is an
+  upscaled image, not the native frame every number in this repository was measured on. Every
+  historical figure has to be re-taken on the new baseline before it means anything.
+- **The upscaler costs GPU time too, and the GPU is already the ceiling.** `NR_LAYER_ASYNC`
+  measured `gpu` rising 38→43 ms once two things shared this A770. Adding an upscaler to the
+  same card is the same argument again; measure, do not assume.
+- **Interop is new surface.** Shared D3D12/Vulkan resources, fences across two APIs, and a
+  per-title convention for the vectors. `check_motion_convention` exists for the last of these.
+- **Licence.** The host is GPL-3.0. The separate-DLL-plus-ABI shape is what keeps us outside
+  it; that is a decision for the owner, and it is better made before code than after.
+- **Not every title qualifies.** 9.2 is a filter on the game list, and it is better applied
+  before choosing a target than after installing anything.
