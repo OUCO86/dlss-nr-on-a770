@@ -263,6 +263,8 @@ static int capture_key;
 static int capture_armed;      /* a press is waiting for its answer */
 static int capture_sent;       /* that press's input frame is written */
 static unsigned long armed_at; /* the frame the press happened on */
+static unsigned long sent_at;  /* the frame its input went out on */
+static int capture_down;       /* the key was down last present */
 static long live_every;
 static int async_live;
 /* How many frames process_frame_async lets out before it starts collecting answers:
@@ -1899,6 +1901,7 @@ static int process_frame(struct device_data *data, struct swapchain_data *chain,
 	if (!capture_key || (capture_armed && !capture_sent)) {
 		write_capture(capture_path, chain, data->mapped, needed, header[0]);
 		capture_sent = 1;
+		sent_at = data->frame_counter;
 	}
 	if (!socket_path) return -1;
 	/* The mask travels immediately after the colour, one byte a pixel. */
@@ -1909,8 +1912,11 @@ static int process_frame(struct device_data *data, struct swapchain_data *chain,
 			return -1;
 		}
 		memcpy(data->mapped, data->result, (size_t)needed);
-		write_capture(capture_out_path, chain, data->mapped, needed, header[0]);
-		capture_armed = capture_sent = 0;
+		if (!capture_key || (capture_armed && capture_sent)) {
+			write_capture(capture_out_path, chain, data->mapped, needed,
+				      header[0]);
+			capture_armed = capture_sent = 0;
+		}
 		nr_layer_log("processed %ux%u with a ui mask",
 			chain->extent.width, chain->extent.height);
 		return 0;
@@ -1921,8 +1927,10 @@ static int process_frame(struct device_data *data, struct swapchain_data *chain,
 		return -1;
 	}
 	memcpy(data->mapped, data->result, (size_t)needed);
-	write_capture(capture_out_path, chain, data->mapped, needed, header[0]);
-	capture_armed = capture_sent = 0;
+	if (!capture_key || (capture_armed && capture_sent)) {
+		write_capture(capture_out_path, chain, data->mapped, needed, header[0]);
+		capture_armed = capture_sent = 0;
+	}
 	nr_layer_log("processed %ux%u", chain->extent.width,
 		chain->extent.height);
 	return 0;
@@ -1974,6 +1982,7 @@ static int process_frame_async(struct device_data *data, struct swapchain_data *
 		if (!capture_key || (capture_armed && !capture_sent)) {
 			write_capture(capture_path, chain, data->mapped, needed, header[0]);
 			capture_sent = 1;
+			sent_at = data->frame_counter;
 		}
 		int fd = exchange_send(header, sizeof header, data->mapped, (size_t)needed,
 				       (size_t)needed);
@@ -1988,8 +1997,14 @@ static int process_frame_async(struct device_data *data, struct swapchain_data *
 	}
 	if (!answered) return -1;
 	memcpy(data->mapped, data->result, (size_t)needed);
-	write_capture(capture_out_path, chain, data->mapped, needed, 0x304E524Eu);
-	capture_armed = capture_sent = 0;
+	if (!capture_key || (capture_armed && capture_sent &&
+	    data->frame_counter > sent_at)) {
+		/* Later than the input went out: the answer a present shows belongs to
+		 * the frame before it, so this one is finally that pair's own. */
+		write_capture(capture_out_path, chain, data->mapped, needed,
+			      0x304E524Eu);
+		capture_armed = capture_sent = 0;
+	}
 	return 0;
 }
 
@@ -2100,19 +2115,29 @@ static VkResult present_locked(VkQueue queue,
 	 * no input hooking inside another process's window, and can be set from a script
 	 * or a hotkey daemon. While it exists the processed frame is held on screen. */
 	int wanted = trigger_path && access(trigger_path, F_OK) == 0;
-	if (!wanted && capture_key) {
-		/* The hotkey replaces every-N: a press arms one pair, and the frames
-		 * stay armed until the answer is back so async mode pairs correctly.
-		 * The cap keeps a press from sticking if the daemon stops answering. */
-		if (!capture_armed && (GetAsyncKeyState(capture_key) & 0x8000)) {
+	int pressed = 0;
+	if (capture_key) {
+		/* Asked on its own, not in place of anything else: with NR switched on
+		 * the trigger already qualifies every present, and a test that waited
+		 * for the frames the trigger turns down would never fire at all. A
+		 * press arms one pair; the cap releases it if no answer comes. */
+		int down = (GetAsyncKeyState(capture_key) & 0x8000) != 0;
+		if (down && !capture_down && !capture_armed) {
 			capture_armed = 1;
 			capture_sent = 0;
 			armed_at = data->frame_counter;
+			sent_at = data->frame_counter;
 		} else if (capture_armed && data->frame_counter - armed_at > 30) {
+			/* Thirty frames without an answer: let the press go rather than
+			 * arm every present after it. */
 			capture_armed = capture_sent = 0;
 		}
-		wanted = capture_armed != 0;
-	} else if (!wanted && capture_every > 0)
+		capture_down = down;
+		pressed = capture_armed != 0;
+	}
+	if (!wanted && pressed)
+		wanted = 1;
+	if (!wanted && capture_every > 0)
 		wanted = data->frame_counter % (unsigned long)capture_every == 0;
 
 	for (uint32_t i = 0; i < info->swapchainCount; i++) {
