@@ -253,6 +253,7 @@ static void remember_instance(VkInstance instance, PFN_vkGetInstanceProcAddr nex
 
 static const char *capture_path;
 static const char *capture_out_path;
+static const char *capture_file_path;
 static long capture_every;
 /* NR_CAPTURE_KEY: a virtual-key code. Nothing is written while the key is up;
  * one press captures one pair - the frame sent to the daemon and the answer
@@ -264,7 +265,9 @@ static int capture_armed;      /* a press is waiting for its answer */
 static int capture_sent;       /* that press's input frame is written */
 static unsigned long armed_at; /* the frame the press happened on */
 static unsigned long sent_at;  /* the frame its input went out on */
-static int capture_down;       /* the key was down last present */
+/* NR_CAPTURE_FILE: fires a pair when the file exists, then deletes it. The
+ * key is the convenient way in; this is the one that cannot be swallowed by
+ * the game, and it is how NR is turned on and off here anyway. */
 static long live_every;
 static int async_live;
 /* How many frames process_frame_async lets out before it starts collecting answers:
@@ -1369,6 +1372,7 @@ VKAPI_ATTR VkResult VKAPI_CALL nr_CreateInstance(const VkInstanceCreateInfo *inf
 		capture_every = every ? strtol(every, NULL, 10) : 0;
 		const char *hotkey = getenv("NR_CAPTURE_KEY");
 		capture_key = hotkey ? (int)strtol(hotkey, NULL, 0) : 0;
+		capture_file_path = getenv("NR_CAPTURE_FILE");
 		const char *sync = getenv("NR_LAYER_SYNC");
 		(void)sync;
 		const char *live = getenv("NR_LAYER_LIVE");
@@ -1403,8 +1407,11 @@ VKAPI_ATTR VkResult VKAPI_CALL nr_CreateInstance(const VkInstanceCreateInfo *inf
 		nr_layer_log("sync: present waits + private fences (readback and writeback)");
 		if (capture_key)
 			nr_layer_log("capture hotkey: virtual-key 0x%x - one press takes "
-				"one pair, nothing is written while the key is up",
+				"one pair, nothing is written otherwise",
 				(unsigned)capture_key);
+		if (capture_file_path)
+			nr_layer_log("capture trigger: creating %s takes one pair and the "
+				"layer deletes it again", capture_file_path);
 		nr_layer_log("active; socket=%s trigger=%s capture=%s%s%s every=%ld",
 			socket_path ? socket_path : "(none)",
 			trigger_path ? trigger_path : "(none)",
@@ -1898,7 +1905,8 @@ static int process_frame(struct device_data *data, struct swapchain_data *chain,
 
 	uint32_t header[4] = { masked ? 0x314E524Eu : 0x304E524Eu, chain->extent.width,
 			       chain->extent.height, (uint32_t)chain->format };
-	if (!capture_key || (capture_armed && !capture_sent)) {
+	if ((!capture_key && !capture_file_path) ||
+	    (capture_armed && !capture_sent)) {
 		write_capture(capture_path, chain, data->mapped, needed, header[0]);
 		capture_sent = 1;
 		sent_at = data->frame_counter;
@@ -1927,9 +1935,11 @@ static int process_frame(struct device_data *data, struct swapchain_data *chain,
 		return -1;
 	}
 	memcpy(data->mapped, data->result, (size_t)needed);
-	if (!capture_key || (capture_armed && capture_sent)) {
+	if (!capture_key && !capture_file_path ||
+	    (capture_armed && capture_sent)) {
 		write_capture(capture_out_path, chain, data->mapped, needed, header[0]);
 		capture_armed = capture_sent = 0;
+		if (capture_file_path) remove(capture_file_path);
 	}
 	nr_layer_log("processed %ux%u", chain->extent.width,
 		chain->extent.height);
@@ -1979,7 +1989,8 @@ static int process_frame_async(struct device_data *data, struct swapchain_data *
 	if (socket_path) {
 		uint32_t header[4] = { 0x304E524Eu, chain->extent.width, chain->extent.height,
 				       (uint32_t)chain->format };
-		if (!capture_key || (capture_armed && !capture_sent)) {
+		if ((!capture_key && !capture_file_path) ||
+		    (capture_armed && !capture_sent)) {
 			write_capture(capture_path, chain, data->mapped, needed, header[0]);
 			capture_sent = 1;
 			sent_at = data->frame_counter;
@@ -1997,13 +2008,14 @@ static int process_frame_async(struct device_data *data, struct swapchain_data *
 	}
 	if (!answered) return -1;
 	memcpy(data->mapped, data->result, (size_t)needed);
-	if (!capture_key || (capture_armed && capture_sent &&
-	    data->frame_counter > sent_at)) {
+	if ((!capture_key && !capture_file_path) ||
+	    (capture_armed && capture_sent && data->frame_counter > sent_at)) {
 		/* Later than the input went out: the answer a present shows belongs to
 		 * the frame before it, so this one is finally that pair's own. */
 		write_capture(capture_out_path, chain, data->mapped, needed,
 			      0x304E524Eu);
 		capture_armed = capture_sent = 0;
+		if (capture_file_path) remove(capture_file_path);
 	}
 	return 0;
 }
@@ -2116,23 +2128,29 @@ static VkResult present_locked(VkQueue queue,
 	 * or a hotkey daemon. While it exists the processed frame is held on screen. */
 	int wanted = trigger_path && access(trigger_path, F_OK) == 0;
 	int pressed = 0;
-	if (capture_key) {
+	if (capture_key || capture_file_path) {
 		/* Asked on its own, not in place of anything else: with NR switched on
 		 * the trigger already qualifies every present, and a test that waited
-		 * for the frames the trigger turns down would never fire at all. A
-		 * press arms one pair; the cap releases it if no answer comes. */
-		int down = (GetAsyncKeyState(capture_key) & 0x8000) != 0;
-		if (down && !capture_down && !capture_armed) {
-			capture_armed = 1;
-			capture_sent = 0;
-			armed_at = data->frame_counter;
-			sent_at = data->frame_counter;
-		} else if (capture_armed && data->frame_counter - armed_at > 30) {
-			/* Thirty frames without an answer: let the press go rather than
-			 * arm every present after it. */
+		 * for the frames the trigger turns down would never fire at all. */
+		int fired = 0;
+		if (capture_key && (GetAsyncKeyState(capture_key) & 0x0001))
+			fired = 1;   /* pressed since the last present, however brief */
+		int file_waiting = capture_file_path &&
+			access(capture_file_path, F_OK) == 0;
+		if (!capture_armed) {
+			if (fired || file_waiting) {
+				capture_armed = 1;
+				capture_sent = 0;
+				armed_at = data->frame_counter;
+				sent_at = data->frame_counter;
+			}
+		} else if (data->frame_counter - armed_at > 30) {
+			/* Thirty frames without an answer: let the pair go rather than arm
+			 * every present after it, and take the file away so it does not arm
+			 * the next one too. */
 			capture_armed = capture_sent = 0;
+			if (capture_file_path) remove(capture_file_path);
 		}
-		capture_down = down;
 		pressed = capture_armed != 0;
 	}
 	if (!wanted && pressed)
