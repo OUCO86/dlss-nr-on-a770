@@ -179,6 +179,56 @@ static struct swapchain_data swapchains[MAX_SWAPCHAINS];
 static nr_mutex_t lock = NR_MUTEX_INIT;
 static PFN_vkGetInstanceProcAddr next_instance_proc;
 static VkInstance layer_instance;
+
+/* Khronos's loader document (docs/LoaderLayerInterface.md) has the layer fill its
+ * own dispatch table per instance — `my_data->instance_dispatch_table`, built from
+ * the next entity's vkGetInstanceProcAddr — and the one it is given is the one
+ * belonging to that instance.
+ *
+ * This layer kept a single one for the whole process, which holds while a game
+ * makes one instance and breaks the moment it makes two: the second one's went in
+ * over the first's, and every later question about the first — a physical-device
+ * property, a name to resolve against it — was put to the second one's instead.
+ *
+ * A second instance is not a rarity here. DOOM Eternal made one on every start
+ * measured on 2026-10-12, a few lines of log after the first, and went on drawing
+ * with the first: the two differed in nothing else, and the second never built a
+ * swapchain. So each instance's is remembered and answered from, with the first
+ * one's kept as the fall-back, which is also what the physical-device queries use
+ * — a physical device is not an instance's to begin with. */
+#define NR_INSTANCES 8
+static struct {
+	VkInstance instance;
+	PFN_vkGetInstanceProcAddr next;
+} instance_next[NR_INSTANCES];
+static int instance_next_count;
+/* A game that makes a second instance says so once, not once a present. */
+static int second_instance_said;
+
+static PFN_vkGetInstanceProcAddr next_for(VkInstance instance)
+{
+	if (instance)
+		for (int i = 0; i < instance_next_count; i++)
+			if (instance_next[i].instance == instance)
+				return instance_next[i].next;
+	return next_instance_proc;
+}
+
+static void remember_instance(VkInstance instance, PFN_vkGetInstanceProcAddr next)
+{
+	if (!instance || !next) return;
+	for (int i = 0; i < NR_INSTANCES; i++)
+		if (instance_next[i].instance == instance) {
+			instance_next[i].next = next;
+			return;
+		}
+	if (instance_next_count < NR_INSTANCES) {
+		instance_next[instance_next_count].instance = instance;
+		instance_next[instance_next_count].next = next;
+		instance_next_count++;
+	}
+}
+
 static const char *capture_path;
 static long capture_every;
 static long live_every;
@@ -1237,12 +1287,33 @@ VKAPI_ATTR VkResult VKAPI_CALL nr_CreateInstance(const VkInstanceCreateInfo *inf
 {
 	VkLayerInstanceCreateInfo *link = instance_chain(info);
 	if (!link) return VK_ERROR_INITIALIZATION_FAILED;
-	next_instance_proc = link->u.pLayerInfo->pfnNextGetInstanceProcAddr;
+	PFN_vkGetInstanceProcAddr next = link->u.pLayerInfo->pfnNextGetInstanceProcAddr;
 	link->u.pLayerInfo = link->u.pLayerInfo->pNext;
 	PFN_vkCreateInstance create =
-		(PFN_vkCreateInstance)next_instance_proc(NULL, "vkCreateInstance");
+		(PFN_vkCreateInstance)next(NULL, "vkCreateInstance");
 	VkResult r = create(info, allocator, instance);
 	if (r == VK_SUCCESS) {
+		remember_instance(*instance, next);
+		/* Only the first instance sets the layer up.
+		 *
+		 * Everything below it is once-per-process, and none of it is safe to do
+		 * twice: it reads the switches again, counts the frames in flight again,
+		 * and moves `layer_instance` out from under the frames already going. A
+		 * second instance is another Vulkan of the same game's — a video
+		 * player's, an overlay's — and it does not draw a frame this layer ever
+		 * sees; on the game measured here it never even built a swapchain. Its
+		 * device, if it makes one, is still tracked: that is nr_CreateDevice's
+		 * to do, and it does not ask which instance set the layer up. */
+		if (layer_instance) {
+			if (!second_instance_said) {
+				second_instance_said = 1;
+				nr_layer_log("the game made a second instance; the layer "
+					"stays with the first, which is the one that "
+					"draws");
+			}
+			return r;
+		}
+		next_instance_proc = next;
 		/* Physical-device entry points cannot be resolved against a NULL
 		 * instance — only the handful of global ones can — so the instance has
 		 * to be kept. */
@@ -2050,7 +2121,10 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL nr_GetInstanceProcAddr(VkInstance insta
 	INTERCEPT(DestroySwapchainKHR);
 	INTERCEPT(GetDeviceQueue);
 	INTERCEPT(GetDeviceQueue2);
-	return next_instance_proc ? next_instance_proc(instance, pName) : NULL;
+	/* The one that belongs to the instance being asked about, not the last one
+	 * that came in: see `remember_instance`. */
+	PFN_vkGetInstanceProcAddr next = next_for(instance);
+	return next ? next(instance, pName) : NULL;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkNegotiateLoaderLayerInterfaceVersion(
