@@ -211,7 +211,7 @@ def receive(connection, count, probe_ok=False, keep=None):
     return buffer if buffer is not None else b"".join(chunks)
 
 
-def _extmem_publish(args, backend, pid=None):
+def _extmem_publish(args, backend, pid=None, connection=None):
     """Offer the layer the frame's buffer and the frame's semaphore.
 
     Phase 2. Both are the daemon's to make, and both are handles in *this* process,
@@ -236,6 +236,17 @@ def _extmem_publish(args, backend, pid=None):
     """
     if pid is None:
         pid = int(os.environ.get("NR_LAYER_PID", "0") or 0)
+    # Who is on the other end, said once per connection and not once a frame: this
+    # is the only place the daemon learns it, and counting the offers is what makes
+    # the two sides comparable. The layer says its own pid and which instance of
+    # that process it is; here is the pid the pipe reports. Where they disagree,
+    # the pid has come round again — Windows hands a dead process's number out —
+    # and that is the case 2026-10-12 could not settle.
+    if connection is not None and not getattr(connection, "_nr_said_pid", False):
+        connection._nr_said_pid = True
+        print(f"a connection is serving pid {pid} "
+              f"(this would be offer number {getattr(args, 'extmem_offers', 0) + 1})",
+              flush=True)
     if getattr(args, "extmem_published", False) and pid == getattr(args, "extmem_pid", 0):
         return
     mapping = _mapping(args)
@@ -246,9 +257,11 @@ def _extmem_publish(args, backend, pid=None):
         # back before making another: the handles in it are not for whoever is asking.
         mapping.clear_extmem()
         print(f"a new process is asking for frames (pid {pid}); the frame's buffers "
-              f"are offered again, duplicated into it", flush=True)
+              f"are offered again, duplicated into it "
+              f"(offer number {getattr(args, 'extmem_offers', 0) + 1})", flush=True)
     args.extmem_published = True
     args.extmem_pid = pid
+    args.extmem_offers = getattr(args, "extmem_offers", 0) + 1
     if not pid:
         print("the layer's pid is not in the environment; the frame stays in the "
               "mapping", flush=True)
@@ -1221,7 +1234,8 @@ def stage_prepare(connection, backend, args, pipeline=None):
     # makes the layer write into it, so it cannot wait for a frame that already did.
     # Whoever is on the other end of this connection decides whether it is offered
     # again — see `_extmem_publish`.
-    _extmem_publish(args, backend, getattr(connection, "client_pid", 0) or None)
+    _extmem_publish(args, backend, getattr(connection, "client_pid", 0) or None,
+                    connection)
     header = receive(connection, 16, probe_ok=True)
     if header is None:
         return

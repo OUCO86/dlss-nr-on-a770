@@ -204,6 +204,27 @@ static struct {
 static int instance_next_count;
 /* A game that makes a second instance says so once, not once a present. */
 static int second_instance_said;
+/* How many instances this process has asked for. It goes in the log beside the pid
+ * because the two together are the only way to tell the two apart from the other
+ * side of the pipe, and they are what 2026-10-12 could not decide between: the
+ * daemon had made no offer for the second game of a session, yet the layer had
+ * plainly started up again in it. Either the pid had come round again — Windows
+ * hands a dead process's number out freely, and the games were minutes apart —
+ * or the layer had run its start-up twice inside one process, which its own
+ * guards say it cannot. Both are in the log from here on. */
+static int instance_seen;
+
+/* Whose process this is. The daemon is older than the game that started it and
+ * stays after it has gone, so it counts games by the pid on the other end of the
+ * pipe — and a pid is a number that gets given out again. */
+static unsigned long nr_layer_pid(void)
+{
+#ifdef _WIN32
+	return (unsigned long)GetCurrentProcessId();
+#else
+	return (unsigned long)getpid();
+#endif
+}
 
 static PFN_vkGetInstanceProcAddr next_for(VkInstance instance)
 {
@@ -1294,6 +1315,12 @@ VKAPI_ATTR VkResult VKAPI_CALL nr_CreateInstance(const VkInstanceCreateInfo *inf
 	VkResult r = create(info, allocator, instance);
 	if (r == VK_SUCCESS) {
 		remember_instance(*instance, next);
+		/* Said for every instance, before the branch below decides what to do with
+		 * it: which process this is and which instance of it, in one line, because
+		 * the two are what a log on the daemon's side cannot tell apart. Counted
+		 * here rather than below so a second instance says so too. */
+		nr_layer_log("this is instance %d of the layer's process, which is "
+			"pid %lu", ++instance_seen, nr_layer_pid());
 		/* Only the first instance sets the layer up.
 		 *
 		 * Everything below it is once-per-process, and none of it is safe to do
