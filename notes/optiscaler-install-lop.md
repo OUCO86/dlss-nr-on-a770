@@ -91,3 +91,61 @@ r.FidelityFX.FSR3.UseRHI=0
 
 Double-click `uninstall_optiscaler.bat` in the game directory. It restores the original
 `amd_fidelityfx_dx12.dll` and deletes everything this step added.
+
+## 8. First run, 2026-10-12 19:58 — what the log actually says
+
+The user launched the game with FSR selected in its settings. `OptiScaler.log`, verbatim:
+
+    [W] OptiScaler v0.9.4-final (7534ad0) loaded
+    [I] CheckWorkingMode OptiScaler working as dxgi.dll, system dll loaded
+    [I] HookFSR3ExeInputs Trying to hook FSR3 methods
+    [I] ffxCreateContext_Dx12 context created: 1EE8
+    [I] NVSDK_NGX_D3D12_CreateFeature Creating new xess upscaler
+    [I] IFeature::SetInitParameters Init Flag JitteredMV: false
+    [I] IFeature::SetInitParameters Init Flag LowResMV: true
+    [I] IFeature::SetInitParameters Render Resolution: 1130x636, Display Resolution 1920x1080, Quality: 1
+    [I] XeSSProxy::Version XeSS Version: v2.0.2
+    [I] FeatureProvider_Dx12::ChangeFeature init successful for xess, upscaler changed
+
+**The question this step existed to answer is answered: the host receives this game's real
+motion vectors.** `LowResMV: true` and `JitteredMV: false` come with the feature's init
+parameters, so the vectors are unjittered and at render resolution — which is exactly the
+shape a temporal pass needs. Nothing here is our own estimate; it is the engine's.
+
+Three things in the same log that are not clean and are recorded rather than smoothed over:
+
+- `[E] XeSSFeature::InitXeSS CreateHeap bufferHeapDesc failed 80070057!` twice, yet the next
+  line is `init successful for xess`. 80070057 is E_INVALIDARG. It is not known whether the
+  failing heap is a first attempt that is retried with different parameters, or something
+  that is silently degraded. Not investigated yet.
+- `[E] UpdateFfxApiProviderEx for: SwapchainDX12, result: 0X80004002` — E_NOINTERFACE, i.e.
+  the game has no FSR swapchain to query. Expected, not a fault.
+- `[I] CheckForGPU RDNA4: true, RDNA3: false, Fsr4Update: true` on an Intel A770, which has
+  no RDNA4 in it. The host has misidentified the card. Worth watching, because FSR4 branches
+  hang off that flag.
+
+## 9. The core already adapts to whatever resolution the game hands it
+
+Nothing in the core fixes a resolution, so the bridge does not have to either. From
+`src/layer/nr_daemon.py`:
+
+    active_height, active_width = bottom - top, right - left
+    extent = (active_width, active_height)
+    if live.render_scale < 1.0:
+        extent = nr_frame.render_extent(active_width, active_height, float(live.render_scale),
+                                        int(live.min_extent))
+
+The extent comes from the frame actually received, every time. `768x448` was never a constant
+— it is only what `1920x1080 x 0.4` happens to equal, and `0.4` is a setting
+(`render_scale`, a live knob, range 0.05 to 1.0), not a compiled-in number. Setting it to
+`1.0` takes the `if` branch not at all and feeds the core the frame at the size it arrived.
+
+That is the right setting once the input is pre-SR. Working before super resolution means the
+colour arrives already at render resolution — 1130x636 in the run above — so shrinking it
+again by 0.4 would discard detail for nothing. Which quality preset the user picks changes
+the render resolution, and the core follows it without being told, because the extent is
+derived from the frame.
+
+One consequence to expect: a preset change changes the extent, and a different extent is a
+different network field. The resident path rebuilds on a new extent, so switching presets
+will cost one rebuild. That is a behaviour to measure later, not a reason to fix a size.
