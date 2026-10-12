@@ -217,7 +217,15 @@ set "LAUNCH=%DEPLOY%\launch-nr.bat"
   echo set "VK_INSTANCE_LAYERS=VK_LAYER_dlssnr_intel"
   echo set "ENABLE_NR_LAYER=1"
   echo set "NR_LAYER_SPAWN=1"
-  echo set "NR_LAYER_LIVE=1"
+  echo rem 2026-10-12: every 2nd present, and one frame behind. Measured in DOOM
+  echo rem Eternal: 26 ms a frame against 54.8 ms with every present going through the
+  echo rem network synchronously, and 52.3 ms with one frame behind but every present
+  echo rem still going through. The player switched the effect on and off mid-game and
+  echo rem reported no discomfort from the picture refreshing every other frame.
+  echo rem NR_DAEMON_PIPELINE stays off: with NR_LAYER_ASYNC=2 it measured 130.9 ms
+  echo rem against 72.8 (docs/A770-HANDOFF.md), and the two were never told apart.
+  echo set "NR_LAYER_LIVE=2"
+  echo set "NR_LAYER_ASYNC=1"
   echo rem Windows talks to the daemon over a named pipe, not a Unix socket.
   echo set "NR_LAYER_SOCKET=\\.\pipe\nr_dlssnr_intel"
   echo rem The weights stay in the checkout; only this path points at them.
