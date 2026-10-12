@@ -734,3 +734,51 @@ enumerated first and is not the card the game renders on, which is the reason th
 never takes `pds[0]`. And `dedicated only` means every imported image gets its own
 allocation — the reference bridge allocates through `VkMemoryDedicatedAllocateInfo` for the
 same reason, so this is the expected answer rather than a restriction to work around.
+
+---
+
+## 18. The second question: can the game's command list be cut? (2026-10-13, 00:2x)
+
+The first question was about the driver (§17: can a shared D3D12 resource be imported into a
+Vulkan device of our own). This one is about the game's own recording: the upscaler's
+evaluate happens in the middle of a command list that belongs to the game, and the work has
+to be sandwiched on the GPU —
+
+```
+[ producer ... ] -> Execute -> our work -> Execute -> [ continuation ... ]
+```
+
+Asked the same way, in a process of its own, on real hardware: `src/probe/split_probe.cpp`,
+built by `tools/build_split_probe.py`. The shape is the reference's own submission module
+(`refs/optiscaler/src/ta_submission`, taken unmodified) plus Detours from the OptiScaler
+tree. Two textures make one execute prove both halves: the producer clears the first, the
+continuation clears the second.
+
+```
+   adapter: vendor 0x1002  AMD Radeon RX 9070 XT
+   adapter: vendor 0x8086  Intel(R) Arc(TM) A770 Graphics
+   chosen: Intel(R) Arc(TM) A770 Graphics
+   submission hooks armed: 0x00000000
+   CreateCommandList: 0x00000000
+   ILogicalCommandList: 0x00000000 (proxied)
+   SplitSegments: 0x00000000
+   between slot ran on queue 00000151981605B0 (hit 1)
+   producer texture    : 1.00 0.00 0.00 1.00
+   continuation texture: 0.00 1.00 0.00 1.00
+RESULT: the list was cut and both halves ran, the between slot between them
+```
+
+Red in the first and green in the second is the ordering, not an inference from it: the
+producer ran before the between slot and the continuation ran after it.
+
+Two build notes that will matter again. The reference's tracker is C++20
+(`std::unordered_map::contains`), so this is not a C++17 file. And the submission module's
+only outside dependency is `../amd/GraphicsTracker.h` — it carries no host header, which is
+what made it possible to ask this question without touching the host at all.
+
+What this does **not** show: whether the list the game hands us at evaluate time is one that
+may be cut. The reference lists what makes a list ineligible — an open split barrier, an open
+or invalid query, predication, enhanced barriers, an open render pass, meta commands, RTAS
+builds and copies, root or sample overflow. Lies of P is Unreal, and an evaluate inside a
+render pass would be ineligible. That is the next question, and unlike these two it can only
+be asked inside the game.
