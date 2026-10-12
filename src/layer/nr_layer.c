@@ -251,6 +251,7 @@ static void remember_instance(VkInstance instance, PFN_vkGetInstanceProcAddr nex
 }
 
 static const char *capture_path;
+static const char *capture_out_path;
 static long capture_every;
 static long live_every;
 static int async_live;
@@ -1346,6 +1347,7 @@ VKAPI_ATTR VkResult VKAPI_CALL nr_CreateInstance(const VkInstanceCreateInfo *inf
 		 * to be kept. */
 		layer_instance = *instance;
 		capture_path = getenv("NR_LAYER_CAPTURE");
+		capture_out_path = getenv("NR_LAYER_CAPTURE_OUT");
 		socket_path = getenv("NR_LAYER_SOCKET");
 		ensure_daemon();
 		trigger_path = getenv("NR_LAYER_TRIGGER");
@@ -1385,10 +1387,12 @@ VKAPI_ATTR VkResult VKAPI_CALL nr_CreateInstance(const VkInstanceCreateInfo *inf
 			nr_layer_log("live runs while the trigger exists; "
 				"remove it to hand the game back");
 		nr_layer_log("sync: present waits + private fences (readback and writeback)");
-		nr_layer_log("active; socket=%s trigger=%s capture=%s every=%ld",
+		nr_layer_log("active; socket=%s trigger=%s capture=%s%s%s every=%ld",
 			socket_path ? socket_path : "(none)",
 			trigger_path ? trigger_path : "(none)",
-			capture_path ? capture_path : "(off)", capture_every);
+			capture_path ? capture_path : "(off)",
+			capture_out_path ? " out " : "",
+			capture_out_path ? capture_out_path : "", capture_every);
 		if (ui_mask)
 			nr_layer_log("ui mask on: the first present after the "
 				"trigger is kept to find what held still");
@@ -1832,6 +1836,24 @@ static int mask_worth_sending(uint32_t held, uint32_t pixels)
 	return held < (uint32_t)((uint64_t)pixels * 9 / 10) && held > pixels / 50;
 }
 
+/* Both ends of one present on disk, when asked for: what the game drew, and what
+ * the daemon answered with. Sixteen bytes of header first, then the pixels. Two
+ * files are the only way to tell a seam the network made from one the game's own
+ * bloom already had. */
+static void write_capture(const char *path, const struct swapchain_data *chain,
+			  const unsigned char *pixels, VkDeviceSize needed,
+			  uint32_t magic)
+{
+	if (!path) return;
+	FILE *file = fopen(path, "wb");
+	if (!file) return;
+	uint32_t header[4] = { magic, chain->extent.width, chain->extent.height,
+			       (uint32_t)chain->format };
+	fwrite(header, sizeof header, 1, file);
+	fwrite(pixels, 1, (size_t)needed, file);
+	fclose(file);
+}
+
 static int process_frame(struct device_data *data, struct swapchain_data *chain,
 			 VkQueue queue, uint32_t index)
 {
@@ -1858,14 +1880,7 @@ static int process_frame(struct device_data *data, struct swapchain_data *chain,
 
 	uint32_t header[4] = { masked ? 0x314E524Eu : 0x304E524Eu, chain->extent.width,
 			       chain->extent.height, (uint32_t)chain->format };
-	if (capture_path) {
-		FILE *file = fopen(capture_path, "wb");
-		if (file) {
-			fwrite(header, sizeof header, 1, file);
-			fwrite(data->mapped, 1, (size_t)needed, file);
-			fclose(file);
-		}
-	}
+	write_capture(capture_path, chain, data->mapped, needed, header[0]);
 	if (!socket_path) return -1;
 	/* The mask travels immediately after the colour, one byte a pixel. */
 	if (masked) {
@@ -1875,6 +1890,7 @@ static int process_frame(struct device_data *data, struct swapchain_data *chain,
 			return -1;
 		}
 		memcpy(data->mapped, data->result, (size_t)needed);
+		write_capture(capture_out_path, chain, data->mapped, needed, header[0]);
 		nr_layer_log("processed %ux%u with a ui mask",
 			chain->extent.width, chain->extent.height);
 		return 0;
@@ -1885,6 +1901,7 @@ static int process_frame(struct device_data *data, struct swapchain_data *chain,
 		return -1;
 	}
 	memcpy(data->mapped, data->result, (size_t)needed);
+	write_capture(capture_out_path, chain, data->mapped, needed, header[0]);
 	nr_layer_log("processed %ux%u", chain->extent.width,
 		chain->extent.height);
 	return 0;
@@ -1933,6 +1950,7 @@ static int process_frame_async(struct device_data *data, struct swapchain_data *
 	if (socket_path) {
 		uint32_t header[4] = { 0x304E524Eu, chain->extent.width, chain->extent.height,
 				       (uint32_t)chain->format };
+		write_capture(capture_path, chain, data->mapped, needed, header[0]);
 		int fd = exchange_send(header, sizeof header, data->mapped, (size_t)needed,
 				       (size_t)needed);
 		if (fd >= 0 && data->inflight_count < NR_INFLIGHT_MAX) {
@@ -1946,6 +1964,7 @@ static int process_frame_async(struct device_data *data, struct swapchain_data *
 	}
 	if (!answered) return -1;
 	memcpy(data->mapped, data->result, (size_t)needed);
+	write_capture(capture_out_path, chain, data->mapped, needed, 0x304E524Eu);
 	return 0;
 }
 
