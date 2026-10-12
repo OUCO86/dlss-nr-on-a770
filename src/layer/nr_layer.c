@@ -244,23 +244,29 @@ static void shm_look(void)
 static int extmem_state;              /* 0 not looked for yet, 1 held, -1 there is none */
 static int extmem_tries;
 static unsigned long long extmem_frame;
+/* What the head said the last time a try was made: which offer it was, and the two
+ * handles it carried. A second try is only worth its cost when one of those moved. */
+static unsigned long long extmem_tried_offers;
+static unsigned long long extmem_tried_raw, extmem_tried_sem;
+static int extmem_retries;
 
 static void extmem_look(void)
 {
-	if (extmem_state) return;
+	if (extmem_state == 1) return;
 	const char *want = getenv("NR_EXTMEM");
 	if (!want || !strcmp(want, "0") || !strcmp(want, "off")) {
 		extmem_state = -1;
 		return;
 	}
 	if (shm_state != 1) return;
-	unsigned long long raw = 0, answer = 0, sem = 0;
+	unsigned long long raw = 0, answer = 0, sem = 0, offers = 0;
 	size_t raw_bytes = 0, answer_bytes = 0;
 	/* The buffer is the daemon's to make, and it cannot make it until the first frame
 	 * has told it how big a frame is — so on that frame's way out the handles are not
 	 * in the head yet. Looking again costs one read of it, and the frame crosses in
 	 * the mapping until it works. */
-	if (!nr_shm_extmem(&shm, &raw, &answer, &sem, &raw_bytes, &answer_bytes)) {
+	if (!nr_shm_extmem(&shm, &raw, &answer, &sem, &raw_bytes, &answer_bytes,
+			   &offers)) {
 		if (++extmem_tries > 1800) {
 			nr_layer_log("the daemon never offered the frame's "
 				"buffer; it crosses in the mapping");
@@ -268,20 +274,51 @@ static void extmem_look(void)
 		}
 		return;
 	}
+	/* A failed import is not the last word, and it took a session's log to see it.
+	 *
+	 * The handles in the head are for one process: the daemon duplicates them into
+	 * the game that asked, and the numbers mean nothing anywhere else. A daemon
+	 * outlives the game that spawned it — the pipe is already there when the next
+	 * game looks — so the second game reads the first game's handles and asks for
+	 * memory by a number that is not its own, and vkAllocateMemory (import) says no.
+	 * Twice on 2026-10-12, both times the second game of a daemon's.
+	 *
+	 * The daemon offers them again when the pid on the pipe moves, and the head
+	 * counts its offers — a handle that reads the same is not the same handle, so
+	 * the count is what says the offer is a new one. Try again, then: only on a
+	 * count that moved, or on handles that did, and never past four tries, because
+	 * a try is a VkInstance and a VkDevice of the layer's own (see below).
+	 *
+	 * Reading the head again is one read of 128 bytes a frame, which is nothing;
+	 * building the device is not, and is what the limit is for. */
+	if (extmem_state == -1) {
+		if (offers == extmem_tried_offers && raw == extmem_tried_raw
+		    && sem == extmem_tried_sem)
+			return;
+		if (++extmem_retries > 4)
+			return;
+		nr_layer_log("the daemon offered the frame's buffers again "
+			"(offer %llu, raw %llu, semaphore %llu); the layer "
+			"looks at them once more", offers, raw, sem);
+	}
+	extmem_tried_offers = offers;
+	extmem_tried_raw = raw;
+	extmem_tried_sem = sem;
 	if (nrx_open(raw, raw_bytes, answer, answer_bytes, sem) != 0) {
 		nr_layer_log("the frame's buffers could not be imported (%s); "
 			"it crosses in the mapping instead, and the layer stops asking",
 			nrx_error() ? nrx_error() : "for a reason the layer did not record");
-		/* One try, then the mapping for good - not a per-frame question after all.
-		 * A try is nrx_open, and nrx_open builds a VkInstance and a VkDevice of the
-		 * layer's own inside the game's process and destroys them when it fails.
-		 * Measured on 2026-10-12, the answer's buffer in host memory: 1163 tries
-		 * over one session, one per frame, and the game went from 16.7 ms a frame
-		 * to 105.4 ms - 9.5 fps against 60.0 with the layer handing frames straight
-		 * through. The handles come out of the mapping's head, which the daemon
-		 * fills in once, and a try that used to fail closed them, so every try
-		 * after the first was handed a dead handle and could not have worked
-		 * whatever the import asked for. Both halves are fixed: see nr_extmem.c. */
+		/* One try per offer, then the mapping - not a per-frame question after
+		 * all. A try is nrx_open, and nrx_open builds a VkInstance and a VkDevice
+		 * of the layer's own inside the game's process and destroys them when it
+		 * fails. Measured on 2026-10-12, the answer's buffer in host memory:
+		 * 1163 tries over one session, one per frame, and the game went from
+		 * 16.7 ms a frame to 105.4 ms - 9.5 fps against 60.0 with the layer
+		 * handing frames straight through. The handles come out of the mapping's
+		 * head, which the daemon fills in once, and a try that used to fail
+		 * closed them, so every try after the first was handed a dead handle and
+		 * could not have worked whatever the import asked for. Both halves are
+		 * fixed: see nr_extmem.c. */
 		extmem_state = -1;
 		return;
 	}
@@ -305,6 +342,10 @@ static void shm_track(int fd, int slot)
 			return;
 		}
 }
+
+/* Whether an answer that came back from the daemon's own buffer has already been
+ * reported as unreadable here. One line, not one a frame. */
+static int external_missed;
 
 /* The slot this connection's answer will be in, or -1 when the frame went by pipe. */
 static int shm_untrack(int fd)
@@ -434,6 +475,26 @@ static int exchange_receive(int fd, void *reply, size_t reply_size)
 			size_t have = 0;
 			void *answer = nrx_answer(&have);
 			if (!answer || bytes < reply_size || at + reply_size > have) {
+				/* Said once, and said plainly, because what it looks like
+				 * without it is the daemon being silent. It is not: it put
+				 * the words in a buffer of its own and said where, and
+				 * this side has no way to read one — the import failed,
+				 * or the answer moved past what was imported. A frame
+				 * that comes back this way is the game's own, every
+				 * time, and on 2026-10-12 that was 3647 frames of a
+				 * session with the layer on and the effect off.
+				 *
+				 * The daemon's half of the cure is in stage_finish: a
+				 * frame that crossed in the mapping is answered in the
+				 * slot, whatever way the way back is set. */
+				if (!external_missed) {
+					external_missed = 1;
+					nr_layer_log("the answer is in the daemon's own "
+						"buffer, which this side %s; the frame "
+						"stays as the game drew it",
+						answer ? "has too little of"
+						       : "could not import");
+				}
 				nr_link_close(&link);
 				return -1;
 			}

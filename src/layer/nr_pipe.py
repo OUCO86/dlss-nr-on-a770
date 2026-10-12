@@ -54,15 +54,26 @@ _k32.CloseHandle.argtypes = [wintypes.HANDLE]
 _k32.CloseHandle.restype = wintypes.BOOL
 _k32.DisconnectNamedPipe.argtypes = [wintypes.HANDLE]
 _k32.DisconnectNamedPipe.restype = wintypes.BOOL
+# Who is on the other end of a connected instance. Phase 2 needs it: the handles the
+# daemon offers the layer are duplicated *into a process*, and a daemon that outlives
+# the game it was spawned by is asked for them again by the next one — whose numbers
+# for them are not the ones in the head. The pid is how it can tell.
+_k32.GetNamedPipeClientProcessId.argtypes = [wintypes.HANDLE,
+                                             ctypes.POINTER(wintypes.DWORD)]
+_k32.GetNamedPipeClientProcessId.restype = wintypes.BOOL
 
 
 class NamedPipeConnection:
     """One connected byte-mode pipe endpoint, shaped like a socket."""
 
-    def __init__(self, handle, timeout=None):
+    def __init__(self, handle, timeout=None, client_pid=0):
         self._handle = int(handle)
         self._timeout = timeout
         self._open = True
+        # 0 when it could not be asked for, which is a question nobody answers on a
+        # platform that has no such call. Phase 2 checks it against the pid the handles
+        # were last duplicated for and offers them again when it moved.
+        self.client_pid = int(client_pid)
 
     def settimeout(self, seconds):
         self._timeout = seconds
@@ -204,7 +215,15 @@ class NamedPipeServer:
             if err != ERROR_NO_DATA:
                 raise OSError(err, "ConnectNamedPipe")
             _k32.DisconnectNamedPipe(self._handle)
-        connection = NamedPipeConnection(self._handle, self._timeout)
+        pid = wintypes.DWORD(0)
+        # The pipe instance is still ours here, before it is handed over: the client's
+        # pid is a property of the connected instance, so it has to be asked before the
+        # next `accept` makes a new one. A "no" leaves 0, and Phase 2 then offers the
+        # handles once for whoever asks, exactly as it did before.
+        if not _k32.GetNamedPipeClientProcessId(self._handle, ctypes.byref(pid)):
+            pid = wintypes.DWORD(0)
+        connection = NamedPipeConnection(self._handle, self._timeout,
+                                         client_pid=pid.value)
         # A fresh pipe instance replaces the one just handed over, so the next
         # `accept` waits on a new endpoint rather than the one in use. When the
         # backlog is momentarily full this leaves `_handle` empty and the next
@@ -254,7 +273,14 @@ class FrameMapping:
     # 2 added the handles at the end of the head; the head grew from 64 to 128 bytes to
     # hold them. A layer that only knows version 1 refuses the mapping, which is what
     # makes growing it safe.
-    VERSION = 2
+    #
+    # 3 added the count of offers behind them, at offset 72. The handles themselves
+    # cannot be the thing that says "this is a new offer": they are numbers inside a
+    # process, and a process that gets a fresh table hands out the same low numbers
+    # again, so the second game of a daemon's can be offered handles that *look*
+    # exactly like the first one's and are not its own. The count is the daemon's to
+    # raise and nobody else's, so it alone says an offer was made again.
+    VERSION = 3
     HEAD = 128
     SLOTS = 4
 
@@ -293,9 +319,27 @@ class FrameMapping:
         struct.pack_into("<4I", self._map, 0, self.MAGIC, self.VERSION, slots, 0)
         struct.pack_into("<QQ", self._map, 16, self.colour, self.mask)
         # No handles yet, and the flag that says so: the layer must not read a handle
-        # out of a head that was never given one.
-        struct.pack_into("<5Q", self._map, 32, 0, 0, 0, 0, 0)
+        # out of a head that was never given one. Nor a first offer: the count starts
+        # at 0, which is what makes the first one count as one.
+        struct.pack_into("<6Q", self._map, 32, 0, 0, 0, 0, 0, 0)
         struct.pack_into("<I", self._map, 12, 0)
+        self._offers = 0
+
+    def clear_extmem(self):
+        """Take the offer back, before a new one is written in its place.
+
+        The flag first: a layer reading the head at any moment must never see the new
+        sizes beside the old handles, and never the old handles beside no flag. It is
+        the whole of what makes offering them twice safe — the first offer is for a
+        game that has already gone, and the numbers it left are meaningless in the
+        process that is asking now.
+
+        The count is left alone. It is what says which offer this is, so taking one
+        back has to leave the number standing: a layer that saw offer 4 keeps knowing
+        it saw offer 4, and only a new one — 5 — is worth another try.
+        """
+        struct.pack_into("<I", self._map, 12, 0)
+        struct.pack_into("<5Q", self._map, 32, 0, 0, 0, 0, 0)
 
     def publish_extmem(self, raw, answer, sem, raw_bytes, answer_bytes):
         """Offer the layer the frame's buffers, as handles in *its* process.
@@ -303,8 +347,14 @@ class FrameMapping:
         The three numbers have to have been duplicated into the layer's process first:
         a handle is only meaningful where it was made. The flag goes in last, so a
         layer reading the head never sees sizes without the handles they belong to.
+
+        The count of offers goes in with them and is raised here, which is the only
+        place it is ever raised: it is what tells the layer this offer is not the one
+        it tried before, and a handle that looks the same is not.
         """
-        struct.pack_into("<5Q", self._map, 32, raw, answer, sem, raw_bytes, answer_bytes)
+        self._offers += 1
+        struct.pack_into("<6Q", self._map, 32, raw, answer, sem, raw_bytes,
+                         answer_bytes, self._offers)
         struct.pack_into("<I", self._map, 12, 1)
 
     def _plane(self, slot, offset, count):

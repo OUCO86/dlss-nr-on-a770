@@ -183,7 +183,7 @@ static int nr_link_read(nr_link *link, void *data, size_t count)
  */
 
 #define NR_SHM_MAGIC 0x4D52534Eu      /* what the daemon writes in the layout head */
-#define NR_SHM_VERSION 2u
+#define NR_SHM_VERSION 3u
 #define NR_SHM_MAX_SLOTS 8u
 #define NR_SHM_HEAD 128u              /* the layout head, and the slots' alignment */
 
@@ -196,8 +196,18 @@ static int nr_link_read(nr_link *link, void *data, size_t count)
  * The handles are only there when `NR_EXTMEM` is set on the daemon's side. A handle is
  * a number inside the process that holds it, so the daemon has to DuplicateHandle all
  * three into the layer's process before writing them — the numbers it writes are not
- * the ones it got from the driver. */
+ * the ones it got from the driver.
+ *
+ * Version 3 put the count of offers behind them, at offset 72. It is there because the
+ * handles cannot say it themselves: the same process is not the only thing that hands
+ * out the same low handle numbers, a fresh one does too. The second game to ask a
+ * daemon that outlived the first for frames is offered handles that read exactly like
+ * the first game's and are not its own, and importing one is asking for memory by a
+ * number that means something else here — vkAllocateMemory (import) says no, which is
+ * twice in the log of 2026-10-12. Only the daemon knows whether it has offered them
+ * again, and the count is how it says so. */
 #define NR_SHM_EXTMEM 12u             /* offset of the flag, 1 when the handles are set */
+#define NR_SHM_OFFERS 72u             /* offset of the count of offers, raised by the daemon */
 
 /* The magic on the wire. The two shared-memory values are the pipe's two with 2 added,
  * so a daemon that has never heard of a mapping rejects them rather than reading the
@@ -252,7 +262,8 @@ static void nr_shm_write_layout(unsigned char *base, unsigned slots, size_t colo
  * what this asks for. */
 static int nr_shm_extmem(const nr_shm *shm, unsigned long long *raw,
 			 unsigned long long *answer, unsigned long long *sem,
-			 size_t *raw_bytes, size_t *answer_bytes)
+			 size_t *raw_bytes, size_t *answer_bytes,
+			 unsigned long long *offers)
 {
 	if (!shm->usable) return 0;
 	uint32_t *head = (uint32_t *)shm->base;
@@ -263,6 +274,10 @@ static int nr_shm_extmem(const nr_shm *shm, unsigned long long *raw,
 	*sem = words[2];
 	*raw_bytes = (size_t)words[3];
 	*answer_bytes = (size_t)words[4];
+	/* Version 3's count. A head too old to carry one is read as no offer at all,
+	 * which is the truth for it: a daemon that cannot count its offers cannot have
+	 * made a second one. */
+	*offers = head[1] >= 3 ? *(uint64_t *)(shm->base + NR_SHM_OFFERS) : 0;
 	return *raw && *sem && *raw_bytes;
 }
 
@@ -398,11 +413,13 @@ static unsigned char *nr_shm_answer(nr_shm *shm, unsigned slot)
 
 static int nr_shm_extmem(const nr_shm *shm, unsigned long long *raw,
 			 unsigned long long *answer, unsigned long long *sem,
-			 size_t *raw_bytes, size_t *answer_bytes)
+			 size_t *raw_bytes, size_t *answer_bytes,
+			 unsigned long long *offers)
 {
 	(void)shm;
 	*raw = *answer = *sem = 0;
 	*raw_bytes = *answer_bytes = 0;
+	*offers = 0;
 	return 0;
 }
 

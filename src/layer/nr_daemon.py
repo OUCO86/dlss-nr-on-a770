@@ -211,24 +211,44 @@ def receive(connection, count, probe_ok=False, keep=None):
     return buffer if buffer is not None else b"".join(chunks)
 
 
-def _extmem_publish(args, backend):
-    """Offer the layer the frame's buffer and the frame's semaphore, once.
+def _extmem_publish(args, backend, pid=None):
+    """Offer the layer the frame's buffer and the frame's semaphore.
 
     Phase 2. Both are the daemon's to make, and both are handles in *this* process,
     so they have to be duplicated into the layer's before the layer can import
     either; `publish_extmem` then writes them where the layer looks for them.
 
-    Fail-soft throughout, and tried once: a layer that never sees the handles keeps
-    putting the frame in the mapping, and the daemon keeps reading it there, which is
-    where it has always read it.
+    Once *per process that asks*, which is not the same as once. A handle is a number
+    inside the process that holds it, and the daemon outlives the game that spawned
+    it more often than not: the next game finds the pipe already there, asks the same
+    daemon for a frame, and reads handles out of the head that were duplicated for a
+    process that has since gone. Importing one of those is asking for memory by a
+    number that means something else here, and vkAllocateMemory says no — twice in
+    the log of 2026-10-12, both times in the second game of a daemon's, and every
+    frame after them answered with nothing at all. So the offer is remade whenever
+    the pid on the other end of the pipe has moved: the flag comes off first
+    (`clear_extmem`), so a layer reading the head in between sees no handles rather
+    than an old set, and it asks again when the new ones appear.
+
+    Fail-soft throughout: a layer that never sees the handles keeps putting the frame
+    in the mapping, and the daemon keeps reading it there, which is where it has
+    always read it.
     """
-    if getattr(args, "extmem_published", False):
+    if pid is None:
+        pid = int(os.environ.get("NR_LAYER_PID", "0") or 0)
+    if getattr(args, "extmem_published", False) and pid == getattr(args, "extmem_pid", 0):
         return
-    args.extmem_published = True
     mapping = _mapping(args)
     if mapping is None:
         return
-    pid = int(os.environ.get("NR_LAYER_PID", "0") or 0)
+    if getattr(args, "extmem_published", False):
+        # A second game, and the first offer was for the first one's process. Take it
+        # back before making another: the handles in it are not for whoever is asking.
+        mapping.clear_extmem()
+        print(f"a new process is asking for frames (pid {pid}); the frame's buffers "
+              f"are offered again, duplicated into it", flush=True)
+    args.extmem_published = True
+    args.extmem_pid = pid
     if not pid:
         print("the layer's pid is not in the environment; the frame stays in the "
               "mapping", flush=True)
@@ -247,6 +267,11 @@ def _extmem_publish(args, backend):
         # there is no point in having it before knowing it can be offered.
         answer_getter = getattr(backend, "extmem_answer_buffer", None)
         answer_buffer = answer_getter(args.max_pixels) if answer_getter else None
+        # A fresh semaphore every time, and it cannot be the same one twice: a
+        # timeline's counter only ever goes up (VUID-VkSemaphoreSignalInfo-value-03258),
+        # and a new game starts counting its frames at 1 against a counter the game
+        # before it left at some thousands. The buffers are kept — they are the
+        # backend's, made once and sized for the pixel limit — but this is made again.
         args.extmem_sem = backend.runtime.export_semaphore()
         raw_handle, raw_bytes = backend.extmem_handles()
         answer_handle, answer_bytes = (backend.extmem_answer_handles()
@@ -1136,7 +1161,14 @@ class Frame:
                  "colour", "active_height", "active_width", "inner", "geometry", "shot",
                  "history_inner", "history_full", "history_pixels", "features",
                  "channels", "grade", "neural", "control", "held", "previous", "kind",
-                 "head", "split", "request", "head_device", "head_stride", "shm")
+                 "head", "split", "request", "head_device", "head_stride", "shm",
+                 # `in_raw`: this frame's bytes came into a buffer of ours, which means
+                 # the layer holds that buffer and can be told to read the answer out
+                 # of one. A frame that crossed in the mapping has no such buffer on
+                 # the layer's side — it may have failed to import it — and has to be
+                 # answered in the slot however the daemon is set up. See the comment
+                 # at the `send_answer` below, and notes/phase2-extmem.md.
+                 "in_raw")
 
     def __init__(self, **fields):
         for name in self.__slots__:
@@ -1187,8 +1219,9 @@ def stage_prepare(connection, backend, args, pipeline=None):
     """
     # Offer the layer the frame's buffer before reading anything: the offer is what
     # makes the layer write into it, so it cannot wait for a frame that already did.
-    # Tried once and kept — see `_extmem_publish`.
-    _extmem_publish(args, backend)
+    # Whoever is on the other end of this connection decides whether it is offered
+    # again — see `_extmem_publish`.
+    _extmem_publish(args, backend, getattr(connection, "client_pid", 0) or None)
     header = receive(connection, 16, probe_ok=True)
     if header is None:
         return
@@ -1444,7 +1477,8 @@ def stage_prepare(connection, backend, args, pipeline=None):
                  history_pixels=history_pixels, features=features, channels=channels,
                  grade=grade, neural=neural, control=control, held=held,
                  previous=previous, kind=kind, head=None, split=None,
-                 request=request, head_device=None, head_stride=0, shm=slot)
+                 request=request, head_device=None, head_stride=0, shm=slot,
+                 in_raw=in_raw)
 
 
 def stage_network(frame, backend):
@@ -1628,9 +1662,22 @@ def stage_finish(frame, backend, args):
     # buffer — its extent outgrew the backend's — has its words somewhere the layer
     # cannot see, and telling the layer where to look anyway hands it the frame
     # before's. `encoded_at` moves with the extent, so the offset is this frame's.
+    #
+    # `in_raw` as well, and it is the half that was missing. `answer_external` says
+    # where the *daemon* has the words, which is the backend's buffer whenever the
+    # way back is on; it says nothing about whether the layer can see that buffer.
+    # A layer that could not import it sends the frame in the mapping instead, and
+    # answering that frame with "the words are in my buffer at N" is answering it
+    # with a place it has no way to read: `nrx_answer` is NULL there, the frame is
+    # left as the game drew it, and the log fills with "the daemon did not answer".
+    # Measured on 2026-10-12, one session: 3647 of them, every frame of it, the game
+    # showing 16.7 ms and 59.9 fps with the layer on — the effect silently off, which
+    # is worse than slow. Only a frame that came in through the buffer may be told to
+    # read the answer out of one; every other frame's answer goes in the slot, which
+    # is where it went before Phase 2 and still can.
     send_answer(connection, _mapping(args), frame.shm, encoded,
                 at=frame.request.encoded_at * 4
-                   if frame.request is not None
+                   if frame.in_raw and frame.request is not None
                    and getattr(frame.request, "answer_external", False) else None)
     if changed is None and composed is not None:
         changed = mean_change(composed[rows], colour[rows], "change")

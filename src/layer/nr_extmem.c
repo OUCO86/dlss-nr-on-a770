@@ -302,9 +302,20 @@ static int import_buffer(VkDeviceSize bytes, unsigned long long handle,
 		.allocationSize = req.size, .memoryTypeIndex = mt,
 	};
 	VkDeviceMemory mem;
-	if (vkAllocateMemory(nrx_dev, &mai, NULL, &mem) != VK_SUCCESS) {
+	VkResult allocated = vkAllocateMemory(nrx_dev, &mai, NULL, &mem);
+	if (allocated != VK_SUCCESS) {
 		vkDestroyBuffer(nrx_dev, buf, NULL);
 		nrx_fail("vkAllocateMemory (import)");
+		/* The number, every time. A refusal reported by name alone cannot be told
+		 * apart from any other, and two days of the log went by with 1164 of them
+		 * read as one thing when they were two: first "the exported buffer is too
+		 * small", the layer's own arithmetic, then this, the driver's answer to a
+		 * handle that was never this process's to import. VK_ERROR_INVALID_EXTERNAL_
+		 * HANDLE is -17, VK_ERROR_OUT_OF_DEVICE_MEMORY -2; whatever it is, it is
+		 * the only thing here that says which. */
+		nr_layer_log("the import was refused: %llu bytes of handle %llu "
+			     "into memory type %u, VkResult %d",
+			     (unsigned long long)req.size, handle, mt, (int)allocated);
 		return -1;
 	}
 	if (vkBindBufferMemory(nrx_dev, buf, mem, 0) != VK_SUCCESS) {
