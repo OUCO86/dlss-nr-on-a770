@@ -422,3 +422,46 @@ in the `[Hotfix]` section. The official build it replaced is at
 **Not yet known:** whether the probe prints motion vectors at all, what size they
 are, and what the scale is. That is the next observation, and nothing is built on
 top of it until it has been made.
+
+## 13. What the probe printed, 2026-10-12 21:04
+
+The user launched Lies of P with FSR selected, as before. `OptiScaler.log`, verbatim:
+
+    [21:04:36.784051] [I] NrBridge::ProbeBeforeUpscale NrBridge frame 0 cmdList=0x22bf9d67cd0
+      960x540 mv=(960,540) jitter=(0.125,0.278) preExp=0.360 reset=0 |
+      color=960x540 R11G11B10_FLOAT(26) rt uav | mv=960x540 R16G16_FLOAT(34) rt uav |
+      depth=1920x1080 R32G8X24_TYPELESS(19)
+    [21:04:36.784065] [I] NrBridge::ProbeBeforeUpscale NrBridge contract:
+      motion=true depth=true exposure=false backend=xess
+
+**Motion vectors arrive, and they are the engine's.** Read off that line:
+
+- `color` 960x540 `R11G11B10_FLOAT`, rt + uav — low dynamic range render target at render
+  resolution, which is what pre-SR means here.
+- `mv` 960x540 `R16G16_FLOAT`, rt + uav — two channels, float, **the same size as the
+  colour**, i.e. render-resolution vectors, matching the host's `LowResMV: true`.
+- `mv=(960,540)` — the scale is exactly the frame size, both components positive. It is
+  worth saying plainly how different that is from the only other number we had: the B580
+  project recorded `xessSetVelocityScale=(2,-2)`. Same host, same output backend, different
+  game, different convention. This is the entire reason the probe exists and the reason
+  `check_motion_convention` has to run on real frames rather than on a belief.
+- `jitter` changes every frame (0.125/0.278, then -0.125/-0.278, then 0.375/0.056 ...)
+  while the init flags say `JitteredMV: false`. So the colour is jittered and the vectors
+  are not — the case a temporal pass wants, and the case where forgetting to unjitter
+  produces the artefact we are chasing.
+- `preExp` 0.360, then 0.250, then 1.000 later on. It moves, so it has to be read per
+  frame and not captured once.
+- `exposure=false` — this game hands no exposure texture, so the scalar is all there is.
+- `depth` is 1920x1080 on the first two frames and 960x540 from the third onward. Not
+  explained. Either the game is still resizing during the first evaluates, or the first
+  two frames carry a different buffer. It settles, so it is recorded rather than chased,
+  but a pass that reads depth must not assume the first frame is representative.
+
+One thing the run also settled that was only argued before: the render resolution is
+**960x540 here and was 1130x636 in the earlier log**. The user changed quality preset
+between the two runs. Nothing in the bridge or the core has a fixed size, and §9's claim
+that the extent follows the frame is now observed rather than read from the source.
+
+**What this run did not do: change a single pixel.** The probe reads and prints. The
+absence of any visible difference, and the absence of a menu entry, are both correct for
+this stage — there is nothing yet to switch on.
