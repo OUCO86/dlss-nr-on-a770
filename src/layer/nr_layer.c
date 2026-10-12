@@ -265,6 +265,15 @@ static int capture_armed;      /* a press is waiting for its answer */
 static int capture_sent;       /* that press's input frame is written */
 static unsigned long armed_at; /* the frame the press happened on */
 static unsigned long sent_at;  /* the frame its input went out on */
+/* A key press comes from inside the game and is taken at once. A file can
+ * only be made from outside it, which means the game has lost focus and
+ * comes back showing its own menu - clearing that costs a click and the
+ * walk back to where the player was. So the file waits this long before
+ * the pair is taken, counted from the moment the layer first sees it.
+ */
+static unsigned long long wait_until;   /* GetTickCount64 goal */
+static unsigned long long wait_stamp;   /* the write time it armed against */
+static long capture_file_delay_ms = 10000;
 /* NR_CAPTURE_FILE: fires a pair when the file exists, then deletes it. The
  * key is the convenient way in; this is the one that cannot be swallowed by
  * the game, and it is how NR is turned on and off here anyway. */
@@ -1373,6 +1382,9 @@ VKAPI_ATTR VkResult VKAPI_CALL nr_CreateInstance(const VkInstanceCreateInfo *inf
 		const char *hotkey = getenv("NR_CAPTURE_KEY");
 		capture_key = hotkey ? (int)strtol(hotkey, NULL, 0) : 0;
 		capture_file_path = getenv("NR_CAPTURE_FILE");
+		const char *delay = getenv("NR_CAPTURE_DELAY_MS");
+		capture_file_delay_ms = delay ? strtol(delay, NULL, 10) : 10000;
+		if (capture_file_delay_ms < 0) capture_file_delay_ms = 0;
 		const char *sync = getenv("NR_LAYER_SYNC");
 		(void)sync;
 		const char *live = getenv("NR_LAYER_LIVE");
@@ -1410,8 +1422,10 @@ VKAPI_ATTR VkResult VKAPI_CALL nr_CreateInstance(const VkInstanceCreateInfo *inf
 				"one pair, nothing is written otherwise",
 				(unsigned)capture_key);
 		if (capture_file_path)
-			nr_layer_log("capture trigger: creating %s takes one pair and the "
-				"layer deletes it again", capture_file_path);
+			nr_layer_log("capture trigger: creating %s takes one pair %ld ms "
+				"later - long enough to be back in the level, not on the menu - "
+				"and the layer deletes it again", capture_file_path,
+				capture_file_delay_ms);
 		nr_layer_log("active; socket=%s trigger=%s capture=%s%s%s every=%ld",
 			socket_path ? socket_path : "(none)",
 			trigger_path ? trigger_path : "(none)",
@@ -1865,6 +1879,38 @@ static int mask_worth_sending(uint32_t held, uint32_t pixels)
  * the daemon answered with. Sixteen bytes of header first, then the pixels. Two
  * files are the only way to tell a seam the network made from one the game's own
  * bloom already had. */
+/* The trigger file may carry its own number of milliseconds, so a script can
+ * ask for more than the default without touching the environment the game was
+ * started with. Anything unreadable falls back to that default.
+ */
+static long file_delay_ms(const char *path)
+{
+	FILE *handle = fopen(path, "rb");
+	if (!handle) return capture_file_delay_ms;
+	char text[32];
+	size_t got = fread(text, 1, sizeof(text) - 1, handle);
+	fclose(handle);
+	if (got) {
+		text[got] = '\0';
+		long asked = strtol(text, NULL, 10);
+		if (asked > 0) return asked;
+	}
+	return capture_file_delay_ms;
+}
+
+/* Writing the file again restarts the wait, so a double-click that caught the
+ * player halfway through is a request for more time rather than a second pair.
+ */
+static unsigned long long file_write_time(const char *path)
+{
+	WIN32_FILE_ATTRIBUTE_DATA info;
+	memset(&info, 0, sizeof info);
+	if (!path || !GetFileAttributesExA(path, GetFileExInfoStandard, &info))
+		return 0;
+	return ((unsigned long long)info.ftLastWriteTime.dwHighDateTime << 32) |
+	       (unsigned long long)info.ftLastWriteTime.dwLowDateTime;
+}
+
 static void write_capture(const char *path, const struct swapchain_data *chain,
 			  const unsigned char *pixels, VkDeviceSize needed,
 			  uint32_t magic)
@@ -2138,11 +2184,33 @@ static VkResult present_locked(VkQueue queue,
 		int file_waiting = capture_file_path &&
 			access(capture_file_path, F_OK) == 0;
 		if (!capture_armed) {
-			if (fired || file_waiting) {
+			if (fired) {
+				/* Pressed from inside the game: what was on screen is what the
+				 * player meant, so take that frame now. */
 				capture_armed = 1;
 				capture_sent = 0;
 				armed_at = data->frame_counter;
 				sent_at = data->frame_counter;
+				wait_until = wait_stamp = 0;
+			} else if (file_waiting) {
+				unsigned long long stamp = file_write_time(capture_file_path);
+				if (!wait_until || stamp != wait_stamp) {
+					wait_until = GetTickCount64() +
+						(unsigned long long)file_delay_ms(capture_file_path);
+					wait_stamp = stamp;
+					nr_layer_log("capture: the trigger file arrived, taking "
+						"the pair in %ld ms so the menu is gone by then",
+						file_delay_ms(capture_file_path));
+				} else if (GetTickCount64() >= wait_until) {
+					capture_armed = 1;
+					capture_sent = 0;
+					armed_at = data->frame_counter;
+					sent_at = data->frame_counter;
+					wait_until = wait_stamp = 0;
+					nr_layer_log("capture: taking this frame");
+				}
+			} else {
+				wait_until = wait_stamp = 0;   /* taken away before its moment */
 			}
 		} else if (data->frame_counter - armed_at > 30) {
 			/* Thirty frames without an answer: let the pair go rather than arm
