@@ -78,6 +78,7 @@ typedef pthread_mutex_t nr_mutex_t;
 #endif
 #ifdef _WIN32
 #include <windows.h>
+#pragma comment(lib, "user32.lib") /* GetAsyncKeyState, for the capture hotkey */
 #include <process.h>
 #ifndef R_OK
 #define R_OK 4
@@ -253,6 +254,15 @@ static void remember_instance(VkInstance instance, PFN_vkGetInstanceProcAddr nex
 static const char *capture_path;
 static const char *capture_out_path;
 static long capture_every;
+/* NR_CAPTURE_KEY: a virtual-key code. Nothing is written while the key is up;
+ * one press captures one pair - the frame sent to the daemon and the answer
+ * that comes back - so loading screens never pay for capture. The every-N
+ * mode it replaces wrote 16 MB from inside present and ran the game at 23 fps.
+ */
+static int capture_key;
+static int capture_armed;      /* a press is waiting for its answer */
+static int capture_sent;       /* that press's input frame is written */
+static unsigned long armed_at; /* the frame the press happened on */
 static long live_every;
 static int async_live;
 /* How many frames process_frame_async lets out before it starts collecting answers:
@@ -1355,6 +1365,8 @@ VKAPI_ATTR VkResult VKAPI_CALL nr_CreateInstance(const VkInstanceCreateInfo *inf
 		ui_mask = mask && strcmp(mask, "0") != 0;
 		const char *every = getenv("NR_LAYER_EVERY");
 		capture_every = every ? strtol(every, NULL, 10) : 0;
+		const char *hotkey = getenv("NR_CAPTURE_KEY");
+		capture_key = hotkey ? (int)strtol(hotkey, NULL, 0) : 0;
 		const char *sync = getenv("NR_LAYER_SYNC");
 		(void)sync;
 		const char *live = getenv("NR_LAYER_LIVE");
@@ -1387,6 +1399,10 @@ VKAPI_ATTR VkResult VKAPI_CALL nr_CreateInstance(const VkInstanceCreateInfo *inf
 			nr_layer_log("live runs while the trigger exists; "
 				"remove it to hand the game back");
 		nr_layer_log("sync: present waits + private fences (readback and writeback)");
+		if (capture_key)
+			nr_layer_log("capture hotkey: virtual-key 0x%x - one press takes "
+				"one pair, nothing is written while the key is up",
+				(unsigned)capture_key);
 		nr_layer_log("active; socket=%s trigger=%s capture=%s%s%s every=%ld",
 			socket_path ? socket_path : "(none)",
 			trigger_path ? trigger_path : "(none)",
@@ -1880,7 +1896,10 @@ static int process_frame(struct device_data *data, struct swapchain_data *chain,
 
 	uint32_t header[4] = { masked ? 0x314E524Eu : 0x304E524Eu, chain->extent.width,
 			       chain->extent.height, (uint32_t)chain->format };
-	write_capture(capture_path, chain, data->mapped, needed, header[0]);
+	if (!capture_key || (capture_armed && !capture_sent)) {
+		write_capture(capture_path, chain, data->mapped, needed, header[0]);
+		capture_sent = 1;
+	}
 	if (!socket_path) return -1;
 	/* The mask travels immediately after the colour, one byte a pixel. */
 	if (masked) {
@@ -1891,6 +1910,7 @@ static int process_frame(struct device_data *data, struct swapchain_data *chain,
 		}
 		memcpy(data->mapped, data->result, (size_t)needed);
 		write_capture(capture_out_path, chain, data->mapped, needed, header[0]);
+		capture_armed = capture_sent = 0;
 		nr_layer_log("processed %ux%u with a ui mask",
 			chain->extent.width, chain->extent.height);
 		return 0;
@@ -1902,6 +1922,7 @@ static int process_frame(struct device_data *data, struct swapchain_data *chain,
 	}
 	memcpy(data->mapped, data->result, (size_t)needed);
 	write_capture(capture_out_path, chain, data->mapped, needed, header[0]);
+	capture_armed = capture_sent = 0;
 	nr_layer_log("processed %ux%u", chain->extent.width,
 		chain->extent.height);
 	return 0;
@@ -1950,7 +1971,10 @@ static int process_frame_async(struct device_data *data, struct swapchain_data *
 	if (socket_path) {
 		uint32_t header[4] = { 0x304E524Eu, chain->extent.width, chain->extent.height,
 				       (uint32_t)chain->format };
-		write_capture(capture_path, chain, data->mapped, needed, header[0]);
+		if (!capture_key || (capture_armed && !capture_sent)) {
+			write_capture(capture_path, chain, data->mapped, needed, header[0]);
+			capture_sent = 1;
+		}
 		int fd = exchange_send(header, sizeof header, data->mapped, (size_t)needed,
 				       (size_t)needed);
 		if (fd >= 0 && data->inflight_count < NR_INFLIGHT_MAX) {
@@ -1965,6 +1989,7 @@ static int process_frame_async(struct device_data *data, struct swapchain_data *
 	if (!answered) return -1;
 	memcpy(data->mapped, data->result, (size_t)needed);
 	write_capture(capture_out_path, chain, data->mapped, needed, 0x304E524Eu);
+	capture_armed = capture_sent = 0;
 	return 0;
 }
 
@@ -2075,7 +2100,19 @@ static VkResult present_locked(VkQueue queue,
 	 * no input hooking inside another process's window, and can be set from a script
 	 * or a hotkey daemon. While it exists the processed frame is held on screen. */
 	int wanted = trigger_path && access(trigger_path, F_OK) == 0;
-	if (!wanted && capture_every > 0)
+	if (!wanted && capture_key) {
+		/* The hotkey replaces every-N: a press arms one pair, and the frames
+		 * stay armed until the answer is back so async mode pairs correctly.
+		 * The cap keeps a press from sticking if the daemon stops answering. */
+		if (!capture_armed && (GetAsyncKeyState(capture_key) & 0x8000)) {
+			capture_armed = 1;
+			capture_sent = 0;
+			armed_at = data->frame_counter;
+		} else if (capture_armed && data->frame_counter - armed_at > 30) {
+			capture_armed = capture_sent = 0;
+		}
+		wanted = capture_armed != 0;
+	} else if (!wanted && capture_every > 0)
 		wanted = data->frame_counter % (unsigned long)capture_every == 0;
 
 	for (uint32_t i = 0; i < info->swapchainCount; i++) {
