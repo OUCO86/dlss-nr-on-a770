@@ -255,3 +255,75 @@ Archived at `refs/optiscaler/`: official `README.md`, `Features.md`, `Spoofing.m
 `Config.md`, the compatibility list, the Unreal Engine tweaks page, and issue #15 verbatim —
 plus `TheAutomatic`'s README, `docs/mochizuki.md` and `docs/architecture/overview.md`. Chinese
 summary with the verbatim/paraphrase distinction marked: `refs/optiscaler/提炼.md`.
+
+## 10. Where the code goes, now that the host has been seen running
+
+Upstream v0.9.4 is cloned at `src/OptiScaler` (`--depth 1`, tag `v0.9.4`), so these are lines
+in code we hold, not lines recollected from a browser.
+
+**The insertion point.** `OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp:949`:
+
+    evalResult = deviceContext->feature->Evaluate(InCmdList, InParameters);
+
+`TheAutomatic` hangs his pass *after* that line, on the upscaler's output. Our input is
+pre-SR, so ours goes *before* it, on `Color`. Same file, same function, the other side of the
+same call.
+
+**What is in `InParameters` at that point.** For this game the inputs arrive through the FFX
+path, `inputs/FfxApi_Dx12.cpp:614-636`, verbatim:
+
+    params->Set(NVSDK_NGX_Parameter_Jitter_Offset_X, dispatchDesc->jitterOffset.x);
+    params->Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, dispatchDesc->jitterOffset.y);
+    params->Set(NVSDK_NGX_Parameter_MV_Scale_X, dispatchDesc->motionVectorScale.x);
+    params->Set(NVSDK_NGX_Parameter_MV_Scale_Y, dispatchDesc->motionVectorScale.y);
+    params->Set(NVSDK_NGX_Parameter_DLSS_Pre_Exposure, dispatchDesc->preExposure);
+    params->Set(NVSDK_NGX_Parameter_Reset, dispatchDesc->reset ? 1 : 0);
+    params->Set(NVSDK_NGX_Parameter_Width, dispatchDesc->renderSize.width);
+    params->Set(NVSDK_NGX_Parameter_Height, dispatchDesc->renderSize.height);
+    params->Set(NVSDK_NGX_Parameter_Depth, dispatchDesc->depth.resource);
+    params->Set(NVSDK_NGX_Parameter_ExposureTexture, dispatchDesc->exposure.resource);
+    params->Set(NVSDK_NGX_Parameter_Color, dispatchDesc->color.resource);
+    params->Set(NVSDK_NGX_Parameter_MotionVectors, dispatchDesc->motionVectors.resource);
+    params->Set(NVSDK_NGX_Parameter_Output, dispatchDesc->output.resource);
+
+That is the whole shopping list, and `MV_Scale_X/Y` is in it — the value our
+`check_motion_convention` exists to pin down, handed to us by the engine instead of guessed.
+The log's `LowResMV: true` says the vectors are at render resolution; `MV_Scale` is what turns
+them into pixels, and the sign of the second component is exactly the trap recorded from the
+Intel-Arc project in section 8.
+
+**The shape, taken from his module and not invented.** His `dlssnr/README.md` states the
+terms plainly: no compile switch, because "code behind an `#if` was code nobody compiled and
+therefore nobody tested"; the call sites are one line each; deleting the module is deleting
+them. Six of them, of which the ones that matter to us are the two in
+`inputs/NVNGX_DLSS_Dx12.cpp` (one per evaluate route), the one in
+`upscalers/IFeature_VkwDx12.cpp` (the Vulkan-on-D3D12 bridge — the mirror image of what we
+need), and the three in `Config.h` / `Config.cpp`. We take the same shape: a directory beside
+his, a handful of one-line call sites, no switch.
+
+**Where we differ, and it is only the far end.** His module calls `nvngx_dlssnr.dll`. Ours
+calls our own core, through a single C-ABI export, from a DLL the host does not link. The
+frame crosses as handles and sizes, not as pixels on the host's side:
+
+    struct NrBridgeFrame {           // what the host-side line hands over
+        void* color; void* depth; void* motionVectors;
+        unsigned renderWidth, renderHeight;      // from NGX Width/Height
+        unsigned displayWidth, displayHeight;
+        float jitterX, jitterY;                  // Jitter_Offset_*
+        float mvScaleX, mvScaleY;                // MV_Scale_*
+        float preExposure;                       // DLSS_Pre_Exposure
+        int   reset;                             // Reset
+    };
+
+Field by field that is the list above and nothing added. If a field cannot be read, the field
+is absent rather than defaulted, and the core falls back to identity — the same rule we
+already hold for `confidence=0`.
+
+**Failure.** His header: "it builds what it needs on first use and disables itself for the
+session if anything fails, rather than retrying into a crash." Ours says the same thing: one
+failure closes the pass for the frame, and the game keeps the frame it already had.
+
+**Not yet known.** How the solution builds here: which MSVC it wants, whether its submodules
+are needed for the parts we touch, and whether `dxgi.dll` we ship has to be built whole or can
+be built with only our module changed. That is the next thing to find out, by building it, and
+it is not estimated in advance.

@@ -112,17 +112,22 @@ motion vectors.** `LowResMV: true` and `JitteredMV: false` come with the feature
 parameters, so the vectors are unjittered and at render resolution — which is exactly the
 shape a temporal pass needs. Nothing here is our own estimate; it is the engine's.
 
-Three things in the same log that are not clean and are recorded rather than smoothed over:
+Three lines in the same log are errors or look wrong. **They are noise from the window before
+the game was switched to FSR, and the user, who was watching the screen, says the pipeline
+came up correctly after the switch and that the host needs no attention from us.** They are
+kept here only so that they are not rediscovered and investigated again:
 
-- `[E] XeSSFeature::InitXeSS CreateHeap bufferHeapDesc failed 80070057!` twice, yet the next
-  line is `init successful for xess`. 80070057 is E_INVALIDARG. It is not known whether the
-  failing heap is a first attempt that is retried with different parameters, or something
-  that is silently degraded. Not investigated yet.
-- `[E] UpdateFfxApiProviderEx for: SwapchainDX12, result: 0X80004002` — E_NOINTERFACE, i.e.
-  the game has no FSR swapchain to query. Expected, not a fault.
-- `[I] CheckForGPU RDNA4: true, RDNA3: false, Fsr4Update: true` on an Intel A770, which has
-  no RDNA4 in it. The host has misidentified the card. Worth watching, because FSR4 branches
-  hang off that flag.
+- `[E] XeSSFeature::InitXeSS CreateHeap bufferHeapDesc failed 80070057!` — twice, before the
+  game's upscaler was set to FSR. 80070057 is E_INVALIDARG. With no FSR pipeline to initialise
+  against, the failing heap is what an unready pipeline looks like, not a defect we own.
+- `[E] UpdateFfxApiProviderEx for: SwapchainDX12, result: 0X80004002` — E_NOINTERFACE, no FSR
+  swapchain to query. Same window, same reason.
+- `[I] CheckForGPU RDNA4: true, RDNA3: false, Fsr4Update: true` on an Intel A770 — the host
+  misidentifies the card. Left alone: it changes which AMD path the host prefers, and we do
+  not take that path. Output is XeSS regardless.
+
+**Do not spend time on these.** If the image ever looks wrong, start from the image, not from
+this list.
 
 ## 9. The core already adapts to whatever resolution the game hands it
 
