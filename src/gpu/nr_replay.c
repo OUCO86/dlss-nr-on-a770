@@ -667,7 +667,26 @@ static int prepare_fused(replay *r)
 	/* 65539: whether the history is this frame's own colour. It starts set, because
 	 * there is no history behind the first frame. */
 	table[65539u] = 1.0f;
-	r->table = f_buf_create_kind(table_bytes, 0);
+	/* Host-visible, and the kind is the whole of the reason.
+	 *
+	 * This table is eight bytes of frame: the pre-exposure and whether the history is
+	 * this frame's own colour, written before the graph runs and read twice by it --
+	 * once by the input pass, once by the composition. Everything else about the frame
+	 * crosses in a copy the device does on its own; these eight bytes were crossing as
+	 * a staging transfer, which on a card without resizable BAR means a submit on the
+	 * graph's own queue and a fence wait behind it (libxmx.c:1818 stage_copy, which
+	 * memcpy's a mapped buffer and does not do any of that).
+	 *
+	 * It measured 81ms over 35 calls with a single call at 41ms, against a frame that is
+	 * 63ms -- which is the forty-five milliseconds that made one frame in three cost
+	 * 107 instead of 63, and that is the flicker.
+	 *
+	 * Kind 1 is the host-visible one: `unmapped = kind == 0 && g.unmapped` (libxmx.c:1321)
+	 * is false for it, so the buffer is mapped and the write is a memcpy. It costs a
+	 * cross of the bus for the few cache lines the shaders read, which is four bytes at
+	 * a uniform index and nothing per pixel -- and it is the only way to hand the graph a
+	 * value that changes every frame without putting a queue round trip in front of it. */
+	r->table = f_buf_create_kind(table_bytes, 1);
 	if (r->table < 0) {
 		free(table);
 		return r->why = "the gate table's buffer would not come up", -1;
@@ -1074,9 +1093,13 @@ int nr_net_time_report(nr_net* n, double* out, unsigned cap)
 	(void)n;
 	if (!f_time_report || !f_time_reset || !out || cap < 8)
 		return -1;
-	double v[8] = {};
-	f_time_report(v, 8);
-	for (unsigned i = 0; i < 8u; i++)
+	/* Twelve: the submit's three costs, then the staging transfers' total, slowest,
+	 * calls, and the room for one more the library keeps for itself. */
+	if (cap < 12u)
+		return -1;
+	double v[12] = {};
+	f_time_report(v, 12);
+	for (unsigned i = 0; i < 12u; i++)
 		out[i] = v[i];
 	/* Cleared after the read, so a report covers the frames since the last one and two
 	 * reports are not the same span counted twice. */
@@ -1219,58 +1242,6 @@ void *nr_net_features(nr_net *n)
 	return r ? r->in : NULL;
 }
 
-/* The network's own input, per channel: mean, lowest and highest of each of the sixteen.
- *
- * A mean of the whole buffer says nothing about which channel is wrong, and the sixteen are
- * where a wrong one hides: the noise is in 0-2, the colour in 4-6, the history in 7-9, a
- * control in 10-14, and a constant in 3 and 15. Forty-eight numbers say which.
- */
-int nr_net_probe_features(nr_net *n, float *out)
-{
-	if (!n || !out || !f_buf_download)
-		return -1;
-	replay *r = (replay *)n;
-	diagf("probe reads features buffer %d\n", r->features >= 0 ? r->ids[r->features] : -1);
-	if (r->features < 0 || r->ids[r->features] < 0)
-		return -1;
-
-	static const unsigned long long window = 1ull << 20;
-	const unsigned long long halfs = window / 2ull;
-	const unsigned long long total = (unsigned long long)nr_plan_extent[0] * nr_plan_extent[1] * 16ull;
-	const unsigned long long from = 0ull;
-	uint16_t *raw = (uint16_t *)malloc((size_t)window);
-	if (!raw)
-		return -1;
-	if (f_buf_download(r->ids[r->features], raw, from, window) != 0) {
-		free(raw);
-		return -1;
-	}
-
-	for (int c = 0; c < 16; c++) {
-		double sum = 0.0;
-		float low = 1e30f, high = -1e30f;
-		unsigned long long n = 0;
-		for (unsigned long long i = c; i < halfs; i += 16ull) {
-			const unsigned bits = raw[i];
-			const unsigned sign = (bits >> 15) & 1u, e = (bits >> 10) & 0x1Fu, m = bits & 0x3FFu;
-			float f = e == 0u ? (m / 1024.0f) * (float)ldexp(1.0, -14)
-			                  : (1.0f + m / 1024.0f) * (float)ldexp(1.0, (int)e - 15);
-			if (sign) f = -f;
-			sum += f;
-			if (f < low) low = f;
-			if (f > high) high = f;
-			n++;
-		}
-		diagf("feature %d: first %04X %04X %04X %04X", c, raw[c*8], raw[c*8+1], raw[c*8+2], raw[c*8+3]);
-		out[c * 3 + 0] = (float)(n ? sum / (double)n : 0.0);
-		out[c * 3 + 1] = low;
-		out[c * 3 + 2] = high;
-		diagf("feature %2d: mean %10.4f low %10.4f high %10.4f\n", c, out[c * 3 + 0], low, high);
-	}
-	free(raw);
-	return 0;
-}
-
 /* The input pass on its own, submitted outside the graph.
  *
  * One question this answers and the graph cannot: whether the pass writes the features at
@@ -1318,18 +1289,7 @@ unsigned long long nr_net_head_bytes(nr_net *n)
 }
 
 int nr_net_run(nr_net *n)
-{	/* The input pass writes the features, and the graph has not run yet: this is the
-	 * features as the input pass left them. The host's reading comes after the graph, and
-	 * the two together say whether the graph is what overwrites them. A megabyte is read
-	 * either way, so only the first frame and then every thirtieth: this is a diagnostic
-	 * and a diagnostic that costs a frame is not one. */
-	static int beforeTick = 0;
-	if (beforeTick++ % 30 == 0) {
-		float channels[48] = {};
-		diagf("features BEFORE the graph://n");
-		nr_net_probe_features(n, channels);
-	}
-
+{
 	replay *r = (replay *)n;
 	if (!r || r->why || r->features < 0 || r->head < 0)
 		return -1;

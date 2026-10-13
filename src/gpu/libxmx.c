@@ -171,6 +171,16 @@ static unsigned subm_frames;
 static double subm_submit_max, subm_wait_max, subm_collect_max;
 static int time_submit;
 
+/* The staging transfer's own cost, which is a different queue interaction again: a
+ * buffer that cannot be mapped goes through `stage_copy`'s staging branch, and that ends
+ * in `submit_transfer` -- a submit on the same queue the game is waiting on, and a
+ * `vkWaitForFences` behind it. The exposure of this frame goes in that way, every frame.
+ *
+ * Counted apart from the submit's three because it is not one of them: that is the
+ * graph's submit, and this is a transfer in front of it. */
+static double stage_ms, stage_max;
+static unsigned stage_calls, stage_blocks;
+
 /* The wall clock, in milliseconds. QueryPerformanceCounter rather than anything else:
  * it is what the host's own timings use, so the numbers here and the ones beside them
  * in the log are the same clock, and it counts while the CPU is inside a driver call --
@@ -1818,25 +1828,42 @@ static int ensure_stage(VkDeviceSize size)
 static int stage_copy(int to_device, int id, const void *src, void *dst,
 		      unsigned long long offset, unsigned long long bytes)
 {
-	if (id < 0 || id >= MAX_RBUF || !rbufs[id].live) FAIL("buffer is not live", 0);
-	if (offset + bytes > rbufs[id].size) FAIL("transfer runs past the buffer", 0);
-	if (!bytes) return 0;
+	/* Taken before the two branches below, so a mapped buffer is measured as the memcpy
+	 * it is and a staging one as the round trip through the queue it is. The two are not
+	 * the same thing by anything like the same cost, and which one a buffer gets is
+	 * `want_unmapped`'s decision about the card, not the caller's. */
+	const double s0 = time_submit ? wall_ms() : 0.0;
+#define STAGE_DONE() do { \
+		if (time_submit) { \
+			const double s1 = wall_ms(); \
+			stage_ms += s1 - s0; \
+			stage_calls++; \
+			if (s1 - s0 > stage_max) stage_max = s1 - s0; \
+		} \
+	} while (0)
+
+	if (id < 0 || id >= MAX_RBUF || !rbufs[id].live) { STAGE_DONE(); FAIL("buffer is not live", 0); }
+	if (offset + bytes > rbufs[id].size) { STAGE_DONE(); FAIL("transfer runs past the buffer", 0); }
+	if (!bytes) { STAGE_DONE(); return 0; }
 	if (rbufs[id].mapped) {
 		unsigned char *p = (unsigned char *)rbufs[id].p + offset;
 		if (to_device) memcpy(p, src, (size_t)bytes);
 		else memcpy(dst, p, (size_t)bytes);
+		STAGE_DONE();
 		return 0;
 	}
-	if (ensure_stage((VkDeviceSize)bytes)) return -1;
+	if (ensure_stage((VkDeviceSize)bytes)) { STAGE_DONE(); return -1; }
 	if (to_device) memcpy(g.stage.p, src, (size_t)bytes);
-	if (begin_transfer()) return -1;
+	if (begin_transfer()) { STAGE_DONE(); return -1; }
 	VkBufferCopy region = { .srcOffset = to_device ? 0 : offset,
 				.dstOffset = to_device ? offset : 0, .size = bytes };
 	if (to_device) vkCmdCopyBuffer(g.tcb, g.stage.b, rbufs[id].b, 1, &region);
 	else vkCmdCopyBuffer(g.tcb, rbufs[id].b, g.stage.b, 1, &region);
-	if (submit_transfer()) return -1;
+	if (submit_transfer()) { STAGE_DONE(); return -1; }
 	if (!to_device) memcpy(dst, g.stage.p, (size_t)bytes);
+	STAGE_DONE();
 	return 0;
+#undef STAGE_DONE
 }
 
 /* Clearing a buffer the host cannot address is the device's job, and it has to work
@@ -3521,6 +3548,8 @@ void xmx_time_reset(void)
 	subm_submit_ms = subm_wait_ms = subm_collect_ms = 0.0;
 	subm_submit_max = subm_wait_max = subm_collect_max = 0.0;
 	subm_frames = 0;
+	stage_ms = stage_max = 0.0;
+	stage_calls = stage_blocks = 0;
 }
 
 int xmx_time_submit(int on)
@@ -3544,6 +3573,12 @@ void xmx_time_report(double* out, unsigned n)
 	out[3] = subm_wait_ms;    out[4] = subm_wait_max;
 	out[5] = subm_collect_ms; out[6] = subm_collect_max;
 	out[7] = subm_frames > 0 ? (subm_submit_ms + subm_wait_ms + subm_collect_ms) / subm_frames : 0.0;
+	/* Two more: the staging transfers in total and the slowest one, which is the round
+	 * trip through the queue that a buffer which cannot be mapped costs. */
+	out[8] = stage_ms;
+	out[9] = stage_max;
+	out[10] = (double)stage_calls;
+	out[11] = (double)stage_blocks;
 }
 
 void xmx_profile_reset(void)

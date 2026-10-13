@@ -114,9 +114,15 @@ NR_NET_API void nr_net_profile_reset(nr_net *);
 
 /* The submit's three costs, which the pass timings cannot see: the CPU handing the work
  * over, the CPU waiting for it, and the read-back. `nr_net_time_submit(n, 1)` turns the
- * counting on; `nr_net_time_report(n, out, 8)` reads it back into eight numbers --
- * frames, submit total, submit max, wait total, wait max, collect total, collect max,
- * and the mean of the three -- and clears the span, so one report is one span.
+ * counting on; `nr_net_time_report(n, out, 12)` reads it back into twelve
+ * numbers -- frames, submit total, submit max, wait total, wait max, collect total,
+ * collect max, the mean of the three, and then the staging transfers' total, slowest,
+ * call count -- and clears the span, so one report is one span.
+ *
+ * The staging transfers are the frame's exposure and the diagnostics' reads. A buffer
+ * the card will not let the host map goes through a copy on the same queue the game is
+ * waiting on, behind a fence wait, and that is a cost the submit's three do not
+ * include.
  *
  * Off until asked: three clock reads a frame, which is not what a game should pay for a
  * diagnostic. */
