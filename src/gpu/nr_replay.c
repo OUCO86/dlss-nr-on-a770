@@ -1022,6 +1022,30 @@ int nr_net_exposure(nr_net* n, float value, int fresh)
 	return f_buf_upload(r->table, pair, 65538u * 4ull, sizeof pair);
 }
 
+/* Whether the model's edit is applied to the picture, as a number the composition
+ * blends by. Zero is the picture the network read, unchanged.
+ *
+ * The reference calls the switch `apply_model` and is explicit about what it is not:
+ * turning it off does not stop the pass, it only stops its answer being used, so a
+ * frozen frame can be toggled and compared and the frame cost stays the same on both
+ * sides (`ta_DlssNr_Menu.cpp`, "Off shows the clean upscaler frame while the pass
+ * keeps running"). That is why this is a value in the frame's own table rather than a
+ * branch around the run: the network runs either way, and only the blend moves.
+ *
+ * `nr_post.comp` reads it at 65536 and computes `rgb + blend * (predicted - rgb)`, so
+ * zero is exactly the input colour -- not an approximation of it, which is what makes
+ * it a clean A/B. `nr_net_fuse` seeds it at 1.0.
+ *
+ * Same shape and the same buffer as `nr_net_exposure` above: a host-visible write of
+ * one float, no synchronisation, so it can be asked for on a running frame. */
+int nr_net_intensity(nr_net* n, float value)
+{
+	replay *r = (replay *)n;
+	if (!r || r->table < 0)
+		return -1;
+	return f_buf_upload(r->table, &value, 65536u * 4ull, sizeof value);
+}
+
 /* Start the per-pass timing. Free when it is off: libxmx's own comment says a stamp is a
  * command-buffer write and not a synchronisation point, so the frame it measures is the
  * frame that would have run. It costs one query per pass -- 417 of them -- which is not

@@ -100,6 +100,18 @@ NR_NET_API int nr_net_pre_alone(nr_net *);   /* 0 = the colour in, 1 = the answe
 
 NR_NET_API int nr_net_exposure(nr_net *, float, int fresh);
 
+/* Whether the model's edit is applied, as the number the composition blends by. Zero
+ * is the frame's own colour, exactly: `nr_post.comp` computes `rgb + blend *
+ * (predicted - rgb)`, so zero is the input rather than a lookalike.
+ *
+ * The network runs either way. This is the reference's `apply_model`, whose own note
+ * is that turning it off "shows the clean upscaler frame while the pass keeps running"
+ * (`ta_DlssNr_Menu.cpp`) -- so a frozen frame can be toggled and compared with the
+ * same cost on both sides. Seeded at 1.0 by `nr_net_fuse`.
+ *
+ * Safe to ask for on a running frame: one host-visible float, no synchronisation. */
+NR_NET_API int nr_net_intensity(nr_net *, float);
+
 /* Per-pass GPU timing, which libxmx already keeps (`xmx_profile`) and nothing asked for.
  * On: every recorded pass gains a timestamp query -- a command-buffer write, not a
  * synchronisation point -- so it costs a little and measures the frame that would have run.
