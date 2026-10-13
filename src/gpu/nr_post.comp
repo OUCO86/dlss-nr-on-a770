@@ -1,0 +1,201 @@
+#version 450
+/*
+ * nr_post — the network's fused image output, Mochi's Kind::Post / NR_FUSED_IMAGE_OUTPUT.
+ *
+ * Reads the head the network ended on and the colour it was given, composes them the way
+ * nr_image.c's temporal_pixel and finish_pixel do, and writes the answer back in the
+ * format the game handed the colour over in. It is the other half of nr_pre: between the
+ * two, a frame goes from the game's buffer to the network's and back without the host
+ * touching a pixel.
+ *
+ * The gate is the model's own, looked up: the logit is rounded to half first, so there
+ * are only 65536 of them and the table holds what NumPy's sigmoid gave for every one.
+ * The reference does the same rather than recomputing the exponential, because expf and
+ * NumPy's float32 exp disagree in the last bit and the contract is byte-identical output.
+ */
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) buffer FloatBuf { float v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer WordBuf { uint v[]; };
+
+layout(push_constant, scalar) uniform Push {
+    WordBuf a;              // the colour the network was given, R11G11B10
+    FloatBuf b;             // the head, (k, batch, 4) float32
+    FloatBuf c;             // the previous output, (k, batch, 3) float32
+    WordBuf d;              // where the answer goes, R11G11B10
+    uint m, n, k, batch;    // pixels on the source extent, 3, network height, width
+    uint sa, sb, sc, flags; // words to a row, source height, source width, 0
+    float p0, p1, p2, p3;   // p0/p1 the gate table's, p2/p3 the kept prediction's
+} pc;
+
+float half_(float x) { return unpackHalf2x16(packHalf2x16(vec2(x, 0.0f))).x; }
+
+/* nr_frame.truncate_half: the mantissa's low thirteen bits dropped, not rounded, and a
+ * subnormal a multiple of 2^-24. What the next frame's history is made of, which is
+ * why it is the prediction that is kept and not the composed output. */
+float truncate_half(float x)
+{
+    uint f = floatBitsToUint(x);
+    float kept = uintBitsToFloat(f & 0xffffe000u);
+    float small = floor(abs(x) * 16777216.0f) * exp2(-24.0f);
+    small = x < 0.0f ? -small : small;
+    return (f & 0x7fffffffu) >= 0x38800000u ? kept : small;
+}
+
+float decode11(uint v)
+{
+    uint e = (v >> 6u) & 0x1Fu, m = v & 0x3Fu;
+    return e == 0u ? 0.0f : float(64u + m) * exp2(float(e) - 21.0f);
+}
+
+float decode10(uint v)
+{
+    uint e = (v >> 5u) & 0x1Fu, m = v & 0x1Fu;
+    return e == 0u ? 0.0f : float(32u + m) * exp2(float(e) - 20.0f);
+}
+
+/* frexp leaves f in [0.5, 1), and the stored form wants (64 + m) / 64 with m in
+ * [0, 64), so the mantissa is 128f - 64 and the exponent is e + 14. */
+uint encode11(float v)
+{
+    if (!(v > 0.0f)) return 0u;
+    int e;
+    float f = frexp(v, e);
+    uint m = uint(clamp(128.0f * f - 64.0f + 0.5f, 0.0f, 63.0f));
+    int biased = e + 14;
+    if (biased >= 31) return 31u << 6u;
+    if (biased <= 0) return 0u;
+    return (uint(biased) << 6u) | m;
+}
+
+uint encode10(float v)
+{
+    if (!(v > 0.0f)) return 0u;
+    int e;
+    float f = frexp(v, e);
+    uint m = uint(clamp(64.0f * f - 32.0f + 0.5f, 0.0f, 31.0f));
+    int biased = e + 14;
+    if (biased >= 31) return 31u << 5u;
+    if (biased <= 0) return 0u;
+    return (uint(biased) << 5u) | m;
+}
+
+/* Scene-linear <-> the sRGB proxy the model was trained on (src/ref/nr_display.py):
+ * "The network was trained on a display-referred sRGB picture in [0, 1]." A game hands
+ * scene-linear, and the linear value read as sRGB is much darker than it is, which is
+ * a frame pressed towards black and not a frame that was denoised. */
+/* Scene-linear <-> the sRGB proxy the model was trained on (src/ref/nr_display.py):
+ * "The network was trained on a display-referred sRGB picture in [0, 1]." A game hands
+ * scene-linear, and a linear value read as sRGB is a darker pixel than it is. */
+
+/* Scene-linear -> the display-referred sRGB picture the model was trained on, which is
+ * what `encode` in src/ref/nr_display.py is: "Scene-linear HDR -> the sRGB proxy the
+ * model expects. The knee is on *luminance*, not per channel, so a bright saturated
+ * highlight rolls off without changing hue." That last part is the whole reason this is
+ * not a clamp and not a per-channel shoulder: this game's pixels have been measured past
+ * 1500, and both of those turn every one of them into the same white. */
+float luminance(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+
+
+/* `original` is scene-linear with the game's exposure already taken back out. Returns the
+ * proxy and, through `scale`, the factor that goes with it: the answer comes back as a
+ * ratio of the proxy, so the proxy's own scale has to be remembered. */
+vec3 to_proxy(vec3 original, out float scale)
+{
+    const vec3 display = max(original, vec3(0.0));
+    const float lit = luminance(display);
+    const float rolled = 0.75 + 0.25 * (1.0 - exp(-(lit - 0.75) / 0.25));
+    scale = lit > 0.75 ? rolled / max(lit, 1e-6) : 1.0;
+    return display * scale;
+}
+
+void main()
+{
+    uint pixel = gl_GlobalInvocationID.x;
+    if (pixel >= pc.m) return;
+    uint width = pc.sc;
+    uint x = pixel % width, y = pixel / width;
+
+    /* The network's extent is padded past the source's, so the head is indexed by the
+     * network's width while this dispatch walks the source's rows. */
+    uint network = y * pc.batch + x;
+
+    /* The gate table's address: bits, not a float's value -- see nr_pre.comp. */
+    FloatBuf table = FloatBuf(uint64_t(floatBitsToUint(pc.p0))
+                              | (uint64_t(floatBitsToUint(pc.p1)) << 32u));
+    const uint intensityAt = 65536u;
+    const uint confidenceAt = 65537u;
+    const uint exposureAt = 65538u;
+    float intensity = table.v[intensityAt];
+    float confidence = table.v[confidenceAt];
+    float exposure = table.v[exposureAt];
+
+    uint word = pc.a.v[y * pc.sa + x];
+    float rgb[3];
+    rgb[0] = decode11(word & 0x7FFu);
+    rgb[1] = decode11((word >> 11u) & 0x7FFu);
+    rgb[2] = decode10((word >> 22u) & 0x3FFu);
+    if (exposure > 0.0f)
+        for (uint ch = 0u; ch < 3u; ch++) rgb[ch] /= exposure;
+    /* The scene-referred value the input pass turned into a proxy, kept for the way back. */
+    float shown[3];
+    for (uint ch = 0u; ch < 3u; ch++) shown[ch] = rgb[ch];
+
+    /* The same proxy the input pass made, from the same number: the two halves of the cut
+     * have to agree on what the frame's brightness is. */
+    float proxyScale = 1.0;
+    const vec3 proxy = to_proxy(vec3(rgb[0], rgb[1], rgb[2]), proxyScale);
+    for (uint ch = 0u; ch < 3u; ch++) rgb[ch] = proxy[ch];
+
+    /* The gate: the model's own weight for the history, from the head's fourth channel
+     * by the table, then the confidence as NumPy applies it. */
+    uint bits = packHalf2x16(vec2(half_(pc.b.v[network * 4u + 3u]), 0.0f)) & 0xFFFFu;
+    float alpha = table.v[bits];
+    if (confidence != 1.0f) alpha *= confidence;
+
+    /* No clamp on the blend: the NumPy this transcribes does not clamp it either, and
+     * the vendor's clamp is the one thing the composition drops so that an intensity
+     * above 1 can extrapolate. */
+    float blend = intensity;
+    float predicted[3];
+    for (uint ch = 0u; ch < 3u; ch++) {
+        predicted[ch] = clamp(rgb[ch] + half_(pc.b.v[network * 4u + ch]) * 0.25f, 0.0f, 1.0f);
+        predicted[ch] += alpha * (pc.c.v[network * 3u + ch] - predicted[ch]);
+    }
+
+    /* Kept before the blend: the next frame's history is the model's own prediction,
+     * not what the composition made of it. */
+    /* The kept prediction's address, in the same two float slots. */
+    FloatBuf neural = FloatBuf(uint64_t(floatBitsToUint(pc.p2))
+                               | (uint64_t(floatBitsToUint(pc.p3)) << 32u));
+    for (uint ch = 0u; ch < 3u; ch++)
+        neural.v[network * 3u + ch] = truncate_half(predicted[ch]);
+
+    for (uint ch = 0u; ch < 3u; ch++)
+        predicted[ch] = clamp(rgb[ch] + blend * (predicted[ch] - rgb[ch]), 0.0f, 1.0f);
+
+    /* Back out of the proxy by the ratio, as `resolve` in src/ref/nr_display.py does:
+     * "No inverse tone curve: the model's ratio to the proxy is what carries over, so a
+     * highlight the proxy compressed comes back at the original's own level." Applying the
+     * model's answer as a ratio of the proxy in the proxy's own linear light is the same
+     * statement: a highlight the knee rolled off is back at the level it left from. */
+    for (uint ch = 0u; ch < 3u; ch++)
+    {
+        const float proxyLinear = proxy[ch];
+        const float modelLinear = predicted[ch];
+        const float ratio = proxyLinear > 1e-6f ? modelLinear / proxyLinear : 1.0f;
+        predicted[ch] = max(shown[ch] * ratio, 0.0f);
+    }
+
+    /* Back through the exposure the game had put on it, and into the game's format. */
+    if (exposure > 0.0f)
+        for (uint ch = 0u; ch < 3u; ch++) predicted[ch] *= exposure;
+    pc.d.v[y * pc.sa + x] = encode11(predicted[0]) | (encode11(predicted[1]) << 11u)
+                          | (encode10(predicted[2]) << 22u);
+}

@@ -105,6 +105,11 @@ COMMON = ["/nologo", "/c", "/O2", "/Ot", "/fp:fast", "/std:c++latest",
 # headers are handed to the A entry points.
 DEFS = ["/DNDEBUG", "/D_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR", "/D_WINDOWS", "/D_USRDLL",
         "/DUNICODE", "/D_UNICODE"]
+# Diagnostic build only (2026-10-13): the first frame records copy commands into the game's
+# list and Close() answers E_INVALIDARG, which is the list's error state -- debug layer names
+# the exact command and argument at record time. Remove this define for regular builds.
+if os.environ.get("OPTI_DEBUG_LAYER") == "1":
+    DEFS.append("/DENABLE_DEBUG_LAYER_DX12")
 
 log = open(LOG, "w", encoding="utf-8", errors="replace")
 

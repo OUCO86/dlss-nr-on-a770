@@ -1,0 +1,263 @@
+#version 450
+/*
+ * nr_pre — the network's fused image input, Mochi's Kind::Pre / NR_FUSED_IMAGE_INPUT.
+ *
+ * Reads the game's colour in the format the game left it in, reads its motion vectors,
+ * reprojects the previous output by them, and writes the sixteen feature channels
+ * straight into the buffer the graph's first GEMM reads.
+ *
+ * The point of the pass is that no pixel crosses to the host: the frame goes from the
+ * game's own buffer into the network's, which is what the reference does by keeping
+ * `Pre` a step of the plan beside the network's layers rather than a host pass feeding
+ * them (refs/DLSSNR-AMD/core/nr_native_plan.cpp, Kind::Pre).
+ *
+ * The five-tap Catmull-Rom and its bilinear are history.comp's, moved here so the
+ * reprojection and the feature packing are one dispatch: the coordinate is built
+ * exactly as that shader builds it, because a last-bit difference moves a tap.
+ */
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) buffer FloatBuf { float v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer WordBuf { uint v[]; };
+
+layout(push_constant, scalar) uniform Push {
+    WordBuf a;              // the colour, R11G11B10, `sa` words to a row
+    FloatBuf b;             // the motion, (source height, source width, 2), in pixels
+    FloatBuf c;             // the previous output, (k, batch, 3), float32
+    WordBuf d;              // the features, (k, batch, 16) fp16: eight words a pixel
+    uint m, n, k, batch;    // pixels on the network extent, 16, network height, width
+    uint sa, sb, sc, flags; // words to a row, source height, source width, 1 = uv given
+    float p0, p1, p2, p3;   // p0/p1 the plan's address, p2 the exposure to undo
+} pc;
+
+/* A float rounded to half and back. The reference rounds three times in a row and each
+ * one is a rounding, so this is called once per rounding and never folded. */
+float half_(float x) { return unpackHalf2x16(packHalf2x16(vec2(x, 0.0f))).x; }
+
+/* R11G11B10, unsigned, no sign bit: the exponent bias is 15 and the mantissa is
+ * implicit, so a normal is (64 + m) * 2^(e - 21). Zero exponent is zero here: the
+ * subnormals below 6e-5 are darker than anything the network was trained on, and the
+ * one branch they would cost is in the middle of a per-pixel loop. */
+float decode11(uint v)
+{
+    uint e = (v >> 6u) & 0x1Fu, m = v & 0x3Fu;
+    return e == 0u ? 0.0f : float(64u + m) * exp2(float(e) - 21.0f);
+}
+
+float decode10(uint v)
+{
+    uint e = (v >> 5u) & 0x1Fu, m = v & 0x1Fu;
+    return e == 0u ? 0.0f : float(32u + m) * exp2(float(e) - 20.0f);
+}
+
+/* Catmull-Rom collapsed onto bilinear taps: the two inner weights fold into one offset
+ * sample, which is why five taps stand in for sixteen. history.comp's, unchanged. */
+void catmull(float normalized, uint dimension,
+             out float outer0, out float middle, out float outer3,
+             out float weight0, out float weight3, out float gain)
+{
+    precise float pixel = normalized * float(dimension) - 0.5;
+    float base_index = floor(pixel);
+    float t = clamp(pixel - base_index, 0.0, 1.0);
+    float square = t * t, cube = square * t;
+    weight0 = -0.5 * t + square - 0.5 * cube;
+    float w1 = 1.0 - 2.5 * square + 1.5 * cube;
+    float w2 = 0.5 * t + 2.0 * square - 1.5 * cube;
+    weight3 = -0.5 * square + 0.5 * cube;
+    gain = w1 + w2;
+    float base = base_index + 0.5;
+    float lower = 0.5, upper = float(dimension) - 0.5;
+    outer0 = clamp(base - 1.0, lower, upper);
+    middle = clamp(base + w2 / gain, lower, upper);
+    outer3 = clamp(base + 2.0, lower, upper);
+}
+
+void bilinear(float x, float y, uint height, uint width, out float rgb[3])
+{
+    float px = x - 0.5, py = y - 0.5;
+    int x0 = int(clamp(floor(px), 0.0, float(width - 1u)));
+    int y0 = int(clamp(floor(py), 0.0, float(height - 1u)));
+    int x1 = min(x0 + 1, int(width - 1u));
+    int y1 = min(y0 + 1, int(height - 1u));
+    float tx = clamp(px - float(x0), 0.0, 1.0);
+    float ty = clamp(py - float(y0), 0.0, 1.0);
+    for (uint ch = 0u; ch < 3u; ch++) {
+        precise float top = pc.c.v[(uint(y0) * width + uint(x0)) * 3u + ch] * (1.0 - tx)
+                          + pc.c.v[(uint(y0) * width + uint(x1)) * 3u + ch] * tx;
+        precise float bottom = pc.c.v[(uint(y1) * width + uint(x0)) * 3u + ch] * (1.0 - tx)
+                             + pc.c.v[(uint(y1) * width + uint(x1)) * 3u + ch] * tx;
+        rgb[ch] = top * (1.0 - ty) + bottom * ty;
+    }
+}
+
+/* Scene-linear <-> the sRGB proxy the model was trained on (src/ref/nr_display.py):
+ * "The network was trained on a display-referred sRGB picture in [0, 1]." A game hands
+ * scene-linear, and the linear value read as sRGB is much darker than it is, which is
+ * a frame pressed towards black and not a frame that was denoised. */
+/* Scene-linear <-> the sRGB proxy the model was trained on (src/ref/nr_display.py):
+ * "The network was trained on a display-referred sRGB picture in [0, 1]." A game hands
+ * scene-linear, and a linear value read as sRGB is a darker pixel than it is. */
+/* The shoulder, as the reference's codec has it (native_codec_encode.hlsl):
+ *   float3 shoulder = 0.75 + 0.25 * (1.0 - exp(-5.770780 * (value-0.75)));
+ *   value = saturate(value <= 0.75 ? value : shoulder);
+ * A game hands scene-linear HDR -- this one's pixels reach past 1500 -- and a clamp
+ * turns every one of those into the same white, which leaves the network a frame of
+ * pure white beside pure black rather than a frame with a highlight in it. Rolling the
+ * highlight off keeps the difference between a highlight and the sky behind it. */
+float shoulder(float v)
+{
+    return v <= 0.75f ? v
+                      : clamp(0.75f + 0.25f * (1.0f - exp(-5.770780f * (v - 0.75f))), 0.0f, 1.0f);
+}
+
+/* Scene-linear -> the display-referred sRGB picture the model was trained on, which is
+ * what `encode` in src/ref/nr_display.py is: "Scene-linear HDR -> the sRGB proxy the
+ * model expects. The knee is on *luminance*, not per channel, so a bright saturated
+ * highlight rolls off without changing hue." That last part is the whole reason this is
+ * not a clamp and not a per-channel shoulder: this game's pixels have been measured past
+ * 1500, and both of those turn every one of them into the same white. */
+float luminance(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+
+
+/* `original` is scene-linear with the game's exposure already taken back out. Returns the
+ * proxy and, through `scale`, the factor that goes with it: the answer comes back as a
+ * ratio of the proxy, so the proxy's own scale has to be remembered. */
+vec3 to_proxy(vec3 original, out float scale)
+{
+    const vec3 display = max(original, vec3(0.0));
+    const float lit = luminance(display);
+    const float rolled = 0.75 + 0.25 * (1.0 - exp(-(lit - 0.75) / 0.25));
+    scale = lit > 0.75 ? rolled / max(lit, 1e-6) : 1.0;
+    return display * scale;
+}
+
+void main()
+{
+    uint pixel = gl_GlobalInvocationID.x;
+    if (pixel >= pc.m) return;
+    uint width = pc.batch, height = pc.k;
+    uint x = pixel % width, y = pixel / width;
+
+    /* The plan's address, and the reason this is floatBitsToUint: the slot is a
+     * float the host filled with a pointer's bytes (xmx_rec_pre, the memcpy onto
+     * p.p0), so what it holds is bits, and a conversion of its value -- a
+     * denormal, rounded to zero -- is a null pointer, which is what lost the
+     * device the first time the graph ran. */
+    FloatBuf plan = FloatBuf(uint64_t(floatBitsToUint(pc.p0))
+                             | (uint64_t(floatBitsToUint(pc.p1)) << 32u));
+    const uint noiseAt = 0u;
+    const uint controlAt = height * width * 3u;
+    const uint rowsAt = controlAt + 5u;
+    const uint columnsAt = rowsAt + height;
+
+    /* Where this pixel of the network's extent reads on the game's: the mirror the
+     * reference's extended_indices is, so a padded row reads a real one. */
+    int row = floatBitsToInt(plan.v[rowsAt + y]);
+    int column = floatBitsToInt(plan.v[columnsAt + x]);
+    uint source = uint(row) * pc.sc + uint(column);
+
+    uint word = pc.a.v[uint(row) * pc.sa + uint(column)];
+    float rgb[3];
+    rgb[0] = decode11(word & 0x7FFu);
+    rgb[1] = decode11((word >> 11u) & 0x7FFu);
+    rgb[2] = decode10((word >> 22u) & 0x3FFu);
+
+    /* The game scaled by its pre-exposure before it handed the colour over, so the
+     * network, which was trained on values in [0, 1], sees it divided back out.
+     *
+     * It is this frame's exposure, read out of the table the composition reads it from,
+     * and not a push constant, which would bake the first frame's into the recording
+     * forever: this game's moves between 0.25 and 1 between frames, and a divisor
+     * stuck at one of them over- or under-exposes every frame after it. The reference
+     * takes it the same way -- its codec samples the game's own exposure texture in the
+     * shader (native_codec_decode.hlsl, EffectivePaperWhite). */
+    FloatBuf table = FloatBuf(uint64_t(floatBitsToUint(pc.p2))
+                              | (uint64_t(floatBitsToUint(pc.p3)) << 32u));
+    float exposure = table.v[65538u];
+    if (exposure > 0.0f)
+        for (uint ch = 0u; ch < 3u; ch++) rgb[ch] /= exposure;
+    float proxyScale = 1.0;
+    const vec3 proxy = to_proxy(vec3(rgb[0], rgb[1], rgb[2]), proxyScale);
+    for (uint ch = 0u; ch < 3u; ch++) rgb[ch] = proxy[ch];
+
+    /* The previous frame at where this pixel was. `flags` says the second buffer
+     * already holds the coordinate; otherwise it holds the offset in pixels, which
+     * the reference divides by the extent to add to the pixel's own centre. */
+    float u, v;
+    if (pc.flags != 0u) {
+        u = pc.b.v[source * 2u];
+        v = pc.b.v[source * 2u + 1u];
+    } else {
+        precise float su = (float(x) + 0.5) / float(width);
+        su += pc.b.v[source * 2u] / float(width);
+        precise float sv = (float(y) + 0.5) / float(height);
+        sv += pc.b.v[source * 2u + 1u] / float(height);
+        u = su;
+        v = sv;
+    }
+
+    /* A coordinate the vectors cannot vouch for is put back inside the frame before it
+     * becomes an index. `clamp` does not do this on its own: every comparison against a
+     * NaN is false, so a clamp lets it through, and `int(NaN)` is not a pixel. One such
+     * coordinate takes the whole device with it, which is what the pass did to the queue
+     * the first time it ran. */
+    if (!(u >= 0.0)) u = 0.0;
+    if (!(v >= 0.0)) v = 0.0;
+    u = clamp(u, 0.0, 1.0);
+    v = clamp(v, 0.0, 1.0);
+
+    float xo0, xm, xo3, xw0, xw3, xg, yo0, ym, yo3, yw0, yw3, yg;
+    catmull(u, width, xo0, xm, xo3, xw0, xw3, xg);
+    catmull(v, height, yo0, ym, yo3, yw0, yw3, yg);
+
+    float weights[5] = float[5](xw0 * yg, xg * yw0, xg * yg, xg * yw3, xw3 * yg);
+    float coords[5][2] = float[5][2](float[2](xo0, ym), float[2](xm, yo0),
+                                     float[2](xm, ym), float[2](xm, yo3),
+                                     float[2](xo3, ym));
+    float was[3] = float[3](0.0f, 0.0f, 0.0f);
+    float tap[3];
+    for (uint i = 0u; i < 5u; i++) {
+        bilinear(coords[i][0], coords[i][1], height, width, tap);
+        for (uint ch = 0u; ch < 3u; ch++) {
+            precise float term = weights[i] * tap[ch];
+            was[ch] += term;
+        }
+    }
+    precise float denominator = weights[0] + weights[1];
+    denominator += weights[2];
+    denominator += weights[3];
+    denominator += weights[4];
+    for (uint ch = 0u; ch < 3u; ch++) was[ch] /= denominator;
+
+    /* The sixteen channels, as nr_image.c's feature_pixel lays them out: noise, the
+     * scaled colour, the scaled history, then the controls. Three roundings to half in
+     * a row, because the reference does three and each one changes the value. */
+    float values[16];
+    /* Whether the history is this frame's own colour. nr_image.c's feature_pixel:
+     * "out[7 + c] = was ? ... : scaled" -- a frame with no history behind it repeats
+     * the colour in those three channels, which is what the vendor's first-frame
+     * layout does, and it matters more than it looks: a history of black is a history
+     * the network reads as the previous frame having been black, and since the
+     * composition writes its own prediction back into that buffer, one black frame
+     * makes every frame after it black too. */
+    const float fresh = table.v[65539u];
+    for (uint ch = 0u; ch < 3u; ch++) {
+        float scaled = half_(half_(half_(rgb[ch]) - 0.5f) * 0.125f);
+        values[ch] = plan.v[noiseAt + pixel * 3u + ch];
+        values[4u + ch] = scaled;
+        values[7u + ch] = fresh != 0.0f ? scaled
+                                        : half_(half_(half_(was[ch]) - 0.5f) * 0.125f);
+    }
+    values[3] = 1.0f;
+    for (uint ch = 0u; ch < 5u; ch++) values[10u + ch] = plan.v[controlAt + ch];
+    values[15] = 0.0f;
+
+    for (uint j = 0u; j < 8u; j++)
+        pc.d.v[pixel * 8u + j] = packHalf2x16(vec2(values[j * 2u], values[j * 2u + 1u]));
+}

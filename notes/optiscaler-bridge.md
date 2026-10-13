@@ -1001,3 +1001,841 @@ which the one-call version necessarily breaks by hanging the semaphore type off 
 
 Cases C, D and E narrow the rest: an empty command buffer is not the problem, the wait stage
 is not the problem, and the Vulkan to D3D12 direction does not depend on the wait at all.
+
+---
+
+## 23. 调试手段速查（2026-10-13，Passthrough 第一帧 E_INVALIDARG 时建）
+
+### 日志级别：LogLevel 是 spdlog 级别，**不是越大越详细**
+`Config.cpp:343` 读 ini，`Logger.cpp:183` 直接 `(spdlog::level::level_enum) LogLevel`：
+
+| LogLevel | 含义 | 用途 |
+|---|---|---|
+| 0 | Trace | 最细，日志爆炸，基本不用 |
+| **1** | **Debug** | ✅ 看 `[D]`（含 debug layer 消息）——**诊断时用这个** |
+| 2 | Info | 默认。正常跑 NrBridge 就用它 |
+| 3 | Warn | ⚠️ **会把 `[I]`/`[D]` 全滤掉**，只剩 `[W]`/`[E]`（2026-10-13 我误设成 3，日志只剩 26 行，流程全看不见） |
+| 4 | Error | 只留错误 |
+
+⚠️ 结论：**诊断先设 `LogLevel = 1`，跑完记得调回 2**（debug 级别日志几秒上百 MB，
+还可能自己拖慢帧、掩盖问题）。诊断版 dll 与正式版要区分，别拿 debug layer 版跑性能。
+
+### D3D12 debug layer：让 runtime 点名哪条命令非法
+OptiScaler 自带这套，无需自己写：
+- 编译宏 `ENABLE_DEBUG_LAYER_DX12`（`hooks/D3D12_Hooks.cpp:237`、`:1335`）
+  → 在 `hkD3D12CreateDevice` 里 `EnableDebugLayer()` + 注册 `InfoQueue1` 回调，
+  回调把消息打 `LOG_DEBUG`（**所以必须配 LogLevel=1 才看得见**）。
+- 构建方式（已在 `tools/build_optiscaler.py` 做成环境变量开关，不想用时不用改代码）：
+  ```
+  set OPTI_DEBUG_LAYER=1
+  python tools/build_optiscaler.py
+  ```
+- 生效确认：日志里出现 `[W] hkD3D12CreateDevice Debug layers active!`
+- 可选更狠：`ENABLE_GPU_VALIDATION`（GPU-Based Validation，会非常慢，一般不开）。
+
+### 为什么 E_INVALIDARG 出现在 Close() 而不是记录那一行
+D3D12 runtime 记录命令时遇到非法参数会**把命令列表置进错误状态**，
+真正把这个错误吐出来的是 `ID3D12GraphicsCommandList::Close()`。
+所以 UE 弹窗 `CommandList->Close() failed ... E_INVALIDARG`（D3D12CommandList.cpp）
+= **列表里有某条命令参数非法**，而不是 Close 本身坏了。要找那条命令，就得靠 debug layer
+在记录时刻的报错，而不是盯着 Close 的位置。
+
+
+---
+
+## 24. 插槽里该跑什么网络：三条路的实测与证伪（2026-10-13，Passthrough 验收后）
+
+Passthrough 验收通过（菜单恢复、游戏正常、`runs/submits/waits=2825 failures=0`、
+`copies=2825 nowork=0`、CPU 0.094 ms/次）之后，"画面没有 NR"是**设计如此**——插槽里只有一条
+`vkCmdCopyBuffer`。真正的问题是：**下一步接哪个网络**。这里把三条路都查到底，两条被证伪。
+
+### 24.1 ⛔ 路 A：照抄 The/Mochizuki 的 NR —— 在 A770 上不成立
+
+曾经最诱人的一条（用户亲口说"以前用 The 的版本会有 NR 效果"），但**现象真、归因假**：
+
+| 证据 | 出处 |
+|---|---|
+| "Runs the NR model of NVIDIA DLSS 5 in games on **AMD Radeon RX 9000 (RDNA4)**" | `refs/DLSSNR-AMD/README.md:3` |
+| "**Tested only on an RX 9070 XT.** Other cards are not guaranteed to work." | `README.md:18` |
+| "Both need an RX 9000 series (RDNA4); older cards (RX 7000 and earlier) lack the FP8 matrix" | `README.md:62` |
+| 二进制里硬编码 `RX 9070 XT (1002:7550) not found; set NR_GPU` | `F:/Dlss5_Vlukan/11/optiscaler/dlssnr_core.dll`（字符串提取） |
+| "this D3D12 device exposes no Vulkan handles; the AMD backend needs **vkd3d-proton**, not native Windows D3D12" | 同上 |
+
+→ **它只在 RX 9070 XT 上验证过，且要 vkd3d（Linux/Wine 路线）**。用户早先看到的 NR 效果
+发生在 **9070 XT** 上，不是 A770；本项目渲染与 NR 全在 A770，**这条路走不通**。
+
+⚠️ 但两个部件仍有价值，别一并丢掉：
+- `refs/optiscaler/ta_mz_api.h` 的 `MochizukiNrFrameInfo{ void* motion; uint32_t motion_width,
+  motion_height; float motion_scale_x, motion_scale_y; }` —— **真 MV 的接口形状**就该长这样，
+  我们的 `Frame` 结构可以照它补 MV 字段。
+- `ta_MochizukiNrRuntime.cpp` 后端是**纯 Vulkan**（vk 出现 372 次，`hip` 只出现在遗留函数名
+  `EnqueueHipFn` 里，无 NVIDIA/NGX 依赖）—— 所以"它慢"不是因为 HIP，而是因为它挑卡。
+
+### 24.2 📊 路 B：主仓 R 的 NR —— 能跑，但只能异步
+
+- 规模：**723 个 pass/帧**（`nr_daemon.py:1924` "120 of its 723 passes"）。pass 数由网络层数定，
+  **与分辨率无关**（层数固定，每趟的数据量随 extent 变）。
+- 速度：**pass 数 ≠ 时间**。同一份 723 pass：网络 extent 768x448 → device **36.41 ms**
+  （`notes/frame-ledger-a770.md`、`device-budget-a770.md`）；extent 1344x768（720p）→ **179.5 ms**
+  （`HANDOFF.md:994`，staged GEMM 优化后 198 ms，`:1875`）；320x320 → 31.7 ms（`:880`）。
+  按面积外推，LOP 的 960x540（0.518 MP）**约 55-75 ms**。
+  ⚠️ 此前记的"723 pass / 180-200 ms"是把两个不同 extent 的数字并在一起了，2026-10-13 纠正。
+- 结论：**塞不进 33 ms 的同步插槽**。同步一帧 ≈ device 55-75 + host 24（与 device **串行**）
+  + 跨进程 8.3 MB×2 ≈ 9 → **约 70-100 ms**。只能像 R 现在这样**异步**跑（daemon 流水线），
+  结果延迟数帧回来。
+- 编排在 **Python**（`nr_resident.py` + `nr_frame_resident.py`），C 层 `libxmx` 只有原语，
+  **没有 run-one-frame**。要在进程内重建，等于把 120 KB 的编排逻辑移植一遍 —— 不划算。
+- 好消息：resident 路径**零 descriptor set**（buffer 走 `buffer_reference` + push constant 的
+  64 位设备地址）、**零 VkImage**，全是线性 buffer —— 与我们的共享线性 buffer 天然契合。
+
+### 24.3 📌 一个此前没说破的事实
+
+**主仓的 NR 从未在 LOP 上跑过**：`notes/HANDOFF.md` 全文没有 "Lies of P"。
+因为 R 的 layer 是 **Vulkan layer**（`nr_layer.dll` + `src/layer/VkLayer_dlss_nr.json`），
+而 LOP 是 **DX12**，抓不到帧。**这正是"借 OptiScaler 打通 DX12"的全部理由**——
+不是"NR 坏了"，而是"NR 从来没有接到这个游戏上"。
+
+### 24.4 ✅ 路 C（推荐）：桥扮演帧源，喂给已有的 daemon
+
+前人已经把接口设计好了（`notes/motion-source-plan.md`）：
+
+- 真 MV 走 `TemporalSession.process(frame, motion=...)`，field 是 `(height, width, 2) float32`，
+  单位是**像素**，在处理 extent 上；`history_confidence` 是独立参数（可阻尼而不动 gate）。
+- 重投影那一半**已经写完并在设备上**：`src/gpu/history.comp`（五抽头 Catmull-Rom，
+  `pc.flags != 0` 时读 motion buffer 自己算采样坐标）。
+- **缺的只是"谁产出这个 field"** —— 就是桥现在的活。
+
+所以闭环是：桥（DX12，有真 MV）→ 帧 + MV 送进 daemon → daemon 跑 NR + 时间管线 → 结果回传 →
+桥拷回 result 纹理交给 XeSS。NR 的 device 时间（36-180 ms，看网络 extent）由 daemon 的
+异步流水线吸收，帧率不掉。
+
+要动 daemon 吗：**可以不改**。daemon 已经有一套"外部喂帧"的通道
+（`src/layer/nr_extmem.c`、`nr_transport.h` 的 `Local\NR_SHM_<pipe>` + 三个 NT handle），
+桥只要**按那套协议扮演 layer**（含 spawn daemon），daemon 一行都不用改——这也守住了
+"只写桥"的红线。
+
+### 24.5 待办（按顺序）
+
+1. 桥：`Frame` 补 MV 字段（形状照 `ta_mz_api.h`），把 MV 和 color 一起拷进共享 buffer；
+   注意 MV 是 **R16G16_FLOAT**，与 color 的 R11G11B10 不同，footprint 要分别算。
+2. 桥：按 `nr_transport.h` 的协议把 buffer handle 交给 daemon（并负责 spawn）。
+3. 桥：结果回传后拷回 result 纹理（拷回链路已经跑通，见 §22-23）。
+4. 验证：先看 `history_confidence` 与 gate 是否从 0.032 抬起来（`motion-source-plan.md` 说
+   正确 history 能到 0.705），这是"真 MV 真的起作用"的硬判据。
+
+## 25 「同步为什么慢」—— 四层拆解（2026-10-13）
+
+用户问：同步会慢那么多，是不是代码机制有问题？是不是传入的数据不符合硬件契约？
+查完的结论分四层，第一层是纠正我自己的数字。
+
+### 25.1 同步没有让 NR 变慢，它只是把成本搬到帧的关键路径上
+
+NR 一帧的固有成本（A770，网络 extent 768x448，1920x1080 出）：device **36.42 ms**
++ host **24.41 ms** + 跨进程往返约 9 ms ≈ 68-75 ms。同步只是让这笔钱从"后台"变成
+"每帧必付"。异步（`NR_DAEMON_PIPELINE=2` + `NR_LAYER_ASYNC`）实测 **71.14 → 43.55 ms**
+（`notes/daemon-cpu-cost.md`）—— 省下的 27.6 ms 正是 host 那一段被设备时间盖住。
+
+### 25.2 真正的机制问题有三个，都不在「同步」这个开关上
+
+1. **host 与 device 串行**：daemon 单线程，`xmx_graph_run` 阻塞，host 的 24.4 ms
+   一点都没被设备的 36.4 ms 盖住。前人在搬（`notes/host-passes-to-gpu.md`）：
+   resample 3.46 → 1.98、features 1.79 → 0、gpu_in 2.23 → 0.02。
+2. **每帧 8.3 MB×2 过管道**：`receive` 0.66 + `sendall` 1.11，加上 layer 侧的 memcpy 和
+   WriteFile/ReadFile，约 9 ms 的跨进程往返。Phase 2 的 external memory 是为这个。
+3. **723 趟之间的全屏障**（`libxmx.c:1054`）让相邻趟不能重叠；325 个 unary 只值 4.45 ms，
+   每趟 14 µs，排空的占比不小。
+4. **已排除的怀疑**：723 趟**不是** 723 次 submit。整帧一个 command buffer、一次
+   `vkQueueSubmit`（`libxmx.c:3061`）+ 一次 fence，submit→fence 未计入的开销只有 3.27 ms
+   （`notes/device-budget-a770.md`）。调度机制本身是对的。
+
+### 25.3 「数据不符合硬件契约」：内存这条是好的，算术这条偏紧
+
+- **内存：没问题。** A770 开着 resizable BAR，图的缓冲是
+  `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`（显存，主机直接写），`want_unmapped()` 判据
+  不需要 —— `notes/discrete-memory-path-a770.md` 的结论是"独显内存路径本来就是对的"。
+  回读的 head 落在 HOST_CACHED 系统内存是**有意的**（每 16 个 float 取 4 个的跨步读，
+  缓存命中比"在显存里但 uncached"划算），不是踩坑。
+- **算术：契合规格很紧。** XMX 大 GEMM 只到 **~8 % 峰值**（iGPU 实测 2584 GFLOP/s /
+  32 TFLOP/s，`notes/phase20-machine-limits.md`）；A770 上 gemm 家族 13.94 ms / 198 趟，
+  却只跑到 115-236 GB/s（显存 560 GB/s）→ 是 occupancy/算力受限，不是带宽受限。
+  紧在哪：shared memory 128 KB cap、GRF 128 寄存器上限（`notes/phase26`），大 tile 放不下，
+  只能 staged 切成多趟 —— 723 这个数有一半是这么来的。
+- **过路费**：为喂 int8 dpas，每帧 193 个 `quantize_row` + 120 个 residual unary
+  （`notes/frame-ledger-a770.md`）。
+
+### 25.4 对桥的含义
+
+- 跨进程共享 buffer 必然落在**系统内存**（PCIe 约 5 GB/s），所以**只能搬输入和输出**
+  （960x540 的 color+MV 约 4 MB，<1 ms），**绝不能让网络的中间 tensor 落在那儿**。
+  daemon 自己的图缓冲在它进程内的显存上，不受影响。
+- **异步不能凭空创造算力**：渲染和 NR 在**同一张卡**（实测同一个 luid，
+  `notes/host-passes-to-gpu.md` §二）。异步做的是移出关键路径 + host/device 重叠，
+  代价是输出滞后数帧。要真正并发，得看 NR 能否上**独立的 compute 队列**
+  （Windows GPU Engine 计数里 Compute/Copy/Video 常年为 0，那条引擎是空的）——
+  **这需要实测，不能猜。**
+
+## 26 与 Mochizuki 的量级对比（2026-10-13）
+
+用户实测：Mochi 在 9070XT 上 **1080p 90 fps、NR 整链 ~6 ms**（OptiScaler 的
+"Vulkan core total"，含 network + 其它 core 处理，**不含** adapter/D3D12 拷贝、upscaling、FG）。
+R 在 A770 上：0.344 MP 网络 device 36.4 ms + host 24.4 ms。**差一个数量级以上。**
+
+### 26.1 它到底怎么走的（`refs/DLSSNR-AMD/ARCHITECTURE.md`，逐字要点）
+
+- 网络 = **Vulkan compute，FP8 矩阵乘走 `VK_KHR_cooperative_matrix` + `VK_EXT_shader_float8`**，
+  编译成 RDNA4 的 WMMA 指令。**精度逐算子跟 NVIDIA 原版对齐：NVIDIA 用 FP8 的地方用 FP8，
+  其余 FP16/FP32 —— 没有 INT8 量化路径。**
+- 逐字：`"The network is one sequential chain of about 150 layers (only one adjacent pair is
+  independent)"` —— 网络本身串行，没有层间并行度可挖（与 R 的 `phase46`「71 blocks 串行」是同一事实）。
+- `linux/shaders/rdna4/` 的 **pipelines.json 列出每个 pipeline 及其 defines** → **算子级特化编译**。
+- 融合：OptiScaler 集成文档明说 network 含 **fused temporal pre/post shaders**。
+- **Linux：录进游戏自己的 command buffer，同一个 VkDevice，零拷贝、零跨 API 同步。**
+  Windows：独立 VkDevice（按 LUID 匹配）+ 共享 D3D 纹理导入 + D3D fence 导入成 Vulkan
+  timeline semaphore —— **和我们的桥是同一个形状**。
+- **不用 HIP**：集成 README 逐字 "HIP is not used by this backend"；ARCHITECTURE 给了四条理由，
+  核心是"代码跑在游戏进程里，Vulkan 已经在场"。
+
+### 26.2 它没有 Python 层（这是查实的，不是推断）
+
+`ta_MochizukiNrRuntime.cpp` 里 `python` / `numpy` / `Py_` **各 0 次**，`vkCmdDispatch` 也是 0 次
+（核心在 `MochizukiNrRuntime.dll`，宿主 cpp 只做 interop / 录制所有权 / 菜单 / 打包）。
+Python 只出现在**装模型那一步**（`tools/install/mochizuki-model.py` 抽权重，一次性）。
+→ **每帧零 Python。**
+
+### 26.3 那 R 的 24.4 ms 是什么
+
+不是"解释器开销"，是 **NumPy 在 CPU 上做全分辨率像素运算**（`notes/daemon-cpu-cost.md`）：
+compose_encode 8.98、bilinear×2 4.00、mean_change 2.58、to_half 2.17、decode8 1.90、features 1.89。
+Mochi 这些全是 GPU shader。
+当初为什么这么写：R 是**逆向出来的参考实现**，先求数值正确（Python 便于跟参考逐位对照），
+再逐步搬 GPU —— `notes/host-passes-to-gpu.md` 正在搬，已搬掉 resample 3.46→1.98、
+features 1.79→0、gpu_in 2.23→0.02。
+
+### 26.4 差距的账本（保守口径）
+
+| 项 | Mochi / 9070XT | R / A770 | 说明 |
+|---|---|---|---|
+| 精度通路 | FP8 coopmat（RDNA4 WMMA） | FP16 coopmat + INT8 dpas | **A770 没有 FP8**，硬件上限 |
+| 一趟网络的 pipeline 数 | **~150** | **723**（其中 313 趟是量化过路费） | 趟数 4.8× |
+| 每帧 host 端像素工作 | **0** | 24.4 ms | 比对方整链还贵 |
+| 矩阵峰值利用率 | 未测 | **个位数**：iGPU 大 GEMM 8.1 %、整帧真实形状 4.4 %；A770 的 `window_block` **5 %** | 前辈测过很多遍，见 26.9 |
+| 跨进程搬运 | Linux 零拷贝 / Win 共享纹理 | 8.3 MB×2 管道 ≈ 9 ms | Phase 2 external memory |
+
+**可修的**：利用率（最大杠杆）、趟数（融合）、host 24.4 ms、管道搬运。
+**不可修的**：几乎没有。A770 的 INT8 是 9070XT FP8 的 **0.67**（官方规格，见 26.9），
+**不是** 2.5-3 倍。（2026-10-13 更正：这里原先写"FP8 吞吐约为 INT8 的 2 倍，硬件差 2.5-3 倍"，
+**错了** —— RDNA4 上 FP8 与 INT8 官方同速，都是 FP16 的 2 倍。）
+
+### 26.5 下一步该量的一个数
+
+A770 上的 **XMX 峰值利用率从未被直接量过**（8 % 是 iGPU 上的大 GEMM 基准）。
+先补这个数：在 A770 上跑一个大 GEMM，得 GFLOP/s ÷ 峰值。
+**这个数决定"36 ms 里有多少是白丢的"，也决定值不值得重构 GEMM。**
+
+### 26.6 上游核心的真实形状（2026-10-13 抓到本地，可直接对齐比）
+
+抓到 `refs/DLSSNR-AMD/`：`shaders/pipelines.json`、`core/nr_native_plan.cpp`、
+`core/nr_runtime_dispatch.hpp`、`core/nr_frame.txt`、`shaders/nr_chain.glsl`、`core/build_network.py`。
+
+- **整个网络只有 52 个 pipeline**（`pipelines.json` 的 `pipelines` 键 = 52），加 6 个 temporal 变体。
+  名字即特化维度：`fswin32 / fswin64 / fswin128 / fswin256`（按窗口尺寸各编译一份）、
+  `fswinds*`、`fswindsp*`、`fswinp*`、`fswinpds*`、`fswinpup*`、**`fswinfusedup*`**、
+  `gemmnores / gemmpool / gemmproj / gemmprojc / gemmprojt / gemmprojw / gemmvact /
+  gemmvnores / gemmvproj / gemmvqkv / gemmvqkvnorm / gemmvqkvnorms / gemmvqkvs`、
+  `ffwd3 / ffwd3w`、`attn / vitattn`、`decups / upsview / repack / noisefield`、
+  `fswinimagepre* / fswinimagepost*`。
+- **静态编译计划**：`nr_native_plan.cpp` 的 `records[]`（19 列一张表）在网络构建时把每层的
+  形状、tokens、grid 尺寸**一次算好**，运行时按表 dispatch。host 每帧不推形状。
+- 融合点（markers `shader-constants.txt`）：`qkv_fused_norm 1`、`ds_fuse 15`、`ups_fused_mode 2`、
+  `wide_ups_fused_mode 2`、`tchain 1`、`post_alpha 1`；
+  **persistent kernel**：`persist_df 1 / persist_ds 7 / persist_up 7 / persist_strag 25 / persist_one 6`。
+- GEMM tile：`gemm_wide_mt 64 / gemm_wide_nt 256`、`gemm_proj_mt 32 / gemm_proj_nt 128`、
+  `gemm_projw_mt 64 / gemm_projw_nt 128`。
+
+### 26.7 对齐到 R：哪些差距与硬件无关（可学），哪些是硬件（学不了）
+
+| 维度 | Mochi | R | 性质 |
+|---|---|---|---|
+| 每帧 dispatch 数 | ~150（52 pipeline 复用） | **723**（其中 313 趟是 quantize_row 193 + residual 120） | **可学**：融合广度 |
+| 算子特化 | 按形状各编译一份（4 种窗口 × 变体） | 通用 kernel + push constant 分支 | **可学**：特化编译 |
+| epilogue 融合 | upsample / norm / downsample / 激活 全融进主算子 | **已做** FFN 融合 + QKV epilogue（`improve-qkv-epilogue.md`，值 22 %）+ window fuse；**量化/residual 仍独立** | **可学**：继续扩展 |
+| host 每帧工作 | 0（静态计划表） | 717 次 Python 调用 + 24.4 ms 像素运算 | **可学**：见 26.3 |
+| persistent kernel | 有 | 未见 | 可学（未验证收益） |
+| 矩阵 tile | 64×256 / 32×128 | **8×16**（Intel coopmat 契约上限） | **硬件** |
+| 精度 | FP8（逐算子对齐 NVIDIA） | FP16 + INT8 | **硬件**，但劣势只有 **1.5×**，不是数量级（26.9） |
+
+⚠️ **2026-10-13 更正（我上一轮写错了，用户当场指出）**：我曾说"对方跑 FP8，
+FP8 吞吐约为 INT8 的 2 倍，所以硬件劣势是 2.5-3 倍"。**这句话是错的**，两个错误叠在一起：
+
+1. **RDNA4 上 FP8 与 INT8 官方同速。** AMD 9070 XT 规格页逐字：
+   FP16 矩阵 195 TFLOPs ／ **FP8 矩阵 389 TFLOPs** ／ **INT8 矩阵 389 TOPs**
+   —— 8 位两种格式速率相同，都是 FP16 的 2 倍。不存在"FP8 = 2× INT8"。
+2. **用户原来估的 2/3 是对的。** Intel 官方规格：A770 **GPU 峰值 TOPS (Int8) = 262**
+   （16 GB 版与 8 GB 版同值；XMX 引擎 512 个，显卡时钟 2100 MHz）。
+   262 / 389 = **0.673 ≈ 2/3** —— 与用户原估逐位相符。
+
+→ **硬件只能解释 1.5 倍的差距。** 剩下那 20-30 倍全部是软件与架构，见 26.9。
+
+### 26.8 一个反直觉的事实（对"减趟"要谨慎）
+
+`notes/frame-ledger-a770.md`：int8 **off** = 415 趟 / 43.49 ms；int8 **on** = 723 趟 / 36.41 ms。
+**多付 308 趟只换来 16 % 提速** —— 说明量化路径本身不便宜。
+而趟数本身不总是敌人：`device-budget-a770.md` 里 325 个 unary 只值 4.45 ms（13.7 µs 一趟），
+减趟的收益要看屏障排空占多少，**不能只凭趟数下结论**。
+
+### 26.9 硬件算力对账（官方规格，2026-10-13 查证）
+
+| 项 | A770（Xe-HPG，本项目） | RX 9070 XT（RDNA4，Mochi） | 比值 |
+|---|---|---|---|
+| INT8 矩阵 | **262 TOPS**（Intel 官方 GPU Peak TOPS(Int8)） | 389 TOPs | **0.67** |
+| FP8 矩阵 | ⛔ 无 `VK_EXT_shader_float8` | 389 TFLOPs | — |
+| FP16 矩阵 | 官方未公布（按 INT8 一半 ≈ 131 TFLOP/s） | 195 TFLOPs | ≈0.67 |
+| 显存带宽 | 512-560 GB/s | 640 GB/s | 0.80-0.88 |
+| 矩阵引擎数 | XMX 512 | AI 加速器 128 | — |
+
+**9070 XT 的 FP8 与 INT8 官方同速（都是 389），都是 FP16（195）的 2 倍。**
+→ **硬件劣势 = 1.5 倍，用户原估的 2/3 精确正确。**
+
+⚠️ **口径悬点（未解决，但不影响结论）**：A770 的 FP16 峰值在笔记里有两个口径——
+由官方 INT8 262 反推的 **131 TFLOP/s**，和 `frame-ledger-a770.md:378` 实际使用的
+**39 TFLOPS**（roofline 平衡点 39/560 = 70 FLOP/byte）。差 3.4 倍，从来没有统一过
+（iGPU 侧是推出来的：64 XMX × 128 MAC × 2 × 1.95 GHz = 31.9 TFLOP/s FP16、INT8 64-67 TOPS，
+与 Intel 宣传的 67 TOPS 相符，`phase26-the-register-ceiling.md:42`）。
+**但结论对口径不敏感**：按 39 算利用率 5 %，按 131 算 1.5 % —— 都是个位数。
+→ 所以**不需要**再为"量一个利用率"开一轮测量。用户 2026-10-13 明说：前辈测过很多遍了。
+
+### 26.10 前辈已经测过的利用率（我此前没查，是失职）
+
+| 出处 | 实测 |
+|---|---|
+| `phase20-machine-limits.md:50` | iGPU 大 GEMM 4096x1024x4096：**2584 GFLOP/s = 8.1 %** |
+| `phase21:214` | 整帧 GEMM 459.6 GFLOP / 327 ms = 1.4 TFLOP/s = **4.4 %** |
+| `phase26:121` | 全项目见过的天花板 **3.9 TFLOP/s**；可用区间 **8-12 %** |
+| `frame-ledger-a770.md:372` | A770 `window_block`：**1941 GFLOP/s ≈ 5 %** |
+| `frame-ledger-a770.md` | 每 lane 约 7000 条指令，**99 % 是逐元素的**；SPIR-V 里 Load+Store 990 条(27 %) vs 算术 390 条(11 %) → **搬运指令是算术的 2.5 倍** |
+| `frame-ledger-a770.md` | fill 实验 0/100/200/400/800 轮：**从 0 就是直线**，每 100 轮 +0.78-0.87 ms，**没有平台期 → 没有空闲发射槽可填** |
+| `frame-ledger-a770.md` | 算术强度 **28 FLOP/byte** vs roofline 70；全局带宽只用了 12 %(69 GB/s)，九成搬运发生在共享内存 |
+| A770 skill 的 VTune 引用 | "XVE 57 % Stalled, **XMX pipeline 19.5 % active**" |
+
+### 26.11 差距怎么拆：已知硬件 1.5×，实测差 20-30×
+
+用户实测：Mochi **1080p 整链 90 fps**，NR 段约 **6 ms**。
+我们：768x448 一帧 device **36.42 ms**（`device-budget-a770.md`）。
+按面积归一到 1080p（2.07 MP / 0.344 MP = 6.02×）≈ **219 ms**。
+
+    219 / 6 = 36 倍；硬件只能解释 1.5 倍 → **约 24 倍来自架构**
+
+架构账（全部在前辈笔记里，不是新发现）：
+
+1. **723 趟 vs ~150 趟**（其中 313 趟是量化过路费）。
+2. **host 24.4 ms**（对方 0，静态计划表）。
+3. **一个窗口搬 21 KB 只换 590 kFLOP** —— 算术强度 28，roofline 70。
+4. **99 % 指令逐元素**，XMX 只有 19.5 % 在活动 —— 发射槽被搬运占满，矩阵单元闲着。
+5. **每帧 717 次 Python 调用推形状**，对方构建期算好。
+
+→ **结论：用户说得对——核心架构利用硬件性能极度低下。这不是"慢一点"，也没有硬件借口可找。**
+
+## 27. 接通的路：进程内原生重放器（2026-10-13 拍板）
+
+### 27.1 为什么不走跨进程 daemon
+
+Route C（桥按 `nr_extmem` / `nr_transport` 协议把帧喂给 daemon，异步回传）能把 NR 接上，
+但它是**折中方案**：接进去得到的是一个 Python 拖累、滞后数帧的东西，等优化到最后发现
+Python 是瓶颈，整个推翻重写。**用户明确否决：不走折中，既然决定优化，就按 Mochi 的形状做。**
+
+Mochi 的形状是什么（`refs/DLSSNR-AMD/ARCHITECTURE.md`、`core/nr_native_plan.cpp`）：
+
+- 进程内，零跨进程；
+- **静态编译计划表**（`records[]`，构建期算好，运行时只查表 dispatch）；
+- **每帧零 Python**（Python 只出现在装模型那一步，`mochizuki-model.py` 抽权重，一次性）。
+
+### 27.2 我们的对应物：把「构建期」从 Python 挪到 C
+
+关键发现：`libxmx.c` 不只是执行器，它**已经有图录制与重放**——
+`xmx_rec_*`（约 20 个录制器）+ `xmx_graph_capture()` / `xmx_graph_run(id)` /
+`xmx_graph_destroy(id)`。`xmxres.CommandGraph` 的文档串逐字：
+*"Replayable commands. Referenced buffers must outlive this object."*
+
+也就是说：**R 的 GPU 侧已经是 Mochi 的形状**（整块录成一个 command buffer、一次 submit），
+缺的只是"谁来走这一遍"——现在是每帧的 Python。所以不用重写 kernel，不用手写 dispatch
+循环，只需要：
+
+1. **离线走一次**，把 Python 的每一步录制调用记下来 → 静态计划表；
+2. **运行时用 C 按表走一遍**，`xmx_graph_run` 一次跑完。
+
+这正是 Mochi 的 `records[]`，只是我们的表由"跑一次 Python"生成，而不是手写。
+
+### 27.3 已建成（2026-10-13）
+
+| 文件 | 作用 |
+|---|---|
+| `tools/dump_plan.py` | 钩住 libxmx 的每个 `xmx_rec_*` / `xmx_buf_*`，跑一次 `ResidentFrame`，写出计划 |
+| `src/gpu/nr_plan.h` | 计划的形状：opcode 枚举、`nr_step` / `nr_buffer` / `nr_blob` |
+| `src/gpu/nr_replay.c` | 重放器：按表建缓冲、灌权重、逐步录制、capture、每帧 `xmx_graph_run` |
+
+计划表由 `dump_plan.py` 的 `emit_c` 直接生成 C 源码（`work/plan_<W>x<H>.c`），
+**不给 C 侧留任何解析的活**——和 Mochi 把手写表编进二进制是同一件事。
+
+### 27.4 两个坑（都踩过，都记下）
+
+1. **权重不是 upload 进去的。** A770 开着 resizable BAR，`Buffer.view` 直接给主机指针，
+   NumPy 穿透写，`xmx_buf_upload` 一次都不走（实测 `uploaded 0.0 MB`）。
+   → 只能靠 `xmx_buf_ptr` 认出"主机写过哪些缓冲"，在**第一次 `graph_run` 之前**拍一次快照读回来。
+   快照时机是硬的：之后图已经跑过，权重缓冲里装的是激活值。
+2. **`xmx_window_init` 被调了 104 次，不是 1 次。** 计划里的 text 表必须**每条路径参数一个
+   条目**（160 条），而不是每种调用一个。第一版只收了 4 条，第 10 条之后全是越界读，
+   症状是 `cannot open spv` 出现在第 1297 步——离真正的错因有十万八千里。
+   同时 `nr_plan_names` 曾按 dump 顺序排、却用枚举值索引，把报错里的函数名打错，
+   直接把人往沟里带。**两个表都必须按 `nr_plan.h` 的枚举顺序写。**
+
+还有一步差点漏：`xmx_abort`。Python 是「dry 录制探 scratch → **abort** → 真录制」，
+漏了它第二次 `xmx_begin` 就 `already recording`。
+
+### 27.5 实测（A770，768x448）
+
+```
+build 213 ms           一次性：662 个缓冲 + 306.4 MB 权重
+run   43.9 ms          415 passes，四次 44.13 / 43.81 / 43.85 / 43.90
+```
+
+**正确性：逐位一致。**
+
+```
+重放 : -0.05398422 0.14897376 0.06821892 6.95267725
+Python: -0.053984225 0.14897376 0.06821892 6.9526772
+```
+
+判据是天然的：blobs 里包含输入缓冲的快照，重放用的是与 Python 那次**完全相同的输入**，
+所以输出必须逐位相等。相等即证明：形状没推错、顺序没错、float 位模式没坏、权重没搬错。
+
+### 27.6 数字的含义
+
+- 768x448 一帧 **43.9 ms**。LOP 是 960x540，按面积外推约 **66 ms**。
+- 基线是 30 ms / 33 fps。**同步放不进一帧**——第一版接入必然是异步（滞后数帧）。
+- 但架构对了：接下来减趟、融合、算子特化，都是在这张表上改，
+  **不会返工**。这也是用户否决折中方案的理由。
+
+### 27.7 下一步
+
+1. dump 960x540（LOP 的实际分辨率）的计划，重放校验；
+2. 接进桥（`nrbridge`）：color+MV 进输入缓冲 → `xmx_graph_run` → 结果拷回 result 交 XeSS；
+3. 之后才是减趟与融合（从 830 rec / 415 pass 往 Mochi 的 ~150 靠）。
+
+## 28. 接入的输入输出契约（2026-10-13）
+
+### 28.1 网络的 extent 不是渲染分辨率
+
+960x540 **直接跑会失败**：`ValueError: rows=1980 must be a multiple of 8`。
+网络要连续 halving 五次，extent 必须能被整除；540 不是，544（=32x17）是。
+
+→ **LOP 的 960x540 必须 pad 到 960x544**。多出的 4 行在输入侧留空（或复制最后一行），
+输出侧拷回时只取前 540 行。这个 pad 是接入的一部分，不是可选项。
+
+（R 自己从未在 LOP 尺寸上跑过：它是 Vulkan layer，只接过 Vulkan 游戏。）
+
+### 28.2 网络输入不是 color，是 16 通道 features
+
+`ResidentFrame.run(features)` 要求 `features.shape == (height, width, 16)`。
+dump 用的是随机生成的 features，所以**计划表从 features 开始，不含编码**。
+编码在 `src/ref/nr_frame.py: build_features` → `work/mlx-dlss/.../features.py: make_features`。
+
+**16 通道布局（权威，`features.py:175-189`）**：
+
+| 通道 | 内容 |
+|---|---|
+| 0-2 | `deterministic_noise(network_h, network_w, frame_index)` |
+| 3 | 常数 `1.0` |
+| 4-6 | `scaled_color(color)` |
+| 7-9 | `scaled_color(color)` — **history 会替换这三通道** |
+| 10 | `half(normalized_style)` |
+| 11 | `half(local_tone_strength)` |
+| 12 | `half(local_structure_strength)` |
+| 13 | `half(skin_structure)` 或 `-1` |
+| 14 | `half(automatic_structure)` 或 `-1` |
+| 15 | `0` |
+
+`scaled_color(c) = half(half(half(c) - 0.5) * 0.125)`（三次 half 舍入，顺序不能变）。
+color 先经 `geometry.source_rows()/source_columns()` gather 镜像到网络 extent。
+
+### 28.3 🎯 画质线真因的确切位置
+
+`nr_features`（`src/ref/nr_image.c:310`）里 history 的采样：
+
+```c
+const float *old = history ? history + rows[y] * ty : 0;
+...old + columns[x] * tx...
+```
+
+**用的是和 color 完全相同的 `rows`/`columns`，没有 MV 偏移——这就是恒等重投影。**
+注释也写明了（`nr_frame.py:240`）：*"A Vulkan layer at vkQueuePresentKHR has no motion
+vectors... so the reprojection is the identity."*
+
+→ 有了真 MV 之后，这里要改成
+`history + (rows[y] + mv_y) * ty + (columns[x] + mv_x) * tx`。
+**改动本身很小，但这是画质的全部赌注所在**（对应记忆里的"画质线：必须有 MV"）。
+
+### 28.4 输入输出侧都有现成的纯 C 实现，零 Python 就能用
+
+`work/libnr_image.dll`（146,944 B，已在树里）导出 10 个函数：
+
+```
+nr_features  nr_features_half  nr_compose  nr_compose_temporal
+nr_compose_encode  nr_resize_axis  nr_area_mean  nr_to_half
+nr_decode8  nr_encode8
+```
+
+- 输入侧：`nr_features` — mirror + 三次 half 舍入 + history 替换通道 7-9，**一次 pass**
+- 输出侧：`nr_compose_encode` — head 沿两个 bilinear 轴上采样 + 合成 + 编码，一次 pass
+
+都是 C ABI、OpenMP 并行。**桥可以直接 LoadLibrary 调用，不需要 NumPy，不需要 Python。**
+
+### 28.5 每帧管线（进程内，零 Python）
+
+```
+color(R11G11B10) + MV(R16G16)
+   -> nr_features(...)            16 通道 features，960x544
+   -> 写进 plan 的 features buffer
+   -> xmx_graph_run()             60.8 ms
+   -> 读 head（960x544, 4 通道）
+   -> nr_compose_encode(...)      RGB，960x540
+   -> 拷回 result 纹理 -> XeSS
+```
+
+### 28.6 实测（960x544，A770）
+
+```
+build 270 ms            一次性：662 缓冲 + 312.1 MB
+run   60.81 / 60.84 / 60.78 / 61.40 ms   415 passes
+```
+
+**逐位一致**：
+```
+重放 : -0.43158343 -0.64304703 -0.58204538 7.03977346
+Python: -0.43158343 -0.64304703 -0.5820454  7.0397735
+```
+
+对比 768x448 的 43.9 ms —— 面积比 1.39x，时间比 1.38x，**基本线性**。
+基线 30 ms，所以 60.8 ms **同步放不进一帧，第一版必须异步**（滞后数帧）。
+
+### 28.7 一个坑：默认 bin 路径写死会骗人
+
+重放器的默认 blobs 路径原来写死 `plan_768x448.bin`。换成 960x544 的 plan 后不传参数，
+读的是 306 MB 的旧文件，而 blob 628 需要到 311 MB → 报
+`blob 628 runs past the plan file`。**表是对的，错的是读的文件**，而报错把人指向表。
+已改成按编译进来的 `nr_plan_extent` 拼文件名。
+
+### 28.8 已库化：桥可以像调函数一样跑一帧
+
+`src/gpu/nr_net.h` + `src/gpu/nr_replay.c`（同一个文件，两种编法）：
+
+| 编译方式 | 产物 | 用途 |
+|---|---|---|
+| 不带 `NR_REPLAY_STANDALONE` + `-LD` | `work/nr_net.dll` | 桥链接它 |
+| 带 `-DNR_REPLAY_STANDALONE` | `work/nr_replay_<W>x<H>.exe` | 离线基准与逐位校验 |
+
+导出 9 个符号：`nr_net_open / close / error / extent / features / features_bytes /
+head / head_bytes / run`。
+
+**两个缓冲由 kind 认出，不写死编号**（plan 按创建顺序编号，那个顺序不是承诺）：
+`HOST_WRITE` = features（16,711,680 B = 544x960x16x**2** → fp16 16 通道），
+`HOST_READ` = head（8,355,840 B = 544x960x4x**4** → float32 4 通道）。
+
+**端到端已验证**（`src/gpu/nr_net_probe.c`）：把 dump 额外导出的输入快照
+（`plan_960x544_in.bin`，16.7 MB）当作**调用者填进去的帧**写进 `nr_net_features`，
+`nr_net_run`，读 `nr_net_head`：
+
+```
+head: -0.43158343 -0.64304703 -0.58204538 7.03977346
+again: -0.43158343 -0.64304703 -0.58204538 7.03977346
+Python: -0.43158343 -0.64304703 -0.5820454  7.0397735
+```
+
+**这跟重放器不是一回事**：重放器用的是 blob 快照自动灌进去的输入，
+库跑的是**调用者填的帧** —— 后者才是桥要的。且连续四次结果一致（确定性）。
+
+### 28.9 三个坑（本轮新踩）
+
+1. **默认 bin 路径写死**会骗人（见 28.7）。
+2. **C 里函数声明不能省参数名**：`void nr_net_extent(nr_net *, unsigned *, unsigned *)`
+   是 `error C2055`，第一个参数必须有名字。而这次编译报错时我跑的其实是**旧二进制**，
+   输出看着正常——**编译失败后的"验证通过"是假的**。
+3. **`cl -TC` 会把 `.lib` 也当 C 源文件编译**（`error C3872` 在一堆乱码字符上）。
+   编可执行文件时不要加 `-TC`，让它按扩展名判断。
+
+### 28.10 下一步（接进桥）
+
+1. 桥加载 `nr_net.dll` + `libnr_image.dll`；
+2. 每帧：color/MV 回读 → `nr_features_half` → `nr_net_features` → `nr_net_run`
+   → `nr_net_head` → `nr_compose_encode` → 拷回 result 交 XeSS；
+
+## 29. 已接进桥（2026-10-13，12:0x 装机）
+
+### 29.1 形状：两次提交，主机工作在中间
+
+插槽里现在不是一次拷贝，是**两次提交**：
+
+```
+gap:  queue->Signal(toVk, v)
+      #1 Submit(wait toVk[v], input->stageColour, mvInput->stageMotion, 不 signal)
+      WaitLast()                       ← 等 GPU 把帧搬完
+      主机：decode -> features -> nr_net_run -> compose -> encode
+      #2 Submit(wait toVk[v], stageResult->output, signal fromVk[v])
+      queue->Wait(fromVk, v)
+```
+
+原因：共享 buffer 是 **DEVICE_LOCAL**（`SharedBuffer::Create` 按 `DEVICE_LOCAL` 选类型），
+导入契约要的就是这个，驱动不给主机指针。所以帧要过主机就得再倒一次。
+
+新增 `VulkanGap::Staging`（HOST_VISIBLE|HOST_COHERENT，常驻映射）+ `Transfer` 结构
+（`VkBufferCopy` 不带 buffer，必须自己带）+ `WaitLast()`。
+
+**降级路径**：任一环节失败 → 退回 reference 的 Passthrough（input→output 一次拷贝）。
+画面不会黑，只是没 NR。
+
+### 29.2 为什么是 `nr_compose_temporal` 而不是 `nr_compose_encode`
+
+`nr_compose_encode` 只出 **uint8**（bgra8/rgba8），而 result 必须跟 color 同格式
+（R11G11B10_FLOAT）。所以走 `nr_compose_temporal`（出 float32 RGB），自己编码回去。
+
+顺带省掉一整块：compose_encode 需要 bilinear axis plan（`_axis_plan`），而
+**head 544 行的前 540 行与输入 540 行是一一对应的**（mirror 是行对齐的），
+直接取前 540 行就对，`low_y/low_x` 全传 NULL（= "该轴已在输出尺寸"）。
+
+### 29.3 移植到 C++ 的三样东西（Python 有、C 库没有）
+
+都在 `NrPipeline.cpp`：
+
+| 东西 | 出处 |
+|---|---|
+| `deterministic_noise`（544x960x3） | `features.py:87` + `_dynamic_shift_mix`/`_uniform24` |
+| `gate_table`（65536 项，按 half 位索引） | `nr_frame.py:330`，用 **double exp** 再转 float（expf 与 NumPy 的 float32 exp 差最后一位，这是唯一会逐像素放大的地方） |
+| mirror `rows`/`columns` | `NetworkGeometry.extended_indices`：`y<extent ? y : 2*extent-2-y` |
+
+外加 `float<->half`（round to nearest even）与 R11G11B10 编解码（5 exp bias 15，无符号，
+mantissa 6/6/5）。
+
+### 29.4 🎯 MV 的语义（照抄参考实现，不猜）
+
+`ta_MochizukiNrRuntime.cpp:4042` 逐字：
+
+```cpp
+// value * scale = pixels of the motion extent; the network reads previous uv = uv + mv.
+next.motionScaleX = info->motion_scale_x / float(motionW);
+```
+
+LOP 实测 `mv=(960,540)`（即 `MV_Scale_X=960`）、MV 纹理 960x540 →
+`motionScaleX = 960/960 = 1.0`（uv 空间）→ **像素偏移 = mv 值 × (960, 540)**，
+符号是 `prev = cur + mv`。
+
+实现上**没有改 `nr_image.c`**（红线：核心一行不改）：把 history 先按 MV gather 成
+`warped_`，再按恒等喂给 `nr_features_half`。最近邻 + clamp，518k 像素。
+
+### 29.5 preExposure 与一个已知缺陷
+
+FSR 的 `PrepareRgb`（宿主自带 `ffx_fsr3upscaler_common.h:491`）逐字 `fRgb /= fPreExposure`
+→ **buffer 里存的是 real × preExposure**，还原要**除**。LOP 实测 `preExp=0.360`。
+
+⚠️ **已知缺陷**：除完之后值可能 >1（这是 pre-tonemap 的 HDR scene color，不是网络训练时的
+[0,1] LDR 图）。目前**直接 clip**。参考实现（The）有 `preprocess`（exposure/curve/contrast/
+saturation + white point），**本树没有**。下一步要么补 tonemap，要么换输入点。
+日志会打 `colour in [low, high]` 看被裁掉多少。
+
+### 29.6 本轮三个坑
+
+1. **`nr_net_open` 会 `SetDllDirectoryA(folder)` 且不还原** —— 会污染整个游戏的
+   DLL 搜索路径。桥里在调用前后 `GetDllDirectoryA` / `SetDllDirectoryA` 包住。
+   （加载两个 dll 时同样包一层，否则找不到 libgomp。）
+2. **`Staging` 不能定义在 `MemoryType` 之前**（我插在 `TheBridge()` 后 → C3861）。
+   改成前置声明 + 定义在 `MemoryType` 之后。
+3. **MV 与 color 必须同 extent** 才喂给管线（`nr_compose_temporal` 按 output extent 采
+   history）。不同则 `haveMotion=false`，history 站住不动。
+
+### 29.7 开关（ini `[DlssNr]`）
+
+```
+Network=true      关了就退回 Passthrough（隔离"网络崩"和"hand-over 崩"）
+MvReproject=true  关了就是恒等重投影（A/B 用）
+Folder=...        网络文件目录，默认 dlss-nr-on-a770/work
+```
+
+### 29.8 下一步
+
+先看日志：网络起没起（`network up in N ms`）、`net=` 多少 ms、`gate=` 多少、
+`colour in [low, high]` 被裁多少。然后才是减趟与异步。
+3. 60.8 ms 放不进 30 ms 帧 → 第一版异步（滞后数帧）。
+
+## §30 全 GPU 路线：Pre / Post 融进计划表（2026-10-13 装机，待用户跑）
+
+CPU 那版（`decode=73 mv=119 encode=24.5` = 216 ms 的 PCI-e 惩罚）**搁浅不用**。
+改为照 Mochi 的 `Kind::Pre` / `Kind::Post`：features 与 compose 融进网络首尾，零 CPU 往返。
+
+### 新增
+- `src/gpu/nr_pre.comp` → `work/nr_pre.spv`（20 KB）：
+  R11G11B10 解码 + 除 preExposure + **按 MV 做 5-tap Catmull-Rom 重投影**
+  （catmull/bilinear 从 `history.comp` 逐字照抄）+ 打包 16 通道 fp16。
+  `half()` 三次舍入顺序不可变；通道 7-9 是重投影后的 history。
+- `src/gpu/nr_post.comp` → `work/nr_post.spv`（13 KB）：
+  `temporal_pixel` + `finish_pixel` + gate 查表 + `truncate_half` 写 neural + 编码回 R11G11B10。
+  p0/p1 = gate 表地址，p2/p3 = neural 地址（照 `xmx_rec_ffn_stem` 的既有做法，未改 push 结构）。
+- `libxmx.c` 四个纯新增接口：`xmx_buf_import`（导入 D3D12 共享句柄）、`xmx_prepost_init`、
+  `xmx_rec_pre`、`xmx_rec_post`。
+- `nr_replay.c`：`nr_net_fuse`（open 前调用）+ `nr_net_wait`（导入游戏 fence，图内等）。
+  Pre 插在**第一个 `op >= OP_XMX_REC_COPY`** 之前，Post 插在 `OP_XMX_GRAPH_CAPTURE` 之前；
+  `prepare_fused` 在 `OP_XMX_RES_INIT` 之后跑（buffer 要 runtime 就绪）。
+  **history 与 neural 是同一 buffer**：同一 invocation 先读自己像素再写，安全，无需乒乓。
+- `NrPipeline::{Fuse,RunFused}`、`VulkanGap` 保留 `toVkShared` 句柄、`SlotRead/Write` 在 fused 时跳过 staging。
+
+### 三个坑
+1. glslangValidator 本机没有 → 下载 glslang 16.6.0 到 `tools/glslang/`（GitHub 资产名是
+   `glslang-16.6.0-windows-x86_64-release.zip`，不是 master-tot）。
+2. Git Bash 会把 `/nologo` 当路径转换传给 cl → **必须用 `-` 前缀**（`cl -nologo ... -LD`）。
+   多源文件不能带 `/Fo`。`work/plan_*.c` 要 `nr_plan.h`，已复制一份到 `work/`。
+3. `unpackHalf2x16` 吃一个 uint 返回 vec2，不是吃 uvec2。
+
+### 待验证
+日志看 `fused` 是否成立、`net=` ms（应 ~65 ms 但**不再有 decode/mv/encode**）、
+以及 `the fused pass did not run: <why>` 有没有出现。
+
+## 31. 首跑 fused 实测（13:45-13:47）：四处契约错
+
+现象：载入卡在 20% → 等约 60 秒 → 能进游戏、完全没有 NR。
+
+### 31.1 日志四条铁证
+
+```
+232  [W] SlotRead  the fused path would not start: the network library has no fused passes
+243  [I] gap run #1 took=612.344ms  copy=18.320 decode=6.283 mv=2.275 features=3.530
+                                    net=64.677 compose=1.605 encode=24.288
+245  [W] SlotWork  the fused pass did not run: the graph would not run
+246  [I] gap run #2 took=60043.771ms
+```
+
+第 243 行那一串就是 **§29 那版被搁浅的 CPU 路径**（decode/mv/features/compose/encode 全在）：
+fused 根本没生效。第 246 行 60 秒是图内等游戏 fence 等不到 → 设备被拖挂，之后每帧 2-7 ms 快速失败。
+
+### 31.2 四处契约错
+
+| # | 错在哪 | 证据 | 修法 |
+|---|---|---|---|
+| 1 | `Fuse()` 在 `EnsureNetwork()` 之前调，而 `nr_net_fuse` 是 `nr_net.dll` 的导出，dll 在 EnsureNetwork 里才加载 | `NrBridge.cpp:1274-1289`、`NrPipeline.cpp:487` | `Fuse()` 收 `folder`，库没加载就自己 `LoadLibraries`；**已 open 就拒绝**并给 why |
+| 2 | 宿主 `fused_` 只是"请求发出去了"，网络侧 `r->fused` 才是"Pre/Post 真插进去了" | `nr_replay.c:624` 只在 `fuse.asked` 已置位时才 `prepare_fused` | 新增 `nr_net_fused(n)`；`Pipeline::Fused()` **问网络**，答不上来就当没 fused（降级 CPU 路径，画面不黑） |
+| 3 | 共享 fence 的句柄类型两边不一致 | 宿主 `VulkanGap.h:260` 用 `D3D12_FENCE_BIT`；网络 `libxmx.c:1540` 用 `OPAQUE_WIN32` | 新增 `xmx_sem_import_fence`（D3D12_FENCE_BIT + TIMELINE，导入前先问 `vkGetPhysicalDeviceExternalSemaphoreProperties`） |
+| 4 | 等到不该等的值是**挂死**不是报错 | 60 秒 | `nr_net_wait` 先比 `xmx_sem_value(id) < value`，counter 落后于要等的值就直接返回错误 |
+
+第 3 条最值得记住：`xmx_sem_import` 上面 1504-1510 行的注释自己写着
+"it has to match what the other side exported — VUID-VkImportSemaphoreWin32HandleInfoKHR-handleType-03262"，
+是我自己写的注释，接的时候没照它做。D3D12 fence 的共享句柄不是 opaque win32 句柄，
+拿错类型导入后驱动照样答 SUCCESS，然后等一个永远不动的 counter。
+
+### 31.3 第 5 个契约错（第二跑 14:15 才暴露）：计划表里没有那一步
+
+修完上面四处再跑，`network up in 390 ms`（open 成功），但每帧刷
+`the fused path would not start: the network is already open...`，段位仍是
+`copy=19 decode=12.8 mv=4.7 features=1.6 net=64.9 compose=1.9 encode=24.9`（138 ms/帧）。
+
+**`OP_XMX_RES_INIT` 在 2314 步里出现 0 次**（`OP_XMX_REC_COPY` 同样 0 次）：
+
+```
+total 2314
+  OP_BUF 669 / OP_XMX_BUF_PTR 642 / OP_XMX_REC_GEMM 276 / ... / OP_XMX_GRAPH_CAPTURE 1
+  RES_INIT: None      REC_COPY: None
+```
+
+`build()` 的触发条件是「走到 `s->op == OP_XMX_RES_INIT`」，那一步不存在 →
+`prepare_fused` 从未被调用 → `r->fused` 恒 0 → **Pre/Post 一次都没插进录制**。
+open 照样成功（res_init 是 `prepare()` 里直接调的，不在录制的 `xmx_rec_*` 序列里），
+所以宿主拿到一个"起来了但没融合"的网络，每帧重试、每帧刷警告、每帧走 CPU 路径。
+
+修法：`prepare_fused` 挪到**遍历之前**（runtime 已由 prepare 就绪，它不依赖 plan 的 buffer id），
+遍历结束再查 `!fused` / `!pre_done` / `!post_done`，任一不成立就写进 `r->why`，
+宿主于是报 `the network would not start: <why>`——**不再静默退回老路径**。
+
+🚩可推广的教训：凡"等计划表走到某一步"的写法，先数那一步在表里出现几次。
+这次靠统计 2314 步的 `OP_` 名字才看见 0。
+
+### 31.4 第三跑（14:25）：`the walk failed` —— 真因是着色器取指针取错了
+
+**不再让用户当试验品**：新增 `src\gpu\nr_fuse_probe.cpp` + `tools\build_fuse_probe.bat`。
+它自己建 D3D12 设备（按 vendor 0x8086 选 A770）、三个共享 buffer（照 `SharedBuffer.h` 的
+16 MB floor + 64 KB 对齐），走完整的 `nr_net_fuse` → `nr_net_open`，**17 秒出结果，不开游戏**。
+`nr_replay.c` 的 stderr 现在同时也写 `work\nr_net.log`（游戏是 GUI 进程，原本谁也看不见）。
+
+探针输出：
+
+```
+step 2312 (xmx_graph_run): resident fence wait (-4)
+```
+
+`-4` = `VK_ERROR_DEVICE_LOST`，且发生在**图第一次真正执行**时（2311=CAPTURE，2312=RUN）。
+
+**真因**（逐字对照库源码，不是猜）：
+
+| 处 | 代码 |
+|---|---|
+| `libxmx.c:3197` | `memcpy(&p.p0, &at, sizeof at);` —— 把 8 字节地址**按位**塞进两个 float 槽 |
+| `nr_pre.comp:35` | `float p0, p1, p2, p3;` —— 槽声明成 **float** |
+| `nr_pre.comp:105` | `FloatBuf plan = FloatBuf(uint64_t(pc.p0) \| (uint64_t(pc.p1) << 32u));` |
+
+`uint64_t(一个 float)` 是**把浮点值取整**，不是取回那 32 个位：地址的位模式被当浮点解释后
+是个极小的非规格化数，取整得 **0** → shader 往地址 0 写 → GPU 页错误 → 设备丢失。
+`nr_post.comp:99`（table）与 `:134`（neural）同一个错。
+
+前辈惯例佐证：`residual_epilogue.glsl:21` 能直接 `uint64_t(pc.d)`，是因为**那个字段声明的就是
+buffer_reference 类型**；我们的槽是 float，必须 `floatBitsToUint`。
+
+三处改成 `floatBitsToUint` → 重编 spv → 探针输出 **`the network is up; nr_net_fused says 1`**。
+
+**为什么前两轮没炸**：那两轮 `prepare_fused` 压根没被调用（31.3 那个契约错），Pre/Post 从没
+进过图；一进图就炸。所以"fused 从未生效"和"一生效就丢设备"是同一段代码的两个面。
+
+### 31.5 按 Mochi 改的两处违背（`mz_win_interop_d3d12.md` 逐字）
+
+1. **导入前问句柄**：Mochi `nr_pe_bridge.cpp:360-374`（`external_ok`）与 `:416-467`
+   （`get_handle_properties_` → `vkGetMemoryWin32HandlePropertiesKHR`）先问句柄能进哪些内存类型。
+   `xmx_buf_import` 原本只按 buffer 自己的 `memoryTypeBits` 选类型 → 改为取二者交集。
+2. **导入用资源真实大小**：Mochi `import_image(handle, type, width, height, …)` 用资源的真实维度。
+   我们宿主 `SharedBuffer.h:114` 的资源是 `max(round_up_64k(bytes), 16MB)`，VulkanGap 导入用的
+   正是它（`:157 bi.size = width`），但 `nr_net_fuse` 传的却是 `footprint.bytes`（约 4 MB）
+   → 同一句柄在两个 device 上是两个不同大小的对象。改为传 `SharedBuffer::size`。
+
+### 31.6 构建
+
+`R\tools\build_fused.bat`（新，ASCII+CRLF）：只编 `libxmx.dll` 与 `nr_net.dll`，5 秒。
+`work\libxmx.def` 手工加 `xmx_sem_import_fence` 一行（不用 build_msvc.bat 里那段
+powershell 抓符号的写法，避免再碰安全策略）。
+宿主照旧 `tools\build_optiscaler.py`（2m12s）。
+备份 `backups/dxgi-before-contract-fix-20261013.dll`。
+
+
+### 31.7 证伪：通路数值本来就是对的（2026-10-13 晚）
+
+此前两条结论**是错的**，错在判别实验的设计，不是通路：
+
+- ~~“网络读到的是未初始化显存”~~
+- ~~“两个 device 各导一遍导致读不到”~~（据此改的 `SharedBuffer` 拆分与 `CreateOn` 保留，
+  因为它合上了 Mochi 的形状；但它**不是**当初那个现象的成因）
+
+错法：`nr_net_fuse` 的三个浮点是 exposure / **intensity** / confidence，而 `prepare_fused`
+用 `fuse.intensity` **覆盖** `table[65536]`。所以改 `table[65536]` 毫无作用。探针一直传
+`intensity=1.0`，于是 `blend=1` → `out = clamp(rgb + 1*(predicted-rgb))` = 网络预测值，
+自然不像输入。看着像“读到垃圾”，其实是读到之后被预测值盖掉了。
+
+改 `intensity=0`（`blend=0` → `out = rgb`）后，逐位一致：
+
+```
+in 0x701C0380 (0.5)  -> out 0x701C0380
+in 0x681A0340 (0.25) -> out 0x681A0340
+in 0x781E03C0 (1.0)  -> out 0x781E03C0
+```
+
+**结论：Pre 解码 → 网络 → Post 编码，全链路数值正确，共享 buffer 导入也读得到。**
+
+### 31.8 真 bug：`libxmx.def` 漏导出（确凿）
+
+`work\libxmx.def` 是手工维护的列表，漏了 6 个：`xmx_idle`、`xmx_vk_instance / _physical /
+_device / _queue / _family`。后果：
+- `nr_net_device()` 恒返回 0 → `Pipeline::Boot` 恒 false → hand-over 只能自建 device，
+  **“合成一个 device”从未真正生效**（黑屏那版就是这样）。
+
+已改：`build_fused.bat` 每次用 python 从 `libxmx.c` 抓全部非 static 顶层函数重写 def
+（111 个），不再手工维护。同 device 导两次也已实测无碍（`THE SAME BYTES`）。

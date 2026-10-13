@@ -61,6 +61,10 @@ static struct {
 	VkPipeline rglobal;       /* a bottleneck block's attention in one pass, likewise */
 	VkPipeline rtiled32;      /* the 32x32 register block, built on first use */
 	VkPipeline rtiled8;       /* the 8x32 register block, likewise */
+	/* The fused image input and output, Mochi's Kind::Pre and Kind::Post. Built by
+	 * xmx_prepost_init, which is separate from xmx_res_init because the plan that
+	 * wants them is the bridge's and not every runtime has the two shaders. */
+	VkPipeline rpre, rpost;
 	VkPipeline rquant;        /* the activation quantiser onto the integer path's grid */
 	VkPipeline rint8f;        /* the integer GEMM that quantises as it goes, built on first use */
 	/* The integer GEMM with a residual epilogue, on a 32-row block: the only build of it
@@ -153,6 +157,37 @@ static unsigned prof_hits[PROF_KINDS];
 /* Every pass's own duration, in recording order, since the last reset: what the totals
  * above sum away. `frame_profile.py --calls` pairs it with the calls that recorded them. */
 static double prof_each[MAX_STAMPS];
+/* The wall clock of a frame's submit, split three ways: the CPU handing the work over,
+ * the CPU waiting for it, and the read-back afterwards. The pass timings above are the
+ * device's own and cannot see the first two -- a frame that is slow in `vkQueueSubmit`
+ * has every pass looking quick, which is exactly what the frame totals showed: 62ms
+ * with nothing over 2.6ms anywhere in it.
+ *
+ * Off by default and free when off, like the pass timing. `NR_TIME_SUBMIT` turns it on,
+ * because it costs three clock reads a frame and nothing else, but there is no reason
+ * for a game to pay them. */
+static double subm_submit_ms, subm_wait_ms, subm_collect_ms;
+static unsigned subm_frames;
+static double subm_submit_max, subm_wait_max, subm_collect_max;
+static int time_submit;
+
+/* The wall clock, in milliseconds. QueryPerformanceCounter rather than anything else:
+ * it is what the host's own timings use, so the numbers here and the ones beside them
+ * in the log are the same clock, and it counts while the CPU is inside a driver call --
+ * which is exactly the span being measured. */
+static double wall_ms(void)
+{
+#ifdef _WIN32
+	LARGE_INTEGER f, c;
+	if (!QueryPerformanceFrequency(&f) || f.QuadPart == 0) return 0.0;
+	QueryPerformanceCounter(&c);
+	return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
+#else
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec * 1e-6;
+#endif
+}
 static unsigned char prof_each_kind[MAX_STAMPS];   /* the kind each timed pass was stamped with */
 static unsigned prof_each_n;
 
@@ -161,7 +196,7 @@ static unsigned prof_each_n;
  * is HOST_CACHED, so the host can still write inputs and read outputs in place. */
 #define MAX_RBUF 8192
 struct rbuf { VkBuffer b; VkDeviceMemory m; void *p; VkDeviceAddress addr;
-		 VkDeviceSize size; int live, mapped;
+		 VkDeviceSize size; int live, mapped; int imported;
 		 /* Phase 2: set when the allocation was made exportable, so another
 		  * process can import it. `handle` is the NT handle vkGetMemoryWin32HandleKHR
 		  * gave us; it belongs to us and has to be closed (the specification says the
@@ -1583,6 +1618,74 @@ int xmx_sem_signal(int id, unsigned long long value)
 #endif
 }
 
+/* The same import for a handle that came from a game instead of from a layer of
+ * our own: a shared D3D12 fence is a D3D12 fence, and it arrives as
+ * VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT. Importing one as OPAQUE_WIN32
+ * is outside VUID-VkImportSemaphoreWin32HandleInfoKHR-handleType-03262 -- the two
+ * handle types name different objects -- and on this driver the wait then never
+ * completes: the submit hangs until the device is lost, a minute, and every submit
+ * after it with it. That is what a game loading to 20% and then having no pass in
+ * it looked like on 2026-10-13.
+ *
+ * Timeline only, and always: a shared fence carries a counter, and a counter is what
+ * lets the graph wait for the frame's own number rather than for "a signal". */
+int xmx_sem_import_fence(unsigned long long handle)
+{
+#ifdef _WIN32
+	if (!g.rready) FAIL("resident runtime not initialised", 0);
+	if (!handle) FAIL("no semaphore handle given", 0);
+	VkSemaphoreTypeCreateInfo stci = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+		.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+	};
+	/* Asked before it is done, the way the reference asks: a driver that cannot do
+	 * this says so here rather than at the wait, a minute later. */
+	VkPhysicalDeviceExternalSemaphoreInfo ask = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO,
+		.pNext = &stci,
+		.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT,
+	};
+	VkExternalSemaphoreProperties props = {
+		.sType = VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES,
+	};
+	vkGetPhysicalDeviceExternalSemaphoreProperties(g.pd, &ask, &props);
+	if ((props.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT) == 0)
+		FAIL("this device cannot import a D3D12 fence as a timeline semaphore", 0);
+	int id;
+	for (id = 0; id < MAX_XSEM && g.xsems[id]; id++);
+	if (id == MAX_XSEM) FAIL("out of external semaphore slots", 0);
+	VkSemaphoreCreateInfo sci = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &stci,
+	};
+	VkSemaphore sem;
+	if (vkCreateSemaphore(g.dev, &sci, NULL, &sem) != VK_SUCCESS)
+		FAIL("vkCreateSemaphore (import)", 0);
+	PFN_vkImportSemaphoreWin32HandleKHR import = (PFN_vkImportSemaphoreWin32HandleKHR)
+		vkGetDeviceProcAddr(g.dev, "vkImportSemaphoreWin32HandleKHR");
+	if (!import) {
+		vkDestroySemaphore(g.dev, sem, NULL);
+		FAIL("vkImportSemaphoreWin32HandleKHR absent", 0);
+	}
+	VkImportSemaphoreWin32HandleInfoKHR ii = {
+		.sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR,
+		.semaphore = sem,
+		.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT,
+		.handle = (HANDLE)(uintptr_t)handle,
+	};
+	VkResult r = import(g.dev, &ii);
+	if (r) {
+		vkDestroySemaphore(g.dev, sem, NULL);
+		FAIL("vkImportSemaphoreWin32HandleKHR (d3d12 fence)", r);
+	}
+	g.xsems[id] = sem;
+	g.xsems_timeline[id] = 1;
+	return id;
+#else
+	(void)handle;
+	FAIL("importing a semaphore is Windows only", 0);
+#endif
+}
+
 /* The next submit waits on this semaphore before running anything. That is how the
  * layer says "the frame is in the buffer" without a copy: it writes the bytes on its
  * own CPU and then signals. One submit consumes it.
@@ -3001,6 +3104,229 @@ int xmx_rec_history(int history, int motion, int out, unsigned pixels, unsigned 
 	return 0;
 }
 
+/* The device the network runs on, as handles a host can build its own work on.
+ *
+ * The reference is one device and one queue for both halves of the bridge -- the
+ * hand-over and the network -- and it says so where it hands them over
+ * (`nr_pe_session.cpp`, `access.queue = bdev->queue()`, with the queue's lock given
+ * along with it). Two devices of our own, each importing the same shared resource,
+ * is what reads the wrong bytes: the memory is one object, but the two imports do
+ * not agree about what is in it, and there is no queue they share to order them.
+ *
+ * So the way to be one device here is for the hand-over to be built on the device
+ * the network already has, which is what these are for. */
+unsigned long long xmx_vk_instance(void) { return (unsigned long long)(uintptr_t)g.inst; }
+unsigned long long xmx_vk_physical(void) { return (unsigned long long)(uintptr_t)g.pd; }
+unsigned long long xmx_vk_device(void) { return (unsigned long long)(uintptr_t)g.dev; }
+unsigned long long xmx_vk_queue(void) { return (unsigned long long)(uintptr_t)g.q; }
+unsigned int xmx_vk_family(void) { return g.qi; }
+
+/* A buffer the game already owns, imported by its shared handle rather than copied.
+ *
+ * Mochi's `Pre` and `Post` read the colour where the game put it and write the answer
+ * where the upscaler will read it, so the bridge hands the handle over instead of
+ * staging a copy -- which is what keeps a frame off the host entirely. Imported memory
+ * is device-local and is never mapped, as a created buffer's is on a discrete card. */
+int xmx_buf_import(unsigned long long handle, unsigned long long bytes)
+{
+#ifdef _WIN32
+	if (!g.rready) FAIL("resident runtime not initialised", 0);
+	if (!handle) FAIL("the shared handle is null", 0);
+	int id = -1;
+	for (int i = 0; i < MAX_RBUF; i++)
+		if (!rbufs[i].live) { id = i; break; }
+	if (id < 0) FAIL("out of buffer slots", 0);
+	struct rbuf *rb = &rbufs[id];
+	/* The buffer carries the handle type too, not only the memory it is given: the two
+	 * halves have to agree about what this buffer is for, and the pair is what the
+	 * bridge's own import of the same handle puts on its side. */
+	VkExternalMemoryBufferCreateInfo embi = {
+		.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+		.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT,
+	};
+	VkBufferCreateInfo bi = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &embi,
+				  .size = bytes ? bytes : 4,
+				  .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+					   | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
+					   | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT };
+	VkResult r = vkCreateBuffer(g.dev, &bi, NULL, &rb->b);
+	if (r) FAIL("vkCreateBuffer (import)", r);
+	VkMemoryRequirements mr;
+	vkGetBufferMemoryRequirements(g.dev, rb->b, &mr);
+	/* What the handle itself can be imported into, asked before anything is given to
+	 * it. Mochi asks the same question first (`nr_pe_bridge.cpp`, the call bound to
+	 * `vkGetMemoryWin32HandlePropertiesKHR`, and `external_ok` beside it): the memory
+	 * types a shared handle may go into are the handle's, not the buffer's, so a type
+	 * chosen from the buffer's own requirements alone is a type the import may be
+	 * refused for, or one that binds to the wrong memory. */
+	PFN_vkGetMemoryWin32HandlePropertiesKHR props_of = (PFN_vkGetMemoryWin32HandlePropertiesKHR)
+		vkGetDeviceProcAddr(g.dev, "vkGetMemoryWin32HandlePropertiesKHR");
+	uint32_t allowed = mr.memoryTypeBits;
+	if (props_of) {
+		VkMemoryWin32HandlePropertiesKHR hp = {
+			.sType = VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR,
+		};
+		VkResult pr = props_of(g.dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT,
+				       (HANDLE)(uintptr_t)handle, &hp);
+		if (pr) FAIL("the driver would not say what the shared handle can be imported into", pr);
+		allowed = mr.memoryTypeBits & hp.memoryTypeBits;
+		if (!allowed) FAIL("the shared handle and the buffer agree on no memory type", 0);
+	}
+	/* Dedicated, as the bridge's import of the same handle is: the memory behind a
+	 * D3D12 resource's handle is the resource's own, and sharing it with anything
+	 * besides that one buffer is not something a driver has to offer. */
+	VkMemoryDedicatedAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+					     .buffer = rb->b };
+	VkImportMemoryWin32HandleInfoKHR imp = {
+		.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR, .pNext = &dai,
+		.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT,
+		.handle = (HANDLE)(uintptr_t)handle };
+	VkMemoryAllocateFlagsInfo fl = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+					 .pNext = &imp,
+					 .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT };
+	uint32_t mt = memtype_device(mr.memoryTypeBits);
+	if (mt == UINT32_MAX) {
+		vkDestroyBuffer(g.dev, rb->b, NULL);
+		*rb = (struct rbuf){ 0 };
+		FAIL("no device-local memory type the shared handle can be imported into", 0);
+	}
+	VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &fl,
+				    .allocationSize = mr.size, .memoryTypeIndex = mt };
+	if ((r = vkAllocateMemory(g.dev, &ai, NULL, &rb->m))) {
+		vkDestroyBuffer(g.dev, rb->b, NULL);
+		*rb = (struct rbuf){ 0 };
+		FAIL("vkAllocateMemory (import)", r);
+	}
+	if ((r = vkBindBufferMemory(g.dev, rb->b, rb->m, 0))) {
+		vkDestroyBuffer(g.dev, rb->b, NULL);
+		vkFreeMemory(g.dev, rb->m, NULL);
+		*rb = (struct rbuf){ 0 };
+		FAIL("vkBindBufferMemory (import)", r);
+	}
+	VkBufferDeviceAddressInfo bai = { .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+					  .buffer = rb->b };
+	rb->addr = vkGetBufferDeviceAddress(g.dev, &bai);
+	rb->size = bi.size;
+	rb->imported = 1;
+	rb->live = 1;
+	return id;
+#else
+	(void)handle; (void)bytes;
+	FAIL("importing a buffer handle is Windows only", 0);
+#endif
+}
+
+/* The two fused passes, built from their own shaders: the colour in the game's format
+ * becomes the network's sixteen channels, and the network's head becomes the colour
+ * again. They belong beside the network's layers in the plan rather than on the host,
+ * which is the whole of what Mochi's Kind::Pre and Kind::Post are for. */
+int xmx_prepost_init(const char *pre_spv, const char *post_spv)
+{
+	if (!g.rready) FAIL("resident runtime not initialised", 0);
+	if (!pre_spv || !post_spv) FAIL("the fused passes need both shaders", 0);
+	if (build_pipeline(pre_spv, g.rpl, &g.rpre)) return -1;
+	if (build_pipeline(post_spv, g.rpl, &g.rpost)) return -1;
+	return 0;
+}
+
+/* The sixteen feature channels: one invocation per pixel of the network's extent, from
+ * the colour in the game's own format, its motion vectors, and the previous output.
+ * `plan` holds the noise, the controls and the mirror, and travels in p0/p1 the way the
+ * fused feed-forward's fifth pointer does. */
+int xmx_rec_pre(int colour, int motion, int history, int features, int plan,
+		unsigned pixels, unsigned height, unsigned width,
+		unsigned pitch, unsigned source_h, unsigned source_w, unsigned flags, int table)
+{
+	if (!g.recording || !g.rpre) FAIL("the fused input is not ready for recording", 0);
+	struct push p = { .a = addr_of(colour), .b = addr_of(motion), .c = addr_of(history),
+			  .d = addr_of(features),
+			  .m = pixels, .n = 16u, .k = height, .batch = width,
+			  .sa = pitch, .sb = source_h, .sc = source_w, .flags = flags, };
+	uint64_t at = addr_of(plan);
+	memcpy(&p.p0, &at, sizeof at);
+	/* The gate table, which carries this frame's exposure too: the input pass and the
+	 * output pass have to divide and multiply by the same number, and a number that
+	 * moves from frame to frame can only live in a buffer both of them read. */
+	uint64_t scales = addr_of(table);
+	memcpy(&p.p2, &scales, sizeof scales);
+	if (!p.a || !p.b || !p.c || !p.d || !at || !scales)
+		FAIL("a fused input operand is not a live buffer", 0);
+	/* The game's own buffers, imported rather than copied.
+	 *
+	 * This was a queue family ownership transfer with FOREIGN on one side, which is a
+	 * different thing and a wrong one: a transfer is a release on one family and an
+	 * acquire on another, and the specification wants the pair -- one of them alone leaves
+	 * what it touches undefined, and here it was undefined as colour noise. The reference
+	 * does not do it either: its `ImageBarrier` names `VK_QUEUE_FAMILY_IGNORED` on both
+	 * sides (ta_MochizukiNrRuntime.cpp:1143), because with one device and one queue family
+	 * there is no other family to transfer from. Ordering between the game's queue and
+	 * this one is the shared fence's job; all a barrier has to do here is make the copy's
+	 * writes visible to the shader. */
+	VkBufferMemoryBarrier take[2];
+	unsigned wanting = 0;
+	for (int i = 0; i < 2; i++) {
+		const int id = i == 0 ? colour : motion;
+		if (id < 0 || id >= MAX_RBUF || !rbufs[id].live || !rbufs[id].imported)
+			continue;
+		VkBufferMemoryBarrier b = {
+			.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+			.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.buffer = rbufs[id].b,
+			.offset = 0,
+			.size = VK_WHOLE_SIZE,
+		};
+		take[wanting++] = b;
+	}
+	/* ALL_COMMANDS on both sides, which is what both references do: the reference's
+	 * `ImageBarrier` reaches for it (ta_MochizukiNrRuntime.cpp:717), and the core's
+	 * `transition` names IGNORED on both families and ALL_COMMANDS on both stages
+	 * (nrvk.hpp:712,717). Naming the copy stage instead would be tighter, but the copy is
+	 * the game's and its stage is not ours to promise; over-synchronising a buffer once a
+	 * frame is nothing, under-synchronising it is colour noise. */
+	if (wanting)
+		vkCmdPipelineBarrier(g.rcb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+				    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL,
+				    wanting, take, 0, NULL);
+	if (getenv("XMX_SAY_PRE"))
+		fprintf(stderr, "input pass: features id %d at %llx, %u pixels, %u groups\n",
+		        features, (unsigned long long)p.d, pixels, (pixels + 63u) / 64u);
+	vkCmdBindPipeline(g.rcb, VK_PIPELINE_BIND_POINT_COMPUTE, g.rpre);
+	vkCmdPushConstants(g.rcb, g.rpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof p, &p);
+	vkCmdDispatch(g.rcb, (pixels + 63u) / 64u, 1, 1);
+	barrier();
+	g.recorded++;
+	return 0;
+}
+
+/* The composition, and the way back into the game's format. `table` holds the gate and
+ * the three scalars that follow it; `neural` is the prediction kept for the next frame's
+ * history. The two travel in p0/p1 and p2/p3, as the fifth and sixth pointers. */
+int xmx_rec_post(int colour, int head, int history, int result, int table, int neural,
+		 unsigned pixels, unsigned height, unsigned width,
+		 unsigned pitch, unsigned source_h, unsigned source_w)
+{
+	if (!g.recording || !g.rpost) FAIL("the fused output is not ready for recording", 0);
+	struct push p = { .a = addr_of(colour), .b = addr_of(head), .c = addr_of(history),
+			  .d = addr_of(result),
+			  .m = pixels, .n = 3u, .k = height, .batch = width,
+			  .sa = pitch, .sb = source_h, .sc = source_w };
+	uint64_t at = addr_of(table);
+	memcpy(&p.p0, &at, sizeof at);
+	uint64_t keep = addr_of(neural);
+	memcpy(&p.p2, &keep, sizeof keep);
+	if (!p.a || !p.b || !p.c || !p.d || !at || !keep)
+		FAIL("a fused output operand is not a live buffer", 0);
+	vkCmdBindPipeline(g.rcb, VK_PIPELINE_BIND_POINT_COMPUTE, g.rpost);
+	vkCmdPushConstants(g.rcb, g.rpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof p, &p);
+	vkCmdDispatch(g.rcb, (pixels + 63u) / 64u, 1, 1);
+	barrier();
+	g.recorded++;
+	return 0;
+}
+
 /* Read the timestamps back and add each pass to its kind's running total. Called only
  * once the fence has signalled, so every query is available; WAIT is passed anyway
  * because a driver may still report a query as not-ready immediately after. */
@@ -3058,9 +3384,22 @@ static int submit_commands(VkCommandBuffer commands, int passes)
 				wait_value);
 	}
 #endif
+	const double t0 = time_submit ? wall_ms() : 0.0;
 	if ((r = vkQueueSubmit(g.q, 1, &si, g.rfence))) FAIL("resident submit", r);
+	const double t1 = time_submit ? wall_ms() : 0.0;
 	if ((r = vkWaitForFences(g.dev, 1, &g.rfence, VK_TRUE, 60ull * 1000000000ull)))
 		FAIL("resident fence wait", r);
+	if (time_submit) {
+		/* The wait is where the device's time lands, and the submit is where the host's
+		 * does. A frame slow in one and quick in the other wants opposite fixes, so they
+		 * are kept apart rather than summed. */
+		const double t2 = wall_ms();
+		subm_submit_ms += t1 - t0;
+		subm_wait_ms += t2 - t1;
+		subm_frames++;
+		if (t1 - t0 > subm_submit_max) subm_submit_max = t1 - t0;
+		if (t2 - t1 > subm_wait_max) subm_wait_max = t2 - t1;
+	}
 	return passes;
 }
 
@@ -3071,7 +3410,13 @@ int xmx_submit(void)
 	VkResult r = vkEndCommandBuffer(g.rcb);
 	if (r) FAIL("end resident recording", r);
 	int passes = submit_commands(g.rcb, g.recorded);
+	const double c0 = (time_submit && passes >= 0) ? wall_ms() : 0.0;
 	if (passes >= 0) collect(g.prof_n, stamp_kind);
+	if (time_submit && passes >= 0) {
+		const double c1 = wall_ms();
+		subm_collect_ms += c1 - c0;
+		if (c1 - c0 > subm_collect_max) subm_collect_max = c1 - c0;
+	}
 	return passes;
 }
 
@@ -3092,6 +3437,8 @@ int xmx_graph_capture(void)
 	if (r) { vkFreeCommandBuffers(g.dev, g.cpool, 1, &replacement); FAIL("end graph recording", r); }
 	graphs[id].commands = g.rcb;
 	graphs[id].passes = g.recorded;
+	if (getenv("XMX_SAY_GRAPH"))
+		fprintf(stderr, "graph %d: %d passes recorded\n", id, g.recorded);
 	graphs[id].stamps = g.prof_n;
 	free(graphs[id].kinds);
 	graphs[id].kinds = NULL;
@@ -3103,6 +3450,20 @@ int xmx_graph_capture(void)
 	g.rcb = replacement;
 	g.recording = 0;
 	return id;
+}
+
+/* Nothing left in flight on the queue.
+ *
+ * Not for a frame: a frame is ordered by the semaphores the game's queue and the
+ * hand-over's share, and waiting here would cost the whole point of running beside
+ * the game. It exists so a probe can read an answer back and know the answer is
+ * there -- which is how the fused path is checked without a game. */
+int xmx_idle(void)
+{
+	if (!g.dev || !g.q) FAIL("no device", 0);
+	VkResult r = vkQueueWaitIdle(g.q);
+	if (r) FAIL("vkQueueWaitIdle", r);
+	return 0;
 }
 
 int xmx_graph_run(int id)
@@ -3149,6 +3510,40 @@ int xmx_profile(int on)
 	}
 	g.prof = 1;
 	return 0;
+}
+
+/* The submit's three costs, and the read-out for them. Off until asked, because it is
+ * three clock reads and a game should not pay them for a diagnostic. `xmx_time_submit`
+ * turns it on; `xmx_time_report` prints what has been gathered and clears it, so one
+ * report covers one span of frames rather than everything since the process started. */
+void xmx_time_reset(void)
+{
+	subm_submit_ms = subm_wait_ms = subm_collect_ms = 0.0;
+	subm_submit_max = subm_wait_max = subm_collect_max = 0.0;
+	subm_frames = 0;
+}
+
+int xmx_time_submit(int on)
+{
+	/* A call is the request; there is no environment variable for it, because the thing
+	 * that knows when is the host and the thing that pays is the game, and only the
+	 * former should be able to ask. Off leaves the counters clear, so turning it on
+	 * again measures the frames that follow rather than everything since the start. */
+	time_submit = on ? 1 : 0;
+	if (!on)
+		xmx_time_reset();
+	return 0;
+}
+
+void xmx_time_report(double* out, unsigned n)
+{
+	/* n wants 8 numbers: frames, submit total/max, wait total/max, collect total/max. */
+	if (!out || n < 8) return;
+	out[0] = (double)subm_frames;
+	out[1] = subm_submit_ms;  out[2] = subm_submit_max;
+	out[3] = subm_wait_ms;    out[4] = subm_wait_max;
+	out[5] = subm_collect_ms; out[6] = subm_collect_max;
+	out[7] = subm_frames > 0 ? (subm_submit_ms + subm_wait_ms + subm_collect_ms) / subm_frames : 0.0;
 }
 
 void xmx_profile_reset(void)
