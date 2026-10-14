@@ -38,6 +38,7 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src" / "gpu"))
 sys.path.insert(0, str(ROOT / "src" / "ref"))
+sys.path.insert(0, str(ROOT / "src" / "bench"))
 
 # Every function that ends up as a pass in the graph begins with xmx_rec_. The rest are
 # what put the buffers and the bytes in place for them, and what bounds a graph.
@@ -405,6 +406,14 @@ def main():
     import xmxres
     import nr_model
     import nr_frame_resident as F
+    import game_settings
+
+    # The trap `notes/frame-ledger-a770.md` opens with: a script that is not the daemon
+    # runs with `NR_INT8_PROJECT` at its default of "0", and records a graph no game
+    # ever ran. The plan is what the game runs, so the game's switches have to be on
+    # before the Runtime is built. Every standalone benchmark calls this; the plan
+    # dumper is a benchmark of the same kind.
+    game_settings.apply()
 
     trace = Trace()
     install(xmxres._load(), trace)

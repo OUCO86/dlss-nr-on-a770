@@ -111,6 +111,30 @@ static int (*f_rec_unary2)(unsigned, int, int, int, int, int, unsigned, unsigned
 			   unsigned, unsigned, unsigned, unsigned, unsigned);
 static int (*f_rec_ffn_merge)(int, int, int, int, int, int, int,
 			      unsigned, unsigned, unsigned, unsigned);
+/* The integer path. The plan recorded with the game's switches on (dump_plan.py calls
+ * game_settings.apply()) asks for these by name; without them the replayer fell
+ * through to the default and refused a plan no float graph ever made. The signatures
+ * are xmx_rec_quant / _quant_window / _gemm_int8 / _gemm_int8_batched /
+ * _gemm_int8_residual / _gemm_window_int8_residual / _gemm_int8_qkv / _gemm_int8_fused
+ * in libxmx.c, kept in the same argument order. */
+static int (*f_rec_quant)(int, int, int, unsigned, unsigned);
+static int (*f_rec_quant_window)(int, int, int, unsigned, unsigned,
+				 unsigned, unsigned, unsigned, unsigned);
+static int (*f_rec_gemm_int8)(int, int, int, int, int,
+			      unsigned, unsigned, unsigned, unsigned);
+static int (*f_rec_gemm_int8_batched)(int, int, int, int, int,
+				      unsigned, unsigned, unsigned, unsigned,
+				      unsigned, unsigned, unsigned, unsigned,
+				      unsigned, unsigned, unsigned, unsigned);
+static int (*f_rec_gemm_int8_residual)(int, int, int, int, int, int, int,
+				       unsigned, unsigned, unsigned, unsigned);
+static int (*f_rec_gemm_window_int8_residual)(int, int, int, int, int, int, int,
+					      unsigned, unsigned, unsigned, unsigned,
+					      unsigned, unsigned, unsigned, unsigned);
+static int (*f_rec_gemm_int8_qkv)(int, int, int, int, int, int, int, int,
+				  unsigned, unsigned, unsigned, unsigned, unsigned);
+static int (*f_rec_gemm_int8_fused)(int, int, int, int, int,
+				    unsigned, unsigned, unsigned, unsigned);
 
 static const char *(*f_error)(void);
 /* The fused passes and the import they need: Mochi's Kind::Pre and Kind::Post,
@@ -281,6 +305,14 @@ static int open_library(const char *path)
 	GRAB(f_rec_global_attention, "xmx_rec_global_attention");
 	GRAB(f_rec_unary2, "xmx_rec_unary2");
 	GRAB(f_rec_ffn_merge, "xmx_rec_ffn_merge");
+	GRAB(f_rec_quant, "xmx_rec_quant");
+	GRAB(f_rec_quant_window, "xmx_rec_quant_window");
+	GRAB(f_rec_gemm_int8, "xmx_rec_gemm_int8");
+	GRAB(f_rec_gemm_int8_batched, "xmx_rec_gemm_int8_batched");
+	GRAB(f_rec_gemm_int8_residual, "xmx_rec_gemm_int8_residual");
+	GRAB(f_rec_gemm_window_int8_residual, "xmx_rec_gemm_window_int8_residual");
+	GRAB(f_rec_gemm_int8_qkv, "xmx_rec_gemm_int8_qkv");
+	GRAB(f_rec_gemm_int8_fused, "xmx_rec_gemm_int8_fused");
 	GRAB(f_error, "xmx_error");
 	GRAB(f_device, "xmx_device");
 	return 0;
@@ -563,6 +595,51 @@ static int step(replay *r, const struct nr_step *s)
 				       r->ids[a[3]], r->ids[a[4]], r->ids[a[5]],
 				       r->ids[a[6]], (unsigned)a[7], (unsigned)a[8],
 				       (unsigned)a[9], (unsigned)a[10]);
+	case OP_XMX_REC_QUANT:
+		return f_rec_quant(r->ids[a[0]], r->ids[a[1]], r->ids[a[2]],
+				   (unsigned)a[3], (unsigned)a[4]);
+	case OP_XMX_REC_QUANT_WINDOW:
+		return f_rec_quant_window(r->ids[a[0]], r->ids[a[1]], r->ids[a[2]],
+					  (unsigned)a[3], (unsigned)a[4], (unsigned)a[5],
+					  (unsigned)a[6], (unsigned)a[7], (unsigned)a[8]);
+	case OP_XMX_REC_GEMM_INT8:
+		return f_rec_gemm_int8(r->ids[a[0]], r->ids[a[1]], r->ids[a[2]],
+				       r->ids[a[3]], r->ids[a[4]], (unsigned)a[5],
+				       (unsigned)a[6], (unsigned)a[7], (unsigned)a[8]);
+	case OP_XMX_REC_GEMM_INT8_BATCHED:
+		return f_rec_gemm_int8_batched(r->ids[a[0]], r->ids[a[1]], r->ids[a[2]],
+					       r->ids[a[3]], r->ids[a[4]],
+					       (unsigned)a[5], (unsigned)a[6],
+					       (unsigned)a[7], (unsigned)a[8],
+					       (unsigned)a[9], (unsigned)a[10],
+					       (unsigned)a[11], (unsigned)a[12],
+					       (unsigned)a[13], (unsigned)a[14],
+					       (unsigned)a[15], (unsigned)a[16]);
+	case OP_XMX_REC_GEMM_INT8_RESIDUAL:
+		return f_rec_gemm_int8_residual(r->ids[a[0]], r->ids[a[1]], r->ids[a[2]],
+						r->ids[a[3]], r->ids[a[4]], r->ids[a[5]],
+						r->ids[a[6]], (unsigned)a[7],
+						(unsigned)a[8], (unsigned)a[9],
+						(unsigned)a[10]);
+	case OP_XMX_REC_GEMM_WINDOW_INT8_RESIDUAL:
+		return f_rec_gemm_window_int8_residual(r->ids[a[0]], r->ids[a[1]],
+						r->ids[a[2]], r->ids[a[3]], r->ids[a[4]],
+						r->ids[a[5]], r->ids[a[6]],
+						(unsigned)a[7], (unsigned)a[8],
+						(unsigned)a[9], (unsigned)a[10],
+						(unsigned)a[11], (unsigned)a[12],
+						(unsigned)a[13], (unsigned)a[14]);
+	case OP_XMX_REC_GEMM_INT8_QKV:
+		return f_rec_gemm_int8_qkv(r->ids[a[0]], r->ids[a[1]], r->ids[a[2]],
+					   r->ids[a[3]], r->ids[a[4]], r->ids[a[5]],
+					   r->ids[a[6]], r->ids[a[7]], (unsigned)a[8],
+					   (unsigned)a[9], (unsigned)a[10],
+					   (unsigned)a[11], (unsigned)a[12]);
+	case OP_XMX_REC_GEMM_INT8_FUSED:
+		return f_rec_gemm_int8_fused(r->ids[a[0]], r->ids[a[1]], r->ids[a[2]],
+					     r->ids[a[3]], r->ids[a[4]], (unsigned)a[5],
+					     (unsigned)a[6], (unsigned)a[7],
+					     (unsigned)a[8]);
 	default:
 		diagf("the plan asks for %s, which this replayer does not "
 			"know how to make\n", nr_plan_names[s->op]);
