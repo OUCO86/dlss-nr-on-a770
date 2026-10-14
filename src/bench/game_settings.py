@@ -39,6 +39,13 @@ SETTINGS = {
     "NR_INT8_OUT": "1",
     "NR_INT8_EXPAND": "1",
     "NR_INT8_TRANSITION": "0",     # measured, no gain, left off on purpose
+    # Task #68 (2026-10-14): the grouped feed-forward on the integer grid. The
+    # switch was left off pending a look at the picture; `notes/int8-ffn-groups-a770.md`
+    # carries the measured trade: -1.92 ms (34.75 -> 32.83 at 768x448) against 14.93 %
+    # of the network's effect as this one switch's increment. The game's fused path
+    # takes it through the recorded plan, so it has to be on before `dump_plan.py`
+    # records; the daemon path takes it through `set_int8`, which is already wired.
+    "NR_INT8_FFN_GROUPS": "1",   # 2026-10-14 #68: 16:33 黑屏是分辨率乌龙，960x540 实测 wait 51.7->46.4 正常
 }
 
 

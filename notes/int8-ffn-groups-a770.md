@@ -106,6 +106,23 @@ look at in a game before turning it on.
 
 ## Status
 
+**2026-10-14: ON, verified in the game.** `game_settings.py` now sets
+`NR_INT8_FFN_GROUPS=1` and the recorded plan carries it: 144 batched steps at
+960x544, `xmx_rec_gemm` 260 -> 84, quantise +176, 1206 -> 1382 passes. In-game
+the device's wait fell **51.7 -> 46.4-47.2 ms** over 3200 frames, `copies=3199
+nowork=0 failures=0`, and the picture is normal. The first game run looked
+black; that was a **resolution red herring** - someone had changed the game's
+resolution away from the one the plan was recorded for (956x538 vs 960x540),
+and the NR only runs at the extent the plan knows. Lesson: when the game goes
+black, check the `NrBridge frame` line's extent against the plan's before
+suspecting the plan. Two escape hatches for future bisection, both default-on
+(no behaviour change): `NR_INT8_FFN_BATCH=0` keeps `int8_first` and returns the
+grouped products to float; `NR_INT8_FFN_FIRST=0` is its mirror. Also fixed on
+the way: `xmxres.py` declared 15 argtypes for a 17-parameter recorder - the
+last two (`scale_stride`, `flags`) were never passed on a live call. The plan
+itself was fine (the dumper encodes every Python argument it saw), which is
+why the bug hid: the benchmarks read right, the ctypes call was the wrong one.
+
 `NR_INT8_FFN_GROUPS` defaults to **0**. Nothing a game runs changes until it is set and
 the picture has been looked at. It is not wired into `nr_settings.json` for live
 switching: unlike the other integer knobs it decides how the weights are quantised, so

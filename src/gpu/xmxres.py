@@ -211,7 +211,14 @@ def _load():
     # native build open, and a build without this symbol must still load. `int8_ffn_groups`
     # reads it back, so a tree running an older library keeps the float grouped GEMM.
     if hasattr(lib, "xmx_rec_gemm_int8_batched"):
-        lib.xmx_rec_gemm_int8_batched.argtypes = [ctypes.c_int] * 5 + [ctypes.c_uint] * 10
+        # 5 int (a, b, c, a_scale, b_scale) + 12 unsigned (M, N, K, batch, sa, sb, sc,
+        # lda, ldb, ldc, scale_stride, flags) = 17, matching xmx_rec_gemm_int8_batched in
+        # libxmx.c. It used to declare 10 unsigneds (15 total), which truncated the last
+        # two -- scale_stride and flags -- so ctypes never passed them and the recorder
+        # read stack garbage for the epilogue. The plan's encoder iterated all 17 Python
+        # arguments and stored them, so the recorded plan looked right while the live call
+        # that made it was wrong.
+        lib.xmx_rec_gemm_int8_batched.argtypes = [ctypes.c_int] * 5 + [ctypes.c_uint] * 12
         lib.xmx_rec_gemm_int8_batched.restype = ctypes.c_int
     lib.xmx_buf_ptr.argtypes = [ctypes.c_int]
     lib.xmx_buf_ptr.restype = ctypes.c_void_p

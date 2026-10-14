@@ -97,6 +97,10 @@ def grouped_integer_pays(rows, cols, inner):
         return False
     if (cols, inner) == (256, 64):
         return False
+    # 诊断逃生门（2026-10-14 黑屏定位）：NR_INT8_FFN_BATCH=0 只关 grouped 的
+    # batched 分支，int8_first（gemm_int8 单发）不受影响。默认开，不改行为。
+    if os.environ.get("NR_INT8_FFN_BATCH", "1") == "0":
+        return False
     return cols >= 64 or rows >= 5376
 
 
@@ -158,7 +162,8 @@ class SplitBlockWeights:
         # (`work/probe-ffn-int8-batched.txt`). It needs no batch to take it.
         self.int8_first = (quantise_weight(
             runtime, weights[f"block{index}.layer0.first_projection_weight"])
-            if runtime.int8_ffn_groups else None)
+            if (runtime.int8_ffn_groups
+                and os.environ.get("NR_INT8_FFN_FIRST", "1") != "0") else None)
         # the split family's per-group expansion and projection, on the integer grid
         self.int8_expand = self.int8_project = None
         if runtime.int8_ffn_groups:
