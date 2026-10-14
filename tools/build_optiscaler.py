@@ -153,27 +153,36 @@ def objname(rel):
     return os.path.join(BUILD, rel.replace("\\", "_").replace("/", "_").replace(".cpp", ".obj"))
 
 
-def compile_batch(rels, label, use_pch):
-    rsp = os.path.join(BUILD, "src_%s.rsp" % label)
-    with open(rsp, "w") as f:
-        f.write("\n".join('"%s"' % os.path.join(PROJ, s) for s in rels))
+def compile_one(rel, use_pch):
+    """One cl process, one source file, no /MP.
+
+    The Security Center misfires on the C1xx child processes /MP spawns: it generates a
+    precise deny rule per .obj at run time and blocks a random batch of them each build,
+    over any directory allowlist (first match wins). A separate cl per file -- the shape
+    the nopch batch below has always used, never blocked in six builds -- writes its own
+    obj directly, so there is no child to misfire on. Running many of these at once is
+    still parallel; it is just parallel at the process level instead of inside cl."""
     args = [CL] + COMMON + DEFS
     if use_pch:
-        args += ["/MP", "/Yupch.h", "/Fp" + os.path.join(BUILD, "pch.pch")]
+        args += ["/Yupch.h", "/Fp" + os.path.join(BUILD, "pch.pch")]
     else:
-        args += ["/MP", "/Y-"]
-    # one /Fo per file is not allowed, so compile with an explicit obj per file
-    # is impossible in a single call; instead compile serially for this small batch.
+        args += ["/Y-"]
+    # Match the object name the link step expects: with_pch keeps the basename,
+    # without_pch uses the path-qualified objname().
     if use_pch:
-        args += ["/Fo" + BUILD + "\\", "@" + rsp]
-        return run(args, PROJ, "compile %s" % label)
-    rc = 0
-    for s in rels:
-        one = [CL] + COMMON + DEFS + ["/Y-", "/Fo" + objname(s), os.path.join(PROJ, s)]
-        rc = run(one, PROJ, "compile %s" % s)
-        if rc != 0:
-            return rc
-    return 0
+        obj = os.path.join(BUILD, os.path.basename(rel).replace(".cpp", ".obj"))
+    else:
+        obj = objname(rel)
+    args += ["/Fo" + obj, os.path.join(PROJ, rel)]
+    return run(args, PROJ, "compile %s" % rel)
+
+
+def compile_batch(rels, label, use_pch):
+    from concurrent.futures import ThreadPoolExecutor
+    workers = min(8, len(rels)) or 1
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        rcs = list(ex.map(lambda s: compile_one(s, use_pch), rels))
+    return 0 if all(r == 0 for r in rcs) else 1
 
 
 rc = compile_batch(with_pch, "pch_sources", True)
