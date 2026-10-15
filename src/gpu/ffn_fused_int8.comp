@@ -4,58 +4,48 @@
  * ffn_fused_int8 — a narrow block's whole feed-forward on the integer path, with the
  * hidden layer kept on chip AND on the integer grid.
  *
- * The int8 chain ran the narrow blocks' feed-forward as four passes: quantise the
- * input, the expand GEMM publishing a half hidden layer, quantise that, the
- * projection GEMM with the residual. The hidden layer left the chip and came back
- * twice, and the second quantise is a pass of its own. This kernel keeps the hidden
- * layer in shared memory as E4M3 bytes — the values the expand GEMM publishes are
- * exactly that, so nothing is lost — and quantises it where it stands: the row peak
- * spans the whole row because the whole row is here, which is the wall the separate
- * pass existed to work around. Two passes and the hidden round trip go away; the
- * input's quantise stays (the graph already wrote it, and its peak spans only the
- * 32 input columns).
+ * The chain this replaces for a narrow block's feed-forward: quantise the input, the
+ * expand GEMM (K = 32 — too shallow for the staged kernel's 64 gate, which is why
+ * these blocks ran the fp16 fused kernel instead), publish a half hidden layer,
+ * quantise that, the projection GEMM with the residual. Here the expand reads the
+ * quantised input directly at TK = 32 — one multiply-add, exactly the staged
+ * kernel's step — keeps the hidden layer in shared as E4M3 bytes (the published
+ * values ARE exactly that, so nothing is lost), quantises it where it stands — the
+ * whole row is in the subgroup, which is the wall the separate pass existed to work
+ * around — and runs the contract from those bytes. The second quantise pass and the
+ * hidden round trip go away; the input's stays (the graph already wrote it).
  *
- * Bit-identical to the chain by construction, following the order each pass uses:
- *   expand: the chain runs hidden columns as four workgroups of one 32x32 tile each
- *     (K = 32 = one TK step from zero); here the same four tiles in one subgroup,
- *     chunks ascending. Dequantise through shared exactly as `gemm_staged_int8.comp`
- *     does — float(w) * row_scale * column_scale, left to right — then
- *     publish(EPI_GATE_E4M3) and store the value as its E4M3 code, which holds it
- *     exactly (the half the chain stores is that same value; test compares bytes).
- *   quantise: E4M3 codes are monotonic in magnitude (the subnormal step 2^-9 is
- *     finer than the normal minimum 2^-6 = 8 steps), so the largest |code| is the
- *     largest |value|: peak = the decoded max code, scale = peak/127 (1.0 for a zero
- *     row), the same reciprocal, the same roundEven/clamp-127 grid as
- *     `quantize_row.comp`, applied in place, bytes for bytes.
- *   contract: the chain's K = 128 loop (BK = 64, TK = 32) takes hidden columns
- *     0..31, 32..63, 64..95, 96..127 into the same int32 accumulator — four MMAs a
- *     fragment in that order. Same here. Residual as the chain's INT8_RESIDUAL
- *     store: fma(skip, cosine, float(w) * scale_h * column_scale) under `precise`,
- *     then publish(epilogue).
+ * Why int8 at all: the width sweep (notes/int8-width-sweep.md, specialized against
+ * specialized) — at the frame's FFN shapes the int8 GEMM runs 1.3-1.8x the fp16
+ * one. The first build of this kernel lost at 130560x32x128 where the raw GEMM won
+ * 1.57x: a 32-element local array spilled (the driver reported scratch 960) and
+ * 8-row subgroups doubled the fixed cost per row. This build: 16 rows a subgroup,
+ * eight subgroups — 2 KB of hidden bytes + 2 KB of int32 staging a subgroup, 32 KB
+ * a workgroup, the budget exactly — and the quantise reads shared twice instead of
+ * caching a row in registers. No local array over a handful of words anywhere.
  *
- * The shape: 8 rows a subgroup, not the fp16 kernel's 16 — the shared budget is the
- * reason. A subgroup keeps its 8 rows' whole hidden row (8 x 128 bytes = 1 KB) and
- * reuses a second kilobyte as the int32 staging the dequantise passes through:
- * 2 KB x 16 subgroups is the 32 KB a workgroup gets; 16 rows would need 4 KB. The
- * graph's row counts are multiples of 16 either way. The weights (4 KB + 4 KB of
- * int8) are read from global/L2 by every subgroup: 128 KB a workgroup against
- * 854 GB/s of L2 is nothing, and the fp16 kernel's staging note was about fp16's
- * double width.
+ * Bit-identical to the chain by construction:
+ *   expand: one int32 MMA per hidden chunk from zero (K = 32 = one TK step), chunks
+ *     ascending; dequantise through shared exactly as gemm_staged_int8's store loop —
+ *     float(w) * row_scale * column_scale, left to right — publish(3) (gate then
+ *     e4m3), and store the value as its E4M3 code.
+ *   quantise: E4M3 codes are monotonic in magnitude, so the largest |code| decodes to
+ *     the row peak the half path measured; scale = peak/127 (1.0 for a zero row), one
+ *     reciprocal, roundEven and clamp-127 exactly as quantize_row.comp.
+ *   contract: the chain's K = 128 walk — hidden columns 0..31, 32..63, 64..95,
+ *     96..127 into the same int32 accumulator, four MMAs a fragment; then the
+ *     INT8_RESIDUAL store: fma(skip, cosine, float(w) * scale_h * column_scale) under
+ *     precise, publish(epilogue).
+ * The hidden's row scales travel in the ascale buffer's second half (index M + row):
+ * 64 bytes a subgroup through L2 — the shared budget has no room and the registers
+ * the first build spent on them spilled.
  *
- * The register arithmetic: the expand's four accumulators die into shared before
- * the contract's are born — 4 + 4 live int32 matrices, never 8 + 8. The cliff at 16
- * (measured 2026-10-15: scratch 8 KB, 4.1x) stays clear by a wide margin.
- *
- * Operands, in the resident push block (128 bytes, the fp16 kernel's layout with
- * its unused fields re-aliased): a the quantised input (int8, M x 32 — what
- * quantize_row wrote), b the expand weights (int8, 128 x 32 = hidden x channels —
- * what quantise_weight stores for the chain's GEMM), c the output, d the residual's
- * skip (half with 0x40000, float32 without), `ascale` the input's row scales
- * (float32, M), `col_scale_e` the expand weights' column scales (128),
- * `col_scale_p` the contract weights' column scales (32), `residual_cos` the skip's
- * per-channel cosine, `projection` the contract weights (int8, 32 x 128 = channels x
- * hidden — the chain's other quantise_weight). m rows, n = 32 channels, k = 128
- * hidden, ldc the output's row stride.
+ * Operands (the struct push layout, offsets in comments): a the quantised input
+ * (int8, M x 32), b the expand weights ((hidden x channels) = 128 x 32, the chain's
+ * quantise_weight layout), c the output, d the skip (half with 0x40000), ascale at
+ * 64 (float32, 2M: input scales then this kernel's hidden scales), col_scales at 72
+ * (expand's 128 then contract's 32), ldc at 88, residual_cos at 96, projection at
+ * 120 ((channels x hidden) = 32 x 128, the chain's other quantise_weight).
  */
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference2 : require
@@ -72,7 +62,7 @@
 
 #include "publish.glsl"
 
-layout(local_size_x = 512) in;
+layout(local_size_x = 256) in;
 
 layout(buffer_reference, scalar, buffer_reference_align = 16) buffer Int8Buf  { int8_t  v[]; };
 layout(buffer_reference, scalar, buffer_reference_align = 16) buffer FloatBuf { float   v[]; };
@@ -81,39 +71,35 @@ layout(buffer_reference, scalar, buffer_reference_align = 8)  buffer Half4Buf { 
 layout(buffer_reference, scalar, buffer_reference_align = 4)  buffer HalfBuf  { float16_t v[]; };
 
 layout(push_constant, scalar) uniform Push {
-    // byte-for-byte the struct push libxmx fills (offsets in comments); the fp16
-    // fused kernel's merge/stem fields are re-aliased for the int8 chain's scale
-    // vectors, as gemm_staged_int8 aliases a_scale/b_scale. Both column-scale sets
-    // share one buffer (expand's 128 then contract's 32) to fit the four u64 slots.
-    Int8Buf a, b; FloatBuf c; HalfBuf d;   // 0,8,16,24: input, expand weights, out, skip
+    Int8Buf a, b; FloatBuf c; HalfBuf d;   // 0,8,16,24
     uint m, n, k, batch;                    // 32
     uint sa, sb, sc, flags;                 // 48
-    uint64_t ascale;                        // 64: input row scales (float32, M)
+    uint64_t ascale;                        // 64: float32, 2M (input; hidden at M)
     uint64_t col_scales;                    // 72: expand's 128 then contract's 32
-    uint lda, ldb, ldc, spare;              // 80: the output's row stride (ldc, at 88)
-    uint64_t residual_cos;                  // 96: the skip's cosine (ffn_cos)
+    uint lda, ldb, ldc, spare;              // 80
+    uint64_t residual_cos;                  // 96
     uint spare3, spare4, spare5, spare6;    // 104
-    uint64_t projection;                    // 120: contract weights (32 x 128)
+    uint64_t projection;                    // 120
 } pc;
 
 #include "specialize.glsl"
 
 /* A770 / Xe-HPG: int8 cooperative matrix is 8x8x32, as gemm_staged_int8.comp takes it. */
 const uint TM = 8, TN = 8, TK = 32;
-const uint ROWS = 8u, OUT = 32u, HIDDEN = 128u, SUBGROUPS = 16u;
-const uint RN = OUT / TN;                              // 4
+const uint ROWS = 16u, OUT = 32u, HIDDEN = 128u, SUBGROUPS = 8u;
+const uint RM = ROWS / TM;                 // 2
+const uint RN = OUT / TN;                  // 4
 
-/* 32 KB, every view the same bytes (the aliased-shared-block pattern
- * ffn_fused.comp and gemm_staged_int8.comp already rely on; the driver's Workgroup
- * Memory Size is checked to read 32768, not 65536, in test_ffn_fused_int8's stats).
- * Subgroup s's two kilobytes at 2 KB * s — its hidden rows (E4M3 bytes, then int8 in
- * place) in the low kilobyte, its int32 staging in the high one. */
+/* 32 KB, every view the same bytes: subgroup s's four kilobytes at 4 KB * s — its
+ * hidden rows (E4M3 bytes, then int8 in place) in the low 2 KB, its int32 staging
+ * (16 rows x 32 words) in the high 2 KB. */
 layout(scalar) shared AsByte { uint8_t  u8[32768]; };
 layout(scalar) shared AsI8   { int8_t   i8[32768]; };
 layout(scalar) shared AsInt  { int32_t  i32[8192]; };
+layout(scalar) shared AsUint { uint     u32[8192]; };
 
 /* The E4M3 code of a value already rounded onto the grid — what publish(3) leaves.
- * 0x7f/0xff cannot appear (the rounding clamps to 448 = 0x7e and never emits NaN). */
+ * 0x7f/0xff cannot appear (publish clamps to 448 = 0x7e and never emits NaN). */
 uint e4m3_code(float v)
 {
     uint sb = (floatBitsToInt(v) >> 31) << 7;
@@ -124,8 +110,8 @@ uint e4m3_code(float v)
     return sb | (e << 3u) | ((b >> 20) & 7u);
 }
 
-/* The value of an E4M3 code: bias 7, subnormals in 2^-9 steps — the format the code
- * names, and the exact float32 the chain's half container held. */
+/* The value of an E4M3 code: bias 7, subnormals in 2^-9 steps — the exact float32 the
+ * chain's half container held. */
 float e4m3_value(uint b)
 {
     uint exponent = (b >> 3u) & 15u, mantissa = b & 7u;
@@ -145,43 +131,54 @@ void main() {
     uint sub = gl_SubgroupID;
     uint row = gl_WorkGroupID.x * (ROWS * SUBGROUPS) + sub * ROWS;
     if (row >= pc.m) return;
+    uint last = pc.m - 1u;
     uint lane = gl_SubgroupInvocationID;
     uint ldc = pc.ldc != 0u ? pc.ldc : OUT;
-    uint hbase = 2048u * sub;                    // hidden bytes, and staging above them
-    uint stw = (2048u * sub + 1024u) / 4u;       // staging, in int32 words
+    uint hbase = 4096u * sub;                       // hidden bytes (and int8 in place)
+    uint stw = (4096u * sub + 2048u) / 4u;          // staging, in int32 words
 
-    /* The expand's A fragment: the input's 8 rows x 32 int8, from the pass that
-     * quantised them. One load serves all four hidden chunks. */
-    coopmat<int8_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> fa;
-    coopMatLoad(fa, pc.a.v, row * 32u, 32u, gl_CooperativeMatrixLayoutRowMajor);
     FloatBuf ascale = FloatBuf(pc.ascale), col = FloatBuf(pc.col_scales);
+
+    /* The expand's A fragments: the input's 16 rows x 32 int8, two TM tall, clamped
+     * to the last row past the end as the staged GEMM clamps its partial block — the
+     * surplus rows compute real products and are discarded at the store. */
+    coopmat<int8_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> fa[RM];
+    for (uint i = 0u; i < RM; i++)
+        coopMatLoad(fa[i], pc.a.v, min(row + i * TM, last) * 32u, 32u,
+                    gl_CooperativeMatrixLayoutRowMajor);
 
     for (uint c = 0u; c < 4u; c++) {
         /* One int32 MMA a chunk from zero — the chain's expand takes K = 32 as a
          * single TK step in a workgroup of its own; the same B fragments (the same
-         * rows of the same (hidden x channels) buffer) in the same chunk order. */
-        coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> h[RN];
+         * rows of the same (hidden x channels) buffer) in the same chunk order.
+         * Eight accumulators live here and again in the contract, never both at
+         * once: the peak is 8 + 3 fragments, well clear of the cliff at 16. */
+        coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> h[RM][RN];
         for (uint j = 0u; j < RN; j++) {
             coopmat<int8_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> w;
             coopMatLoad(w, pc.b.v, (c * 32u + j * 8u) * 32u, 32u,
                         gl_CooperativeMatrixLayoutColumnMajor);
-            h[j] = coopMatMulAdd(fa, w,
-                coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0));
+            for (uint i = 0u; i < RM; i++)
+                h[i][j] = coopMatMulAdd(fa[i], w,
+                    coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0));
         }
         subgroupMemoryBarrierShared();           // the previous chunk read staging last
         subgroupBarrier();
-        for (uint j = 0u; j < RN; j++)
-            coopMatStore(h[j], i32, stw + j * 8u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+        for (uint i = 0u; i < RM; i++)
+            for (uint j = 0u; j < RN; j++)
+                coopMatStore(h[i][j], i32, stw + (i * TM) * 32u + j * 8u, 32u,
+                             gl_CooperativeMatrixLayoutRowMajor);
         subgroupMemoryBarrierShared();
         subgroupBarrier();
         /* Dequantise and publish as the chain's expand GEMM's store loop does, then
          * keep the value as its code: the half the chain wrote holds exactly that, and
-         * the quantise below reads it back from there. */
+         * the quantise reads it back from there. */
         for (uint e = lane; e < ROWS * 32u / 4u; e += 32u) {
             uint at = e * 4u;
             uint r = at / 32u, cc = at % 32u;
+            float scale = ascale.v[min(row + r, last)];
             for (uint q = 0u; q < 4u; q++) {
-                precise float value = float(i32[stw + at + q]) * ascale.v[row + r]
+                precise float value = float(i32[stw + at + q]) * scale
                                     * col.v[c * 32u + cc + q];
                 u8[hbase + r * HIDDEN + c * 32u + cc + q] = uint8_t(e4m3_code(publish(3u, value)));
             }
@@ -190,58 +187,68 @@ void main() {
     subgroupMemoryBarrierShared();
     subgroupBarrier();
 
-    /* The hidden's quantise, in place. Four lanes a row, 32 bytes a lane: the row's
-     * peak is the largest |code| (the codes are monotonic in magnitude), decoded once
-     * after the butterflies; scale, reciprocal and grid exactly as quantize_row. */
-    uint r0 = lane / 4u, c0 = (lane % 4u) * 32u;
-    uint at0 = hbase + r0 * HIDDEN + c0;
-    uint bytes[32];
+    /* The hidden's quantise, in place: two lanes a row, 64 bytes a lane. The row
+     * peak is the largest |code| (the codes are monotonic in magnitude) — one pass
+     * for the max, one more to decode, quantise and write back. */
+    uint r0 = lane / 2u, hw = lane % 2u;
+    uint words0 = (hbase + r0 * HIDDEN + hw * 64u) / 4u;
     uint peak_code = 0u;
-    for (uint w = 0u; w < 32u; w++) {
-        bytes[w] = u8[at0 + w];
-        peak_code = max(peak_code, bytes[w] & 0x7Fu);
+    for (uint t = 0u; t < 16u; t++) {
+        uint x = u32[words0 + t];
+        peak_code = max(peak_code, max(x & 0x7Fu, (x >> 8u) & 0x7Fu));
+        peak_code = max(peak_code, max((x >> 16u) & 0x7Fu, x >> 24u));
     }
     peak_code = max(peak_code, subgroupShuffleXor(peak_code, 1u));
-    peak_code = max(peak_code, subgroupShuffleXor(peak_code, 2u));
     float peak = e4m3_value(peak_code);
     float scale = peak == 0.0 ? 1.0 : peak / 127.0;
     float reciprocal = 1.0 / scale;
-    for (uint w = 0u; w < 32u; w++)
-        u8[at0 + w] = uint8_t(uint(grid(e4m3_value(bytes[w]), reciprocal)) & 0xFFu);
+    if (hw == 0u && row + r0 <= last) ascale.v[pc.m + row + r0] = scale;
+    for (uint t = 0u; t < 16u; t++) {
+        uint x = u32[words0 + t];
+        uint g0 = uint(grid(e4m3_value(x & 0xFFu), reciprocal)) & 0xFFu;
+        uint g1 = uint(grid(e4m3_value((x >> 8u) & 0xFFu), reciprocal)) & 0xFFu;
+        uint g2 = uint(grid(e4m3_value((x >> 16u) & 0xFFu), reciprocal)) & 0xFFu;
+        uint g3 = uint(grid(e4m3_value(x >> 24u), reciprocal)) & 0xFFu;
+        u32[words0 + t] = g0 | (g1 << 8u) | (g2 << 16u) | (g3 << 24u);
+    }
     subgroupMemoryBarrierShared();
     subgroupBarrier();
 
-    /* The contract: the chain's K = 128 loop in four chunks into the same
-     * accumulators, the hidden-column order its BK/TK walk takes. The A fragments
-     * come out of the shared bytes just quantised; the B fragments are the chain's
-     * (channels x hidden) buffer read column-major, exactly as gemm_staged_int8
-     * reads its (N x K) weights. */
-    coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> result[RN];
+    /* The contract: the chain's K = 128 walk in four chunks into the same
+     * accumulators. The A fragments come out of the shared bytes just quantised; the
+     * B fragments are the chain's (channels x hidden) buffer read column-major,
+     * exactly as gemm_staged_int8 reads its (N x K) weights. */
+    coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> result[RM][RN];
     for (uint c = 0u; c < 4u; c++) {
-        coopmat<int8_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> g;
-        coopMatLoad(g, i8, hbase + c * TK, HIDDEN, gl_CooperativeMatrixLayoutRowMajor);
+        coopmat<int8_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> g[RM];
+        for (uint i = 0u; i < RM; i++)
+            coopMatLoad(g[i], i8, hbase + (i * TM) * HIDDEN + c * TK, HIDDEN,
+                        gl_CooperativeMatrixLayoutRowMajor);
         for (uint j = 0u; j < RN; j++) {
             coopmat<int8_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> w;
             coopMatLoad(w, Int8Buf(pc.projection).v, j * 8u * HIDDEN + c * 32u, HIDDEN,
                         gl_CooperativeMatrixLayoutColumnMajor);
-            if (c == 0u)
-                result[j] = coopMatMulAdd(g, w,
-                    coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0));
-            else
-                result[j] = coopMatMulAdd(g, w, result[j]);
+            for (uint i = 0u; i < RM; i++) {
+                if (c == 0u)
+                    result[i][j] = coopMatMulAdd(g[i], w,
+                        coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0));
+                else
+                    result[i][j] = coopMatMulAdd(g[i], w, result[i][j]);
+            }
         }
     }
     subgroupMemoryBarrierShared();
     subgroupBarrier();
-    for (uint j = 0u; j < RN; j++)
-        coopMatStore(result[j], i32, stw + j * 8u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+    for (uint i = 0u; i < RM; i++)
+        for (uint j = 0u; j < RN; j++)
+            coopMatStore(result[i][j], i32, stw + (i * TM) * 32u + j * 8u, 32u,
+                         gl_CooperativeMatrixLayoutRowMajor);
     subgroupMemoryBarrierShared();
     subgroupBarrier();
 
     /* The residual and the publish, exactly the chain's INT8_RESIDUAL store loop:
      * fma(skip, cosine, float(w) * row_scale * column_scale) under precise, then
-     * publish(epilogue). The row's scale is in the four lanes that own the row —
-     * a shuffle, not a buffer. */
+     * publish(epilogue). */
     uint epilogue = (operation_flags() >> 8) & 0xFu;
     bool narrow = (operation_flags() & 0x1000u) != 0u;
     bool half_skip = (operation_flags() & 0x40000u) != 0u;
@@ -249,11 +256,12 @@ void main() {
     for (uint e = lane; e < ROWS * 32u / 4u; e += 32u) {
         uint at0 = e * 4u;
         uint r = at0 / 32u, cc = at0 % 32u;
+        if (row + r > last) continue;
         uint at = (row + r) * ldc + group * OUT + cc;
         vec4 skip = half_skip ? vec4(Half4Buf(uint64_t(pc.d)).v4[at >> 2])
                               : Vec4Buf(uint64_t(pc.d)).v4[at >> 2];
         vec4 cosv = cosine.v4[cc >> 2];
-        float hs = subgroupShuffle(scale, r * 4u);
+        float hs = ascale.v[pc.m + row + r];
         vec4 out4;
         for (uint q = 0u; q < 4u; q++) {
             precise float total = fma(skip[q], cosv[q],

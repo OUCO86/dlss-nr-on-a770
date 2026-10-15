@@ -90,3 +90,16 @@ GEMM 是每 subgroup 8 行的窄带（M=8 视角 ≈ 上表 M=640 行 = 0.8×区
 B1 megakernel 的"变宽"= 把窗口块的 64 token × 96 列 QKV 和 128 列 FFN 在一个
 workgroup 里以 16-32 行的行块推进（不是 8 行），让每 workgroup 的 raw GEMM 面积
 ×4，然后全 int8。
+
+## ffn_fused_int8 修后实测（2026-10-16 01:10）：达标但不接入
+重写（16 行×8 subgroup、去 bytes[] spill、hidden scale 走 ascale 后半段）：
+**Scratch=0 ✓ Workgroup=32768 ✓**，三个帧形状 1.06/1.07/1.10×。
+账：raw GEMM 1.57× 的引擎红利，被 int8 链多出的逐元素（e4m3 encode、decode×2、
+grid、两遍 shared 读）抵掉大半；且 fp16 ffn_fused 本来就没有 quantize/hidden 往返
+可省——FFN 恰好是 int8 最不适用的形状（contract N=32 窄、expand K=32 浅）。
+净帧收益 ~0.4-0.6ms（还要加回 input quantize 10 趟 ~0.11ms），**不值画质变化**。
+⇒ 决定：ffn_fused_int8 保留为对照存证，不接帧。
+⇒ B1 的正解 = **window_block 转 int8**：它的 QKV(N=96,K=32/64/128/256/1024)、
+outproj、attn 全是 fp16，按本表 1.33-1.5×（32640x32x128=1.33、32640x128x128=1.48、
+130560x32x128=1.57）；窗口块 9.04ms+qkv 12.54 里的 fp16 部分 → int8 + megakernel
+消中间往返，这才是 2-3.5× 区。

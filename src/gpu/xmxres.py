@@ -1571,7 +1571,7 @@ class Runtime:
             raise ValueError("integer fused feed-forward output must not alias its inputs")
         sizes = [(a, rows * 32), (expand, 128 * 32), (projection, 32 * 128),
                  (target, rows * 32 * (2 if narrow else 4)),
-                 (ascale, rows * 4), (col_scales, 160 * 4)]
+                 (ascale, rows * 8), (col_scales, 160 * 4)]   # ascale: input at [0,M), hidden at [M,2M)
         if skip is not None:
             sizes += [(cosine, 32 * 4), (skip, rows * 32 * (2 if skip_half else 4))]
         if any(buf.nbytes < size for buf, size in sizes):
