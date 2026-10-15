@@ -196,3 +196,24 @@ frame_ledger on/off + test_frame_execution；每特化 XMX_PIPELINE_STATS scratc
 **收益预估**：224 个 quantize_row 里 FFN 相关 ~112 个（2×56?按 ledger:
 feed_forward:719 站点 46+20+... 数一下）≈1.2-1.5ms + hidden16 往返 ~0.6ms +
 dispatch 合并。B1a ≈ **-2ms**；B1b（窗口 attention+FFN 全 megakernel）再 -3-5ms。
+
+## 8. 宽度扫描改写 B1（2026-10-16 01:00，用户观点被证实）
+
+完整表 + 三条读表规则在 `notes/int8-width-sweep.md`。要点：
+
+- **int8 红利由宽度决定，不由引擎决定**：同 8×8 coopmat，宽形状（M≥32640,
+  N≥128, K≥128）int8 赢 **2-3.5×**（130560x1024x64: 3.54×）；窄形状（M≤8160,
+  K=64）0.8-1.0×。fp16 在 6-7.6 TF/s 撞引擎天花板，int8 到 16-20.5。
+- **修正 00:40 的"窄块 FFN 转 int8 净亏"**：那是我的实现开销（bytes[32] 数组
+  spill Scratch=960、ROWS=8 固定开销、barrier 密度），不是方向错——同形状
+  raw GEMM int8 赢 1.57×。kernel 要修：去 spill（两遍读 shared）、8 subgroup
+  x 16 行（4KB+4KB=8KB x 8 = 32KB 正好）、expand 两 chunk 一批（8 累加器，
+  不碰 16 悬崖）。
+- **B1 的"变宽"具体化**：Mochi 的 tile 常数 gemm_wide_mt 64 / gemm_wide_nt 256
+  就是这张表的兑现方式。窗口块 megakernel 每 workgroup 的行块从 8 提到 16-32，
+  QKV 的 96 列、FFN 的 128 列以宽 tile 推进 → 从 0.8× 区搬进 2-3× 区。
+- **按层选引擎**（grouped_integer_pays 先例）：l1/l2/l3 的 FFN 走 int8 赢
+  （1.33-1.77× on contract, expand 用 TK=32 单步），l4/l5 保持 fp16。
+
+B1a 重定义：修 ffn_fused_int8 至无 spill + 16 行块，重测 130560/32640/8160 三形状，
+目标 >=1.3x on l1/l2；达成则接帧（NR_INT8_FFN_FUSE 门 + 逐字节对 numpy 参考链）。

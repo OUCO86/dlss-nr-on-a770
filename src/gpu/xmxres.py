@@ -135,6 +135,8 @@ def _load():
             ("xmx_rec_gemm_dual", [ctypes.c_int] * 4 + [ctypes.c_uint] * 3),
             ("xmx_ffn_init", [ctypes.c_char_p]),
             ("xmx_rec_ffn", [ctypes.c_int] * 6 + [ctypes.c_uint] * 5),
+            ("xmx_int8_ffn_init", [ctypes.c_char_p]),
+            ("xmx_rec_ffn_int8", [ctypes.c_int] * 8 + [ctypes.c_uint] * 3),
             ("xmx_rec_ffn_merge", [ctypes.c_int] * 7 + [ctypes.c_uint] * 4),
             ("xmx_rec_ffn_stem", [ctypes.c_int] * 6 + [ctypes.c_uint] * 2),
             ("xmx_rec_gemm_window_residual_pool", [ctypes.c_int] * 6 + [ctypes.c_uint] * 8),
@@ -1545,6 +1547,46 @@ class Runtime:
                                 cosine.id if cosine is not None else -1,
                                 rows, channels, hidden, groups, flags) != 0:
             raise RuntimeError("xmx_rec_ffn: " + self.lib.xmx_error().decode())
+        self.recorded += 1
+        return self
+
+    def ffn_fused_int8(self, a, expand, projection, target, *, ascale, col_scales,
+                       skip=None, cosine=None, rows, epilogue=0, narrow=False,
+                       skip_half=False):
+        """A narrow block's whole feed-forward on the integer path, hidden on chip.
+
+        What `quantize_row(a) -> gemm_int8(expand, EPI_GATE_E4M3, narrow) ->
+        quantize_row(hidden) -> gemm_int8_residual(projection, ...)` write into
+        `target`, bit for bit, with the hidden layer kept in shared memory as E4M3
+        bytes and quantised there (`ffn_fused_int8.comp`, `src/gpu/test_ffn_fused_int8.py`).
+        `a` is the already-quantised int8 input (rows x 32) with its row scales in
+        `ascale`; `expand` the (128 x 32) and `projection` the (32 x 128) int8 weights;
+        `col_scales` is one buffer, the expand's 128 column scales then the contract's 32.
+        """
+        if rows <= 0 or rows % 8:
+            raise ValueError("the integer fused feed-forward needs 8-row blocks")
+        inputs = {a.id, expand.id, projection.id, ascale.id, col_scales.id}
+        if target.id in inputs or (skip is not None and target.id == skip.id
+                                   and narrow != skip_half):
+            raise ValueError("integer fused feed-forward output must not alias its inputs")
+        sizes = [(a, rows * 32), (expand, 128 * 32), (projection, 32 * 128),
+                 (target, rows * 32 * (2 if narrow else 4)),
+                 (ascale, rows * 4), (col_scales, 160 * 4)]
+        if skip is not None:
+            sizes += [(cosine, 32 * 4), (skip, rows * 32 * (2 if skip_half else 4))]
+        if any(buf.nbytes < size for buf, size in sizes):
+            raise ValueError("integer fused feed-forward buffer is too small")
+        path = os.environ.get("XMX_INT8_FFN_SPV") or str(ROOT / "work" / "ffn_fused_int8.spv")
+        if self.lib.xmx_int8_ffn_init(path.encode()) != 0:
+            raise RuntimeError("integer fused feed-forward pipeline: " + self.lib.xmx_error().decode())
+        flags = _publish(epilogue, narrow) | (0x40000 if skip_half else 0) \
+            | (0x20000 if skip is not None else 0)
+        if self.lib.xmx_rec_ffn_int8(a.id, expand.id, projection.id, target.id,
+                                     skip.id if skip is not None else -1,
+                                     ascale.id, col_scales.id,
+                                     cosine.id if cosine is not None else -1,
+                                     rows, 32, flags) != 0:
+            raise RuntimeError("xmx_rec_ffn_int8: " + self.lib.xmx_error().decode())
         self.recorded += 1
         return self
 

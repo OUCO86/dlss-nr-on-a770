@@ -67,6 +67,10 @@ static struct {
 	VkPipeline rpre, rpost;
 	VkPipeline rquant;        /* the activation quantiser onto the integer path's grid */
 	VkPipeline rint8f;        /* the integer GEMM that quantises as it goes, built on first use */
+	/* A narrow block's whole feed-forward on the integer path, the hidden layer kept
+	 * on chip as E4M3 bytes (ffn_fused_int8.comp): two quantises and a hidden round
+	 * trip gone. Built on first use, like the other fused shapes. */
+	VkPipeline rffn8;
 	/* The integer GEMM with a residual epilogue, on a 32-row block: the only build of it
 	 * that does not spill (xmx_shape.h, XMX_STAGED_BM_RESIDUAL). */
 	VkPipeline rint8r;
@@ -76,7 +80,7 @@ static struct {
 	 * 15 the fused integer GEMM, 16 the integer GEMM's residual build;
 	 * see xmx_tiled32_init / xmx_tiled8_init / xmx_quant_init /
 	 * xmx_int8_fused_init / xmx_int8_residual_init */
-	char *rpaths[17];
+	char *rpaths[18];
 	unsigned specialize;
 	unsigned tiling, tilem, tilen, tilem32, tilen32;
 	unsigned tiled32;         /* the 32x32 block may take a shape the 16x32 one can */
@@ -3139,6 +3143,64 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
 	vkCmdDispatch(g.rcb, (M + 255u) / 256u, 1, 1);
 	barrier();
 	stamp(PK_GEMM, 31);
+	g.recorded++;
+	return 0;
+}
+
+/* A narrow block's whole feed-forward on the integer path (ffn_fused_int8.comp): the
+ * expand and the projection in one pass, the hidden layer kept in shared as E4M3 bytes
+ * and quantised there. The chain it replaces is four passes — quantise, expand GEMM,
+ * quantise, projection GEMM — and the second quantise exists only because the expand's
+ * workgroup saw 32 of the row's 128 columns; here the whole row is in the subgroup. */
+int xmx_int8_ffn_init(const char *path)
+{
+	if (!g.rready) FAIL("resident runtime not initialised", 0);
+	if (g.rffn8) return 0;
+	free(g.rpaths[17]);
+	if (!(g.rpaths[17] = strdup(path))) FAIL("pipeline path allocation", 0);
+	return build_pipeline(path, g.rpl, &g.rffn8);
+}
+
+/* `a` the quantised input (int8, M x 32), `expand` the (128 x 32) weights, `projection`
+ * the (32 x 128), `out` the target, `skip` the residual's (half with 0x40000),
+ * `ascale` the input's row scales (float32, M), `col_scales` the two weights' column
+ * scales in one buffer (expand's 128, then contract's 32), `cosine` the skip's.
+ * Not specialised: the flags ride in the push block, so this is the fallback build
+ * only. Until the shape is proven worth a pipeline of its own, that is the honest
+ * cost — one dispatch a block's feed-forward, and the driver re-decodes the push. */
+int xmx_rec_ffn_int8(int a, int expand, int projection, int out, int skip,
+		     int ascale, int col_scales, int cosine,
+		     unsigned M, unsigned ldc, unsigned flags)
+{
+	if (!g.recording || !g.rffn8) FAIL("integer fused feed-forward not ready for recording", 0);
+	if (!M || M % 8u) FAIL("the integer fused feed-forward needs 8-row blocks", 0);
+	if (flags & ~0x61f00u)
+		FAIL("the integer fused feed-forward takes an epilogue, a half output, a half skip and the residual", 0);
+	if (!(flags & 0x20000u) && skip >= 0)
+		FAIL("a skip without the residual flag", 0);
+	if ((flags & 0x20000u) && (skip < 0 || cosine < 0))
+		FAIL("the integer fused residual needs a skip and a cosine", 0);
+	struct push p = { .a = addr_of(a), .b = addr_of(expand), .c = addr_of(out),
+			  .d = skip >= 0 ? addr_of(skip) : 0,
+			  .m = M, .n = 32u, .k = 128u, .batch = 1u,
+			  .sa = 32u * 128u, .sb = 128u * 32u, .ldc = ldc,
+			  .flags = flags, .residual_cos = addr_of(cosine) };
+	/* the shader reads p0-p1 and p2-p3 as the two 64-bit scale vectors */
+	uint64_t rows = addr_of(ascale), cols = addr_of(col_scales);
+	memcpy(&p.p0, &rows, sizeof rows);
+	memcpy(&p.p2, &cols, sizeof cols);
+	/* the contract's weights travel in the last slot, as the fp16 kernel's do */
+	uint64_t weights = addr_of(projection);
+	memcpy(&p.qkv_scale, &weights, sizeof weights);
+	if (!p.a || !p.b || !p.c || !rows || !cols || !weights ||
+	    ((flags & 0x20000u) && (!p.d || !p.residual_cos)))
+		FAIL("integer fused feed-forward operand is not a live buffer", 0);
+	vkCmdBindPipeline(g.rcb, VK_PIPELINE_BIND_POINT_COMPUTE, g.rffn8);
+	vkCmdPushConstants(g.rcb, g.rpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof p, &p);
+	/* sixteen subgroups of 8 rows a workgroup; the last one's surplus return */
+	vkCmdDispatch(g.rcb, (M + 127u) / 128u, 1, 1);
+	barrier();
+	stamp(PK_GEMM, 32);
 	g.recorded++;
 	return 0;
 }
