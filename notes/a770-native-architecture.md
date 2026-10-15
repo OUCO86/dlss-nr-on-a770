@@ -116,3 +116,40 @@ mochi-rewrite-plan.md §6；ffn_fused_int8 v2（scratch 0、1.06-1.10×）留作
 4. 帧内分布：l0(192 行)→fp16；l1(2040)→fp16 除 QKV-K1024；l2(8160)→QKV int8；
    l3(32640)/l4(130560)→全部 int8。
 红利区数据至此完整：P1-P7 + §7 六条 + 本表。明天 B1 开工不再需要任何测量。
+
+## 9. 统摄法则（用户 2026-10-16 02:15）：单一数据世界，float 只在数学强制的孤岛
+
+**取代 §8 的"按层选引擎"。** 那是 R 的两世界遗留（fp16/int8 共存，边界处才有
+quantize/publish 摩擦）。既然核心自己写、什么都改，正解是**一个世界**：
+
+- **GEMM 操作数一律 int8、累加器一律 int32（精确）、贯穿全链**——不在 fp16↔int8
+  之间来回，就没有那条边界上的 quantize/dequantize/publish 摩擦（§7 红利①的 7ms 池
+  正是这条边界税）。
+- **float 只保留在数学上不可约的孤岛**（不是妥协，是 Mochi 的实际形状——它是 FP8 GEMM
+  + float softmax，同款）：
+  1. attention softmax 的 exp（bit-trick，attention.comp/window_block 现成）；
+  2. layernorm 的 inversqrt / reciprocal（cosine_tree.glsl）；
+  3. dequant 的 scale 乘（int32→float 的那一步，publish.glsl）；
+  4. publish 舍入链（half_round/e4m3）。
+  这些在 int8 GEMM 的 **epilogue/store 循环里**做，不落回 fp16 世界再重新量化。
+
+### 与 §8 冲突处的裁决（诚实）
+§8 实测：孤立 GEMM 在 tiny-M（l0=192、l1=2040）int8 反而 0.74-0.86×慢。
+但**系统级**不同：把这两个形状单独退回 fp16，就要在它们前后各插一次
+quantize/dequantize 跨界——边界税 > 那 0.2× 的 GEMM 罚金。
+⇒ **B1 内必测的一条**（唯一还缺的数据，且只有 megakernel 里才是真形状，
+standalone 测不了——gemm_int8 的 inner%64 闸门拒 K=32，而 K=32=head_dim
+正是 attention scores 的宽度）：l0/l1 的 int8-vs-fp16 **含边界成本**对比。
+先验：int8 K=32 = 一条 TK=32 MMA，fp16 K=32 = 两条 TK=16 MMA（②红利半发射成本），
+v2 的 expand 已跑通这个单步形态。预期 int8 含边界仍赢，但这是 B1 要证的，不假设。
+
+### K=32 的 int8 不是硬件限制，是遗留闸门
+coopmat int8 原生 8×8×**32**——K=32 恰好一条 MMA。"staged 拒 K=32"是前辈
+gemm_staged_int8 的 inner%64 检查（为 BK=64 的 K-loop 设的），不是 Xe-HPG 的边界。
+megakernel 自己写 K-loop，K=32 单步完全合法（v2 expand 已证）。⇒ 单一世界无硬件障碍。
+
+### 这条法则让架构"发货这张卡的优势"的方式
+不是"每个 GEMM 求最快"（那会碎片化成 fp16/int8 混跑），而是"整条数据流求最快"：
+int8 贯穿 → 零边界税 → 512 XMX 全程喂 int8 双率（②③）→ float 只在四个孤岛、
+在 epilogue 内做完（①）。这才是 A770 最擅长的形态：宽数据流、浅每步、少趟、
+无格式转换。§8 的表降级为"若某形状边界税反超预期时的退路清单"，不是默认路由。
