@@ -401,3 +401,84 @@ level 0 那趟 5529 个窗口 1.68 ms → **1941 GFLOP/s，fp16 峰值约 5 %**�
 
 能动的只剩减搬运，而减搬运只剩那条共享内存往返链（每个 logit 在场内存里过四趟）。
 用 `subgroupShuffle` 替掉一部分，是 B3 唯一还有结构的一项。
+
+## 2026-10-15 拆 window_block / ffn_fused（前辈 probe 复跑，768x448）
+
+三 stop 两序（正 5.96/2.47/4.65，反 6.01/2.48/4.65，一致）：
+- 阶段A QKV 投影+gather+normalize（stop1）: **2.47 ms**
+- 阶段B attention（stop2-stop1）: **2.18 ms**
+- 阶段C outproj+residual+publish（stop0-stop2）: **1.35 ms**
+- 全程 stop0: **6.0 ms**（前辈警告：stop 截断后续阶段，前面部分调度偏乐观，分段是上界估计）
+
+per-pass（stop0 反序）：block0 448x768 5376 windows = **1498 us 一趟**（全帧最贵单趟）；
+224x384 各 block 300-367 us。
+
+**两核的 coopmat 尺寸（拆出来的关键事实）**：
+- window_block: `coopmat<fp16 A, 8x16>/<16x8 B>`, 累加器 **8x8 fp32**（QKV、QK^T、
+  attn@V、outproj 全是 8x8）。M=8 = 一个 subgroup 处理 window 的一行（8 tokens）。
+- ffn_fused: `const uint TM=8, TN=8, TK=16`——同样 **8x8 累加器**。
+- 对比：Intel DPAS 原生 16x8x16；gemm_staged_int8 用 64x32 大块。
+  8x8 意味着每条 DPAS 只吃一半 A 行——**tile 比硬件小一档**。
+- M=8 是算法结构（subgroup=一行）决定的，**可以改**：subgroup 跨 2 行 → TM=16，
+  但要重排 shared memory 布局（K/V 已全在 shared，Q 跨行无障碍）。
+
+## 2026-10-15 TM=16 实验（负结果，已定案）
+- ffn_fused sed TM=16：glslang 通过、管线创建成功（驱动接受声明）、但 test_ffn_fused
+  第一 case 即 255 bytes differ → **位不一致**。改动确认进产物（sha 0318.. vs 07e1..，
+  byte 7185 起异），不是 sed 失效。
+- window_block sed 变体（只改声明、语义错）：管线创建成功，5.98ms——只证明声明合法，
+  性能数不作数。
+- **8x8 为什么钉死（两层）**：
+  (a) A770(Xe-HPG) 驱动只广告 fp16 coopmat **8x8x16**——移植记录就写着：
+      ffn_fused.comp:96、gemm_resident.comp:92-93（Xe2 时代 TN=16，A770 降到 8，
+      RN 从 1 变 2）；原机(Xe2) 2026-09-07 探测是 8x16x16（CLAUDE.md:317）。
+  (b) 逐位红线锚定的是**两阶段 fp16 参考路径**（它锚 vendor）。声明 16x8 驱动会
+      lowering 成不同分组的原生 DPAS → e4m3 publish 舍入变 → 255B 差。
+- 硬件本身能做 16x8x16（Xe-HPG DPAS 原生 m16n8k16，Blackwood ESIMD 直接用）——
+  但那要走 SYCL/ESIMD = 换锚点大决策；对照实验已证帧内形状不值得（oneDNN 0/14 赢）。
+- int8 staged 已是 64x32（config 4 广告），不受 8x8 钉。
+- 可动区：融合核的**非矩阵**部分（gather/normalize/softmax/shared 往返/barrier）。
+- 探针文件挪 work/（_wb_tm16_probe.comp、_ffn_tm16_probe.comp、两 spv），src/gpu/ 干净。
+- coopmat_props.py 枚举只作旁证（未查返回码，多数行是垃圾；唯一干净条目 8x8x16 与注释一致）。
+
+## 2026-10-15 帧字节账（frame-bytes.py，推翻旧叙事）
+- 帧最小 DRAM 字节 ≈ **2.37 GB/帧**（960x544；模型按各 pass 操作数 in/out 一次计，
+  weights 按 L2-resident 不计——Blackwood B_L2_reuse 854GB/s 的同一假设）。
+- 按 copy roofline 340GB/s → **字节地板只有 6.97ms**。实测 42.9ms = **地板的 6.2×**。
+- 每族 ms/地板 比值：quantize_row **1.0**（撞墙）、quantize_window 1.3（撞墙）、
+  ffn_fused_stem 1.6、ffn_fused 6.3、window_attention 3.4、
+  **gemm_int8_qkv 25.9×、gemm_int8 25.2×、window_block 21×**（离墙最远）。
+- ⚠ 纠正此前多处"帧是流量受限"的说法：**不是 DRAM 流量受限，是 overhead/发射/epilogue
+  受限**。字节削减只对已经撞墙的 quant 族有效（fold 省 ~2.5-3ms，就是 C1b 的全部真实
+  收益）；GEMM 族的 12.5+5ms 里 ~11ms 是 staging/barrier/epilogue/低算术强度，不是带宽。
+- 交叉验证：oneDNN 在同形状也离墙 ~6×（640x2048x512: 104MB/1.93ms=54GB/s）——
+  官方库也没吃到带宽，差距在 kernel 结构。这正是 Mochi persistent 大核(150 趟 vs 我们
+  691 趟)攻击的东西。
+- 新地板估计：字节 7ms + 矩阵功 oneDNN 级 ~5-8ms（重叠）→ 物理上 15-20ms 可达，
+  但需要重写 qkv/staged GEMM 的 kernel 结构（persistent、int8 C、宽 tile 合法处）。
+  近期安全刀仍是 C1b fold(~3ms)+tail(1.8)+int8 C(~1.5)。
+
+## 2026-10-15 访存宽度测量（spv-memops.py）：局部刀全部耗尽
+按存储类×宽度分流（每核 SPIR-V 静态计数）：
+| 核 | GLOBAL 访存 | 其中 16B | SHARED | register 搬运(本地数组/spill) | coopmat-MMA |
+|---|---|---|---|---|---|
+| window_block | 14 | 8 | 30 | 896 | 3 |
+| ffn_fused | 14 | 6 | 10 | 558 | 4 |
+| gemm_staged_int8 | 12 | 6 | 9 | 587 | 3 |
+| quantize_row | 7 | 4 | 0 | 316 | 0 |
+| attention | 17 | 0(多为4B) | 26 | 941 | — |
+**结论：全局访存早已 16B 向量化（每核仅 3-17 个 global op），"向量化 global load"这条杠杆=空。**
+真正的逐元素成本在 **register 搬运 300-940 次/核**（本地数组索引 + spill；window_block
+scratch=12032B 证实有 spill）。这与前辈 26.10"Load+Store 27%、是算术 2.5×、99% 逐元素"
+完全吻合——瓶颈是**围绕 GEMM 的本地数组/暂存搬运**，不是 DRAM、不是 global 宽度。
+⚠ 工具瑕疵：coopmat-load/store 计数为 0（opcode 映射未完全对，MMA 有数）；不影响
+GLOBAL/register/SHARED 分流这个主结论。
+## 全天局部刀的总账（都实测）
+- 合并窄 GEMM→宽：零收益（已 batched）
+- e4m3 字节容器：慢 5-18%（窄 load 每字节更贵；解码换免费也不变→非 ALU 受限）
+- BN=64 解锁 fold：撞 qkv_epilogue 写死 32 列 + 行 max 需整行
+- 全局向量化：已耗尽（global op 本就 16B）
+- persistent GEMM：前辈 fill 实验证明无空闲发射槽可填；且 gemm_resident 已无 shared staging
+⇒ **增量微调这条路已到顶**。24× 差距是结构性的（723 趟 vs Mochi ~150、host 24.4ms、
+  融合广度），前辈 26.11 已定论：要追平必须按 Mochi 形状重写（persistent 大核 + 静态计划表
+  + 消 quant/residual 独立趟），这是大工程不是"下一刀"。

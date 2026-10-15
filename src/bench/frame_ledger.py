@@ -49,7 +49,10 @@ def say(*a):
 
 def main():
     rounds = int(sys.argv[1]) if len(sys.argv) > 1 else 6
-    height, width_ = 448, 768
+    # The game runs 960x544 now; the old hard-coded 768x448 made every number in this
+    # ledger about an extent no game runs. (2026-10-14, per user: re-measure, the
+    # pre-bridge data is stale.)
+    height, width_ = (int(sys.argv[2]), int(sys.argv[3])) if len(sys.argv) > 3 else (544, 960)
 
     import xmxres
     import nr_model

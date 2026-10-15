@@ -140,3 +140,51 @@ matrices were quantised* — and in both cases the result without it was a confi
 `notes/HANDOFF.md` already carries the general form: a test that exercises the mechanism
 around the thing under test proves nothing about it. The specific form is worth adding:
 **an experiment that can do nothing must report how much it did.**
+
+## 2026-10-15 C1b 开工发现（BN 参数化 + 账本重算）
+- 帧账本(960x544, 493 calls/691 pass)：quantize_row 现仅 **3.09ms/281 次**（旧 float 时代是 14ms）。
+  **前人否决"读取侧融合"是 14ms 时代测的，账已变**——但融合本身仍慢，因为读取侧重读代价：
+  A 被 N/BN 个列块反复读，每次重量化。BN=32 时 N=64→重读 2×，这才是 fused 慢的真因。
+- **BN=64 解锁点**：N≤64 的 GEMM 只有一个列块 → A 读 1 次 → 重读罚消失。
+- 已安全参数化 gemm_staged_int8.comp 的 BN（`#ifndef STAGED_BN 32`）：默认 64x32 构建
+  **逐字节 == 在跑的 spv**（cmp 通过）。wide 变体 -DSTAGED_BM=32 -DSTAGED_BN=64 编译过、
+  **驱动报告 Scratch=0**（与默认同，寄存器不溢出）、shared 同 8192。
+  ⚠ 但 B/A 的 fill 映射(line 154 `bn=thread/4`)仍按 BN=32 硬编码，wide 版只填了 32/64 列，
+  要补 fill 逻辑才能正确跑——这是下一步的实际工作量。
+- 更干净的落点其实是**写入侧折叠**：expand GEMM(nr_resident:559) 现写 hidden16(fp16)+
+  EPI_GATE_E4M3，随后 record_project_residual→quantize_row(:781) 再读回量化。让 expand
+  直接出 int8+行 scale，省掉 :781 那次 quant（hidden 宽 128/256，是大 quant）。
+- 帧里还有 18 次 gemm/0(0.71ms) 是没转 int8 的小 GEMM（downsample/upsample），可一并转。
+
+## 2026-10-15 e4m3 容器实验：基础设施已落地，但**不省时间**（负结果，已定案）
+- 落地：quantize_row.comp 加 flag 0x8000000 的 e4m3 字节读分支；libxmx.c 新导出
+  `xmx_rec_quant_e4m3`；xmxres 新 `quantize_row_e4m3`。新 dll 已重建（115 导出），
+  备份 `libxmx.dll.bak-20261015-e4m3pre`、`quantize_row.spv.bak-20261015-e4m3pre`。
+- 正确性：`test_quantize_e4m3.py`（新）——同一批 e4m3 网格值，字节容器与 half 容器
+  两条设备路径 **packed 与 scale 逐位相同**（0 differ），4 形状全过。地基1 亦真
+  （e4m3→fp16→fp32 逐位还原）。
+- 无回归：half 热路径 0.0596 vs 旧 spv 0.0581（噪声内）；整帧 44.85 vs 44.75（噪声内）；
+  `test_frame_execution` + `test_glue` 全 bit-exact。**分支保留但无站点调用**（死代码存证）。
+- 性能：字节读比 half 读**慢 5-14%**，且撑到 133MB（远超 16MB L2、真 DRAM-bound）仍慢 5%。
+  两种解码都试了：算术重建（8 exp2）-14%，256 项 shared LUT（8 LDS + 填表 barrier）-13%。
+  half 路径每 8 值只花 4 次 unpackHalf2x16——省下的访存不够付解码。
+- **由此纠正帧字节账的解读**：quantize 族标 ratio=1.0"BW"是误读。3MB/pass ÷ 0.011ms =
+  273GB/s 看着撞 291 屋顶，但省一半读字节反而更慢 ⇒ 它实际是 **ALU/发射受限**，
+  数据本就 L2 热（producer 刚写）。省字节无效；要省时间只能省每元素算术，或**消掉这个 pass**。
+- 推论：C1b 的真正形态仍是 fold 进 producer（消 pass），不是换容器。而 fold 的障碍是
+  行 max 需整行（BN 限制）+ qkv_epilogue 写死 32 列一 head——两条都已实测撞墙。
+  下一刀因此转向：(a) 攻 quantize 的 ALU（SIMD 化 round/clamp，收益 ~1ms 上限），
+  或 (b) 转 C 结构刀（persistent GEMM，攻 ratio 21-26 的大头）。
+
+## 2026-10-15 e4m3 慢的真机制（探针分离，推翻"字节账"分母）
+三方对照（同一 e4m3 字节 load，只换 decode）：exp2 -16% / unpackHalf -17% / float(b) -18%。
+**decode 从最贵换到免费，时间恒定 0.069** ⇒ 惩罚不在解码 ALU。half(16B load)=0.059 vs
+e4m3(8B load)=0.069，唯一差 load 宽度 ⇒ **成本由访存事务数决定，不由字节数决定；
+8B 窄 load 每字节比 16B 宽 load 贵——搬得少反而慢**。
+- 统一解释全帧反常：合并零收益、GEMM ratio 25×、e4m3 省字节反慢——**全帧是事务数/发射
+  受限，非带宽受限**。frame-bytes.py 用"字节流量"当分母是错的，正确分母=load/store 指令数+发射。
+- quantize pass 已近其结构最优(16B load+unpackHalf)。省时间两条都撞墙且同根因:
+  换容器撞 load 宽度墙; fold 消它撞 BN 墙(行 max 需整行, workgroup 只 32 列)。
+  **两墙同一根因=workgroup 太小→一行散在多列块→既要独立 quantize、又摊不薄每 pass 固定 load 成本。**
+- ⇒ persistent 大核(一 workgroup 拥有整行)同时拆两墙: 消 quantize pass + 减 load 事务。
+  C 结构刀是 a/b 的共同根因解，不是并列选项。

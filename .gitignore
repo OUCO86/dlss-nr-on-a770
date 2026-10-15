@@ -48,3 +48,5 @@ nr_daemon.log
 backups/
 # Build logs
 /logs/
+
+backups-plan-*/
