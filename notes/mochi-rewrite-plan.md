@@ -217,3 +217,22 @@ dispatch 合并。B1a ≈ **-2ms**；B1b（窗口 attention+FFN 全 megakernel�
 
 B1a 重定义：修 ffn_fused_int8 至无 spill + 16 行块，重测 130560/32640/8160 三形状，
 目标 >=1.3x on l1/l2；达成则接帧（NR_INT8_FFN_FUSE 门 + 逐字节对 numpy 参考链）。
+
+## 9. 综合（2026-10-16 01:20）：引擎线关闭，B 修正为"消趟数"单核
+今晚四组实测拼出的完整图：
+1. **宽 GEMM 已在 int8**（276+60 趟覆盖 N≥96/K≥64 的 2-3.5× 区）。剩余 fp16 全是
+   窄/小 M：window_block 内部每 subgroup M=8（扫描 M=640 段已 0.8×，M=8 更糟——
+   B1b"窗口块转 int8"被现有数据判死，无需写码）；ffn_fused v2 实测 1.06-1.10×。
+2. **Mochi 的宽 tile 不可移植**：gemm_wide_nt 256 = 32 累加器矩阵；压力探针实测
+   悬崖 16（scratch 8KB、4.1×）。Xe-HPG 128-GRF 装不下 RDNA4 256-VGPR 的形状。
+   Mochi 快 5× 的可迁移部分 = 趟数与搬运，不是 tile 宽度，也不是引擎。
+3. ⇒ **B 的便携核心只剩一条：消趟数，引擎原样。** 第一刀 B1'（取代 B1a/B1b）：
+   把 quantize 折进 **N=32 的 fp16 producer epilogue**——这些 producer 一个列块
+   拥有整行（BN 墙不存在），写 int8+行 scale 喂给本来就存在的 gemm_int8。
+   零画质变化、零引擎切换。消 281 趟里 N=32 来源的那批（~150 趟 ≈ 1.5-2ms）。
+   machinery 复用 ffn_fused_int8 v2（e4m3 code / shared 量化 / ascale 2M 布局），
+   去掉它捆绑的亏本 GEMM 切换。
+4. 窗口块 megakernel（原 B1b）降级 B2 可选：消 10 趟间往返 ~1-2ms，v2 已证
+   32KB 预算内塞得下整个块。B3=上下采样融合，B4=链计数器，不变。
+5. ffn_fused_int8 处置：保留为"换引擎不变宽"的对照存证（scratch 0、结构正确、
+   数值待逐字节测试——测试补上作归档，不接帧）。
