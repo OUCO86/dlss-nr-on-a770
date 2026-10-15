@@ -76,3 +76,22 @@
 今晚全部负结果与参数实测：notes/int8-width-sweep.md、improve-int8-bottleneck.md
 （e4m3 两节）、frame-ledger-a770.md（字节账+宽度账）、reg_pressure_probe 表在
 mochi-rewrite-plan.md §6；ffn_fused_int8 v2（scratch 0、1.06-1.10×）留作对照。
+
+## 7. A770 的红利清单（收获面，用户 2026-10-16 01:56 追问后补全）
+
+避墙(P1-P7)只是防守；这张架构的收入是六条，每条有实测：
+
+| 红利 | 证据 | 收法 |
+|---|---|---|
+| ① epilogue 算术免费 | 前辈:fp16 staged GEMM +e4m3+gate = 531/530/533us 不变 | quantize 3.09 + residual ~2 + publish ~0.7 + partition/upsample 1.6 ≈ **7ms 池**折进 store 循环 |
+| ② int8=2×矩阵率+半发射成本(TK32/16) | 宽度扫描 1.3-3.5×，20.5 vs 7.6 TF/s | P3 逐形状配；megakernel 批窗口把有效 M 推入红利区 |
+| ③ 512 XMX 奖励广度不奖励深度 | 26.9:XMX 512 vs 128；19.5% active | 原生 8x8x32、≤12 累加器、32KB LDS → occupancy 拉满 |
+| ④ 16MB L2 权重重载免费 | L2_reuse 854GB/s；块权重 6-16KB | megakernel 不做权重 LDS staging，LDS 留给中间值 |
+| ⑤ LDS 交接便宜 | e4m3 反证(贵的是 global 窄事务)；window_block 已用 | 阶段间 coopMatStore→LDS→load，不落 global |
+| ⑥ 发射口是唯一稀缺 | fill 无平台期；register-move 300-940/核 | 一切以每帧指令数为货币(691→~150 的理由) |
+
+**收获预算**：①7 + ③⑤往返 3-5 + ⑥launch 2-3 + ②新增 1-2 ≈ 13-17ms
+⇒ device 44.75 → **28-32ms**（比 §4 的 25-30 更保守可辩护）。
+⚠ 反面细节：residual 折进 staged int8 GEMM 在 K=64 不免费(1162 vs 531,前辈实测)——
+①只对 fp16 staged 与 store-loop 形态成立；megakernel 的 LDS-residual 形态 B1 内单独验证。
+桥接层不动（用户确认，2026-10-16）：红利全在核心层与计划器。
