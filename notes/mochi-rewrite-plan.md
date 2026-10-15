@@ -160,3 +160,39 @@ B1-B3 后 device ~22-26ms（960x544），wall ~31-35ms，~30fps。
 4. 探针注意：NACC≥16 时 fb[NACC] 也占寄存器（真实核每阶段只有 2-4 个 fragment），
    所以悬崖位置对真实核可能略靠后（14-18 之间），但"12 安全、16 危险"的
    设计约束按保守值执行。
+
+## 7. B1a 设计（2026-10-15 晚，实现前钉死；shared 算术是主约束）
+
+**范围裁定**：完整窗口 megakernel（FFN+attention 一趟）太大；B1a 先做
+**ffn_fused 的 int8 模式**——它已拥有"一 subgroup 全行"（16 行 × 全部 32 输入通道 /
+128 hidden 列都在手），正是拆掉行-max 依赖墙的形态。等于把 C1b fold + 合并
+两个 GEMM + 消 hidden16 往返三件事一次做完，且 kernel 骨架已有（ffn_fused 现
+10 趟/7.75ms 逐字节已验证）。
+
+**位序论证（逐字节红线）**：现 int8 路径 = quantize_row(value16) → gemm_int8
+(K=32, BK=64/TK=32 → 每 tile 1 个 int32 MMA from zero) → hidden16(fp16, gate+e4M3
+publish) → quantize_row(hidden16) → gemm_int8_residual (K=128 = 2 个 BK 块 ×
+每块 1 MMA，累加顺序 chunk 递增)。fused int8 模式必须复现：expand 每 tile
+1 个 MMA from zero ✓（同 K 同序）；contract 按 chunk 0..3 升序累加进同一 acc ✓
+（ffn_fused 现结构就是 chunk 序）。行 scale：quantize 的 peak=整行 max——
+fused 里整行都在手，peak 逐元素一致 ✓。**但 hidden 的 peak 要在 contract 前
+拿到全部 4 个 chunk** → 必须先把 hidden 全存 shared 再量化 → 预算：
+
+**shared 重排（关键）**：ffn_fused 现 32KB = 16KB weights + 16×1KB(subgroup 的
+hidden chunk+输出 stage)。int8 模式：hidden 全行 16×128 halves = 4KB/subgroup
+装不下 16 个 subgroup（64KB）。解法：**int8 模式改 8 个 subgroup × 32 行？**
+不——ROWS=16 固定。解法 B：**hidden 用 e4m3 字节容器**（16×128 bytes=2KB/
+subgroup × 16 = 32KB，正好替换现 hidden-chunk+stage 的 16KB，weights 走 global/L2
+非 staged 形态——ffn_fused 注释明说非 staged 形态本来就从 global 读 tiles）。
+e4m3 是 publish 后的精确值，quantize 读它解包（unpack 用 LUT？不——这里读侧
+只有 1 字节/元素，事务宽度问题在 16B 对齐的 uvec4 批量读下不存在：每 lane
+一次 16B=16 个 e4m3，比 8B 探针宽）。**写码时以 scratch=0 + 逐字节门裁决。**
+
+**graph**：NR_INT8_FFN_FUSE=1 时 record_feed_forward 的 expand8 分支改调
+ffn_fused(int8 mode)（消 2×quantize + 2×gemm_int8 + hidden16 buffer）。
+验证：test_ffn_fused 加 int8-mode 组（对照现四趟链逐字节）；帧级
+frame_ledger on/off + test_frame_execution；每特化 XMX_PIPELINE_STATS scratch=0。
+
+**收益预估**：224 个 quantize_row 里 FFN 相关 ~112 个（2×56?按 ledger:
+feed_forward:719 站点 46+20+... 数一下）≈1.2-1.5ms + hidden16 往返 ~0.6ms +
+dispatch 合并。B1a ≈ **-2ms**；B1b（窗口 attention+FFN 全 megakernel）再 -3-5ms。
