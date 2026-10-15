@@ -177,3 +177,33 @@ QKV+attn+FFN 的固定成本合并成**每窗口一次**，l0 的 192 token 搭�
 摊不掉 → §8 退路表生效（l0/l1 保 fp16），单一世界降级为"l2-l4 单一 + l0/l1 例外"。
 B1 第一段（窗口块 megakernel，先只做 QKV+attn）跑完 ledger 就给出这个答案。
 数据至此完整：P1-P7 + §7 六红利 + §8 退路表 + §10 地板。B1 零测量依赖。
+
+## 11. 设计规则 R8（用户 02:32 点破框定错误）：流水线不产小 M 形态，退路清单作废
+
+我 §10 把 l0=192/l1=2040 当给定输入去设计退路——错。大换血的含义是
+**流水线形状由我设计**，那规则就是构造性保证，不是事后权衡：
+
+**R8a：独立 GEMM 趟的 M 一律 ≥ 8160（§10 表的 int8 翻正点）。**
+不满足的形状（l0 全局块 192 token、l1 的 2040）**不得成为独立趟**——整个
+l0 级别是一个 block-megakernel（前辈 global_attention 已是"一 level 一核"形态），
+l0 内部的 QKV/attn/outproj/FFN 是核内 stage：无 launch、无独立趟、地板只付一次。
+l1 同理并入其窗口块 megakernel。**小 M 工作不消失，但它永远是 stage 不是 dispatch。**
+
+**R8b：§10 的 0.095ms 地板是我 v2 kernel 的实现成本，不是 int8 固有税。**
+拆解：每 chunk 双 barrier（v2 保守照抄 staged）、encode 走 shared 往返、
+LDS 本不需要任何初始化（Vulkan shared 是 uninitialized，v2 没有清零步骤但
+barrier 密度可减半）、fp16 同形地板也有 0.049。B1 的 kernel 规则：
+stage 间交接用 subgroup-only barrier（窗口 64 行 < 256 线程 workgroup 时根本
+不需要全 workgroup barrier）、encode 直接在 coopMatStore 的寄存器里做完。
+目标地板 ≤ 0.03ms——然后 §10 的 ratio 表在 M≥192 全线翻正。
+
+**R8c：§8 从"退路清单"降级为"合并清单"**——列的是"哪些形状必须并入哪个
+megakernel"，不是"哪里退回 fp16"。单一世界由构造成立：
+独立趟全在 int8 红利区（P3/§8 数据），小 M 全在 megakernel stage 里（R8a），
+float 只在四个数学孤岛（§9）。
+B1 的待证假设随之收窄：不再是"单一世界成不成立"，而是
+"stage 形态的地板摊薄 + R8b 的实现优化能否兑现"——ledger 一趟直接见分晓。
+
+数据完整性复查：§10 表测的是"独立 GEMM"形态，R8a 后这些行只有 M≥8160 的
+会作为独立趟存在（全部 int8 赢），M<8160 的行变成 stage 参数——B1 里用
+PROBE_STOP 式分段实测 stage 成本（前辈先例），不需要新的 standalone 数据。
