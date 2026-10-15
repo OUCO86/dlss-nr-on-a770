@@ -2721,6 +2721,36 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K)
 	return 0;
 }
 
+/* The E4M3-container build of the same pass: the source is bytes the producer already
+ * published through e4m3(), not half. Identical grid, peak and rounding — a published
+ * e4m3 value is a float16-exact one (verified round trip), so the byte and the half
+ * decode to the same float32 — and it halves this pass's read traffic, which on the
+ * model's shapes is the whole of what the quantiser costs (notes/frame-ledger-a770.md:
+ * the quantise family is the one that sits at the bandwidth roofline). Same dispatch,
+ * same stamp; flag bit 0x8000000 selects the decode in the shader. */
+int xmx_rec_quant_e4m3(int source, int packed, int scale, unsigned M, unsigned K)
+{
+	if (!g.recording || !g.rquant) FAIL("the quantiser is not ready for recording", 0);
+	if (!M || !K || K % 16u)
+		FAIL("the quantiser needs a positive extent and K a multiple of 16", 0);
+	struct push p = { .a = addr_of(source), .b = addr_of(packed), .c = addr_of(scale),
+			  .m = M, .k = K, .flags = 0x8000000u };
+	if (!p.a || !p.b || !p.c)
+		FAIL("quantiser operand is not a live buffer", 0);
+	vkCmdBindPipeline(g.rcb, VK_PIPELINE_BIND_POINT_COMPUTE, g.rquant);
+	vkCmdPushConstants(g.rcb, g.rpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof p, &p);
+	unsigned words = K / 8u, per_row = 1u;
+	while (per_row < words && per_row < 32u) per_row <<= 1u;
+	unsigned per = 8u * (32u / per_row);
+	unsigned groups = (M + per - 1u) / per;
+	unsigned x = groups > 65535u ? 65535u : groups;
+	vkCmdDispatch(g.rcb, x, (groups + x - 1u) / x, 1);
+	barrier();
+	stamp(PK_UNARY, 12);
+	g.recorded++;
+	return 0;
+}
+
 /* The same grid, for a window block: the rows are the partition's, gathered out of the
  * image as they are read (0x400000) instead of being written into a half buffer by
  * `partition` for `xmx_rec_quant` to read straight through. What those two passes wrote,

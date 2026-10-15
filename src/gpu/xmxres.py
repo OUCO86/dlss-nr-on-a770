@@ -148,6 +148,7 @@ def _load():
             ("xmx_rec_gemm_int8_fused", [ctypes.c_int] * 5 + [ctypes.c_uint] * 4),
             ("xmx_quant_init", [ctypes.c_char_p]),
             ("xmx_rec_quant", [ctypes.c_int] * 3 + [ctypes.c_uint] * 2),
+            ("xmx_rec_quant_e4m3", [ctypes.c_int] * 3 + [ctypes.c_uint] * 2),
             ("xmx_rec_quant_window", [ctypes.c_int] * 3 + [ctypes.c_uint] * 6),
             ("xmx_rec_unary2", [ctypes.c_uint] + [ctypes.c_int] * 5
              + [ctypes.c_uint, ctypes.c_uint, ctypes.c_float] + [ctypes.c_uint] * 5),
@@ -1343,6 +1344,29 @@ class Runtime:
             raise RuntimeError("quantiser pipeline: " + self.lib.xmx_error().decode())
         if self.lib.xmx_rec_quant(source.id, packed.id, scale.id, rows, inner) != 0:
             raise RuntimeError("xmx_rec_quant: " + self.lib.xmx_error().decode())
+        self.recorded += 1
+        return self
+
+    def quantize_row_e4m3(self, source, packed, scale, rows, inner):
+        """The same quantise, reading the source as E4M3 bytes rather than half.
+
+        For an activation a producer already published through `publish.glsl`'s e4m3()
+        into a byte buffer: every value is one of the 254 E4M3 codes, a float16 holds
+        those exactly, so the grid, the row peak and the rounding come out bit-identical
+        to `quantize_row` — only the bytes this pass moves go down. `source` is rows x
+        inner bytes, `packed` and `scale` as above (quantize_row.comp, flag 0x8000000).
+        """
+        if rows <= 0 or inner <= 0 or inner % 16:
+            raise ValueError("the quantiser needs a positive extent and inner a multiple of 16")
+        for buf, needed in ((source, rows * inner), (packed, rows * inner),
+                            (scale, rows * 4)):
+            if buf.nbytes < needed:
+                raise ValueError("quantiser buffer is too small")
+        path = os.environ.get("XMX_QUANT_SPV") or str(ROOT / "work" / "quantize_row.spv")
+        if self.lib.xmx_quant_init(path.encode()) != 0:
+            raise RuntimeError("quantiser pipeline: " + self.lib.xmx_error().decode())
+        if self.lib.xmx_rec_quant_e4m3(source.id, packed.id, scale.id, rows, inner) != 0:
+            raise RuntimeError("xmx_rec_quant_e4m3: " + self.lib.xmx_error().decode())
         self.recorded += 1
         return self
 

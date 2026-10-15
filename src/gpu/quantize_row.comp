@@ -113,6 +113,60 @@ float peak8(uvec4 w)
                max(max(abs(p2.x), abs(p2.y)), max(abs(p3.x), abs(p3.y))));
 }
 
+/* Bit 0x8000000: the source is E4M3 bytes rather than half. A producer that published
+ * through `publish.glsl`'s e4m3() could in principle store those values a byte deep —
+ * every one is a float16-exact code (verified round trip), so the decode and the half
+ * path give the same float32 — and this branch exists to measure that.
+
+ * MEASURED 2026-10-15, and the answer is no: the byte path is never faster. At the
+ * frame's own shapes it costs 5-14 % more, and it stays 5 % behind even with the
+ * source at 133 MB, far past the 16 MB L2 — where the read traffic it saves should
+ * have paid for itself. Two reasons, both visible in the numbers. The half path
+ * unpacks eight values with four `unpackHalf2x16`'s; the byte path needs eight
+ * decodes, whether reconstructed by exponent (eight exp2's, 17 % behind) or looked
+ * up in a shared table (eight LDS's plus a fill barrier, 13 % behind): the ALU or
+ * shared-memory cost of the decode is larger than the DRAM it saves. And the pass
+ * is not DRAM-bound where it matters: the producer wrote these bytes moments ago,
+ * so they are still in L2, and the frame's measured 0.011 ms a pass against 856 MB
+ * of nominal traffic is the same fact from the other side. The container can be
+ * halved; the pass does not get faster. The branch is kept, tested
+ * (`test_quantize_e4m3.py`, bit-identical to the half path on every shape), and
+ * left unrecorded: no site in the graph calls it. */
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer ByteBuf { uint8_t b[]; };
+
+/* One E4M3 code to float32, the format's own decode — bias 7, subnormals in 2^-9
+ * steps, 0x7f/0xff NaN (e4m3() never emits a NaN, so they map to zero). */
+float e4m3_decode(uint b)
+{
+    uint exponent = (b >> 3u) & 15u;
+    uint mantissa = b & 7u;
+    float value = exponent == 0u
+        ? float(mantissa) * exp2(-9.0)                    // mantissa/8 * 2^-6 = mant * 2^-9
+        : (1.0 + float(mantissa) * 0.125) * exp2(float(exponent) - 7.0);
+    return (b & 0x80u) != 0u ? -value : value;
+}
+
+/* Eight E4M3 bytes onto the grid, as eight bytes. */
+uvec2 quantise8_e4m3(uvec2 w, float reciprocal)
+{
+    float v0 = e4m3_decode(w.x & 0xFFu), v1 = e4m3_decode((w.x >> 8u) & 0xFFu);
+    float v2 = e4m3_decode((w.x >> 16u) & 0xFFu), v3 = e4m3_decode(w.x >> 24u);
+    float v4 = e4m3_decode(w.y & 0xFFu), v5 = e4m3_decode((w.y >> 8u) & 0xFFu);
+    float v6 = e4m3_decode((w.y >> 16u) & 0xFFu), v7 = e4m3_decode(w.y >> 24u);
+    return uvec2(pack4(grid(v0, reciprocal), grid(v1, reciprocal),
+                       grid(v2, reciprocal), grid(v3, reciprocal)),
+                 pack4(grid(v4, reciprocal), grid(v5, reciprocal),
+                       grid(v6, reciprocal), grid(v7, reciprocal)));
+}
+
+float peak8_e4m3(uvec2 w)
+{
+    return max(max(max(abs(e4m3_decode(w.x & 0xFFu)), abs(e4m3_decode((w.x >> 8u) & 0xFFu))),
+                   max(abs(e4m3_decode((w.x >> 16u) & 0xFFu)), abs(e4m3_decode(w.x >> 24u)))),
+               max(max(abs(e4m3_decode(w.y & 0xFFu)), abs(e4m3_decode((w.y >> 8u) & 0xFFu))),
+                   max(abs(e4m3_decode((w.y >> 16u) & 0xFFu)), abs(e4m3_decode(w.y >> 24u)))));
+}
+
 void main() {
     uint words = pc.k / 8u;                     // a row, in 16-byte words
     /* The lanes that share a row: as many as the row has words, up to a whole warp. A
@@ -128,13 +182,17 @@ void main() {
      * that is never coming, and the row depends on the lane here, so it is the shuffle
      * that has to be reached by all of them. Only the stores are guarded. */
     uint held = min(row, pc.m - 1u);
+    bool e4m3 = (pc.flags & 0x8000000u) != 0u;
     Uvec4Buf source = Uvec4Buf(uint64_t(pc.a));
+    Uvec2Buf source8 = Uvec2Buf(uint64_t(pc.a));
     Uvec2Buf packed = Uvec2Buf(uint64_t(pc.b));
 
     /* Where the row's words live. Straight through, that is the row's own extent; with a
      * window gather it is the token's pixel, whose channels are contiguous in the image
-     * and whose words therefore are too. */
-    bool gather = (pc.flags & 0x400000u) != 0u;
+     * and whose words therefore are too. The E4M3 container is only ever a plain buffer
+     * (a producer that published e4m3 into its own output), never a window gather, so the
+     * gather branch stays on the half path. */
+    bool gather = (pc.flags & 0x400000u) != 0u && !e4m3;
     bool outside = false;
     uint base = held * words;
     if (gather) {
@@ -152,8 +210,12 @@ void main() {
 
     float peak = 0.0;
     if (!outside) {
-        for (uint w = within; w < words; w += per_row)
-            peak = max(peak, peak8(source.v[base + w]));
+        if (e4m3)
+            for (uint w = within; w < words; w += per_row)
+                peak = max(peak, peak8_e4m3(source8.v[base + w]));
+        else
+            for (uint w = within; w < words; w += per_row)
+                peak = max(peak, peak8(source.v[base + w]));
     }
     /* Every lane of the group ends up with the row's peak: four shuffles, no barrier. */
     for (uint s = 1u; s < per_row; s <<= 1u)
@@ -166,7 +228,11 @@ void main() {
     float reciprocal = 1.0 / scale;
     for (uint w = within; w < words; w += per_row) {
         uint at = row * words + w;
-        packed.v[at] = (outside ? uvec2(0u, 0u)
-                                : quantise8(source.v[base + w], reciprocal));
+        if (e4m3)
+            packed.v[at] = (outside ? uvec2(0u, 0u)
+                                    : quantise8_e4m3(source8.v[base + w], reciprocal));
+        else
+            packed.v[at] = (outside ? uvec2(0u, 0u)
+                                    : quantise8(source.v[base + w], reciprocal));
     }
 }

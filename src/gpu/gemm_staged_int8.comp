@@ -51,7 +51,10 @@ const uint WARPS = 4;
 #ifndef STAGED_BM
 #define STAGED_BM 64
 #endif
-const uint BM = STAGED_BM, BN = 32, BK = 64;   // the block, and a K step of two multiply-adds
+#ifndef STAGED_BN
+#define STAGED_BN 32
+#endif
+const uint BM = STAGED_BM, BN = STAGED_BN, BK = 64;   // the block, and a K step of two multiply-adds
 const uint WM = BM / WARPS, RM = WM / TM, RN = BN / TN;
 /* Sixteen bytes of pad keep successive rows off the same banks and every row 16-byte
  * aligned for the vector stores that fill the tiles. */
