@@ -371,3 +371,33 @@ D3D12 侧脚手架踩坑固化（写进 build_l0.sh 注释）：
 **技术上前置条件全部满足**，投 libxmx.c 3777 行重写（Vulkan→L0）不再有未知。
 按规矩：**等大用户明确点头才开工重写**；开工第一期=后端替换+immediate list 提交形态，
 Python 侧 xmx_* 接口不变，之后才是 §17 的调度合并与 int8 直通链。
+
+## 19. 重写开工前的第一道实测门（2026-10-17 00:10）：L0 加载不了出货的 GLSL 风味 SPIR-V——第一期形态必须改
+用户 23:20 拍板开工第一期后，开工第一步不是改代码，而是把 §16 里"只换 C 后端、spv 原样保留"
+这个**未验证前提**先测了（probe_spv_ze.cpp，纯加载测试）。结果推翻它：
+
+- 出货 `work/quantize_row.spv`（glslangValidator --target-env vulkan1.3，GLSL.std.450
+  builtins + GLCompute entry）→ `zeModuleCreate` **直接崩驱动进程**（SEH rc=5），
+  崩前 stderr 吐 `InvalidBuiltinSetName: Expects OpenCL.std. Actual is GLSL.std.450`。
+  ⇒ 不是"干净拒绝"，是 Intel L0 用户态对 Vulkan 方言 SPIR-V 的处理 bug——**永远别把
+  GLSL 编译的 spv 喂给 zeModuleCreate**（会带崩宿主）。
+- 对照：SYCL dump 的 `sycl_spir64.spv`（ESIMD v2 核，OpenCL.std 方言）→ **LOADED (r=0x0)**。
+  ⇒ L0 吃 SYCL/oneAPI 编译链的产物，本机驱动实测成立。
+- 社区旁证（rlx-oneapi crates.io，逐字）："L0's zeModuleCreate + zeKernelSetArgumentValue
+  consume OpenCL/Kernel-flavor SPIR-V ... a different dialect from the Vulkan Shader/GLCompute
+  flavor naga emits from GLSL — they are not interchangeable."
+
+⇒ **"第一期=只换 C API、着色器不动"这条路不存在。** 但终点不变：核心层本来就要换成
+ESIMD/SYCL 核（§16/§17），所以正解是把**整个核编译链迁到 SYCL 工具链**（已装、已证），
+而不是把 GLSL spv 塞进 L0：
+  路线 A'（推荐）：libxmx 变 C++/SYCL dll（C ABI 导出面 xmx_* 逐字节不变，daemon 无感）；
+    全部核走 icx //fsycl 编译（elementwise 核=直译 SYCL，GEMM 核=ESIMD ladder）；
+    D3D12 互操作=get_native<ext_oneapi_level_zero> 取 ze_context/device/queue
+    （backend_traits_level_zero.hpp:59-97 证实存在）+ §18 已证的 ze import；
+    提交形态=§17 的 graph/megakernel + §18 的 immediate list。
+  路线 B'（不推荐）：GLSL→OpenCL C 手工重写核再 ocloc——多一套方言、前辈零先例。
+待补门控③（开工 A' 前最后一块）：SYCL queue 的 native L0 句柄上做 §18 同一套 D3D12
+fence import + 一个 SYCL kernel 挂在它后面跑通——证明"SYCL 宿主+ze interop"组合成立
+（§18 用的是自建 ze context，句柄来源不同，必须实测不能推定）。
+教训固化：§16 写"libxmx 的 Vulkan API 在 L0 全部有对应物"时，**没把 spv 方言这一条列进
+未知**——门控清单漏了最前面的一块。顺序应该是：先测"能不能加载"，再测"能不能互操作"。
