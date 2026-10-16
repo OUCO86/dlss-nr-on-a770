@@ -318,6 +318,56 @@ caveat（诚实）：GRAPH 1.58ms 是 host wall（含 q.wait），比 MEGA 高 2
 ~44ms 下它可被隐藏，但**最终形态应往 megakernel 收敛**，graph 是"保留现有 pass 图、先换后端"
 的过渡形态——正好匹配"libxmx 重写第一期不动调度、第二期合并"的分期。
 
-仍待做=门控探针②：D3D12↔L0 fence/buffer 互操作（zeImportExternalFence/Semaphore +
-ZE_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12；桥接给游戏喂数据靠的就是 D3D12 共享 handle）。
-①绿+②绿 → 才向用户申请投 libxmx.c 3777 行重写。
+## 18. 门控探针②（2026-10-16 23:0x）：D3D12↔Level Zero 互操作全绿——选项 A 技术门控解除
+源码 `src/bench/l0/probe_d3d12_ze.cpp`（编译 `src/bench/l0/build_l0.sh`，exe 在 oneapi/ 跑）。
+本机 A770/120W，D3D12 与 L0 都显式选同一物理卡（vendor 0x8086 dev 0x56a0）。
+
+结果（PROBE_D3D12_ZE GREEN, 0 fails）：
+- GATE A（同步）：D3D12 SHARED fence 的 NT handle → `zeDeviceImportExternalSemaphoreExt`
+  (flag=D3D12_FENCE) 成功；immediate list 上 wait(value=2) 在 fence=1 时**正确阻塞**
+  (sync=NOT_READY)、`cmdq->Signal(fence,2)` 后**正确解锁**(sync=SUCCESS)；控制组 wait(999)
+  正确超时、解锁后设备留干净（10-13 那次"doomed wait 污染一分钟"的坑已按先例处理）。
+- GATE B（内存）：D3D12 committed resource(HEAP_FLAG_SHARED, 16MB=前辈 hand-over 下限)
+  → `zeMemAllocDevice` pNext=`ze_external_memory_import_win32_handle_t`
+  (flag=D3D12_RESOURCE) 成功，ptr 非空、alloc type=2(device)。
+- GATE C/C2/C3（数据通路，一次一个变量逐步钉死）：
+  C  = L0 `AppendMemoryCopy` host→imported 16MB，sync=SUCCESS（16B 也 SUCCESS）；
+  C2 = L0 读回 imported→host：**BIT-EXACT**（0/1024 错）——L0 读写这块内存正确；
+  C3 = L0 写 imported → D3D12 CopyResource 到 READBACK → Map 比对：**BIT-EXACT 0/4194304**。
+  这正是出货管线要的方向（NR 写、游戏读），跨 API 零拷贝共享成立。
+- C0（对照）：plain L0 device alloc 同用法 copy+sync 全过 ⇒ 上面不是我的用法错。
+
+三个纠正/新事实（推翻或补 §16 的凭印象处）：
+1. ⚠ **§16 写的 `zeImportExternalFence` 不存在**（本机 SDK spec 1.19.12 全文零命中）。
+   fence 走 **external-semaphore 扩展**：`zeDeviceImportExternalSemaphoreExt` +
+   `ZE_EXTERNAL_SEMAPHORE_EXT_FLAG_D3D12_FENCE`(ze_api.h:15085) +
+   `ze_external_semaphore_win32_ext_desc_t{handle}`(:15111)；推进/等待=
+   `zeCommandListAppend{Signal,Wait}ExternalSemaphoreExt`(:15267/:15317)。
+2. 🚩 **硬约束：external semaphore 的 signal/wait 只能挂在 immediate command list 上**
+   （spec 明写 "Commandlist handle does not correspond to an immediate command list"=invalid arg）。
+   ⇒ L0 重写的提交形态必须含 immediate list（或 graph 里用 immediate），
+   "全部录进一个 deferred list 一次 execute"对 fence 节点不成立——这条要写进重写设计。
+3. 🚩 **能力查询必须用 dedicated getter `zeDeviceGetExternalMemoryProperties`**：
+   把 `ze_device_external_memory_properties_t` 挂 `zeDeviceGetProperties` 的 pNext，
+   本机驱动**不填**（返回 0x0，差点误判"驱动不支持 import"）；dedicated getter 返回
+   importTypes=0xc4（OPAQUE_WIN32|D3D12_HEAP|D3D12_RESOURCE 全支持）、exportTypes=0x4。
+   （又一次"观测真、归因假"：0x0 是我问错了地方，不是驱动没能力。）
+
+D3D12 侧脚手架踩坑固化（写进 build_l0.sh 注释）：
+- `CreateSharedHandle` 的 Access：fence 用 **GENERIC_ALL**（SYNCHRONIZE 与 0 都被拒）——
+  前辈先例 `nr_fuse_probe.cpp:243-244`，照抄即过。
+- 共享 buffer 一步 `CreateCommittedResource`+`D3D12_HEAP_FLAG_SHARED`（前辈 :70）；
+  `CreateHeap(1MB)+Placed` 被拒 E_INVALIDARG——别重开这个案。
+- readback 用 **READBACK heap、初始态 COPY_DEST**；UPLOAD+`GENERIC_READ→COPY_DEST` 是
+  非法 transition，runtime validation 失败表现为 **Close() 返回 E_INVALIDARG**（MS 文档
+  ResourceBarrier 节逐字："Validation failure causes ID3D12GraphicsCommandList::Close to
+  return E_INVALIDARG"）。
+- `CreateCommandList` 返回的是 **open** list（再 Reset 反而 E_FAIL）。
+- icx 链接：源文件必须在 `//link` **之前**（`//link` 吞掉后面所有参数，前辈
+  `build_probe.sh` 正是这个顺序）。
+- host 推进 fence 只能经 `ID3D12CommandQueue::Signal`（d3d12.h:8740；没有 host SetSignal）。
+
+⇒ §16 的"最大未知=L0↔D3D12 桥接互操作"已闭合：①②两块门控全绿。
+**技术上前置条件全部满足**，投 libxmx.c 3777 行重写（Vulkan→L0）不再有未知。
+按规矩：**等大用户明确点头才开工重写**；开工第一期=后端替换+immediate list 提交形态，
+Python 侧 xmx_* 接口不变，之后才是 §17 的调度合并与 int8 直通链。
