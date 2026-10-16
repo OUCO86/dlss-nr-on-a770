@@ -1,0 +1,14 @@
+LIBRARY libxmx_sycl
+EXPORTS
+    xmx_error
+    xmx_init
+    xmx_buf_create
+    xmx_buf_create_kind
+    xmx_buf_upload
+    xmx_buf_download
+    xmx_buf_zero
+    xmx_buf_destroy
+    xmx_begin
+    xmx_abort
+    xmx_rec_quant
+    xmx_submit
