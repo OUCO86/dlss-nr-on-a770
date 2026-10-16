@@ -62,16 +62,18 @@ layout(push_constant, scalar) uniform Push {
     uint lda, ldb, ldc, spare;
     uint64_t residual_cos;                     // the residual's per-channel cosine
     uint image_h, image_w, window_cols, window_pad;
-    uint64_t qkv_scale;                        // the query's scale (one head)
+    uint64_t qkv_scale;                        // the query's scale (one head) @120
     /* The feed-forward, folded in ahead of the attention (B1a): what
      * record_feed_forward wrote into s.ffn for this pass's gather to read now lives
-     * in the workgroup instead. Three more pointers, past the 128 the base block
-     * fills — the Arc takes 256 (libxmx's struct push, `_Static_assert` at 128).
+     * in the workgroup instead. The batched-GEMM stride group (libxmx blda/bldb/bldc/
+     * bspare, @128) is not read here, so 24 bytes of padding keep the three pointers
+     * at the offsets the _Static_asserts in libxmx.c pin: 144, 152, 160.
      * expand (32 x 128 half), branch (128 x 32 half), ffn_cos (32 float): the same
      * operands `ffn_fused.comp` is handed, in its order. */
-    uint64_t ffn_expand;                       // offset 128
-    uint64_t ffn_branch;                       // 136
-    uint64_t ffn_cos;                          // 144
+    uint pad0, pad1, pad2, pad3, pad4, pad5;   // 128: the stride group, unread
+    uint64_t ffn_expand;                       // 144
+    uint64_t ffn_branch;                       // 152
+    uint64_t ffn_cos;                          // 160
 } pc;
 
 #include "specialize.glsl"
@@ -84,6 +86,22 @@ layout(scalar) shared AsVec2  { vec2 v2[4096]; };
 layout(scalar) shared AsVec4  { vec4 v4[2048]; };
 layout(scalar) shared AsUvec4 { uvec4 u4[2048]; };
 layout(scalar) shared AsHalf4 { f16vec4 h4[4096]; };
+/* The 32 KB, halves-indexed, the base 16 KB exactly as window_block had it:
+ *   h16[0..2047]      K (4 KB)          — first the QKV weights, then K
+ *   h16[2048..4095]   V (4 KB)  VALUES=2048
+ *   f32[2048..4095]   scratch: 256 floats a subgroup (8 KB) — in turn the gathered
+ *                     row (the FFN's A), the projections, the logits, the attention
+ *                     output; and after the feed-forward, the E4M3 of the block's
+ *                     own output (the QKV's A).
+ * and 16 KB more for the folded feed-forward:
+ *   h16[8192..10239]  hidden: 256 halves a subgroup (4 KB) — the 8x32 chunk the
+ *                     expand publishes and the contract reads, one chunk at a time.
+ *   f32[5120..7167]   ffn_out: 256 floats a subgroup (8 KB) — the block's output,
+ *                     FLOAT32 and UNPUBLISHED, exactly what s.ffn holds today
+ *                     (nr_resident:795-798: no epilogue, narrow=False). It is also
+ *                     the result staging the residual reads (the chunk loop is over
+ *                     before it is written), and then both the QKV gather's source
+ *                     and the closing residual's skip. */
 
 const uint VALUES = 2048u;   // where V starts, in halves; K is at 0
 const uint WINDOW_BLOCK = 4u; // row-family profile kind: attention.comp owns 0-2 and 6, window attention 3
@@ -202,21 +220,24 @@ void main() {
     PROBE_MID(PROBE_FILL)
 
     /* ---- The folded feed-forward (B1a) ----
-     * What `record_feed_forward`'s ffn_fused call did for this block's rows, now done
-     * on the gathered row the attention half is about to read: the same two GEMMs, the
-     * same publish chain, the same residual — ffn_fused.comp's non-staged, non-merge,
-     * non-stem shape with RM = 1 (a window row is eight tokens, not sixteen), the
-     * weights read from global (its staged() moved them into shared; the shared here
-     * is spoken for, and L2 costs nothing: bounty ④). The input is the gather's own
-     * published halves — the same e4m3(image) the partition wrote and the projection
-     * read, bit for bit. The output goes to this subgroup's kilobyte, and the QKV
-     * gather below reads the image again for Q/K/V's input exactly as it did: the
-     * two halves of the block touch the same published values, from the same order,
-     * and the chain between them (s.ffn -> the next block's value16) is what the
-     * folding removes. */
+     * What record_feed_forward's ffn_fused call (nr_resident:795-798, the fuse_ffn
+     * branch l1 takes) did for this block's rows, now on the gathered row. That call
+     * is non-staged, non-merge, non-stem, with skip=source and no epilogue: so the
+     * output s.ffn is FLOAT32 and UNPUBLISHED (publish(0)=identity), and it is read
+     * twice downstream — the QKV gather E4M3s it, the closing residual takes it raw.
+     * Here RM = 1 (a window row is 8 tokens, not 16). The weights come from global,
+     * not staged into shared (its staged() branch): the shared is spoken for and L2
+     * is free (bounty ④). Fragment addresses and the publish chain are copied
+     * verbatim from ffn_fused.comp's non-staged shape so the output is bit-identical.
+     *
+     * Shared (halves-indexed, past the base 16 KB):
+     *   fhidden = 8192 + 256*sub   the 8x32 hidden chunk (256 halves)
+     *   ffout   = 5120 + 256*sub   (in f32 words) the block's float32 output — also
+     *                              the result staging the residual reads (the chunk
+     *                              loop is over before it is written), 256 floats. */
     {
-        uint fhidden = 8192u + 512u * sub;       // halves: this subgroup's chunk, then its output
-        uint fout = fhidden + 256u;
+        uint fhidden = 8192u + 256u * sub;
+        uint ffout = 5120u + 256u * sub;         // f32 words
         HalfBuf expand = HalfBuf(uint64_t(pc.ffn_expand));
         HalfBuf branch = HalfBuf(uint64_t(pc.ffn_branch));
         coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> fresult[4];
@@ -241,7 +262,7 @@ void main() {
                     h[j][e] = publish(3u, h[j][e]);          // EPI_GATE_E4M3, as the pass does
                 coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> narrow =
                     coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(h[j]);
-                coopMatStore(narrow, h16, fhidden + 0u * 32u + j * 8u, 32u,
+                coopMatStore(narrow, h16, fhidden + j * 8u, 32u,
                              gl_CooperativeMatrixLayoutRowMajor);
             }
             subgroupMemoryBarrierShared();
@@ -259,42 +280,43 @@ void main() {
             subgroupMemoryBarrierShared();                   // the next chunk overwrites the hidden
             subgroupBarrier();
         }
-        /* The residual and the publish, as ffn_fused's final loop does it — the skip
-         * read from the image, the cosine from ffn_cos, the epilogue and the width
-         * from the flags the graph passes to the pass this replaces. */
-        uint fepi = (operation_flags() >> 8) & 0xFu;
-        bool fnarrow = (operation_flags() & 0x1000u) != 0u;
-        bool fhalf_skip = (operation_flags() & 0x40000u) != 0u;
-        /* The result stage: the chunk loop's hidden kilobyte is free now, so the
-         * projection's accumulators land there (in floats: fhidden words) and the
-         * residual reads them back. scratch is left intact for the QKV gather. */
-        uint fstage = fhidden / 2u;
+        /* The FFN's own residual: fresult + s.value * ffn_cos, no publish (the pass
+         * is called with epilogue=0), stored float32 to ffout. The skip is pc.a read
+         * raw — image4 without the e4m3 the QKV gather applies. */
         for (uint j = 0u; j < 4u; j++)
-            coopMatStore(fresult[j], f32, fstage + j * 8u, 32u,
+            coopMatStore(fresult[j], f32, ffout + j * 8u, 32u,
                          gl_CooperativeMatrixLayoutRowMajor);
         subgroupMemoryBarrierShared();
         subgroupBarrier();
         for (uint e = local * 4u; e < 256u; e += 128u) {
             uint t = e / 32u, c = e % 32u;
             int x = x0 + int(t);
+            if (!row_in || x < 0 || x >= int(pc.image_w)) continue;
             uint at = (uint(y) * pc.image_w + uint(x)) * 32u + c;
-            vec4 skip = fhalf_skip ? vec4(Half4Buf(uint64_t(pc.a)).v4[at >> 2])
-                                   : Vec4Buf(uint64_t(pc.a)).v4[at >> 2];
+            vec4 skip = image4(at);                          // s.value, raw
             vec4 cosine = Vec4Buf(pc.ffn_cos).v4[c >> 2];
-            vec4 out4;
-            for (uint q = 0u; q < 4u; q++) {
-                precise float total = fma(skip[q], cosine[q], f32[fstage + e + q]);
-                out4[q] = publish(fepi, total);
-            }
-            if (!fnarrow) {
-                for (uint q = 0u; q < 4u; q++) h4[(fout + e + q) >> 2] = f16vec4(out4[q]);
-            } else {
-                h4[(fout + e) >> 2] = f16vec4(out4);
-            }
+            for (uint q = 0u; q < 4u; q++)
+                f32[ffout + e + q] = skip[q] * cosine[q] + f32[ffout + e + q];
         }
         subgroupMemoryBarrierShared();
         subgroupBarrier();
     }
+
+    /* The second gather: the QKV's A is now this subgroup's ffout, E4M3-published —
+     * exactly what window_block's own gather did reading s.ffn from memory. scratch
+     * is overwritten with it (the FFN read the first gather's copy, and is done). */
+    {
+        uint t = local / 4u, c0 = (local % 4u) * 8u;
+        uint ffout = 5120u + 256u * sub;
+        vec4 lo = vec4(f32[ffout + t * 32u + c0], f32[ffout + t * 32u + c0 + 1u],
+                       f32[ffout + t * 32u + c0 + 2u], f32[ffout + t * 32u + c0 + 3u]);
+        vec4 hi = vec4(f32[ffout + t * 32u + c0 + 4u], f32[ffout + t * 32u + c0 + 5u],
+                       f32[ffout + t * 32u + c0 + 6u], f32[ffout + t * 32u + c0 + 7u]);
+        for (uint e = 0u; e < 4u; e++) { lo[e] = e4m3(lo[e]); hi[e] = e4m3(hi[e]); }
+        h4[(scratch * 2u + t * 32u + c0) >> 2] = f16vec4(lo);
+        h4[((scratch * 2u + t * 32u + c0) >> 2) + 1u] = f16vec4(hi);
+    }
+    barrier();                                   // every subgroup's ffout is published to scratch
 
     coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseA> rows[2];
     for (uint kk = 0u; kk < 2u; kk++)
@@ -535,12 +557,16 @@ void main() {
      * compact head keeps. The target is then the head's (pixels x 4, float32). */
     bool head = (operation_flags() & 0x1000000u) != 0u;
     f16vec4 kept[2] = f16vec4[2](f16vec4(0.0), f16vec4(0.0));
+    uint ffout = 5120u + 256u * sub;            // the folded feed-forward's float32 output
     for (uint e = local * 4u; e < 256u; e += 128u) {
         uint t = e / 32u, c = e % 32u;
         int x = x0 + int(t);
         if (!row_in || x < 0 || x >= int(pc.image_w)) continue;
         uint at = (uint(y) * pc.image_w + uint(x)) * 32u + c;
-        vec4 skip = image4(at);
+        /* The skip is the feed-forward's output, not the input image: window_block was
+         * handed a=s.ffn and read both its gather and its residual skip from it. Here
+         * s.ffn never left the chip — it is this subgroup's ffout in shared. */
+        vec4 skip = vec4(f32[ffout + e], f32[ffout + e + 1u], f32[ffout + e + 2u], f32[ffout + e + 3u]);
         vec4 cosine = Vec4Buf(pc.residual_cos).v4[c >> 2];
         vec4 out4;
         for (uint i = 0u; i < 4u; i++) {

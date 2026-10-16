@@ -58,6 +58,7 @@ static struct {
 	VkPipeline rrows;         /* the whole-row softmax on 256 lanes */
 	VkPipeline rint8;         /* the staged GEMM on the integer path, built on first use */
 	VkPipeline rblock;        /* a 32-channel window block's attention half, likewise */
+	VkPipeline rmega;         /* the same block with its feed-forward folded in (B1a) */
 	VkPipeline rglobal;       /* a bottleneck block's attention in one pass, likewise */
 	VkPipeline rtiled32;      /* the 32x32 register block, built on first use */
 	VkPipeline rtiled8;       /* the 8x32 register block, likewise */
@@ -80,7 +81,7 @@ static struct {
 	 * 15 the fused integer GEMM, 16 the integer GEMM's residual build;
 	 * see xmx_tiled32_init / xmx_tiled8_init / xmx_quant_init /
 	 * xmx_int8_fused_init / xmx_int8_residual_init */
-	char *rpaths[18];
+	char *rpaths[19];
 	unsigned specialize;
 	unsigned tiling, tilem, tilen, tilem32, tilen32;
 	unsigned tiled32;         /* the 32x32 block may take a shape the 16x32 one can */
@@ -248,12 +249,19 @@ struct push {
 	 * both adapters here), so 160 costs nothing. A shader declaring only the first 128
 	 * still links: it is the layout that is wider, not the block the shaders read. */
 	uint32_t blda, bldb, bldc, bspare;
+	/* The B1a megakernel's feed-forward (window_mega.comp): the two weight matrices
+	 * and the feed-forward residual's cosine, appended past the batched GEMM's
+	 * strides. The Arc takes 256 bytes of push (measured), so 168 costs nothing. */
+	uint64_t ffn_expand, ffn_branch, ffn_cos;
 };
 _Static_assert(offsetof(struct push, lda) == 80, "attention QKV scale pointer ABI");
 _Static_assert(offsetof(struct push, residual_cos) == 96, "residual epilogue ABI");
 _Static_assert(offsetof(struct push, qkv_scale) == 120, "QKV epilogue ABI");
 _Static_assert(offsetof(struct push, p0) == 64, "the merged feed-forward reads p0-p1 as an address");
 _Static_assert(offsetof(struct push, blda) == 128, "batched integer GEMM ABI");
+_Static_assert(offsetof(struct push, ffn_expand) == 144, "megakernel feed-forward ABI");
+_Static_assert(offsetof(struct push, ffn_branch) == 152, "megakernel feed-forward ABI");
+_Static_assert(offsetof(struct push, ffn_cos) == 160, "megakernel feed-forward ABI");
 _Static_assert(sizeof(struct push) <= 256, "push block fits the Arc's limit");
 
 const char *xmx_error(void) { return g.err; }
@@ -2602,6 +2610,19 @@ int xmx_window_block_init(const char *path)
 	free(g.rpaths[10]);
 	if (!(g.rpaths[10] = strdup(path))) FAIL("pipeline path allocation", 0);
 	return build_pipeline(path, g.rpl, &g.rblock);
+}
+
+/* The B1a megakernel's build of the same family (window_mega.comp): a whole window
+ * block, feed-forward and attention in one workgroup. Built on first use, recorded
+ * like xmx_rec_window_block; and a load-only init so the driver's pipeline stats can
+ * be read for the shared-memory budget before the record path is wired. */
+int xmx_window_mega_init(const char *path)
+{
+	if (!g.rready) FAIL("resident runtime not initialised", 0);
+	if (g.rmega) return 0;
+	free(g.rpaths[18]);
+	if (!(g.rpaths[18] = strdup(path))) FAIL("pipeline path allocation", 0);
+	return build_pipeline(path, g.rpl, &g.rmega);
 }
 
 /* A 32-channel window block's attention half, one 8x8 window a workgroup
