@@ -781,6 +781,12 @@ class Runtime:
         # A 32-channel window block's QKV projection, attention and output projection in
         # one pass a window, nothing in between leaving the workgroup.
         self.fuse_window_block = os.environ.get("NR_FUSE_WINDOW_BLOCK", "1") != "0"
+        # B1a: the same window block with its feed-forward folded in ahead of the QKV
+        # gather (window_mega.comp) — s.ffn never leaves the workgroup. Off by default:
+        # the fold re-splits rows, so the float32 feed-forward output can differ by a
+        # ulp the e4m3 publish absorbs (test_window_mega gates it bounded); the final
+        # arbiter is in-game. One variable per run, per the project's rule.
+        self.fuse_window_mega = os.environ.get("NR_FUSE_WINDOW_MEGA", "0") != "0"
         # Block 70's output straight into the compact head inside that pass, never stored.
         self.fuse_head = os.environ.get("NR_FUSE_HEAD", "1") != "0"
         # A bottleneck block's QK^T, softmax, PV and head merge in one pass, no score stored.
@@ -1113,9 +1119,13 @@ class Runtime:
         windows = (ph // 8) * (pw // 8)
         if height <= 0 or width <= 0 or not windows:
             raise ValueError("a megakernel block needs a positive extent")
-        if target.id in {image.id, qkv.id, projection.id, bias.id, cosine.id, scale.id,
+        if target.id in {qkv.id, projection.id, bias.id, cosine.id, scale.id,
                          expand.id, branch.id, ffn_cos.id}:
-            raise ValueError("the megakernel's target must not alias its inputs")
+            raise ValueError("the megakernel's target must not alias its weights")
+        # `image` MAY alias `target` (the graph runs l1 in place): unlike window_block,
+        # the megakernel's closing residual reads its skip from the feed-forward's
+        # output in shared, not from the image, so writing target over image is safe —
+        # each subgroup touches only its own 8 rows, which never overlap another's.
         pixels = height * width
         for buf, needed in ((image, pixels * 32 * (2 if image_half else 4)),
                             (qkv, 32 * 96 * 2), (projection, 32 * 32 * 2),

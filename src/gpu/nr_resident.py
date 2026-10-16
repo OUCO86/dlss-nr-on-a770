@@ -857,6 +857,18 @@ def can_fuse_window_block(runtime, w, s):
             and runtime.fuse_window_residual)
 
 
+def can_fuse_window_mega(runtime, w, s):
+    """B1a: the whole block — feed-forward and attention — in one workgroup
+    (window_mega.comp). Only on top of the window_block fusions (the attention half of
+    the megakernel IS window_block), and only for the plain shape the folded stage
+    reproduces: one head of 32 channels, a 128-wide un-branched feed-forward, no
+    merge/stem/pool/head. The gate is off unless NR_FUSE_WINDOW_MEGA is set."""
+    return (can_fuse_window_block(runtime, w, s)
+            and runtime.fuse_window_mega
+            and not getattr(w, "branched", False) and not getattr(w, "split", False)
+            and w.groups == 0 and s.hidden_width == 128)
+
+
 def record_window_attention(runtime, w, s, source, target=None, publish=0,
                             target_half=False, source_half=False, pool=None, head=None):
     """Window attention over `source`, into `s.attended` — in window order.
@@ -975,6 +987,17 @@ def record_block(runtime, w, s, source=None, target=None, publish=0, source_half
     source = source or s.value
     target = target or s.out
     pixels = s.height * s.width
+    if (can_fuse_window_mega(runtime, w, s)
+            and pool is None and head is None and merge is None and stem is None):
+        # B1a: the whole block — feed-forward then attention — in one workgroup
+        # (window_mega.comp). The feed-forward's output (s.ffn) never leaves the
+        # chip: the QKV gather and the closing residual's skip read it from shared.
+        # Bit-identical to record_feed_forward + record_window_attention on the
+        # half/e4m3 path, bounded-ulp on the float32 one (test_window_mega).
+        runtime.window_mega(source, w.qkv, w.out, target, w.bias, w.attn_cos, w.scale,
+                            w.expand, w.branch, w.ffn_cos, s.height, s.width, w.origin,
+                            epilogue=publish, narrow=target_half, image_half=source_half)
+        return
     if getattr(w, "split", False):
         if source16 is not None:
             raise ValueError("the split feed-forward takes no prepared half copy")
