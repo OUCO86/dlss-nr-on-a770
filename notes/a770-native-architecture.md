@@ -272,3 +272,26 @@ mode 3 (全跳 23 个 barrier): med 64.70 best 64.65 | wall med 71.3 best 71.2
 ⇒ A770-native 大换血的"完美贴合"实测落点 ≈ 前辈现有实现（device ~45 特化口径）
   + 已存在的红利；Mochi 快 5× 的剩余部分是硬件（256-VGPR 宽 tile、FP8、宽 coopmat），
   不是架构能补的。出货路径（windows 主线、mega flag 默认关）今晚零改动。
+
+## 16. 架构分叉实证（2026-10-16 19:00）：ESIMD 进不了 Vulkan——重写核心层=换后端到 Level Zero
+三个实证（全部本机跑出来的，非推测）：
+- `SYCL_DUMP_IMAGES=1` dump v2 核的 SPIR-V：`sycl_spir64.spv` 声明
+  **SPV_INTEL_vector_compute**（+memory_access_aliasing、fp_fast_math_mode）。DPAS 是它的指令。
+- 枚举本机 Intel Vulkan 驱动（32.0.101.9150）全部 160 个 device extension：
+  INTEL 系只有 `VK_INTEL_performance_query`、`VK_INTEL_device_info`——**没有任何 vector-compute 扩展**。
+  ⇒ SPV_INTEL_vector_compute 的 SPIR-V 在 Vulkan 侧加载不了（vkCreateShaderModule 会拒）。
+- 前辈 Mochi 参考本身也是 Vulkan coopmat（ta_MochizukiNrRuntime.cpp:746
+  CooperativeMatrixFeaturesKHR + :757 FP8）——它在 AMD 快是因为 RDNA3 coopmat 宽 tile，
+  不是因为它的 API 选择高级。**在 A770 上，Vulkan coopmat=24.8 接口税，此路封顶。**
+⇒ 结论：要拿 ESIMD 的 40-59 TOPS（v1/v2 实测），核心层后端必须从 Vulkan 换成
+  **Level Zero**（SYCL/L0 正是 Blackwood 前辈全部 ESIMD 工作所在的世界）。
+  libxmx.c 3777 行、233 处 Vulkan API（含与桥接 D3D12 的 external fence/semaphore/memory
+  Win32 互操作）——L0 全部有对应物（zeImportExternalFence/Semaphore、D3D12 共享 handle，
+  同 vendor 栈比跨 Vulkan 更直接）。Python 侧 xmx_* 记录接口可保持不变，只换 C 后端。
+三选项（已实证边界）：
+  A) L0 + ESIMD 手写核：唯一通向 72-100+ TOPS 的路；工作量最大（后端重写+互操作重验）；
+     前辈 Blackwood 的核（GEMM/RMSNorm/softmax/GEMV 全套 ESIMD ladder）都在 L0，可照抄。
+  B) 留 Vulkan coopmat：封顶 24.8（今晚已证），等于放弃重写目标。
+  C) L0 + oneDNN 直通：拿 71.9 饱和但不能融合/改算法（接缝税 5ms 原样在）、
+     eager dispatch 税（前辈实测 +0.2-0.5ms/次×300）在 L0 下同样存在。
+推荐 A，分阶段；最大未知=L0↔D3D12 桥接互操作，先做阶段 1 探针再投大工程。
