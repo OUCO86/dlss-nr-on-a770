@@ -399,5 +399,14 @@ ESIMD/SYCL 核（§16/§17），所以正解是把**整个核编译链迁到 SYC
 待补门控③（开工 A' 前最后一块）：SYCL queue 的 native L0 句柄上做 §18 同一套 D3D12
 fence import + 一个 SYCL kernel 挂在它后面跑通——证明"SYCL 宿主+ze interop"组合成立
 （§18 用的是自建 ze context，句柄来源不同，必须实测不能推定）。
+
+### 门控③已绿（2026-10-17 00:28，src/bench/l0/probe_sycl_ze.cpp，PROBE_SYCL_ZE GREEN 0 fails）
+SYCL queue(L0 后端) → `get_native<ext_oneapi_level_zero>` 取 ctx/dev/cmdq 全非空；
+在 **SYCL 拥有的** ze_device 上 import D3D12 shared fence 成功；immediate list wait(2)
+在 fence=1 时阻塞、D3D12 `cmdq->Signal(2)` 后解锁；**之后同一 SYCL queue 跑普通 kernel
+结果仍正确(0 wrong)**——interop 没污染 SYCL 运行时自己的提交。
+⇒ 路线 A' 四道门全部闭合：①提交开销(§17) ②自建 ze 互操作(§18) ③spv 方言→定 A'(§19)
+③SYCL-native 互操作+共存(本节)。第一刀=libxmx 变 C++/SYCL、xmx_* C ABI 逐字节不变、
+核走 icx //fsycl；等用户确认新形态后切。
 教训固化：§16 写"libxmx 的 Vulkan API 在 L0 全部有对应物"时，**没把 spv 方言这一条列进
 未知**——门控清单漏了最前面的一块。顺序应该是：先测"能不能加载"，再测"能不能互操作"。
