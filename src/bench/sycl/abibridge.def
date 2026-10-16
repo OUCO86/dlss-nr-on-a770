@@ -1,0 +1,9 @@
+LIBRARY abibridge
+EXPORTS
+    xmx_error
+    xmx_init
+    xmx_transform
+    xmx_alloc
+    xmx_free
+    xmx_write
+    xmx_read
