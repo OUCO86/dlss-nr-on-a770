@@ -1,5 +1,13 @@
 # 在 Arc A770 上跑起来（Windows）
 
+> ⚠️ **2026-10-16 更新：当前唯一出货游戏是 Lies of P，不是 DOOM。**
+> 启动方式 = 双击 `F:\Game\Lies of P\LOP.exe`（游戏目录里的 `dxgi.dll` = 我们构建的
+> OptiScaler-NR 桥接，它自动 spawn daemon，管道 `\\.\pipe\nr_lop`）。换 `work/` 里的
+> dll/spv/plan 即生效。运行中开/关 NR = 增删 `work\nr_trigger`（桌面 `NR 开启/关闭.bat`）。
+> **下文所有 "DOOM Eternal (NR).bat / nr_play.bat / DOOMEternalx64vk.exe" 的启动段
+> 全部作废**（那是旧 Vulkan 层路线的历史记录），机制部分（daemon 生命周期、开关文件、
+> 日志判据）对 LOP 同样成立。
+
 上游那份 README 讲的是 Lunar Lake iGPU + Linux。这一篇是 **Intel Arc A770 独显 + Windows**
 的实际跑法，包括启动方式、实时开关、当前实测数字，以及踩过的坑。
 

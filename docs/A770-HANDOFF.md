@@ -1,5 +1,9 @@
 # 交接：Arc A770 这一轮做到哪了，明天怎么验收
 
+> ⚠️ **2026-10-16 更新：当前唯一出货游戏是 Lies of P（`F:\Game\Lies of P\LOP.exe`，
+> 游戏目录 `dxgi.dll` 桥接自动 spawn daemon）。本文里所有 DOOM Eternal / nr_play.bat
+> 的启动段已作废**（旧 Vulkan 层路线），daemon 生命周期、开关文件、日志判据对 LOP 成立。
+
 写这份东西的原因：这一轮我犯过错，也留下了几件没做完的事。
 下一棒（不管是人还是模型）接手前，先读完这一页，别重蹈覆辙。
 
