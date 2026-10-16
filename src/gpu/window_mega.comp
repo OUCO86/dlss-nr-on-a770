@@ -218,6 +218,22 @@ void main() {
     }
     barrier();                                   // the weights, and this subgroup's row
     PROBE_MID(PROBE_FILL)
+#if defined(GATHER_DUMP)
+    /* Decisive probe: dump this subgroup's gathered row (the e4m3-of-image halves in
+     * scratch) to the float32 target and stop, so the test compares the folded
+     * gather's published input against the reference chain's value16 (the e4m3_half
+     * pass) directly. If they match, the gather is right and the feed-forward GEMM is
+     * at fault; if not, the gather's rounding differs from the pass's. */
+    for (uint e = local * 4u; e < 256u; e += 128u) {
+        uint t = e / 32u, c = e % 32u;
+        int x = x0 + int(t);
+        if (!row_in || x < 0 || x >= int(pc.image_w)) continue;
+        uint at = (uint(y) * pc.image_w + uint(x)) * 32u + c;
+        f16vec4 gathered = h4[(scratch * 2u + t * 32u + c) >> 2];   // the row, as halves
+        for (uint q = 0u; q < 4u; q++) pc.c.v[at + q] = float(gathered[q]);
+    }
+    return;
+#endif
 
     /* ---- The folded feed-forward (B1a) ----
      * What record_feed_forward's ffn_fused call (nr_resident:795-798, the fuse_ffn
@@ -265,6 +281,23 @@ void main() {
                 coopMatStore(narrow, h16, fhidden + j * 8u, 32u,
                              gl_CooperativeMatrixLayoutRowMajor);
             }
+#if defined(EXPAND_DUMP)
+            /* Cross-kernel probe matching ffn_fused.comp's EXPAND_DUMP: write this
+             * subgroup's chunk-0 hidden (8 tokens x 32 columns) to the target by
+             * global pixel, so the two kernels' expand outputs land at the same
+             * addresses despite the different row split (window_mega: 8 rows a
+             * subgroup; ffn_fused: 16). */
+            if (chunk == 0u) {
+                for (uint e = local * 4u; e < 256u; e += 128u) {
+                    uint t = e / 32u, c = e % 32u;
+                    int x = x0 + int(t);
+                    if (!row_in || x < 0 || x >= int(pc.image_w)) continue;
+                    uint at = (uint(y) * pc.image_w + uint(x)) * 32u + c;
+                    for (uint q = 0u; q < 4u; q++)
+                        pc.c.v[at + q] = float(h16[fhidden + e + q]);
+                }
+            }
+#endif
             subgroupMemoryBarrierShared();
             subgroupBarrier();
             for (uint kk = 0u; kk < 2u; kk++) {              // the projection, two steps of 16
@@ -295,11 +328,30 @@ void main() {
             uint at = (uint(y) * pc.image_w + uint(x)) * 32u + c;
             vec4 skip = image4(at);                          // s.value, raw
             vec4 cosine = Vec4Buf(pc.ffn_cos).v4[c >> 2];
+            /* Match add_gemm_residual exactly: it writes `branch + skip * cosine` as a
+             * plain expression (no `precise`), and the compiler contracts it to an fma.
+             * My first attempt forced the two roundings apart with `precise` and missed
+             * by an ulp the other way — the reference DOES contract, so this must too.
+             * Same operand order: the accumulator first, the product second. */
             for (uint q = 0u; q < 4u; q++)
-                f32[ffout + e + q] = skip[q] * cosine[q] + f32[ffout + e + q];
+                f32[ffout + e + q] = f32[ffout + e + q] + skip[q] * cosine[q];
         }
         subgroupMemoryBarrierShared();
         subgroupBarrier();
+#if defined(FFN_ONLY)
+        /* A timing/correctness probe (the PROBE_STOP pattern): dump this subgroup's
+         * ffout to the target and stop, so the test can compare the folded
+         * feed-forward's output against ffn_fused's sffn alone, with no attention
+         * downstream to mask or amplify a difference. */
+        for (uint e = local * 4u; e < 256u; e += 128u) {
+            uint t = e / 32u, c = e % 32u;
+            int x = x0 + int(t);
+            if (!row_in || x < 0 || x >= int(pc.image_w)) continue;
+            uint at = (uint(y) * pc.image_w + uint(x)) * 32u + c;
+            for (uint q = 0u; q < 4u; q++) pc.c.v[at + q] = f32[ffout + e + q];
+        }
+        return;
+#endif
     }
 
     /* The second gather: the QKV's A is now this subgroup's ffout, E4M3-published —

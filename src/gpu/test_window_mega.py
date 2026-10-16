@@ -44,6 +44,7 @@ def main():
                 return b
 
             image = alloc(pixels * 32, np.float32)
+            value16 = alloc(pixels * 32, np.float16)      # the graph's e4m3_half of the input
             qkv = alloc(32 * 96, np.float16)
             projection = alloc(32 * 32, np.float16)
             bias = alloc(64 * 64, np.float32)
@@ -75,9 +76,12 @@ def main():
                 for b in (want, got):
                     X.host_write(b, np.full(pixels * 32 + GUARD, fill(dtype), dtype))
                 rt.begin()
-                # reference: the feed-forward into sffn (float32, unpublished), then the
-                # attention half reading sffn — exactly the graph's two calls.
-                rt.ffn_fused(image, expand, branch, sffn, pixels, 32, 128,
+                # reference: what record_feed_forward does for an l1 sequential block
+                # (nr_resident:753-756 then :795-798) — e4m3_half the input, then the
+                # fused feed-forward reading the half, skip the raw float32 source,
+                # leaving sffn float32 and UNPUBLISHED. Then the attention half reads sffn.
+                rt.e4m3_half(image, value16, pixels * 32)
+                rt.ffn_fused(value16, expand, branch, sffn, pixels, 32, 128,
                              skip=image, cosine=ffn_cos)
                 rt.window_block(sffn, qkv, projection, want, bias, cosine, scale,
                                 height, width, origin, epilogue=epilogue, narrow=narrow,

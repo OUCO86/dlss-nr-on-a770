@@ -249,6 +249,21 @@ void main() {
                 coopMatStore(narrow, h16, hidden + i * TM * CHUNK + j * TN, CHUNK,
                              gl_CooperativeMatrixLayoutRowMajor);
             }
+#if defined(EXPAND_DUMP)
+        /* Probe for cross-kernel comparison with window_mega.comp's EXPAND_DUMP:
+         * write this subgroup's chunk-0 hidden (16 rows x 32 columns) straight to the
+         * target by global row, so the two kernels' expand outputs land at the same
+         * addresses regardless of how each splits rows, then stop before the contract.
+         * Default build unaffected. */
+        if (chunk == 0u) {
+            for (uint e = lane * 4u; e < ROWS * TN; e += 32u * 4u) {
+                uint r = e / TN, c = e % TN;
+                if (row + r >= pc.m) continue;
+                pc.c.v[(row + r) * ldc + group * OUT + c] = float(h16[hidden + e]);
+            }
+            return;
+        }
+#endif
         subgroupMemoryBarrierShared();
         subgroupBarrier();
         // the projection over these 32 hidden rows, in two steps of 16
