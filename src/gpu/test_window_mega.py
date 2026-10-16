@@ -52,7 +52,12 @@ def main():
     rng = np.random.default_rng(77)
     cases, fails, notes = 0, [], []
     for height, width in ((16, 16), (24, 40), (32, 32)):
-        for origin in ((0, 0), (-4, -4)):
+        # all four real origins (the frame's l1 uses (0,0), (-4,-4), (0,-4), (-4,0))
+        # and the three real (publish, narrow, image_half) combos:
+        #   blocks 67-69,1-3: EPI_E4M3, half out, half in
+        #   block 66:         EPI_E4M3, half out, FLOAT32 in
+        #   block 4:          none, float32 out (kept unfolded in the graph)
+        for origin in ((0, 0), (-4, -4), (0, -4), (-4, 0)):
             ph, pw, (top, left) = rt.window_extent(height, width, origin, 8)
             windows, rows, pixels = (ph // 8) * (pw // 8), ph * pw, height * width
             buffers = []
@@ -88,7 +93,8 @@ def main():
             X.host_write(branch, rng.normal(0, 0.1, 128 * 32).astype(np.float16))
             X.host_write(ffn_cos, rng.uniform(-1.5, 1.5, 32).astype(np.float32))
 
-            for epilogue, narrow in ((0, False), (X.EPI_E4M3, True)):
+            for epilogue, narrow, image_half in ((0, False, False), (X.EPI_E4M3, True, True),
+                                                 (X.EPI_E4M3, True, False)):
                 dtype = np.float16 if narrow else np.float32
                 want = alloc(pixels * 32 + GUARD, dtype)
                 got = alloc(pixels * 32 + GUARD, dtype)
@@ -99,22 +105,41 @@ def main():
                 # (nr_resident:753-756 then :795-798) — e4m3_half the input, then the
                 # fused feed-forward reading the half, skip the raw float32 source,
                 # leaving sffn float32 and UNPUBLISHED. Then the attention half reads sffn.
-                rt.e4m3_half(image, value16, pixels * 32)
-                rt.ffn_fused(value16, expand, branch, sffn, pixels, 32, 128,
-                             skip=image, cosine=ffn_cos)
-                rt.window_block(sffn, qkv, projection, want, bias, cosine, scale,
-                                height, width, origin, epilogue=epilogue, narrow=narrow,
-                                image_half=False)
-                # the megakernel, same block from the same input.
-                rt.window_mega(image, qkv, projection, got, bias, cosine, scale,
+                if not image_half:
+                    rt.e4m3_half(image, value16, pixels * 32)
+                    rt.ffn_fused(value16, expand, branch, sffn, pixels, 32, 128,
+                                 skip=image, cosine=ffn_cos)
+                    rt.window_block(sffn, qkv, projection, want, bias, cosine, scale,
+                                    height, width, origin, epilogue=epilogue,
+                                    narrow=narrow, image_half=False)
+                else:
+                    # source_half=True: the real l1 source is the previous block's
+                    # published half — an e4m3-grid value — so the e4m3 the folded
+                    # gather applies is idempotent. Generate it that way (e4m3_half
+                    # of the float32 image), not a random half, or the test's two
+                    # paths would differ by the rounding alone and prove nothing.
+                    half_image = alloc(pixels * 32, np.float16)
+                    rt.e4m3_half(image, half_image, pixels * 32)
+                    rt.ffn_fused(half_image, expand, branch, sffn, pixels, 32, 128,
+                                 skip=half_image, cosine=ffn_cos, skip_half=True)
+                    rt.window_block(sffn, qkv, projection, want, bias, cosine, scale,
+                                    height, width, origin, epilogue=epilogue,
+                                    narrow=narrow, image_half=False)
+                # the megakernel, same block from the same input: the half path
+                # hands it the half buffer directly (that is what the graph does).
+                src = half_image if image_half else image
+                rt.window_mega(src, qkv, projection, got, bias, cosine, scale,
                                expand, branch, ffn_cos, height, width, origin,
-                               epilogue=epilogue, narrow=narrow, image_half=False)
+                               epilogue=epilogue, narrow=narrow, image_half=image_half)
                 rt.submit()
+                if image_half:
+                    half_image.free()
                 n = pixels * 32
                 w = X.host_view(want, dtype)[:n]
                 g = X.host_view(got, dtype)[:n]
                 exact, worst, bad = ulp_report(w, g, dtype)
-                label = f"{height}x{width} origin {origin} epi {epilogue} narrow {narrow}"
+                label = (f"{height}x{width} origin {origin} epi {epilogue} "
+                         f"narrow {narrow} ihalf {image_half}")
                 if narrow:
                     ok = exact                     # the half/e4m3 path: bit-exact
                 else:

@@ -866,7 +866,11 @@ def can_fuse_window_mega(runtime, w, s):
     return (can_fuse_window_block(runtime, w, s)
             and runtime.fuse_window_mega
             and not getattr(w, "branched", False) and not getattr(w, "split", False)
-            and w.groups == 0 and s.hidden_width == 128)
+            and w.groups == 0 and s.hidden_width == 128
+            # bisection hook: NR_MEGA_ONLY is a comma list of block indices; when set,
+            # only those blocks fold, so a frame A/B can pin which one diverges.
+            and (getattr(runtime, "mega_only", None) is None
+                 or w.index in runtime.mega_only))
 
 
 def record_window_attention(runtime, w, s, source, target=None, publish=0,
@@ -988,12 +992,29 @@ def record_block(runtime, w, s, source=None, target=None, publish=0, source_half
     target = target or s.out
     pixels = s.height * s.width
     if (can_fuse_window_mega(runtime, w, s)
-            and pool is None and head is None and merge is None and stem is None):
+            and pool is None and head is None and merge is None and stem is None
+            and target_half and source_half):
         # B1a: the whole block — feed-forward then attention — in one workgroup
         # (window_mega.comp). The feed-forward's output (s.ffn) never leaves the
         # chip: the QKV gather and the closing residual's skip read it from shared.
-        # Bit-identical to record_feed_forward + record_window_attention on the
-        # half/e4m3 path, bounded-ulp on the float32 one (test_window_mega).
+        #
+        # Restricted to half-input, half-output blocks (diag10/12, 2026-10-16): the
+        # fold's feed-forward GEMM differs from ffn_fused's by a ulp (8 rows a
+        # subgroup against 16, A from shared against global — a different
+        # accumulation path the compiler takes differently), and that ulp is absorbed
+        # by the e4m3 the QKV gather applies EXCEPT where it straddles an e4m3 grid
+        # boundary. For the half-input blocks the input is already on the grid and the
+        # fold is bit-exact (each folds to 0 head diffs alone and together); block 66,
+        # the one float32-input block of the level, diverges at those boundaries —
+        # isolated 1-73 elements up to 8.0 (a few grid steps), amplified to 7415 by the
+        # six downstream attentions' softmax. It stays unfolded until the GEMM's ulp is
+        # understood; folding the other six removes six of the eight feed-forward
+        # passes at bit-exactness.
+        if not hasattr(runtime, "mega_blocks"):
+            runtime.mega_blocks = []
+        runtime.mega_blocks.append(
+            (w.index, w.channels, w.heads, s.height, s.width, w.origin, source_half,
+             target_half, publish))
         runtime.window_mega(source, w.qkv, w.out, target, w.bias, w.attn_cos, w.scale,
                             w.expand, w.branch, w.ffn_cos, s.height, s.width, w.origin,
                             epilogue=publish, narrow=target_half, image_half=source_half)

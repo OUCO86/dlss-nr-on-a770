@@ -207,3 +207,26 @@ B1 的待证假设随之收窄：不再是"单一世界成不成立"，而是
 数据完整性复查：§10 表测的是"独立 GEMM"形态，R8a 后这些行只有 M≥8160 的
 会作为独立趟存在（全部 int8 赢），M<8160 的行变成 stage 参数——B1 里用
 PROBE_STOP 式分段实测 stage 成本（前辈先例），不需要新的 standalone 数据。
+
+## 12. B1a 实测否证（2026-10-16 11:00）：tiling 冲突的 GEMM 不能折进一个 workgroup
+
+window_mega（FFN 折进 window_block）跑通了，**bit-exact**（A/B head 0-diff、
+回归全绿、6 块 fold 移除 6 趟 415→409），但 **device 慢 6ms**（60.85→66.81，
+特化后仍 73 vs 69 wall）。根因是结构性的，不是实现偷懒：
+
+- window_block 把 QKV 权重 6KB stage 进 shared（母体核心优化）。
+- FFN 的 expand+branch = 16KB，attention 工作集（K/V 8KB + hidden chunk + ffout）
+  已占满 32KB ⇒ **FFN 权重无处 stage，只能每 subgroup 从 global 读**。
+- l1：2040 窗口 × 8 subgroup × 16KB = 261MB 权重流量（≫16MB L2，几乎全 miss）；
+  而 ffn_fused 独立跑 510 workgroup × 16KB = 8MB 全进 L2。
+- 叠加 M 碎片化：FFN 从 256 行/workgroup 退到 64 token/窗口（宽度扫描的反面教训）。
+
+⇒ **架构修正**：megakernel 折的是 **elementwise 进 GEMM epilogue**（红利①，
+不碰 GEMM 的 tiling），不是把 **tiling 冲突的两个 GEMM 折进一个 workgroup**。
+FFN 要大 M（行批 + 权重驻留 L2），attention 要窗口局部（64 token 共享 K/V）——
+两者对 A770 的 32KB shared 与 coopmat 批处理的要求根本不相容。B1a 作废为
+"measured dead-end"（代码保留，flag 默认关），B1 的正确落点改为不碎片化的折叠：
+  - B1c：把 e4m3_half(partition) 折进 ffn_fused 的 gather（ffn_fused 已读 value16，
+    改读 s.value 内联 publish）——省一趟 ~0.7ms，FFN 保持大 M，零碎片。
+  - B3：上下采样融合（partition/upsample 那 1.6ms），同理不碰 GEMM tiling。
+红利①的"elementwise 免费"是对的；错的是我把它外推成"GEMM 也能互相折"。

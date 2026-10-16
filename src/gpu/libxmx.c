@@ -2704,7 +2704,14 @@ int xmx_rec_window_mega(int image, int qkv, int projection, int target, int bias
 	if (!p.a || !p.b || !p.c || !p.d || !weights || !p.residual_cos || !p.qkv_scale
 	    || !p.ffn_expand || !p.ffn_branch || !p.ffn_cos)
 		FAIL("megakernel operand is not a live buffer", 0);
-	vkCmdBindPipeline(g.rcb, VK_PIPELINE_BIND_POINT_COMPUTE, g.rmega);
+	/* family 18, its own specialization slot (rpaths[18]): the fold's flags ride in
+	 * the push block, and specializing the same way the window block is (loops
+	 * unrolled, the shape fixed at creation) is what closes the 8 ms the un-specialized
+	 * build loses. Sharing family 10 with window_block would collide in the
+	 * specialized[] cache — same family, same flags, different pipeline. */
+	VkPipeline pipeline;
+	if (resident_pipeline(18, flags, g.rmega, &pipeline)) return -1;
+	vkCmdBindPipeline(g.rcb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
 	vkCmdPushConstants(g.rcb, g.rpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof p, &p);
 	vkCmdDispatch(g.rcb, windows < 65535u ? windows : 65535u, (windows + 65534u) / 65535u, 1);
 	barrier();
