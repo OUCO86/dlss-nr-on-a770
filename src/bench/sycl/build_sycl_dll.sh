@@ -40,5 +40,6 @@ PYEOF
 # 3. stage + gate from oneapi/ (the SYCL runtime chain lives there)
 RUNDIR="E:/WorkBuddy/2026-10-09-04-20-55/oneapi"
 cp -f libxmx_sycl.dll "$RUNDIR/"
-echo "built libxmx_sycl.dll; running the gate from $RUNDIR:"
+echo "built libxmx_sycl.dll; running the gates from $RUNDIR:"
 ( cd "$RUNDIR" && SYCL_DEVICE_FILTER=level_zero:gpu "C:/Users/wangz/.workbuddy/binaries/python/envs/default/Scripts/python.exe" "$HERE/gate_libxmx_sycl.py" )
+( cd "$RUNDIR" && SYCL_DEVICE_FILTER=level_zero:gpu "C:/Users/wangz/.workbuddy/binaries/python/envs/default/Scripts/python.exe" "$HERE/gate_unary.py" )

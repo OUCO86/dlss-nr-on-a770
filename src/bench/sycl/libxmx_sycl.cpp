@@ -16,6 +16,7 @@
 // GetProcAddress function pointers). See §20 + the abibridge gate for the proven base.
 #include <sycl/sycl.hpp>
 #include "quantize_row_kernel.hpp"
+#include "publish_kernel.hpp"
 #include <cstring>
 #include <cstdio>
 #include <vector>
@@ -114,6 +115,23 @@ int xmx_submit(void) {
         for (auto& fn : g_cmds) fn();   // each qr_launch already .wait()s; ordered like the plan
     } catch (const std::exception& e) { g_cmds.clear(); g_recording = false; FAILMSG("submit: %s", e.what()); }
     g_cmds.clear(); g_recording = false;
+    return 0;
+}
+
+// int xmx_rec_unary32(int source, int dst, unsigned count, unsigned epilogue)
+// float32 elementwise publish — the rounding-point contract, gated bit-exact against
+// nr_model (test_resident.py:65). count is in elements; kernel works in float4.
+int xmx_rec_unary32(int source, int dst, unsigned count, unsigned epilogue) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!count || (count & 3u)) FAILMSG("unary32 count must be a multiple of 4");
+    auto s = g_bufs.find(source), d = g_bufs.find(dst);
+    if (s == g_bufs.end() || d == g_bufs.end()) FAILMSG("bad unary operand");
+    sycl::float4* sp = (sycl::float4*)s->second.p;
+    sycl::float4* dp = (sycl::float4*)d->second.p;
+    unsigned n4 = count / 4u;
+    g_cmds.push_back([=]() {
+        GQ->parallel_for(sycl::range(n4), unary_kernel()(sp, dp, n4, epilogue)).wait();
+    });
     return 0;
 }
 

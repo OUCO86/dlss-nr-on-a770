@@ -435,3 +435,34 @@ local-mem+barrier，shuffle/ESIMD 提速留第 2 期。精确除法用 ext::inte
 骨架(C ABI 不变)接上这个核，或先批量直译其余 elementwise 核。
 教训固化：§16 写"libxmx 的 Vulkan API 在 L0 全部有对应物"时，**没把 spv 方言这一条列进
 未知**——门控清单漏了最前面的一块。顺序应该是：先测"能不能加载"，再测"能不能互操作"。
+
+## 21. 第一刀续（2026-10-17 07:0x）：ABI 桥 + 骨架垂直切片 + publish/unary 核，三道门全绿
+用户"切吧"后连续三块，每块都实测、一次一个变量：
+
+1. **ABI 桥门**（abibridge.cpp/gate_abibridge.py，ABIBRIDGE GREEN）：icx //fsycl 编的
+   C++/SYCL dll，`extern "C"`+`.def` 导出，能被 ctypes 按 xmxres 的 argtypes 加载并驱动
+   真 SYCL 核出正确结果。路线 A' 的成败前提成立。
+   坑固化：def 必须 CRLF 无 BOM（Write 工具 LF + \r\n join = \r\r\n → LNK1107）；
+   icx 链接要 `//link //DEF:NAME`（前辈 build_fused.bat:33 形态），裸 def-as-input 会被
+   当 COFF 对象读→LNK1107；ctypes.CDLL 载 sycl9 依赖链（libmmd/tbb/ur_loader/sycl9）
+   须先预热否则 0x7e MOD_NOT_FOUND（daemon 运行时整链已在内存，故忠实）。
+2. **骨架垂直切片门**（libxmx_sycl.cpp/gate_libxmx_sycl.py，LIBXMX_SYCL GREEN）：复刻
+   libxmx.c 模型（init 单 device+queue、int 键 buffer 表、begin→rec_quant→submit），
+   xmx_rec_quant 用 xmxres 逐字 argtypes（[c_int]*3+[c_uint]*2）。l2/l0/tiny 三形状过
+   numpy 有界门。build_sycl_dll.sh 一键可复现（def 从源码 extern "C" 块自动生成，
+   永不手维护——前辈 build_fused.bat:29 模式）。
+3. **publish/unary 核门**（publish_kernel.hpp/gate_unary.py，PUBLISH GREEN）：
+   half/e4m3/gate/gate+e4m3 四 epilogue × 两尺寸，**bit-exact** vs nr_model
+   （前辈 test_resident.py:65 的判据是 np.array_equal，不是 quantize 的有界）。
+   **FMA 命门解法**：publish.glsl 用 `precise` 禁止"乘加被 FMA 收缩、跳过中间半精度
+   舍入"；SYCL 直译用 `ext::intel::math::fmul_rn`/`fadd_rn` 逐 op 写，与参考 nr_model
+   的 half_fma(乘f32→加→舍half，非硬件融合)逐位对齐。0 differ。
+   **诚实记录一个参考vs出货的语义差异**：e4m3 的 `min(abs,448)`——SYCL fmin 和 GLSL
+   min() 都取非-NaN 方(NaN→448)，而 numpy np.minimum 传播 NaN。这是参考模型与出货
+   实现本就有的差异(出货 GLSL 对 NaN 也出 448)，真实管线不喂 NaN 给 e4m3(输入是 post-gate
+   激活)，前辈测试也避开 NaN 输入。重写匹配的是**出货实现**，不是偏离。
+
+⇒ 第一刀的"elementwise 世界"骨架已成立且可复现。下一刀=批量直译其余 elementwise
+记录器(row/history/unary2 带 publish epilogue)，然后 ESIMD GEMM ladder(第2期性能)，
+再 graph+D3D12 import 接进出货 daemon。铁律不变：链路只走 int8 宽直通，窄形状/fp16
+残留=我代码的错。
