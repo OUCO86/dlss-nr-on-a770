@@ -230,3 +230,45 @@ FFN 要大 M（行批 + 权重驻留 L2），attention 要窗口局部（64 toke
     改读 s.value 内联 publish）——省一趟 ~0.7ms，FFN 保持大 M，零碎片。
   - B3：上下采样融合（partition/upsample 那 1.6ms），同理不碰 GEMM tiling。
 红利①的"elementwise 免费"是对的；错的是我把它外推成"GEMM 也能互相折"。
+
+## 13. B1c 靶子蒸发（2026-10-16 12:30）：前辈 :627 第一条已做完，第二条流量打平
+- 账本独立 partition 趟 = **0**：quantize_window(flags 0x400000) 已是"partition 折进
+  quantise"的成品（quantize_row.comp 注释："until now paid partition for it"——过去式）。
+- 第二条（quantise 折进 gemm_int8_qkv 的 A-loader，即给 staged_int8 补 window gather）：
+  流量账现状 3B/elem(读2写1) + GEMM 读 packed 1B×3列块 = 6B；折进去 = 读 image 2B×3列块
+  = 6B —— **打平，多付 gather+quantise ALU ×3**；且 K 多步(256/512/1024)时行峰值不在
+  单 K-step tile 内 = P5 墙原样复现。float 路径能折是因为它的 partition 是 fp16(省4B/elem)，
+  int8 的 packed 容器已经把读侧砍半，折的毛利没了。⇒ B1c 作废，无新刀。
+- 剩余未动工项只有 B4（链计数器，红利⑥ launch 间隙）——先 scope 再决定。
+
+## 14. B4 否证（2026-10-16 12:40）：barrier 不占可测时间（未特化口径）
+前辈早留了旋钮 `XMX_BARRIER_MODE` 0..3（libxmx:1245），笔记里没有实测记录。交错 A/B
+（每 mode 5 样本、mode 顺序打乱消热噪声）：
+```
+mode 1 (默认): device med 64.72 best 61.13 | wall med 71.1 best 67.7
+mode 2 (去 src WRITE): med 65.03 best 64.55 | wall med 71.5 best 71.0
+mode 3 (全跳 23 个 barrier): med 64.70 best 64.65 | wall med 71.3 best 71.2
+```
+三 mode 中位数一致（64.7-65.0）⇒ 那 23 个 vkCmdPipelineBarrier 在 device 时间上
+**没有可测成本**（单跑看到的 mode2"快 2.1ms"是噪声：同配置两次 mode1 差 1.4ms）。
+符合预期：同 command buffer 内 compute dispatch 本就按序，barrier 只加 fence，
+不改变 dispatch 顺序；消 fence 不重叠 launch（数据依赖挡着）。
+⚠ 口径 caveat：devtime 未调 rt.specialize()，测的是未特化帧；出货是特化帧。
+若特化后帧更短、launch 间隙占比更高，B4 才可能显形——但链计数器(§5 B4)要消的是
+"dispatch 间 ramp/drain 不重叠"，而 mode3 已让 dispatch 背靠背无 barrier 仍不省，
+⇒ 这台 Intel 驱动没有前辈 RDNA 那种 per-dispatch launch 间隙可消。B4 判定为低价值，
+不再投入（除非特化口径重测显示 gap）。
+
+## 15. 今晚 B 系列收敛（2026-10-16 12:45）：可迁移红利已穷尽或已存在
+四轮实测，每条都撞墙或靶子已不存在：
+- B1a FFN 折进 window_block：bit-exact 但 device 慢 6ms（§12 tiling 冲突：FFN 权重
+  无法 stage + M 碎片化）。作废。
+- B1c quantise 折进 int8 GEMM：前辈 :627 第一条(partition→quantise)已做成
+  quantize_window；第二条流量打平撞 P5。靶子不存在（§13）。
+- B4 barrier/链计数器：交错 A/B 不省时间（§14）。
+- 红利①(residual/publish 折 GEMM epilogue)：record_project_residual、各 GEMM 的
+  epilogue publish——**前辈实现早已收割**。剩 quantize 3.09ms 是这台机器不可约
+  （P5 行-max + 流量打平，今晚两次独立证）。
+⇒ A770-native 大换血的"完美贴合"实测落点 ≈ 前辈现有实现（device ~45 特化口径）
+  + 已存在的红利；Mochi 快 5× 的剩余部分是硬件（256-VGPR 宽 tile、FP8、宽 coopmat），
+  不是架构能补的。出货路径（windows 主线、mega flag 默认关）今晚零改动。
