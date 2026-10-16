@@ -142,6 +142,8 @@ def _load():
             ("xmx_rec_gemm_window_residual_pool", [ctypes.c_int] * 6 + [ctypes.c_uint] * 8),
             ("xmx_window_block_init", [ctypes.c_char_p]),
             ("xmx_rec_window_block", [ctypes.c_int] * 8 + [ctypes.c_uint] * 6),
+            ("xmx_window_mega_init", [ctypes.c_char_p]),
+            ("xmx_rec_window_mega", [ctypes.c_int] * 10 + [ctypes.c_uint] * 6),
             ("xmx_global_attention_init", [ctypes.c_char_p]),
             ("xmx_rec_global_attention", [ctypes.c_int] * 4 + [ctypes.c_uint] * 3),
             ("xmx_int8_init", [ctypes.c_char_p]),
@@ -1093,6 +1095,45 @@ class Runtime:
                                          height, width, pw // 8, (top << 16) | left,
                                          flags) != 0:
             raise RuntimeError("xmx_rec_window_block: " + self.lib.xmx_error().decode())
+        self.recorded += 1
+        return self
+
+    def window_mega(self, image, qkv, projection, target, bias, cosine, scale,
+                    expand, branch, ffn_cos, height, width, origin, *,
+                    epilogue=0, narrow=False, image_half=False):
+        """A whole 32-channel window block in one pass (window_mega.comp, B1a).
+
+        What `ffn_fused(image, expand, branch, s_ffn, pixels, 32, 128, skip=image,
+        cosine=ffn_cos)` followed by `window_block(s_ffn, ...)` writes into `target`,
+        bit for bit, with the feed-forward's output (`s.ffn`, float32 and unpublished)
+        never leaving the workgroup. The plain shape only: no pool (block 0's), no
+        head (block 70's). Not specialised yet — the flags ride in the push block.
+        """
+        ph, pw, (top, left) = self.window_extent(height, width, origin, 8)
+        windows = (ph // 8) * (pw // 8)
+        if height <= 0 or width <= 0 or not windows:
+            raise ValueError("a megakernel block needs a positive extent")
+        if target.id in {image.id, qkv.id, projection.id, bias.id, cosine.id, scale.id,
+                         expand.id, branch.id, ffn_cos.id}:
+            raise ValueError("the megakernel's target must not alias its inputs")
+        pixels = height * width
+        for buf, needed in ((image, pixels * 32 * (2 if image_half else 4)),
+                            (qkv, 32 * 96 * 2), (projection, 32 * 32 * 2),
+                            (bias, 64 * 64 * 4), (cosine, 32 * 4), (scale, 4),
+                            (target, pixels * 32 * (2 if narrow else 4)),
+                            (expand, 32 * 128 * 2), (branch, 128 * 32 * 2),
+                            (ffn_cos, 32 * 4)):
+            if buf.nbytes < needed:
+                raise ValueError("megakernel buffer is too small")
+        path = os.environ.get("XMX_WINDOW_MEGA_SPV") or str(ROOT / "work" / "window_mega.spv")
+        if self.lib.xmx_window_mega_init(path.encode()) != 0:
+            raise RuntimeError("megakernel pipeline: " + self.lib.xmx_error().decode())
+        flags = _publish(epilogue, narrow) | (0x8000 if image_half else 0)
+        if self.lib.xmx_rec_window_mega(image.id, qkv.id, projection.id, target.id, bias.id,
+                                        cosine.id, scale.id, expand.id, branch.id,
+                                        ffn_cos.id, windows, height, width, pw // 8,
+                                        (top << 16) | left, flags) != 0:
+            raise RuntimeError("xmx_rec_window_mega: " + self.lib.xmx_error().decode())
         self.recorded += 1
         return self
 

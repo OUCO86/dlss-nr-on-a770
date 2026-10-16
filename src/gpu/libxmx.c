@@ -2672,6 +2672,47 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
 	return 0;
 }
 
+/* The B1a megakernel: the same window block's attention half, with its feed-forward
+ * folded in ahead of the gather (window_mega.comp). Same operands as
+ * xmx_rec_window_block plus the feed-forward's three: `expand` (32 x 128 half),
+ * `branch` (128 x 32 half), `ffn_cos` (32 float) — exactly what xmx_rec_ffn is
+ * handed, so the folded stage and the pass it replaces agree bit for bit. The first
+ * build supports the plain path only: no head (0x1000000) and no pool (0x800000),
+ * which are block 70's and block 0's shapes and neither is a folded feed-forward's
+ * today. It is not specialised yet — the flags ride in the push block, and
+ * bit-identity does not depend on specialization; that is the follow-up step. */
+int xmx_rec_window_mega(int image, int qkv, int projection, int target, int bias,
+			int cosine, int scale, int expand, int branch, int ffn_cos,
+			unsigned windows, unsigned height, unsigned width,
+			unsigned across, unsigned pad, unsigned flags)
+{
+	if (!g.recording || !g.rmega) FAIL("megakernel not ready for recording", 0);
+	if (!windows || !height || !width || !across || windows % across)
+		FAIL("invalid megakernel geometry", 0);
+	if (flags & ~0x9f00u)
+		FAIL("the megakernel takes a publish, a half target and a half image only", 0);
+	struct push p = { .a = addr_of(image), .b = addr_of(qkv), .c = addr_of(target),
+			  .d = addr_of(bias), .m = windows, .n = 32u, .k = 32u, .batch = 1u,
+			  .flags = flags, .residual_cos = addr_of(cosine), .image_h = height,
+			  .image_w = width, .window_cols = across, .window_pad = pad,
+			  .qkv_scale = addr_of(scale),
+			  .ffn_expand = addr_of(expand), .ffn_branch = addr_of(branch),
+			  .ffn_cos = addr_of(ffn_cos) };
+	/* the shader reads p0-p1 as the output projection's address, as the base block does */
+	uint64_t weights = addr_of(projection);
+	memcpy(&p.p0, &weights, sizeof weights);
+	if (!p.a || !p.b || !p.c || !p.d || !weights || !p.residual_cos || !p.qkv_scale
+	    || !p.ffn_expand || !p.ffn_branch || !p.ffn_cos)
+		FAIL("megakernel operand is not a live buffer", 0);
+	vkCmdBindPipeline(g.rcb, VK_PIPELINE_BIND_POINT_COMPUTE, g.rmega);
+	vkCmdPushConstants(g.rcb, g.rpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof p, &p);
+	vkCmdDispatch(g.rcb, windows < 65535u ? windows : 65535u, (windows + 65534u) / 65535u, 1);
+	barrier();
+	stamp(PK_ROW, 4);        /* the same family: a window block, folded or not */
+	g.recorded++;
+	return 0;
+}
+
 int xmx_global_attention_init(const char *path)
 {
 	if (!g.rready) FAIL("resident runtime not initialised", 0);

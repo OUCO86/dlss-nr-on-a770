@@ -70,7 +70,7 @@ layout(push_constant, scalar) uniform Push {
      * at the offsets the _Static_asserts in libxmx.c pin: 144, 152, 160.
      * expand (32 x 128 half), branch (128 x 32 half), ffn_cos (32 float): the same
      * operands `ffn_fused.comp` is handed, in its order. */
-    uint pad0, pad1, pad2, pad3, pad4, pad5;   // 128: the stride group, unread
+    uint pad0, pad1, pad2, pad3;               // 128: the stride group (4 uint), unread
     uint64_t ffn_expand;                       // 144
     uint64_t ffn_branch;                       // 152
     uint64_t ffn_cos;                          // 160
