@@ -408,5 +408,30 @@ SYCL queue(L0 后端) → `get_native<ext_oneapi_level_zero>` 取 ctx/dev/cmdq �
 ⇒ 路线 A' 四道门全部闭合：①提交开销(§17) ②自建 ze 互操作(§18) ③spv 方言→定 A'(§19)
 ③SYCL-native 互操作+共存(本节)。第一刀=libxmx 变 C++/SYCL、xmx_* C ABI 逐字节不变、
 核走 icx //fsycl；等用户确认新形态后切。
+
+## 20. 第一刀·核翻译门（2026-10-17 06:35）：quantize_row.comp → SYCL，对 numpy 契约 ALL OK
+用户 01:07 拍板"切吧"后开工。src/bench/sycl/quantize_row_sycl.cpp 把出货
+quantize_row.comp(238 行)逐行直译成 SYCL；gate_quantize_numpy.py 读探针 dump 的
+qr_*.bin，用**权威 numpy 契约** int8_quant.quantise + 前辈的有界判据(scale≤1ulp、
+packed≤1、重建在半步内)比对。结果：7 个 case 全 ok。
+- plain l2/l3/l4/l0/tiny/gather：packed **0 differ**（SYCL 用 fdiv_rn 直接除，比出货
+  GLSL 的 reciprocal-multiply 更贴 numpy）。
+- e4m3：313/131072 differ 但全在 ±1、within-one True——前辈 test_quantize_e4m3.py 同款已知现象。
+- scale 有 ≤1ulp 差：numpy 的 `peak/127`(int)走 float64 再截、device float32 直除，
+  正是前辈测试注释里"在 double 里比较、别在 32 位上花掉半步"的那个事实。
+
+排障过程（一次一个变量，最终定位到编译器 lowering）：
+- scales 一开始就全对（local-mem+barrier 归约 bit-exact，替代本工具链缺失的公开 shuffle_xor）。
+- packed 差 0.003%：DIAG 逐位钉死=icx 把 `1.0f/scale` 降成近似倒数(0x42888889→888，差1ulp)，
+  再乘放大成 X.5 边界翻。改 `ext::intel::math::fdiv_rn(v, scale)` 后 v/scale 逐位=ULPdiff 0。
+- ⚠ 差点被自己的 C++ host-ref 带偏：它 `nearbyint(38.5)`=39，而 numpy/device 都是 38
+  (half-to-even)——**是脚手架的错，不是核的错**。教训：权威 golden 必须是出货 numpy，
+  C++ 自检只是参考；别再拿自造 host-ref 跟 device 内斗(这就是两次死循环的诱因)。
+
+工具链事实(固化)：本 conda-forge icx 2026.1 的 sycl::sub_group **无公开 shuffle_xor**
+(只有 block 家族；shuffle_xor 在 detail/spirv.hpp 无 wrapper)→elementwise 归约第一版用
+local-mem+barrier，shuffle/ESIMD 提速留第 2 期。精确除法用 ext::intel::math::fdiv_rn。
+⇒ 核翻译模式已验证可复制：直译语义 + fdiv_rn 对齐算术 + numpy 有界门控。下一刀=libxmx
+骨架(C ABI 不变)接上这个核，或先批量直译其余 elementwise 核。
 教训固化：§16 写"libxmx 的 Vulkan API 在 L0 全部有对应物"时，**没把 spv 方言这一条列进
 未知**——门控清单漏了最前面的一块。顺序应该是：先测"能不能加载"，再测"能不能互操作"。
