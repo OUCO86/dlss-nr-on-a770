@@ -1,5 +1,7 @@
 # Index of the notes
 
+> 工具链位置（防清理/防误判，先查这里再扫磁盘）：`notes/toolchain-map.md`
+
 Ninety-one files, sixty-two phases. This is what each one settles, so a reader arriving
 cold can go straight to the answer instead of the archaeology.
 

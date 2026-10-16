@@ -295,3 +295,29 @@ mode 3 (全跳 23 个 barrier): med 64.70 best 64.65 | wall med 71.3 best 71.2
   C) L0 + oneDNN 直通：拿 71.9 饱和但不能融合/改算法（接缝税 5ms 原样在）、
      eager dispatch 税（前辈实测 +0.2-0.5ms/次×300）在 L0 下同样存在。
 推荐 A，分阶段；最大未知=L0↔D3D12 桥接互操作，先做阶段 1 探针再投大工程。
+
+## 17. 门控探针①（2026-10-16 21:4x）：SYCL 提交开销能不能撑起"一次 submit 跑完静态计划"——能
+问题来源：§16 选项 C 被否的机制=前辈实测 oneDNN eager 税 +0.2-0.5ms/次×300。选项 A 的
+自研核走不走同样的坑？用实测回答（probe_graph.cpp，tiny kernel 只测提交机制，趟数=真实帧 691）。
+
+本机实测（A770/120W，SYCL_DEVICE_FILTER=level_zero:gpu，30 帧中位/最好）：
+- EAGER  691 次独立 submit/帧 : med 6.06 ms（8.8 us/submit）
+- MEGA   1 次 launch 装下全部 : med 0.073 ms
+- GRAPH  录一次 691-node、每帧 replay : med 1.58 ms（2.3 us/node）
+- GRAPH-ESIMD  把 vector_compute(ESIMD DPAS) 核放进 graph 节点 : **OK**（值对，非仅编译过）
+
+结论（对重写路线的三块硬事实）：
+1. **自研核没有 oneDNN 那种 host marshalling 税**：裸 submit 8.8us vs oneDNN 0.2-0.5ms，
+   差 20-50×——选项 C 的"装不进静态计划"在自研核上不存在，这是"手写两边可控"的又一实证。
+2. **"一次 submit 跑完 691 趟"两条路都通**：megakernel（最优，0.073ms，host 几乎归零）
+   或 SYCL command_graph（1.58ms，保留 pass 粒度、可增量迁移、有真实依赖边）。
+   ⇒ 691→~150 的"消趟数"红利（§7⑥/§15）在 host 侧兑现路径已被实测打通。
+3. **ESIMD 核 graph 兼容已证**（gate 1b）：§16"裸 C+ze_loader 有 kernel 名坑"因此不必先撞——
+   务实形态 SYCL/ESIMD + L0 command graph 成立（19:55 的判断被实测确认）。
+caveat（诚实）：GRAPH 1.58ms 是 host wall（含 q.wait），比 MEGA 高 20×；真实帧 device
+~44ms 下它可被隐藏，但**最终形态应往 megakernel 收敛**，graph 是"保留现有 pass 图、先换后端"
+的过渡形态——正好匹配"libxmx 重写第一期不动调度、第二期合并"的分期。
+
+仍待做=门控探针②：D3D12↔L0 fence/buffer 互操作（zeImportExternalFence/Semaphore +
+ZE_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12；桥接给游戏喂数据靠的就是 D3D12 共享 handle）。
+①绿+②绿 → 才向用户申请投 libxmx.c 3777 行重写。
