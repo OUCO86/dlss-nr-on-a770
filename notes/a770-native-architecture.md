@@ -702,8 +702,39 @@ int32 输出**——这三样才是我代码造成的。
 次级红利 = 消 `quantize_row` 193 趟 1.62ms（P5 行-max，靠 tile 拥有整行折进 producer epilogue）
 + 消 dispatch（691→~150，R8a megakernel stage 化 + graph）。
 
-下一步（重排，前提已核）：把出货 int8 staged GEMM 的**真实形状**（从 `gemm_int8_qkv` 的
-rows/channels + `gemm_int8` 的账本行取，不再脑补）在 ESIMD v3 上重测，对照 **coopmat int8
-staged**（width-sweep 的 int8 列，同形状），证明"换后端"净赢多少。这是 v3 接骨架后**唯一
-还没做的诚实对照**——之前 v3 的 3.9× 也是 vs v1-int32（第六个稻草人隐患），必须补 coopmat
-对照才算数。
+下一步（重排，前提已核）：~~把出货 int8 staged GEMM 的真实形状在 ESIMD v3 上重测，对照
+coopmat int8 staged~~ **作废（§29）**——这又是"拿当前不健康链路当裁判去测"，用户 10:59 点破：
+当前 coopmat 链路是要替换的对象不是基准，理论数据（width-sweep 48 形状 + §8 coopmat 表 +
+§10 地板 + P1-P7）早已测好=健康链路每个形状的预期。工作=按 §9/S 系列把链路重设计成健康的，
+不是测"换后端 vs 旧链路赢多少"（旧链路赢是必然且无关，健康链路才是要建的东西）。
+
+## 29. 方向纠正（2026-10-17 10:59，用户发火"不要在现在的环境测任何东西"）
+
+§28 我把"下一步"写成"ESIMD vs 出货 coopmat int8-staged 同形状对测"——用户点破这是**模式性错，
+已犯多次**：我又拿当前不健康链路当裁判去测、去推翻，而不是去建。
+
+**裁定（固化进铁律）**：
+- 当前 coopmat 链路（int32 输出、fp16 中间值、碎趟、接口税）= **要被替换的对象，不是基准**。
+  在它上面测"换后端赢多少"毫无意义：旧链路赢是必然且无关，健康链路才是要建的东西。
+- **理论数据早已测好** = `int8-width-sweep.md`(48 形状 int8/fp16 红利) + §8 coopmat 表 +
+  §10 地板 + P1-P7。那就是健康链路每个形状的预期，不需要再测。
+- **数值门控 ≠ 性能测量**：前者（对出货 numpy 权威 golden 证明算得对）前辈一贯做、必须做；
+  后者（拿旧链路比快慢）被禁止。最终帧时间由用户在 LOP 实测，不是我 bench 出来的。
+
+**工作 = 按 §9/S 系列把数据链路重设计成健康的**，从桥进来的数据第一刻就按 A770 最舒服形态：
+1. 激活全程 int8 + 行 scale，零 fp16 中间值；producer GEMM 按"拥有整行"配 tiling（wide
+   producer = 已建的 v3 fused-requant 核！），store 循环里 dequant→requant→int8 写回，
+   **quantize 独立趟 = 0**（消 276 趟）。
+2. publish/dequant half 往返消失（int32 累加器一步 requant 到 int8）。
+3. 所有 GEMM 走 int8 引擎（含 K=32 单步，硬件原生）。
+4. 消趟数 691→~150（megakernel stage 化 R8a + graph）。
+
+**已建好的健康部件**（不是旧链路，是链路的积木）：v3 fused-requant 核（producer 拥有整行 +
+requant 折 epilogue + int8 直出）已接骨架四形状 GREEN；quantize_row SYCL 核；publish/unary 核。
+**缺的 = 把它们串成一条真实层的 int8 直通链**：上游 GEMM 出 int8 → 下游 GEMM 直接吃这个 int8
+（零中间 quantize 趟），端到端对出货 numpy golden 数值门控。这才是"从桥进数据第一刻规划成
+健康形态"的垂直切片，不是测旧链路。
+
+下一步（正确）：建 **int8 直通链垂直切片**——一个完整 transformer 子图（quant→GEMM→fused-requant
+→GEMM→...）全 int8 贯穿，证明"零 quantize 独立趟 + 零 fp16 中间值"端到端数值正确（对出货 golden）。
+性能不 bench 旧链路；健康链路的每个形状用已测好的 width-sweep/§8 预期值投影。
