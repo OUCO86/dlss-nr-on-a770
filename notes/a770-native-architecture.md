@@ -1391,3 +1391,32 @@ window M=64 仍待 megakernel 批大 M；global M=640 现在就能用）；outpr
    attended int8+scale → 对 nr_model 有界门（串通即整条 attention int8 链 GREEN）。
 2. v1→v7 合并后 requant_i8 只留 N=128 出口一个用场；BN=128 变体=perf 刀。
 3. P1 对拍网扩到 attention 段（旧 coopmat attention vs 新 int8 链，同输入 byte-diff）。
+
+## 54. attention 环 int8 全闭环 GREEN（2026-10-17 20:3x）：scores→softmax→attnV 一次 submit（build 第 18 门）
+
+`gate_chain_attnv.py`：per-head 三趟一次 submit = v1 scores GEMM(Q,K^T→int32 acc)
+→ softmax_i8(acc+双scale+bias→int8 probs+行scale ps) → **v7 attnV rq32**(probs,V→int8
+attended+new_scale)。global-640x4 + global-256x2，6 heads 端到端 attended 全 within-one
++ scale≤1ulp。
+
+**golden 铁律（§25 第七次正确执行）=用设备上游字节**：attended 的参照从
+DOWNLOAD 的 device P/ps/V/vc 重建（raw=P@V 是 int32 精确和, 乘 ps×vc=真实幅度,
+v3 divide-form requant 再比 within-one）——绝不重导常数、绝不假设 numpy 上游。最后那一次
+requant 是唯一有损步（其余 int32-exact 或已门控 softmax 链）。
+
+**至此路 B 的单一世界 int8 全链在真形状上闭合**：
+QKV(§46 大 M) → scores(§44) → softmax_i8(§40) → attnV(§53 v7 双-scale) → attended
+int8+scale **就是 outproj 的 b_scale 输入** → outproj(v7-N32/v3rq-N64/v1+requant-N128)。
+attention 环**零 fp16 缝、零独立 requant pass**（§50 point 3 兑现：v7 把 requant 折进
+attnV GEMM 出口，§52 设想的独立 pass 消失了）。
+
+**§52→53→54 的教训链（第三次同型错误被自己的门控网兜住）**：§52 选错 attnV 路径
+（v1 拒 N=32），§53 独立 recorder 修正，§54 串通验证——每步都有门，没让错误进出货。
+invariance 强性质（§53）在集成门里复现：ps_q 只进 new_scale 不碰 int8 字节=链正确性契约。
+
+**十八门**。P2 单一世界核工作**已基本完成**（除 window 块 M=64<BM128 待 megakernel
+批大 M——那是性能放大器，不是链正确性的阻塞）。余下按依赖：
+1. **接 daemon 进 LOP**（用户验收路径，§49/50）：P1 对拍已证明 int8 链 rms 代价 <3%；
+   现在把 QKV+attention 的 int8 链接进真实帧，用户看画面。双引擎共存 buffer 共享=§18 门。
+2. BN=128 变体（outproj N=128、把 v1+requant 也折进 GEMM 出口）=perf 刀。
+3. megakernel 批 window（M=64→大 M，§7⑥/R8a）=perf 放大器 + window attention 的 int8 化。
