@@ -186,6 +186,10 @@ def run_chain(M, K1, N, label):
 run_chain(8192, 64, 64, "chain-l2")
 # deep entry K=128 (stem-ish), still one chain
 run_chain(8192, 128, 64, "chain-deepK")
+# scores form: K=32 single-step (section 8's "attn scores N=64 K=32"; v2 expand precedent
+# says K=32 is hardware-native -- one TK=32 MMA. v3's bench never tested K=32; this is the
+# numeric gate for it: kb_n=1, the double-buffered loop runs exactly one iteration.)
+run_chain(8192, 32, 64, "chain-K32")
 
 print(f"\nCHAIN_S1 {'GREEN' if not fails else 'RED'} ({fails} fails)")
 sys.exit(1 if fails else 0)

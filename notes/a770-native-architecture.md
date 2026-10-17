@@ -790,3 +790,10 @@ dequant/publish 往返；这条链 = 2 gemm + 1 入口 quantize + 1 融合链尾
 下一步（§30 清单续）：① K=32 单步 GEMM（scores 形态）串链中——rq 核约束 K%32==0 已含 32，
 v2 expand 先例证过单步合法，直接门控验证；② QKV 真实 N=3×channels 形态（从 weight 形状表取）；
 ③ graph 提交形态 + D3D12 接 daemon。
+
+## 32. K=32 单步链 GREEN（2026-10-17 11:5x）：scores 形态在 rq 核上首次数值验证
+
+`chain-K32`（8192x64x32 入口）：v3 rq 核约束 K%32==0 天然含 32，kb_n=1 双缓冲循环恰好
+单迭代——§8 表"attn scores N=64 K=32"与 §9"K=32 是 coopmat 原生单步（TK=32 一条 MMA），
+staged 拒 K=32 是旧闸门非硬件"的断言，在**新核**上兑现：rq2 8192x64x32 within-one、
+q0/tail 全绿。v2 expand 先例（coopmat 侧）+ 本条（ESIMD 侧）= K=32 单步两端都有实测。
