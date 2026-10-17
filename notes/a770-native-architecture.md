@@ -1420,3 +1420,28 @@ invariance 强性质（§53）在集成门里复现：ps_q 只进 new_scale 不�
    现在把 QKV+attention 的 int8 链接进真实帧，用户看画面。双引擎共存 buffer 共享=§18 门。
 2. BN=128 变体（outproj N=128、把 v1+requant 也折进 GEMM 出口）=perf 刀。
 3. megakernel 批 window（M=64→大 M，§7⑥/R8a）=perf 放大器 + window attention 的 int8 化。
+
+## 55. whole-network seam-damage 实验=scope 错误，数字作废（2026-10-17 20:4x，第三次 §48 型自省）
+
+`src/bench/chain_damage.py`（保留但标 WRONG-SCOPE）：把 int8 注进**全部 6273 个 weight
+GEMM**（patched_matmul b.ndim==2 无差别命中）+ mine 再加 1576 处 requant-e4m3。结果
+damage mean 65-95/255=图像完全不相干——但这**测的不是游戏**：
+- 游戏真实 int8 scope=账本行（frame-ledger-a770.md）：16 个 gemm_int8_qkv + global
+  blocks(31-38) 的 FFN 对 gemm_int8（=int8_bottleneck 先例测过可接受的区）+ residual 趟。
+  **window/split blocks 的 FFN、down/up、transition 等大多仍 float**（NR_INT8_FFN_GROUPS=0）。
+- 我对 6273 个 GEMM 全部 row-quantize 激活——deep level 激活动态范围 180000x
+  （int8_bottleneck 头注 phase23 原话"answered no for the WHOLE graph"）=把 phase23 已
+  否证的"全图 int8"又测了一遍"很伤"。**测了个不存在的世界, 数字无意义。**
+- 且 71 块网络对早期 1-ULP 差异有蝴蝶放大（e4m3 6.25% 格边界逐层翻转），unpaired
+  whole-net diff 本来就不可作画质代理——§51 的 stage 级 <3% rms 才是可信形状。
+
+**判决**：whole-net damage 实验要么按账本真实 scope 重做（只对 16 QKV + 31-38 FFN 注
+int8；mine 再对 attention 环加 requant——这才对齐"游戏今天 vs 换缝后"），要么**直接放弃
+离线代理、走用户指定的最终裁判=LOP 实看**（用户原话："验证画质没问题立即继续"——
+他们的眼睛才是 arbiter，离线 damage 只是预览）。
+**教训（防第四次）**：任何"误差"实验先问"这 scope 对应哪个真实世界？"——对照物必须
+是出货真正跑的形态（§25 的原话第三次应验：前两次是性能对照，这次是画质对照）。
+
+下一步（按用户批准的顺序，接 daemon=临时画质脚手架）：
+1. 重做 damage 实验到真实 scope（半天级，给我方一个可引用的先验数字），
+2. 然后 host-bounce 接 LOP（用户双击游戏看实况）——这才是裁定性的。
