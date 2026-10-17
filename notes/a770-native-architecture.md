@@ -1011,3 +1011,33 @@ deq=acc·2^-16 精确) ⇒ 只有末端 requantize 有损 ⇒ 有界判据（同
 下一步=积木 3：QKV V 支改**列量化** int8（§38 钉死的坑：attnV 归约维=tokens，V 的
 per-token scale 进不了累加和 ⇒ V 必须按 (window,channel) 列量化；v3 的 SLM atomic-fmax
 转置版，每列跨行归约组内完成）。然后积木 4=attnV rq GEMM 串整环。
+
+## 41. 路 B 积木 3 GREEN：QKV V 支列量化 int8（五组有界全绿，build 第 13 门）
+
+`gemm_qkv_v_i8`（gemm_s8_v5_kernel.hpp）+ `xmx_rec_gemm_qkv_v_i8` + `gate_qkv_v_i8.py`。
+五组全绿（within-one worst 0.50000 step + col_scale≤1ulp）：2x64x64 / 2x64x256(8h) /
+2x64x512(16h) / 4x64x128 / 16x64x64(1024 行, R8a 大 M)。
+
+**§38 钉死的坑兑现**：attnV=P·V 归约维=tokens ⇒ V 的 scale 必须按 **(window,channel) 列**
+（列 scale 从累加和提出：Σ_t p_t·(v_tc·cs_c)=cs_c·Σ_t p_t·v_tc；前辈 e4m3 逐元素容器
+没这问题，int8 有）。核形态=**无 float stage**（Q/K 草稿的教训）：acc GRF 在 epilogue
+还活着（v3 phase2 从 GRF 重读的先例），phase1 每 WI 对自己 tile 16 行做**列向 abs-max**
+（8 行向量逐元素 max，转置的 v3 模式）→ SLM atomic-fmax 进 colmax[2 window][64 col]=512B；
+phase2 从 GRF 重算 deq（纯算术）→ 读 colmax → v3 requantize 契约 → int8 散射
+(window,head,token,32) + 列 scale 写 v_scale[(M/tokens)*channels]。
+BM=128=2 个 64-token window，WI tile 16 行、64%16==0 ⇒ 每 tile 完整落在一 window 内
+（wloc=wi_row>=4），列归约组内完成无跨组。
+
+**教训（§25 第五次，修参照不修核）**：首跑 within-one 全红 worst=254.00000=2×127——
+签名=scale 错配（每元素乘了错列的 scale）。根因=我门控把**散射 buffer** `got.reshape
+(rows,channels)` 当行主序读，但 at 公式是 (window,head,token,32) 散射布局。核的
+bit-exact-vs-divide-form 断言（l2-v True）+ col_scale≤1ulp 全绿=核输出本来就对。修
+golden=反散射 gu[w,t,c]=got[at(w,t,c)] 后再对 deq4。另：ESIMD `simd[j]` 返回
+`simd<float,1>` 不是标量，三元里歧义（v3 先赋值给 float 触发隐式转换，照做）。
+
+**路 B 进度**：积木 1 cosine_norm_i8(§39) ✓ 积木 2 softmax_i8(§40) ✓ 积木 3 V 列量化
+(本轮) ✓。attention 环的**全部四段 int8 形态已就位**：Q/K(int8+行scale, §39) →
+scores rq GEMM(K=32, §32 已绿) → softmax_i8(int8 probs+行scale, §40) → attnV rq GEMM
+(K=tokens=64, 吃 int8 P 行 scale + int8 V 列 scale——rq 核现成) → attended → outproj。
+下一步=积木 4：**整环串一次 submit**（gate_chain_attn：真 QKV→scores→softmax→attnV→
+outproj 端到端对 nr_model.cosine_attention 有界门），然后 graph+D3D12 接 daemon 进 LOP。

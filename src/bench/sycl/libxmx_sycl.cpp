@@ -387,6 +387,47 @@ int xmx_rec_gemm_qkv_v(int a, int b, int v, int a_scale, int b_scale,
     return 0;
 }
 
+// int xmx_rec_gemm_qkv_v_i8(int a, int b, int v8, int v_scale, int a_scale, int b_scale,
+//                           unsigned M, unsigned channels, unsigned heads, unsigned tokens)
+// route-B block 3 (section 41): the V branch with COLUMN quantization -- int8 GEMM ->
+// dequantise -> per-(window,channel) column max (SLM atomic-fmax, the transposed v3
+// pattern) -> requantize -> int8 + column scale, scattered to (window,head,token,32).
+// attnV reduces over tokens, so V's scale must be per-column (out of the sum), NOT
+// per-token (which would sit inside it). v_scale is float[(M/tokens)*channels].
+// M % 128 == 0, channels % 64 == 0, tokens == 64 (BM=128 = 2 windows of 64).
+int xmx_rec_gemm_qkv_v_i8(int a, int b, int v8, int v_scale, int a_scale, int b_scale,
+                          unsigned M, unsigned channels, unsigned heads, unsigned tokens) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!M || !channels || !heads || !tokens || (M % 128u) || (channels % 64u) || (tokens != 64u))
+        FAILMSG("gemm_qkv_v_i8 needs M%%128==0, channels%%64==0, tokens==64");
+    auto ia = g_bufs.find(a), ib = g_bufs.find(b), iv = g_bufs.find(v8);
+    auto ivs = g_bufs.find(v_scale), ias = g_bufs.find(a_scale), ibs = g_bufs.find(b_scale);
+    if (ia == g_bufs.end() || ib == g_bufs.end() || iv == g_bufs.end() ||
+        ivs == g_bufs.end() || ias == g_bufs.end() || ibs == g_bufs.end()) FAILMSG("bad gemm_qkv_v_i8 operand");
+    int8_t* Araw = (int8_t*)ia->second.p;
+    int8_t* Braw = (int8_t*)ib->second.p;
+    signed char* V8 = (signed char*)iv->second.p;
+    float* vs = (float*)ivs->second.p;
+    float* as = (float*)ias->second.p;
+    float* bs = (float*)ibs->second.p;
+    g_cmds.push_back([=]() {
+        size_t na = (size_t)M * channels, nb = (size_t)channels * channels;
+        std::vector<int8_t> hA(na), hB(nb), hAp(na), hBp(nb);
+        GQ->memcpy(hA.data(), Araw, na).wait();
+        GQ->memcpy(hB.data(), Braw, nb).wait();
+        s8v5::pack_a(hA.data(), hAp.data(), (int)M, (int)channels);
+        s8v5::pack_b(hB.data(), hBp.data(), (int)channels, (int)channels);
+        int8_t* dAp = sycl::malloc_device<int8_t>(na, *GQ);
+        int8_t* dBp = sycl::malloc_device<int8_t>(nb, *GQ);
+        GQ->memcpy(dAp, hAp.data(), na).wait();
+        GQ->memcpy(dBp, hBp.data(), nb).wait();
+        s8v5::gemm_qkv_v_i8(*GQ, dAp, dBp, as, bs, V8, vs, (int)M, (int)channels,
+                            (int)heads, (int)tokens).wait();
+        sycl::free(dAp, *GQ); sycl::free(dBp, *GQ);
+    });
+    return 0;
+}
+
 // int xmx_rec_gemm_qkv_deq(int a, int b, int out, int a_scale, int b_scale,
 //                          unsigned M, unsigned channels)
 // S3a pass 1: int8 GEMM -> dequantise (island-3) -> float32 global, tile-local. The Q/K
