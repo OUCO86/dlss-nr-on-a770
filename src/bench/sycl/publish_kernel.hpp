@@ -31,6 +31,32 @@ static inline float qr_e4m3(float x) {
     return x < 0.0f ? -rounded : rounded;
 }
 
+// ESIMD-safe spelling of the SAME function: no SYCL device calls, no libdevice, plain
+// scalar C++ (sycl::bit_cast is a pure compile-time reinterpret, ESIMD-fine -- unlike
+// ext::intel::math::fmul_rn, which is a libdevice wrapper and the compiler refuses to
+// call from an ESIMD context. std::bit_cast is NOT available in the device library;
+// icx says so and points at sycl::bit_cast. The ternaries replace fmin/max; the
+// round-half-even is explicit -- t = mag*reciprocal is in [0,16) on this clamp, so the
+// int cast is a floor). qr_e4m3 above stays for the SYCL kernels; the PUBLISH gate
+// re-runs over BOTH after any change, and gate_qkv_v checks this one end-to-end.
+static inline float qr_e4m3_scalar(float x) {
+    float mag = x < 0.0f ? -x : x;
+    mag = mag < 448.0f ? mag : 448.0f;
+    int exponent = (sycl::bit_cast<int>(mag) >> 23) & 0xFF;
+    exponent = (exponent > 121 ? exponent : 121) - 3;
+    float step = sycl::bit_cast<float>(exponent << 23);
+    float reciprocal = sycl::bit_cast<float>((254 - exponent) << 23);
+    float t = mag * reciprocal;                       // [0,16): exact f32 mul, no add to contract
+    float fl = (float)(int)t;                         // floor (t >= 0)
+    float frac = t - fl;
+    float r;
+    if (frac > 0.5f) r = fl + 1.0f;
+    else if (frac < 0.5f) r = fl;
+    else r = ((int)fl & 1) ? fl + 1.0f : fl;          // ties to even
+    r = r * step;
+    return x < 0.0f ? -r : r;
+}
+
 static inline float qr_gate_activation(float x) {
     float wide = qr_half_round(x);
     float clamped = sycl::clamp(wide, -4.0f, 4.0f);

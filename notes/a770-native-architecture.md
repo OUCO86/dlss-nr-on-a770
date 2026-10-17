@@ -847,3 +847,30 @@ hfma=f32 乘(f16 舍入)+f32 加(f16 舍入) 两步非融合 ✓ 与 numpy half_
 归一化组内做（epilogue 头注：无跨组需求）；三输出 (window,head,token,32) 按 epilogue :60-75
 的 at 公式；门用前辈网格技巧（整数×2^-8 ⇒ int8/fp16 acc 精确相等 ⇒ epilogue bit-exact 可门）
 对 `vendor_cosine_publish`/`_vit_norm`+e4m3 链。cosine 积木已就位，attention 岛②也用它。
+
+## 35. QKV V-branch fused epilogue GREEN（2026-10-17 13:3x）：int8 GEMM→dequant→e4m3→scatter 一趟完成
+
+`gemm_s8_v5_kernel.hpp` + `xmx_rec_gemm_qkv_v` + `gate_qkv_v.py`（build 第 8 门）。
+V 分支=前辈 epilogue 里**不需要跨 WI 归一化**的那一支（qkv_epilogue.glsl:57：V 跳过 cosine
+normalise，publish 直接读 dequantise 值）——所以每 WI 在自己 16x16 tile 内完成
+dequantise(岛③, 乘序=float(acc)*a_scale[row]*b_scale[col] 左到右, gemm_staged_int8.comp:210)
+→ e4m3(岛④) → scatter 到 (window,head,token,32)（epilogue :66-67 的 at 公式），
+**无 SLM float stage、无 barrier、一趟**。Q/K 支（fragment-tree 归一化）是下一刀。
+
+门=前辈的网格技巧（test_gemm_int8_qkv.py:30：整数 × scale=2^-8 ⇒ f32 乘积精确 ⇒ 整链
+bit-exact 可门，e4m3 golden=nr_model.e4m3 已单独 PUBLISH 门绿过）。五形状全 BIT-EXACT
+(0 differ)：128x64x64 / 128x256x2 / 128x512x2 / 256x128x4 / 1024x64x8（heads=channels/32）。
+guard：M=96 被拒（rc=-1）——R8a：帧里 64/96/160/192 rows 的小 QKV 在健康链路里是
+megakernel stage 不是独立 dispatch，standalone 门只覆盖 M%128==0 的大 M 形态。
+
+**两个 bug 的教训（都靠"逐行对照前辈"抓回）**：
+1. **几何混搭**：首版 BM=64 草稿把前辈两套几何拼错了——v2 的 BM=64 自洽是因为
+   WI_COLS=8（wi_row=lid/8 跨 0..3=WI_ROWS）；v1/v3 的 WI_COLS=4 配 BM=128（wi_row=lid/4
+   跨 0..7=WI_ROWS=8）。我写成 BM=64+WI_COLS=4 ⇒ wi_row 跨 0..7 但 WI_ROWS=4，
+   offA=wi_row*512 越出 SLM_A=2048。单 block row 时坏 row 被 rowA<M 挡掉侥幸绿，
+   两 block row 时 block0 后半（rows 64..127）被污染。**诊断法**=identity-weight
+   探针（B=I、scale=1、A=4 的倍数 ⇒ deq 精确= a[r,c]，任何 mismatch 是布局/索引 bug
+   不是舍入 bug）+ row dump 定位错位模式（got[c]=want[c+2] 型）→ 顺藤摸到 fragment 几何。
+2. **FAILMSG 的 % 必须转义 %%**：消息 "needs M%128==0" 被 snprintf 当格式符吞成
+   "M==0"（前辈 :127/:160 都写的 %%，我没照抄）。guard 断言本身绿（rc!=0）但错误消息
+   说谎——修成 %% 后重跑全绿。

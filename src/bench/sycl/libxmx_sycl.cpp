@@ -20,6 +20,7 @@
 #include "cosine_tree_kernel.hpp"
 #include "gemm_s8_v1_kernel.hpp"
 #include "gemm_s8_v3_kernel.hpp"
+#include "gemm_s8_v5_kernel.hpp"
 #include <cstring>
 #include <cstdio>
 #include <vector>
@@ -243,6 +244,47 @@ int xmx_rec_cosine_norm(int source, int dst, unsigned rows, unsigned vit) {
     float* dp = (float*)d->second.p;
     g_cmds.push_back([=]() {
         GQ->parallel_for(sycl::range(rows), ctree::cosine_norm_kernel()(sp, dp, rows, vit)).wait();
+    });
+    return 0;
+}
+
+// int xmx_rec_gemm_qkv_v(int a, int b, int v, int a_scale, int b_scale,
+//                        unsigned M, unsigned channels, unsigned heads, unsigned tokens)
+// QKV V-branch fused epilogue (section 33/35): int8 GEMM -> dequantise (island-3) ->
+// e4m3 (island-4) -> scatter to (window,head,token,32) halves, one pass. V skips the
+// cosine normalise (qkv_epilogue.glsl:57), so no cross-WI float stage is needed -- this
+// is the first QKV step; Q/K's fragment-tree branch comes next (it reuses the proven
+// cosine_tree_kernel.hpp block). M % 128 == 0 (v1 geometry BM=128), channels % 64 == 0
+// (xmxres.py:1331 guard), heads = channels/32. Same host-pack simplification as the
+// other rec_gemm_* (path gate).
+int xmx_rec_gemm_qkv_v(int a, int b, int v, int a_scale, int b_scale,
+                       unsigned M, unsigned channels, unsigned heads, unsigned tokens) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!M || !channels || !heads || !tokens || (M % 128u) || (channels % 64u))
+        FAILMSG("gemm_qkv_v needs M%%128==0, channels%%64==0");
+    auto ia = g_bufs.find(a), ib = g_bufs.find(b), iv = g_bufs.find(v);
+    auto ias = g_bufs.find(a_scale), ibs = g_bufs.find(b_scale);
+    if (ia == g_bufs.end() || ib == g_bufs.end() || iv == g_bufs.end() ||
+        ias == g_bufs.end() || ibs == g_bufs.end()) FAILMSG("bad gemm_qkv_v operand");
+    int8_t* Araw = (int8_t*)ia->second.p;
+    int8_t* Braw = (int8_t*)ib->second.p;
+    sycl::half* V = (sycl::half*)iv->second.p;
+    float* as = (float*)ias->second.p;
+    float* bs = (float*)ibs->second.p;
+    g_cmds.push_back([=]() {
+        size_t na = (size_t)M * channels, nb = (size_t)channels * channels;
+        std::vector<int8_t> hA(na), hB(nb), hAp(na), hBp(nb);
+        GQ->memcpy(hA.data(), Araw, na).wait();
+        GQ->memcpy(hB.data(), Braw, nb).wait();
+        s8v5::pack_a(hA.data(), hAp.data(), (int)M, (int)channels);
+        s8v5::pack_b(hB.data(), hBp.data(), (int)channels, (int)channels);
+        int8_t* dAp = sycl::malloc_device<int8_t>(na, *GQ);
+        int8_t* dBp = sycl::malloc_device<int8_t>(nb, *GQ);
+        GQ->memcpy(dAp, hAp.data(), na).wait();
+        GQ->memcpy(dBp, hBp.data(), nb).wait();
+        s8v5::gemm_qkv_v(*GQ, dAp, dBp, as, bs, V, (int)M, (int)channels,
+                         (int)heads, (int)tokens).wait();
+        sycl::free(dAp, *GQ); sycl::free(dBp, *GQ);
     });
     return 0;
 }
