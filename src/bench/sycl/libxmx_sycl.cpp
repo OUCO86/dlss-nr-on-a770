@@ -18,6 +18,7 @@
 #include "quantize_row_kernel.hpp"
 #include "publish_kernel.hpp"
 #include "cosine_tree_kernel.hpp"
+#include "softmax_kernel.hpp"
 #include "gemm_s8_v1_kernel.hpp"
 #include "gemm_s8_v3_kernel.hpp"
 #include "gemm_s8_v5_kernel.hpp"
@@ -265,6 +266,22 @@ int xmx_rec_cosine_norm_q(int source, int dst, int scale, unsigned rows, unsigne
     g_cmds.push_back([=]() {
         GQ->parallel_for(sycl::range(rows),
                          ctree::cosine_norm_kernel()(sp, dp, rows, vit, scp, heads)).wait();
+    });
+    return 0;
+}
+
+// int xmx_rec_softmax(int source, int dst, unsigned rows, unsigned cols)
+// island-1: the vendor's half bit-affine softmax, f32 logits (rows x cols, cols even) ->
+// e4m3 probability halves. Bit-exact gate vs nr_model.vendor_approximate_softmax (:211).
+int xmx_rec_softmax(int source, int dst, unsigned rows, unsigned cols) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!rows || !cols || (cols & 1u)) FAILMSG("softmax needs rows>0, even cols");
+    auto s = g_bufs.find(source), d = g_bufs.find(dst);
+    if (s == g_bufs.end() || d == g_bufs.end()) FAILMSG("bad softmax operand");
+    const float* sp = (const float*)s->second.p;
+    sycl::half* dp = (sycl::half*)d->second.p;
+    g_cmds.push_back([=]() {
+        GQ->parallel_for(sycl::range(rows), smax::softmax_kernel()(sp, dp, rows, cols)).wait();
     });
     return 0;
 }

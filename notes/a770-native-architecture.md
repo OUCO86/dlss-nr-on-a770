@@ -910,3 +910,26 @@ float32 往返 + 两次 cosine publish + 一次 split（qkv_epilogue 头注：bl
 下一步（§33 清单）：① S3b 融合（ESIMD 原生归一化）；② attention softmax 岛①（skill 包
 有 f32 Softmax ladder 先例，bit-trick 常量在 attention.comp/window_block）；③ graph+D3D12
 接 daemon。
+
+## 37. softmax 岛①积木 GREEN（2026-10-17 14:1x）：bit-affine 变换对 golden bit-exact
+
+`softmax_kernel.hpp`（逐 op 搬 `nr_model.vendor_approximate_softmax`:211 +
+`window_attention.comp`:54-62）+ `xmx_rec_softmax` + `gate_softmax.py`（build 第 10 门）。
+四形状全 BIT-EXACT(0 differ)：64x64/256x64（window attention 64 token）、64x128
+（global 128 token）、128x256（vit token 数）。
+
+**逐 op 核对踩的两个点（都在 golden 注释里，读全才没翻车）**：
+1. `sum(dtype=float16)` **不是**每步 f16 累加——golden :234-236 明说 numpy 跑**顺序 f32
+   累加、最后 round 一次**（这正是它可复现的原因；tree/pairwise 会不同舍入）。我先写成
+   每步 f16（错），再改回纯 f32 顺序+末尾一次 half_round。w256 也绿=确认 numpy 对 256
+   列仍是顺序 f32（担心的 pairwise 未发生）。
+2. `totals` 先 half_round 再倒数：`recip = half_round(fdiv_rn(1, half_round(total)))`
+   （:237-239，两步舍入，不是一步）。
+3. golden 返回 **float32**（numpy 无 e4m3 dtype，用 f32 表示 e4m3 网格值）——门控 want 要
+   astype(f16) 再 bit 比（e4m3 值在 f16 精确可表示：exp[-6,8]+3bit 尾数）。首跑 crash=
+   我按 f16 view 比 f32 want，形状 (64,64)vs(64,128) 广播错误暴露了这点。
+
+**四个数学孤岛现在全部有已门控的积木**：①softmax（本轮）②cosine 归一化（§34）
+③scale 乘（§31 链尾 + §35/36 各 pass）④publish 舍入链（§21/31/35）。链的下一块=把
+scores GEMM（rq 核 K=32 已绿，§32）→ softmax → PV GEMM 串成 attention 环，然后
+graph+D3D12 接 daemon。
