@@ -1100,3 +1100,30 @@ inv=0→out=0/scale=0，两者只在全零行不同，链的 requantize 是 v3 �
 （前辈 matmul_nt 注释: key 存 (tokens,32) coopmat 按列读=转置免费; 我 v1 pack_b 是行主序
 (K,N)，喂 K^T 需转置 pack 或 batched-per-head）+ global 是 per-head batched(4/32 heads)。
 然后接 daemon（用户进 LOP 必经路，95 函数 ABI + graph + D3D12）。
+
+## 44. scores 环集成 GREEN（2026-10-17 16:1x）：K^T 布局 + softmax_i8 吃 v1 acc 端到端（build 第 15 门）
+
+`gate_chain_scores.py`：一次 begin/submit 里 per-head 循环 [rec_gemm_s8(Q,K^T→int32 acc)
+→ rec_softmax_i8(acc→int8 probs+行scale)]。三配置全绿：global-640x4（1920x1088 帧的
+global block）、global-256x8（720p）、small-128x2。每 head 的 acc **BIT-EXACT** vs
+numpy q@k^T（0 differ），probs within-one + scale≤1ulp。
+
+**§43 待查的衔接复杂度=已解**：
+- **K^T 布局**：scores=Q·K^T，前辈 matmul_nt 靠 coopmat 按列读 key 免费转置；我 v1
+  pack_b 要 B 行主序 (K=32, N=tokens) ⇒ **host 侧 `k8[h].T` 转置后上传**（path gate 够用；
+  真链里 K 的 producer 直接按 (32,tokens) 写即可，零额外成本——这是 QKV K 支的 store 布局
+  决策，接 daemon 时定）。
+- **scale 轴**：q_scale per query-row（M 维）、k_scale per key-column（N 维）——§38 钉的
+  "scale 沿非归约维"在 scores 上成立（归约维=head_dim 32）。
+- **softmax_i8 吃 v1 int32 acc**：接口对上了（softmax_i8 签名第一参就是 int32 acc）。
+
+**路 B attention 环现状**：QKV(V 列量化 §41 / Q,K cosine_i8 §39) → scores(本轮集成 ✓)
+→ attnV(v1+requant_i8 §43 积木就位，未串) → outproj(同)。剩 attnV+outproj 的环尾集成
+（probs int8 + V int8 → attnV GEMM → requant → outproj）= 下一刀，积木全绿只差串。
+
+**接 daemon 的 ABI 现实（本轮查 xmxres.py）**：出货 Runtime 调 **95 个 libxmx 函数**
+（buf_create_exportable/graph_capture/graph_run/sem_*/extmem_*/profile_*/各 *_init/
+rec_gemm_int8_qkv/rec_gemm_int8_batched/...）。我的骨架只 25 导出。第一期接法=**不整体替换
+libxmx.dll**，而是让 daemon 的独立 GEMM 段（QKV/outproj/downsample/upsample）走我的
+libxmx_sycl 链、attention/FFN 暂走原 coopmat——但两 dll 的 buffer 要跨设备共享（§18
+D3D12↔L0 互操作门已绿=这条路通）。这是接 daemon 前必须先设计的**双引擎共存**形态。
