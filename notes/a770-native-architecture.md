@@ -1239,3 +1239,38 @@ vs float-GEMM：**合成激活** normal(0,1)，非真实帧激活。结果：
 ⇒ 正确用法：abs-err/rms=0.0079 说明 int8 直通链的**绝对误差量级**在 1% 内（相对投影
 rms），与旧链 e4m3 容器同量级——**没有明显更差**，值得进 LOP 验。下一步不是继续
 合成诊断（会误导），是**接 daemon 跑真实帧**（真实激活 + 用户看画面）。
+
+## 49. 用户裁定：路 B=最终路，路 A 撤销作废（2026-10-17 19:0x）
+
+用户："b是不是才是最终路啊？a为什么会出现？a不成优化老路线了么？"——**对，一针见血**。
+A 出现在菜单里是我把保守项端上桌的残留，这里把裁定和理由落盘，防以后窗口再翻案。
+
+**A 的实质（为什么=优化老路线）**：95 个旧函数签名本身就是旧数据流——每个 rec_gemm_* =
+一条 coopmat GEMM、段间 buffer 类型写死 e4m3/fp16、quantize/publish 是独立趟。1:1 实现
+旧名 ⇒ (a) 把旧路线**每个核原样移植一遍**（attention 205 行、global 197、FFN/tiled/row/
+unary 全部），移植劳力大、零新结构；(b) 链的红利（消 276-quantize 趟、消缝上 float32
+往返、趟数 691→~150）**从旧函数名下漏不出来**——旧 Python 层假设的 buffer 布局/类型/
+scale 位置就是旧缝。A=把老路线换个引擎再优化一遍，与本项目"重写核心"的目的正相反。
+
+**A 当初为什么出现（记教训防复发）**：我求"Python 侧零回归风险"（数千行身经百战的
+xmxres.py/nr_resident.py/graph/scratch 不动），并且**把核心层错当桥接层护**——铁律保护
+的是 dxgi.dll/OptiScaler/nr_lop 管道/nr_trigger；工作记忆白纸黑字="核心层（work/ 的
+dll+spv+网络执行）完全归我重写"。xmxres.py 在重写范围内，不该拿"不动它"当卖点。
+
+**B 的分相（最终路的具体形态）**：
+- Phase 0（已完）：§30-46 十六门=链数值全绿（QKV 全链、scores 环、四孤岛、requant）。
+- **Phase 1=双引擎真实帧**：daemon 的 Python 同时开旧 libxmx(Vulkan) + 我的
+  libxmx_sycl(L0)，buffer 走 §18 D3D12↔L0 import（门已绿=BIT-EXACT 搬运）。只把
+  **QKV 大 M 段**换 int8 链；attention 消费端边界补一次**边界 publish**（unary_i8 族
+  §31/35 组件已绿：int8+scale→cr_mul→qr_e4m3→f16，保持旧 attention 吃 e4m3-half）——
+  这是过渡税，随 Phase 2 后退，不是终态。其余网络照旧。数值门=逐段新旧链对拍 +
+  最终图 vs 旧链全开 byte/diff；然后用户 trigger 进 LOP 看画面（画质裁决权在用户）。
+- Phase 2=逐段重写（window_block / global_attention / FFN 进 megakernel，§7⑥/R8a
+  大 M 化——attnV/outproj 的 int8 划算点在此兑现）：引擎边界不断外推。
+- Phase 3=旧 Vulkan 引擎退役，单 L0 引擎，零边界税。
+- 桥接层全程不动（铁律不破）。
+
+**Phase 1 起手件盘点（本轮已查）**：旧 dll 在 work/（xmxres._load 读 ROOT/work 的
+libxmx.dll，daemon 在用）；我的 dll 在 oneapi/libxmx_sycl.dll（staged）；graph replay
+2.3us/node（§17 门）；D3D12↔L0 fence+mem import BIT-EXACT（§18 门）；真实帧对拍素材
+work/one_frame_pair.npz（source 1920x1080x4 + 8 个 answer 平面=出货最终图基线）。
