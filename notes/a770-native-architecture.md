@@ -933,3 +933,38 @@ float32 往返 + 两次 cosine publish + 一次 split（qkv_epilogue 头注：bl
 ③scale 乘（§31 链尾 + §35/36 各 pass）④publish 舍入链（§21/31/35）。链的下一块=把
 scores GEMM（rq 核 K=32 已绿，§32）→ softmax → PV GEMM 串成 attention 环，然后
 graph+D3D12 接 daemon。
+
+## 38. 用户裁定=路 B：attention 环也进 int8，能消灭的 fp16 全部消灭（2026-10-17 15:02）
+
+用户原话："既然都重新设计核心了，还打包 fp16 太不负责任了。这次就是能消灭 fp16 都消灭。
+当然我得进游戏确认画质。" ⇒ **§58 的"fp16 窄形状不动"豁免作废**（那是旧链路的 P3 判定；
+新核心没有 fp16 世界，就不存在 fp16 边界税）。画质风险由用户 LOP 实测裁决（铁律不变）。
+
+**路 B 精确边界（防扩大化）**：int8 消灭的是**所有 GEMM 缝上的中间值形态**
+（e4m3-as-half operands、fp16 coopmat GEMM、fp16 中间 buffer）。四个数学孤岛内部
+（softmax 的 f32 仿射+位变换、cosine 的 f32/half 树、dequantise 乘、publish 舍入）
+float 照旧合法——§9 从未要求岛内也整型化。scores 的 f32 logits=岛①的输入，合法。
+
+**设计分析（做 attnV 前必须钉死的坑，本轮查前辈核+算术推出来的）**：
+int8 GEMM 的 dequantise 要求 scale 沿**非归约维**（A 按行、B 按列）。逐缝核过：
+- scores = Q·K^T：归约维=head_dim 32。Q 的量化行=(token,head) 的 32 通道=M 维 ✓；
+  K 的量化行=(key-token,head)=scores 的 N 维 ✓。**干净，rq 核直接吃**（K=32 单步 §32 已绿）。
+  且 Q/K 的 32 宽 head-row 在 cosine 核里 h[32] 全在寄存器——行-max 免费，
+  requantize 折进 cosine epilogue（v3 同款契约），276-quantize 逻辑同样消这条缝。
+- attnV = P·V：归约维=tokens(64)。P 按行=(token) ✓；**V 按行=(token,head)=归约维 ✗**——
+  前辈 e4m3 是逐元素浮点格式所以没这个问题，换 int8 后 V 的 per-token scale 会进不进
+  累加和（vs_t 挂在 Σ 里面）。⇒ **路 B 的 V 必须按 (window,channel) 列量化**
+  （scale 沿 N 维=干净）。QKV V 支一个 workgroup 拥有 128 行×64 列（=2 整 head），
+  列-max 用 v3 的 SLM atomic-fmax 模式转置版（每列跨行归约，组内完成）。
+  ⚠ 这改变 V 的舍入路径=画质变化 → LOP 验证项。
+- bias：scores 的 attention_bias（per-head (t,t)）在 scores epilogue 加（前辈 :94-101
+  整 tile 加的先例）——dequantise 之后、softmax 之前，岛①入口处，合法。
+
+**积木顺序（一次一个变量）**：
+1. `cosine_norm_i8`：归一化（已绿树）→ 行-max（寄存器内免费）→ requantize→int8+scale。
+   门=前辈有界判据（within-one + scale≤1ulp），golden=vendor_cosine_normalize 链。← 本轮
+2. scores GEMM=rq(K=32) 吃 int8 Q/K → dequantise+bias → f32 logits → softmax(已绿) →
+   **softmax 直出 int8 probs+行 scale**（行-max 在寄存器内，岛①顺手做，零额外趟）。
+3. QKV V 支改列量化 int8（§35 核上加转置 rmax）。
+4. attnV=rq int8（K=tokens）→ attended → outproj 链。每步对 golden 链有界门；
+   最终链形态进 daemon 让用户 LOP 看画质。
