@@ -675,3 +675,35 @@ int32 输出**——这三样才是我代码造成的。
 4. graph+D3D12 接 daemon（不变）。
 5. 骨架已接的 v3（N==64 门）保留有效：覆盖 attnV/outproj/scores（真实 N=32 pad 64 + N=64），
    即 §8 表里 M≥32640 走 int8 的那几族——**这些是真赢**（§23/§24 已量化）。
+
+## 28. ⚠ v4 立项前提也塌（2026-10-17 10:4x，开工第一步的合并表逼出来的）
+
+§27 把"v4=N=128 两半流式 fused-requant（QKV 族）"列为已证真赢（2.3× vs 出货 fp16
+0.579ms）。合并表证伪 weight 身份后顺手钉 QKV 的 N 语义（`xmxres.py:1313-1330` docstring），
+**两头前提都错**：
+
+1. **真实 QKV 的 N = 3×channels，不是 128。** docstring：weight `b` = int8
+   `(3*channels) × channels`，`a` = int8 `rows × channels` ⇒ GEMM **M=rows、K=channels、
+   N=3×channels**（Q/K/V 三输出拼一起）。约束 `channels=heads*32` 且 `channels%64` ⇒
+   channels∈{64,128,256…} ⇒ **N∈{192,384,768…}**。我 §23/§26 造的 "130560x128x64 l4 QKV"
+   里 N=128≠3×channels、K=64=channels 又要求 N=192 —— **该形状根本不是合法 QKV**，是我
+   从 §8 旧记法（"N=96"=另一套 channels 语义）脑补的代表形状。
+2. **出货 QKV 已经在跑 int8**（`frame-ledger` 里 `gemm_int8_qkv` 16 行 = 实机 replay 记录，
+   `NR_INT8_QKV` 开）。所以"QKV 转 int8 赢 2.3× vs 出货 fp16"是**打一个不存在的靶子**——
+   第五次稻草人，且这次对照物（fp16）和形状（N=128）双双错。
+
+⇒ **§27 的 v4 作废**（不是"接骨架 BN=128"，也不是"N=128 两半流式"——真实 QKV N≥192 且已 int8）。
+合并表这一刀的真实价值 = 连续挡掉两个假方向（沿 M 拼 GEMM、QKV 转 int8），逼出**唯一前提
+扎实、且前辈没完全收割的重写红利**：
+
+**核心红利 = 换后端解锁 XMX 算力（coopmat 24.8 TOPS → ESIMD 手写 36-56 TOPS，已证 v0/v1
+宽形状）**，对照物 = 出货**已在跑的 int8 staged**（`gemm/30` 188 趟 0.048ms/pass），
+不是我造的 int32、也不是不存在的 fp16。这条从没被否证，且是"≥75% 算力"合格线的本体。
+次级红利 = 消 `quantize_row` 193 趟 1.62ms（P5 行-max，靠 tile 拥有整行折进 producer epilogue）
++ 消 dispatch（691→~150，R8a megakernel stage 化 + graph）。
+
+下一步（重排，前提已核）：把出货 int8 staged GEMM 的**真实形状**（从 `gemm_int8_qkv` 的
+rows/channels + `gemm_int8` 的账本行取，不再脑补）在 ESIMD v3 上重测，对照 **coopmat int8
+staged**（width-sweep 的 int8 列，同形状），证明"换后端"净赢多少。这是 v3 接骨架后**唯一
+还没做的诚实对照**——之前 v3 的 3.9× 也是 vs v1-int32（第六个稻草人隐患），必须补 coopmat
+对照才算数。
