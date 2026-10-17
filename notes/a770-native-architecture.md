@@ -493,3 +493,28 @@ local-mem+barrier，shuffle/ESIMD 提速留第 2 期。精确除法用 ext::inte
 下一刀顺序（各带门）：1) requant epilogue（int32→int8+new_scale，对前辈 v2 的
 fused-requant golden，bit-exact）；2) 形状合并设计（先离线算合并后形状表，对 §8 实测
 TOPS 预估收益，再落计划器）；3) graph 提交形态接 §17；4) D3D12 import 接 daemon 端到端。
+
+## 23. 真实形状计时表 + store 宽度实验（2026-10-17 09:0x）：窄形状=内存瓶颈，int8 store 实测 5.6×
+gemm_real_shapes.cpp（v1 核 @ §8 B1 真实管线形状，padding 到 v1 tiling）+ v1 自带
+//DSTORE_INT8（前辈留的"values WRONG, traffic right"纯流量开关）本机实测：
+
+| 形状(MxNxK) | int32 store | int8 store | 加速 | C 字节 |
+|---|---|---|---|---|
+| l4 QKV 130560x128x64 | 269.4us / 7.9 TOPS | — | — | 66.8MB |
+| l3 QKV 32640x64x64 | 126.7us / 2.1 | **22.6us / 11.8** | **5.6×** | 8.4→2.1MB |
+| 9216x128x128 | 35.9us / 8.4 | 23.3us / 12.9 | 1.5× | 4.7→1.2MB |
+| 2560x256x256 | 29.4us / 11.4 | 21.7us / 15.5 | 1.35× | 2.6→0.66MB |
+| 4096³ 宽参照 | 2924us / 47.0 | 2891us / 47.5 | ≈1×(算力饱和) | 67MB |
+
+结论（重写路线的量化支柱）：
+1. **真实窄 GEMM 慢的主因=int32 输出流量**，不是算力也不是"SYCL 慢"。int8 store
+   （=§9 单一世界的正确形态：GEMM 输出直接 requant 成 int8 喂下一层）实测最高 5.6×。
+   到 11.8 TOPS 时 32640x64x64 已近内存带宽顶（~4.2MB 总流量/22.6us≈186GB/s 有效）。
+2. **窄形状是 DLSS transformer 架构固有的**（channel 32..96，§8 表），不是重写引入的；
+   合并（§7⑥/§15）把 N 拼宽是第二红利，但 store 宽度是第一红利且已量化。
+3. l4 QKV 130560x128x64=269us：真实帧里这一族 GEMM 很多（§8 表 l4 行 1.87-2.55×），
+   int8 store + 合并后预计进 ~80-100us 区，对应 device 总账从 44.75ms 往下走的主体路径。
+
+⇒ 下一刀=**fused requant store**：v1 核(宽 tiling BM128/BN64)+v2 的 requant epilogue
+  (行-max→scale→roundEven→int8 store+new_scale，v2 已 PASS 的 golden)，合并成宽形状版。
+  门控=int8 输出+scale 对前辈 v2 fused-requant 参考（nearbyint 精确）。
