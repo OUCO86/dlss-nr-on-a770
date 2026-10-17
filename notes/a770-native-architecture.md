@@ -1153,3 +1153,32 @@ upsample（大 M）。**决定（按裁定推进，不再问）**：
 
 §44 的 scores 环集成仍有效（global scores N=640 满足 v1 N%64；window scores N=64 也满足），
 只是 attnV 环尾不能照 §44 设想硬串——它要 BN=32 变体且只在 megakernel 大 M 下才划算。
+
+## 46. 完整 QKV 投影链 GREEN（2026-10-17 16:3x）：一次 submit 6 趟出 int8 Q/K/V（build 第 16 门）
+
+`gate_chain_qkv.py`：真实 QKV（weight 3×channels×channels 切三片）端到端一次 begin/submit：
+entry quantize(唯一一次) → V: gemm_qkv_v_i8(GEMM+列 requant→int8 V+列 scale) →
+Q: gemm_qkv_deq(GEMM→f32) + cosine_norm_i8(归一化+learned scale+行 requant→int8 Q+行 scale) →
+K: 同 Q 无 scale。四配置全绿（Q/K/V 三输出 within-one + scale≤1ulp）：
+win-2h/win-8h/win-4h/vit-2h。
+
+**这条缝旧链付什么**（qkv_epilogue 头注）：float32 往返 + 两次 cosine publish + 一次 split +
+quantize_row（block0 720p=377MB×3、19ms）。新链=入口 quantize 一次 + 6 趟全 int8 出三输出，
+缝上 quantize=0、fp16 中间 buffer=0。**路 B 最大合法 int8 赢面（账本 16 趟 QKV，
+"为整条 int8 路买单的投影"）至此有完整链形态。**
+
+**教训（§25 第六次，修参照不修核）**：首跑全红 scale 差 24770 ulp——我 golden 的
+`branch_fp` 用了常数 STEP 当入口行 scale，但链里 entry quantize 产出的 `has` 是**每行
+absmax/127（非常数）**。纪律=下游 golden 必须用**设备自己的上游字节**（quantize 实际产出
+的行 scale），不能重导常数。修 golden（download `has` 喂 branch_fp）后四配置全绿。核从头
+到尾没错（各分支早已单独门控）。
+
+**路 B 链形态盘点（16 门）**：
+- QKV 投影（大 M，合法 int8）：完整链 ✓（本轮）
+- scores 环（global N=640/window N=64）：v1 GEMM+softmax_i8 集成 ✓（§44）
+- attnV/outproj（N=32 小 M）：积木就位（v1+requant_i8），**int8 划算要等 megakernel 大 M**（§45）
+- FFN：保留 fp16（§27 否证 int8，算术受限区）
+- 独立段 publish/quantize 往返：链上=0（§30/31/39/40/41 各缝）
+
+下一步=**接 daemon**（用户进 LOP 必经路）：双引擎共存形态（§44 末：95 函数 ABI vs 25 导出，
+第一期只把 QKV 段换 int8 链、其余走 coopmat，buffer 跨设备共享=§18 门已绿）。
