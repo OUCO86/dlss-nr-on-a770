@@ -17,6 +17,7 @@
 #include <sycl/sycl.hpp>
 #include "quantize_row_kernel.hpp"
 #include "publish_kernel.hpp"
+#include "cosine_tree_kernel.hpp"
 #include "gemm_s8_v1_kernel.hpp"
 #include "gemm_s8_v3_kernel.hpp"
 #include <cstring>
@@ -225,6 +226,23 @@ int xmx_rec_unary_i8(int source, int scale, int dst, unsigned count, unsigned co
     float* dp = (float*)d->second.p;
     g_cmds.push_back([=]() {
         GQ->parallel_for(sycl::range(count), unary_i8_kernel()(sp, scp, dp, count, cols, epilogue)).wait();
+    });
+    return 0;
+}
+
+// int xmx_rec_cosine_norm(int source, int dst, unsigned rows, unsigned vit)
+// island-2 building block: rows x 32 f32 -> cosine-normalised f32 (each output element
+// half-rounded, exactly like nr_model.vendor_cosine_normalize / _vit_norm). Bit-exact
+// gate, the senior's contract for the rounding points.
+int xmx_rec_cosine_norm(int source, int dst, unsigned rows, unsigned vit) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!rows) FAILMSG("cosine_norm needs rows>0");
+    auto s = g_bufs.find(source), d = g_bufs.find(dst);
+    if (s == g_bufs.end() || d == g_bufs.end()) FAILMSG("bad cosine_norm operand");
+    const float* sp = (const float*)s->second.p;
+    float* dp = (float*)d->second.p;
+    g_cmds.push_back([=]() {
+        GQ->parallel_for(sycl::range(rows), ctree::cosine_norm_kernel()(sp, dp, rows, vit)).wait();
     });
     return 0;
 }

@@ -826,3 +826,24 @@ q0/tail 全绿。v2 expand 先例（coopmat 侧）+ 本条（ESIMD 侧）= K=32 
   纯 SYCL 每 WI 一行=RMSNorm ladder 形态）——这是 attention 岛②的积木，QKV/attention 共用。
 - 再 QKV epilogue 进 v3 主循环：BN=64=2 head ✓；三输出 (window,head,token,32) 布局按
   epilogue :60-75 的 at 公式；门用前辈网格技巧（int×2^-8）+ vendor_cosine_publish bit-exact。
+
+## 34. cosine 岛②积木 GREEN（2026-10-17 12:1x）：两棵 fragment tree 对 nr_model bit-exact
+
+`cosine_tree_kernel.hpp`（逐字搬 `cosine_tree.glsl`：cr_hfma/cr_hmul/cr_hadd=precise 无收缩；
+inversesqrt=fdiv_rn(1,sqrt)）+ `xmx_rec_cosine_norm` + `gate_cosine.py`（build 第 7 门）。
+形态=前辈 skill 包 RMSNorm champion（每 WI 一行、SIMD32、无跨 lane reduce，techniques.md:113）。
+四形状全 BIT-EXACT：window-tree(256/8192) 对 `vendor_cosine_normalize`(:242)、
+vit-tree(256/8192) 对 `_vit_norm`(:683)。
+
+**教训（第四次参照打架，这次方向对了）**：vit 门首跑 8008/260853 差，起于 tiny 行、32 列同差
+=got 是 half 值 want 是未舍入 f32 乘积的签名——**错在门控脚本的 golden 抄漏了外层
+half_round**（`_vit_norm` 只返回 reciprocal；epilogue :53 的 hmul 与 vit_attend:755 都对乘积
+half_round，核按 GLSL 权威做了）。修的是参照不是核（§25 规则：出货 GLSL/numpy 是权威，
+自抄的对照物可疑时先怀疑抄漏，别改核迁就）。核对的逐 op 同构清单（这次真从 skill 包学到）：
+hfma=f32 乘(f16 舍入)+f32 加(f16 舍入) 两步非融合 ✓ 与 numpy half_fma 同构；xor 树 f16→f32
+无损 ✓；floor=half_round(0.00006198883056640625) ✓；VIT_ROOT 常量 ✓。
+
+下一步（§33 设计执行）：QKV epilogue 进 v3 主循环——BN=64=恰好 2 个完整 head（32 对齐），
+归一化组内做（epilogue 头注：无跨组需求）；三输出 (window,head,token,32) 按 epilogue :60-75
+的 at 公式；门用前辈网格技巧（整数×2^-8 ⇒ int8/fp16 acc 精确相等 ⇒ epilogue bit-exact 可门）
+对 `vendor_cosine_publish`/`_vit_norm`+e4m3 链。cosine 积木已就位，attention 岛②也用它。
