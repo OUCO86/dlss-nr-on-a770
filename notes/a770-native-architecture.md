@@ -518,3 +518,32 @@ gemm_real_shapes.cpp（v1 核 @ §8 B1 真实管线形状，padding 到 v1 tilin
 ⇒ 下一刀=**fused requant store**：v1 核(宽 tiling BM128/BN64)+v2 的 requant epilogue
   (行-max→scale→roundEven→int8 store+new_scale，v2 已 PASS 的 golden)，合并成宽形状版。
   门控=int8 输出+scale 对前辈 v2 fused-requant 参考（nearbyint 精确）。
+
+## 24. v3 = v1 宽主循环 + v2 fused-requantize epilogue（2026-10-17 09:3x）：真实 N=64 形状全 PASS，3.9×
+gemm_s8_v3_kernel.hpp：v1 的 BM128/BN64/BK32/NT32 双缓冲主循环 + v2 的 phase1(行-absmax
+atomic-fmax 进 SLM rmax)+phase2(requant→int8 store+new_scale) **逐字搬进** v1 的 store 位置
+（变量布局完全兼容：wi_row=lid/4、wi_col=lid%4、gr/gc、c00..c11）。设计约束=**N 必须=BN=64**
+（整行一个 workgroup，行-absmax 才完整——§23 逼出的唯一能拿 4× store 红利的形态；写 int32
+再单独 requantize 读回=9B/elem=出货 float32-out 成本，零红利）。N=128 需 BN=128 变体(下一步)。
+gemm_s8_v3_bench.cpp golden=v2 自己的精确算术（fp=acc*col_scale→rmax→ns=rmax/127→
+nearbyint(fp/ns) clip±127），v2 在 9216x128x128 已 PASS，v3 在 N=64 真实形状必须同样 PASS。
+
+本机实测（V3 ALL-PASS，全部 0 wrong/0 scale）：
+| 形状 | v1-int32 | v3-fused-requant | 加速 | 备注 |
+|---|---|---|---|---|
+| 32640x64x64 | 126.7us | **32.7us** | 3.9× | 值正确(v1 STORE_INT8 的 22.6us 是截断错值,不算对照) |
+| 130560x64x64 | 269.4us | 128.8us | 2.1× | l4 attnV |
+| 130560x64x128 | — | 200.9us / 10.6 | — | outproj |
+| 130560x64x512 | — | 276.7us / **30.9 TOPS** | — | deep-K 近算力顶 |
+
+诚实账：v3 比 v1 纯 int8-store 开关(22.6us)慢，因 v3 真做 requantize(SLM atomic+二次 pass)
+但**值对**；比 v1-int32(126.7us)快 3.9× 且省 4× 流量。deep-K=30.9 TOPS 说明 K 大时算力开始
+主导、requant 开销摊薄。⇒ int8 直通(§9)第一红利已在正确核上兑现。
+
+修的一个 bug：v3 照搬 v1 时漏了 v2 的 rmax SLM 初始化(v1 无 rmax)，导致 atomic-fmax 跟垃圾值
+比、大 M FAIL 小 M 蒙混——补 4 次 strided slm_block_store(BM=128=4×32)。教训:合并两个前辈
+核时,每个核的**前置初始化**都要跟着搬,不能只搬主循环+epilogue。
+
+下一步:1) v3 接进骨架 xmx_rec_gemm_s8 的 requant 变体(带 col_scale/new_scale),门控走 ctypes→
+numpy;2) N=128 的 BN=128 变体(QKV/FFNexp);3) 形状合并(§7⑥)把 attnV+outproj 等共享 M 的拼进
+一个 kernel 省读;4) graph+D3D12 接 daemon。
