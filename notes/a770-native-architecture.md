@@ -1041,3 +1041,30 @@ scores rq GEMM(K=32, §32 已绿) → softmax_i8(int8 probs+行scale, §40) → 
 (K=tokens=64, 吃 int8 P 行 scale + int8 V 列 scale——rq 核现成) → attended → outproj。
 下一步=积木 4：**整环串一次 submit**（gate_chain_attn：真 QKV→scores→softmax→attnV→
 outproj 端到端对 nr_model.cosine_attention 有界门），然后 graph+D3D12 接 daemon 进 LOP。
+
+## 42. 方向澄清（15:5x）：路 B 的落点=独立 GEMM 段，attention 融合核已是健康形态
+
+积木 4"整环串接"撞到结构事实，逼出对路 B 的精确化（防再绕晕）：
+
+- **前辈 attention 是融合核**（global_attention.comp 205 行 / window_attention.comp 197 行：
+  QK^T+softmax+PV+merge 一趟，**scores 不落显存**）。它内部用 coopmat fp16 + f32/half 算术，
+  但**没有"缝上 fp16 buffer 搬进搬出"**——scores 在寄存器/SLM 里，正是 §9 要的健康形态。
+  它用的 f32/half 是**岛内算术**（softmax/cosine），不是要消灭的东西。
+- **要消灭的 fp16 往返在独立 GEMM 段之间**：QKV→(e4m3 publish)→attention→(e4m3)→
+  outproj→(quantize)→FFN→... 这些 publish/quantize 独立趟（账本 quantize 193 趟 1.62ms +
+  各 publish）。§58"fp16 窄形状不动"指的正是 attention 融合核——它本来就没有 fp16 往返税。
+- **rq 核 N==64 约束**（gemm_s8rq :160）+ scores 的 N=rows(640/96)、attnV 的 N=channels
+  大多不满足 ⇒ **不能拿 rq 通用核硬串 attention**。要么移植 attention 专用核（~400 行
+  coopmat→ESIMD 大工程），要么保留前辈融合核只替换独立段。
+- **FFN 的 int8 化 §27 已否证**（contract N=32 窄、expand K=32 浅=int8 最不适用的形状；
+  且 tiled/0 那 130 趟 fp16 GEMM 转 int8 实测慢 0.26ms）。FFN 的 fp16 是"消灭不了"的部分。
+
+⇒ **路 B 精确落点**：把**独立 GEMM 段**（QKV projection、outproj、downsample/upsample、
+split_ff 的 project）接成 int8 直通（已建 13 门积木覆盖），**attention 保留前辈融合核**
+（它已健康、无 fp16 往返），FFN 保留 fp16（§27 否证 int8）。"能消灭的 fp16 都消灭"=
+消灭独立段之间的 publish/quantize 往返趟，不是把融合核拆成 int8 再拼回去。
+
+**下一步=接 daemon（用户进 LOP 的必经路）**：daemon 加载 coopmat 的 libxmx.dll + spv；
+路 B 第一期=让 daemon 加载我的 libxmx_sycl.dll，把独立 GEMM 段换成 int8 直通链，
+attention/FFN 暂走原 coopmat 路径。先查 daemon 的 libxmx 调用面（Runtime 契约），
+评估最小改动。§17(graph)+§18(D3D12↔L0)+§21 门已为此绿。
