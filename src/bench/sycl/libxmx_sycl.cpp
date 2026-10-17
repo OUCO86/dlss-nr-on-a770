@@ -243,7 +243,28 @@ int xmx_rec_cosine_norm(int source, int dst, unsigned rows, unsigned vit) {
     const float* sp = (const float*)s->second.p;
     float* dp = (float*)d->second.p;
     g_cmds.push_back([=]() {
-        GQ->parallel_for(sycl::range(rows), ctree::cosine_norm_kernel()(sp, dp, rows, vit)).wait();
+        GQ->parallel_for(sycl::range(rows),
+                         ctree::cosine_norm_kernel()(sp, dp, rows, vit, nullptr, 0)).wait();
+    });
+    return 0;
+}
+
+// int xmx_rec_cosine_norm_q(int source, int dst, int scale, unsigned rows, unsigned heads,
+//                           unsigned vit)
+// the Q variant: same tree, then the learned per-head scale applied after the norm
+// (qkv_epilogue.glsl:52-54; vit inserts VIT_ROOT between). scale = float[heads].
+int xmx_rec_cosine_norm_q(int source, int dst, int scale, unsigned rows, unsigned heads,
+                          unsigned vit) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!rows || !heads || (rows % heads)) FAILMSG("cosine_norm_q needs heads | rows");
+    auto s = g_bufs.find(source), d = g_bufs.find(dst), c = g_bufs.find(scale);
+    if (s == g_bufs.end() || d == g_bufs.end() || c == g_bufs.end()) FAILMSG("bad cosine_norm_q operand");
+    const float* sp = (const float*)s->second.p;
+    float* dp = (float*)d->second.p;
+    const float* scp = (const float*)c->second.p;
+    g_cmds.push_back([=]() {
+        GQ->parallel_for(sycl::range(rows),
+                         ctree::cosine_norm_kernel()(sp, dp, rows, vit, scp, heads)).wait();
     });
     return 0;
 }
@@ -288,5 +309,64 @@ int xmx_rec_gemm_qkv_v(int a, int b, int v, int a_scale, int b_scale,
     });
     return 0;
 }
+
+// int xmx_rec_gemm_qkv_deq(int a, int b, int out, int a_scale, int b_scale,
+//                          unsigned M, unsigned channels)
+// S3a pass 1: int8 GEMM -> dequantise (island-3) -> float32 global, tile-local. The Q/K
+// chain's first leg; the norm (cosine_norm_q) and publish+scatter (qkv_scatter) follow.
+int xmx_rec_gemm_qkv_deq(int a, int b, int out, int a_scale, int b_scale,
+                         unsigned M, unsigned channels) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!M || !channels || (M % 128u) || (channels % 64u))
+        FAILMSG("gemm_qkv_deq needs M%%128==0, channels%%64==0");
+    auto ia = g_bufs.find(a), ib = g_bufs.find(b), io = g_bufs.find(out);
+    auto ias = g_bufs.find(a_scale), ibs = g_bufs.find(b_scale);
+    if (ia == g_bufs.end() || ib == g_bufs.end() || io == g_bufs.end() ||
+        ias == g_bufs.end() || ibs == g_bufs.end()) FAILMSG("bad gemm_qkv_deq operand");
+    int8_t* Araw = (int8_t*)ia->second.p;
+    int8_t* Braw = (int8_t*)ib->second.p;
+    float* OUT = (float*)io->second.p;
+    float* as = (float*)ias->second.p;
+    float* bs = (float*)ibs->second.p;
+    g_cmds.push_back([=]() {
+        size_t na = (size_t)M * channels, nb = (size_t)channels * channels;
+        std::vector<int8_t> hA(na), hB(nb), hAp(na), hBp(nb);
+        GQ->memcpy(hA.data(), Araw, na).wait();
+        GQ->memcpy(hB.data(), Braw, nb).wait();
+        s8v5::pack_a(hA.data(), hAp.data(), (int)M, (int)channels);
+        s8v5::pack_b(hB.data(), hBp.data(), (int)channels, (int)channels);
+        int8_t* dAp = sycl::malloc_device<int8_t>(na, *GQ);
+        int8_t* dBp = sycl::malloc_device<int8_t>(nb, *GQ);
+        GQ->memcpy(dAp, hAp.data(), na).wait();
+        GQ->memcpy(dBp, hBp.data(), nb).wait();
+        s8v5::gemm_qkv_deq(*GQ, dAp, dBp, as, bs, OUT, (int)M, (int)channels).wait();
+        sycl::free(dAp, *GQ); sycl::free(dBp, *GQ);
+    });
+    return 0;
+}
+
+// int xmx_rec_qkv_scatter(int src, int dst, unsigned rows, unsigned heads, unsigned tokens)
+// S3a pass 3: normalised f32 (row-major, channel=head*32+c) -> e4m3 -> (window,head,
+// token,32) scatter. Plain SYCL, qr_e4m3 (PUBLISH-gated).
+int xmx_rec_qkv_scatter(int src, int dst, unsigned rows, unsigned heads, unsigned tokens) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!rows || !heads || !tokens) FAILMSG("qkv_scatter needs rows/heads/tokens");
+    auto s = g_bufs.find(src), d = g_bufs.find(dst);
+    if (s == g_bufs.end() || d == g_bufs.end()) FAILMSG("bad qkv_scatter operand");
+    const float* sp = (const float*)s->second.p;
+    sycl::half* dp = (sycl::half*)d->second.p;
+    unsigned n = rows * heads * 32u;
+    g_cmds.push_back([=]() {
+        GQ->parallel_for(sycl::range(n), qkv_scatter_kernel()(sp, dp, rows, heads, tokens)).wait();
+    });
+    return 0;
+}
+
+// int xmx_rec_gemm_qkv_qk(int a, int b, int t, int a_scale, int b_scale, int qkv_scale,
+//                         unsigned M, unsigned channels, unsigned heads, unsigned tokens,
+//                         unsigned vit, unsigned is_q)
+// REMOVED (S3a): ESIMD cannot call the libdevice rounding ops the proven cosine tree uses.
+// The Q/K chain is now three composed passes: xmx_rec_gemm_qkv_deq + xmx_rec_cosine_norm[_q]
+// + xmx_rec_qkv_scatter. S3b folds them back into the main loop with esimd-native math.
 
 } // extern "C"

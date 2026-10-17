@@ -23,6 +23,7 @@
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 #include "publish_kernel.hpp"   // qr_e4m3_scalar (ESIMD-safe), qr_half_round, cr_mul
+#include "cosine_tree_kernel.hpp"  // ctree::cosine_reciprocal / vit_reciprocal (island-2)
 
 namespace s8v5 {
 using namespace sycl;
@@ -148,6 +149,86 @@ static inline sycl::event gemm_qkv_v(sycl::queue& q, const int8_t* Ap, const int
                         V[atA * 32 + chanA] = sycl::half(qr_e4m3_scalar(vA));
                         V[atB * 32 + chanB] = sycl::half(qr_e4m3_scalar(vB));
                     }
+                }
+            }
+        });
+    });
+}
+
+// ---- S3a pass 1: Q/K branch, GEMM + dequantise -> float32 global (tile-local). ----
+// The cross-WI need is ONLY the fragment-tree norm (one head's 32 channels in one hand),
+// and ESIMD cannot call the libdevice rounding ops the proven ctree uses -- so the chain
+// composes three gated pieces first (section 22's precedent: v1-int32 was a PATH gate,
+// v3 fused it later). S3b = fold passes 2+3 back in with esimd-native arithmetic.
+// Each WI dequantises its own 16x16 tile (shipped multiply order, :210) and stores f32.
+static inline sycl::event gemm_qkv_deq(sycl::queue& q, const int8_t* Ap, const int8_t* Bp,
+                                       const float* a_scale, const float* b_scale,
+                                       float* OUT,
+                                       int M, int channels) {
+    int NB = channels / BN;
+    int wg = (M / BM) * NB;
+    return q.submit([&](handler& h) {
+        h.parallel_for(nd_range(range(wg * NT), range(NT)), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+            esimd::slm_init<SLM_TOTAL>();
+            int gid = (int)it.get_group(0);
+            int lid = (int)it.get_local_id(0);
+            int wg_row = gid / NB, wg_col = gid % NB;
+            int wi_row = lid / WI_COLS, wi_col = lid % WI_COLS;
+            int col0 = wg_col * BN;
+            const int8_t* apb = Ap + (size_t)(wg_row * (channels / BK)) * WI_ROWS * 512;
+            const int8_t* bp = Bp + (size_t)wg_col * (BN / 8) * 256;
+            auto load_block = [=](int buf, int kb) SYCL_ESIMD_FUNCTION {
+                esimd::simd<int8_t, 128> av = esimd::block_load<int8_t, 128>(
+                    apb + (size_t)kb * SLM_A + lid * 128, esimd::overaligned_tag<16>{});
+                esimd::slm_block_store(buf * SLM_A + lid * 128, av, esimd::overaligned_tag<16>{});
+                esimd::simd<int8_t, 64> bv = esimd::block_load<int8_t, 64>(
+                    bp + (size_t)kb * channels * 32 + lid * 64, esimd::overaligned_tag<16>{});
+                esimd::slm_block_store(SLM_B_BASE + buf * SLM_B + lid * 64, bv, esimd::overaligned_tag<16>{});
+            };
+            auto load_grf = [=](int buf, esimd::simd<int8_t,256>& a0, esimd::simd<int8_t,256>& a1,
+                                esimd::simd<int8_t,256>& b0, esimd::simd<int8_t,256>& b1) SYCL_ESIMD_FUNCTION {
+                uint32_t offA = buf * SLM_A + wi_row * 512;
+                uint32_t offB = SLM_B_BASE + buf * SLM_B + wi_col * 512;
+                a0 = esimd::slm_block_load<int8_t, 256>(offA + 0, esimd::overaligned_tag<16>{});
+                a1 = esimd::slm_block_load<int8_t, 256>(offA + 256, esimd::overaligned_tag<16>{});
+                b0 = esimd::slm_block_load<int8_t, 256>(offB + 0, esimd::overaligned_tag<16>{});
+                b1 = esimd::slm_block_load<int8_t, 256>(offB + 256, esimd::overaligned_tag<16>{});
+            };
+            esimd::simd<int8_t, 256> a0, a1, b0, b1;
+            esimd::simd<int32_t, 64> c00(0), c01(0), c10(0), c11(0);
+            load_block(0, 0);
+            esimd::barrier();
+            int kb_n = channels / BK;
+            for (int b = 0; b < kb_n; ++b) {
+                int cur = b & 1, nxt = cur ^ 1;
+                if (b + 1 < kb_n) load_block(nxt, b + 1);
+                load_grf(cur, a0, a1, b0, b1);
+                c00 = esimd::xmx::dpas<8, 8, int32_t>(c00, b0, a0);
+                c01 = esimd::xmx::dpas<8, 8, int32_t>(c01, b1, a0);
+                c10 = esimd::xmx::dpas<8, 8, int32_t>(c10, b0, a1);
+                c11 = esimd::xmx::dpas<8, 8, int32_t>(c11, b1, a1);
+                esimd::barrier();
+            }
+            int gr = wg_row * BM + wi_row * 16, gc = col0 + wi_col * 16;
+            for (int r = 0; r < 8; ++r) {
+                int rowA = gr + r, rowB = gr + 8 + r;
+                if (rowA < M) {
+                    float asA = a_scale[rowA];
+                    esimd::simd<float, 8> f00 = esimd::convert<float>(c00.select<8, 1>(r * 8).read());
+                    esimd::simd<float, 8> f01 = esimd::convert<float>(c01.select<8, 1>(r * 8).read());
+                    esimd::block_store(OUT + (size_t)rowA * channels + gc,
+                                       f00 * asA * esimd::block_load<float, 8>(b_scale + gc, esimd::overaligned_tag<16>{}));
+                    esimd::block_store(OUT + (size_t)rowA * channels + gc + 8,
+                                       f01 * asA * esimd::block_load<float, 8>(b_scale + gc + 8, esimd::overaligned_tag<16>{}));
+                }
+                if (rowB < M) {
+                    float asB = a_scale[rowB];
+                    esimd::simd<float, 8> f10 = esimd::convert<float>(c10.select<8, 1>(r * 8).read());
+                    esimd::simd<float, 8> f11 = esimd::convert<float>(c11.select<8, 1>(r * 8).read());
+                    esimd::block_store(OUT + (size_t)rowB * channels + gc,
+                                       f10 * asB * esimd::block_load<float, 8>(b_scale + gc, esimd::overaligned_tag<16>{}));
+                    esimd::block_store(OUT + (size_t)rowB * channels + gc + 8,
+                                       f11 * asB * esimd::block_load<float, 8>(b_scale + gc + 8, esimd::overaligned_tag<16>{}));
                 }
             }
         });

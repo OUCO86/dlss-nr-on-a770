@@ -95,6 +95,26 @@ inline auto unary_kernel() {
     };
 }
 
+// QKV pass 3: publish + scatter. Reads the normalised f32 in row-major (row, channel)
+// order (channel = head*32 + c within the row, channels = heads*32), writes e4m3 halves
+// to the (window, head, token, 32) target -- qkv_epilogue.glsl:60-75's at formula. Plain
+// SYCL (not ESIMD) so qr_e4m3 (the libdevice spelling, already PUBLISH-gated bit-exact)
+// is legal here. count = rows*channels elements.
+inline auto qkv_scatter_kernel() {
+    return [](const float* src, sycl::half* dst, unsigned rows, unsigned heads,
+              unsigned tokens) {
+        return [=](sycl::item<1> it) {
+            unsigned g = (unsigned)it.get_id(0);
+            if (g >= rows * heads * 32u) return;
+            unsigned row = g / (heads * 32u), rem = g % (heads * 32u);
+            unsigned head = rem / 32u, chan = rem % 32u;
+            unsigned window = row / tokens, token = row % tokens;
+            size_t at = (((size_t)window * heads + head) * tokens + token) * 32u + chan;
+            dst[at] = sycl::half(qr_e4m3(src[g]));
+        };
+    };
+}
+
 // int8 -> float32 publish: dst[i] = publish(epilogue, f32(src[i]) * scale[i/cols]).
 // The chain tail: the producer's int8 output + its per-row new_scale dequantise back to
 // float (section 9 island-3, the scale multiply, done with cr_mul = fmul_rn so it is the

@@ -62,8 +62,13 @@ static inline float vit_reciprocal(const float* h) {
 
 // kernel: rows x 32 f32 in, normalized f32 out (each output element itself half-rounded,
 // exactly as the golden returns astype(float32) of half values). vit flag picks the tree.
+// scale (optional, may be null): the QKV epilogue's learned scale, applied AFTER the
+// norm exactly as qkv_epilogue.glsl:52-54 -- Q gets hmul(value, half_round(scale[head])),
+// and for vit the VIT_ROOT multiply comes between the norm and the scale. K passes null
+// (the GLSL's scale=1.0 path). head index of each 32-row = row % heads.
 inline auto cosine_norm_kernel() {
-    return [](const float* src, float* dst, unsigned rows, unsigned vit) {
+    return [](const float* src, float* dst, unsigned rows, unsigned vit,
+              const float* scale, unsigned heads) {
         return [=](sycl::item<1> it) {
             unsigned r = (unsigned)it.get_id(0);
             if (r >= rows) return;
@@ -71,8 +76,15 @@ inline auto cosine_norm_kernel() {
             const float* s = src + (size_t)r * 32u;
             for (int i = 0; i < 32; ++i) h[i] = qr_half_round(s[i]);
             float recip = vit ? vit_reciprocal(h) : cosine_reciprocal(h);
-            for (int i = 0; i < 32; ++i)
-                dst[(size_t)r * 32u + i] = qr_half_round(cr_mul(h[i], recip));
+            float sc = scale ? qr_half_round(scale[r % heads]) : 0.0f;
+            for (int i = 0; i < 32; ++i) {
+                float v = cr_mul(h[i], recip);        // hmul's half_round is the store below
+                if (scale) {
+                    if (vit) v = cr_mul(qr_half_round(v), VIT_ROOT);
+                    v = cr_mul(qr_half_round(v), sc);
+                }
+                dst[(size_t)r * 32u + i] = qr_half_round(v);
+            }
         };
     };
 }

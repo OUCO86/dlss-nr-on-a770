@@ -874,3 +874,39 @@ megakernel stage 不是独立 dispatch，standalone 门只覆盖 M%128==0 的大
 2. **FAILMSG 的 % 必须转义 %%**：消息 "needs M%128==0" 被 snprintf 当格式符吞成
    "M==0"（前辈 :127/:160 都写的 %%，我没照抄）。guard 断言本身绿（rc!=0）但错误消息
    说谎——修成 %% 后重跑全绿。
+
+## 36. S3a QKV Q/K 链 GREEN + ESIMD 融合边界（2026-10-17 13:5x）：三趟组合，六组 bit-exact
+
+**先查 Intel 参考撞到的硬边界**（用户提醒"查 intel 工程师参考没"之后查的）：
+ESIMD 核（`SYCL_ESIMD_KERNEL`）**不能调 libdevice**——`ext::intel::math::fmul_rn/fdiv_rn`
+（imf_rounding_math.hpp）编译报 "SYCL device function cannot be called from an ESIMD
+context"；`sycl::sqrt` 有 esimd 版（`__esimd_ieee_sqrt`），但已绿的 `ctree` 用的是标量
+`fdiv_rn`。前辈 v3 的 ESIMD epilogue 只做 requantize（`esimd::rnde`），**没在 ESIMD 里做过
+no-contract 归一化算术**——这是新领域，不猜，按前辈节奏拆两步：
+
+- **S3a（本轮）**：Q/K 链=**三个已证积木组合成一次 submit 的三趟**：
+  p1 `xmx_rec_gemm_qkv_deq`（ESIMD GEMM→dequantise→f32，tile-local 无 SLM stage）
+  → p2 `xmx_rec_cosine_norm[_q]`（plain SYCL，libdevice 合法；Q 版=归一化后接
+  learned scale，vit 时 VIT_ROOT 居中，逐 op 对 qkv_epilogue.glsl:52-54）
+  → p3 `xmx_rec_qkv_scatter`（plain SYCL，已证 `qr_e4m3` + epilogue :66-67 的 at 公式）。
+  门控六组全 BIT-EXACT(0 differ)：win-Q/win-K/win-Q8h/win-K8h/vit-Q/vit-K。
+  golden=前辈两条路径各自的权威（window=`vendor_cosine_publish` 先 transpose 到
+  (b,h,t,32)，:432-433；vit=`vit_attend` 链 :754-756 保持 (b,t,h,32)，norm 带 [...,None]）。
+- **S3b（下一步）**：把 p2/p3 折回 ESIMD 主循环——归一化算术改用 esimd 原语
+  （`esimd::sqrt`、`esimd::rnde`、逐 op 无收缩：SIMD 表达式一对一映射指令，
+  收缩危险只在标量 `l*r+acc`；float stage 用前辈 :99-112 的 int32-words-原地写回技巧）。
+
+**§35 教训追加**：BM=64+WI_COLS=4 的几何混搭已修回 v1 的 BM=128（identity-weight 探针
+抓到 got[c]=want[c+2] 错位模式）。另：`slm_block_store` 第一参=**字节**偏移（v3 里
+SLM_A/RMAX_BASE 都自带 ×4，我 Q/K 草稿漏乘——S3a 不再需要 SLM stage 所以绕开，S3b
+必须记得）。cosine 门控首跑 vit 红=我 golden 抄漏前辈 `_vit_norm(query)[..., None]`
+的 None（nr_model:754）——又是修参照不修核（§25 规则第三次正确执行）。
+
+**QKV 三输出分支至此全部有健康链形态**：V=一趟融合（§35，ESIMD 内 dequant+e4m3+scatter）；
+Q/K=三趟组合（本轮），每趟已单独门控，组合端到端 bit-exact。旧链在这条缝上付的
+float32 往返 + 两次 cosine publish + 一次 split（qkv_epilogue 头注：block0 720p=377MB×3、
+19ms）= 健康链里 0。
+
+下一步（§33 清单）：① S3b 融合（ESIMD 原生归一化）；② attention softmax 岛①（skill 包
+有 f32 Softmax ladder 先例，bit-trick 常量在 attention.comp/window_block）；③ graph+D3D12
+接 daemon。
