@@ -208,4 +208,25 @@ int xmx_rec_unary32(int source, int dst, unsigned count, unsigned epilogue) {
     return 0;
 }
 
+// int xmx_rec_unary_i8(int source, int scale, int dst, unsigned count, unsigned cols,
+//                      unsigned epilogue)
+// chain tail: int8 producer output + per-row scale -> dequant (island-3, cr_mul) ->
+// publish rounding chain (island-4) -> float32. count elements, row-major, scale is
+// float[count/cols] one per row. This pass is what the OLD chain split into a
+// dequant + publish round-trip; the straight-through chain pays it once, at the end.
+int xmx_rec_unary_i8(int source, int scale, int dst, unsigned count, unsigned cols,
+                     unsigned epilogue) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!count || !cols || (count % cols)) FAILMSG("unary_i8 needs count a multiple of cols");
+    auto s = g_bufs.find(source), c = g_bufs.find(scale), d = g_bufs.find(dst);
+    if (s == g_bufs.end() || c == g_bufs.end() || d == g_bufs.end()) FAILMSG("bad unary_i8 operand");
+    const signed char* sp = (const signed char*)s->second.p;
+    const float* scp = (const float*)c->second.p;
+    float* dp = (float*)d->second.p;
+    g_cmds.push_back([=]() {
+        GQ->parallel_for(sycl::range(count), unary_i8_kernel()(sp, scp, dp, count, cols, epilogue)).wait();
+    });
+    return 0;
+}
+
 } // extern "C"

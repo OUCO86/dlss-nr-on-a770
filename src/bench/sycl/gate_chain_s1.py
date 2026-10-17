@@ -22,7 +22,9 @@ import ctypes, os, pathlib, sys
 import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "gpu"))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3] / "src" / "ref"))
 import int8_quant
+import nr_model as NM
 
 for d in (os.getcwd(), r"E:\WorkBuddy\toolchain-mamba\sycl\Library\bin",
           r"E:\ProgramData\Microsoft\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64"):
@@ -50,6 +52,7 @@ for nm, at in (
     ("xmx_begin", []), ("xmx_abort", []), ("xmx_submit", []),
     ("xmx_rec_quant", [ctypes.c_int] * 3 + [ctypes.c_uint] * 2),
     ("xmx_rec_gemm_s8rq", [ctypes.c_int] * 5 + [ctypes.c_uint] * 3),
+    ("xmx_rec_unary_i8", [ctypes.c_int] * 3 + [ctypes.c_uint] * 3),
 ):
     if hasattr(lib, nm):
         getattr(lib, nm).argtypes = at
@@ -96,23 +99,30 @@ def run_chain(M, K1, N, label):
     hpk3 = lib.xmx_buf_create_kind(M * 64, 1)
     hns3 = lib.xmx_buf_create_kind(M * 4, 4)
     hcs2 = lib.xmx_buf_create_kind(64 * 4, 4)
-    ok(min(hsrc, hpk1, hsc1, hw1, hw2, hpk2, hns2, hcs1, hpk3, hns3, hcs2) > 0, f"{label}: 11 buffers")
+    hpub4 = lib.xmx_buf_create_kind(M * 64 * 4, 4)   # chain tail: float32 publish (half)
+    hpub3 = lib.xmx_buf_create_kind(M * 64 * 4, 4)   # chain tail: float32 publish (gate+e4m3)
+    ok(min(hsrc, hpk1, hsc1, hw1, hw2, hpk2, hns2, hcs1, hpk3, hns3, hcs2, hpub4, hpub3) > 0,
+       f"{label}: 13 buffers")
 
     lib.xmx_buf_upload(hsrc, half.ctypes.data, 0, M * K1 * 2)
     lib.xmx_buf_upload(hw1, w1.ctypes.data, 0, K1 * N)
     lib.xmx_buf_upload(hw2, w2.ctypes.data, 0, N * 64)
     lib.xmx_buf_upload(hcs1, cs1.ctypes.data, 0, N * 4)
     lib.xmx_buf_upload(hcs2, cs2.ctypes.data, 0, 64 * 4)
-    for h in (hpk1, hsc1, hpk2, hns2, hpk3, hns3): lib.xmx_buf_zero(h)
+    for h in (hpk1, hsc1, hpk2, hns2, hpk3, hns3, hpub4, hpub3): lib.xmx_buf_zero(h)
 
-    # ONE submit carries the whole chain: quant -> rq GEMM -> rq GEMM (3 passes where the
-    # old chain needs 5: quant, gemm, quant, gemm, quant -- the seam quantizes are gone).
+    # ONE submit carries the whole chain: quant -> rq GEMM -> rq GEMM -> publish tail
+    # (4 passes where the old chain needs 6: quant, gemm, quant, gemm, dequant, publish --
+    # the seam quantizes AND the dequant/publish round-trip are gone: the tail reads the
+    # producer's int8+scale and does island-3 (scale multiply) + island-4 (rounding) once).
     ok(lib.xmx_begin() == 0, f"{label}: begin")
     ok(lib.xmx_rec_quant(hsrc, hpk1, hsc1, M, K1) == 0, f"{label}: rec_quant")
     ok(lib.xmx_rec_gemm_s8rq(hpk1, hw1, hpk2, hcs1, hns2, M, N, K1) == 0, f"{label}: rq pass 2")
     ok(lib.xmx_rec_gemm_s8rq(hpk2, hw2, hpk3, hcs2, hns3, M, 64, N) == 0, f"{label}: rq pass 3 (reads pk2)")
+    ok(lib.xmx_rec_unary_i8(hpk3, hns3, hpub4, M * 64, 64, 4) == 0, f"{label}: publish tail epi=4 (reads pk3)")
+    ok(lib.xmx_rec_unary_i8(hpk3, hns3, hpub3, M * 64, 64, 3) == 0, f"{label}: publish tail epi=3 (reads pk3)")
     rc = lib.xmx_submit()
-    ok(rc == 0, f"{label}: submit (whole chain, 3 passes)" +
+    ok(rc == 0, f"{label}: submit (whole chain, 5 passes)" +
        ("" if rc == 0 else " err=" + lib.xmx_error().decode(errors='replace')))
 
     # downloads
@@ -122,6 +132,8 @@ def run_chain(M, K1, N, label):
     ns2 = np.zeros(M, np.float32);   lib.xmx_buf_download(hns2, ns2.ctypes.data, 0, M * 4)
     pk3 = np.zeros(M * 64, np.int8); lib.xmx_buf_download(hpk3, pk3.ctypes.data, 0, M * 64)
     ns3 = np.zeros(M, np.float32);   lib.xmx_buf_download(hns3, ns3.ctypes.data, 0, M * 4)
+    pub4 = np.zeros(M * 64, np.float32); lib.xmx_buf_download(hpub4, pub4.ctypes.data, 0, M * 64 * 4)
+    pub3 = np.zeros(M * 64, np.float32); lib.xmx_buf_download(hpub3, pub3.ctypes.data, 0, M * 64 * 4)
 
     # gate 1: entry quantize vs the shipped numpy contract (senior's bounded criterion)
     wp, ws = int8_quant.quantise(vals, 1)
@@ -150,11 +162,24 @@ def run_chain(M, K1, N, label):
     wns3 = (rmax2 / f32(127.0)).astype(f32)
     within_one(pk3.reshape(M, 64), ns3, fp2, wns3, f"{label} rq3 {M}x64x{N}")
 
-    # structural count: the old chain for two GEMM layers = 2 gemm + 3 quantize passes;
-    # this chain = 2 gemm + 1 quantize (entry only). Assert it ran as 3 recorded cmds.
-    # (g_cmds is internal; the visible proof is the single submit rc==0 above with three
-    # rec_* calls between begin and submit -- already asserted line by line above.)
-    for h in (hsrc, hpk1, hsc1, hw1, hw2, hpk2, hns2, hcs1, hpk3, hns3, hcs2):
+    # gate 4: publish tail -- dequant(island-3) + rounding(island-4) of the DEVICE's own
+    # pk3+ns3. The senior's contract for publish is BIT-EXACT (gate_unary.py: np.array_equal
+    # vs nr_model), so the golden is int8_quant.dequantise's exact formula (packed.astype(
+    # float32) * scale, row-broadcast) piped through nr_model's rounding points -- no new
+    # golden, both halves are shipped authority already gated separately.
+    deq = (pk3.reshape(M, 64).astype(f32) * ns3.astype(f32)[:, None]).ravel()
+    want4 = NM._half_rounded(deq)
+    want3 = NM.e4m3(NM.quadratic_gate_activation(deq))
+    ok(np.array_equal(pub4, want4),
+       f"{label} tail epi=4(half): BIT-EXACT vs dequantise+_half_rounded ({int((pub4 != want4).sum())} differ)")
+    ok(np.array_equal(pub3, want3),
+       f"{label} tail epi=3(gate+e4m3): BIT-EXACT vs dequantise+gate+e4m3 ({int((pub3 != want3).sum())} differ)")
+
+    # structural count: the old chain for two GEMM layers + a published output =
+    # 2 gemm + 3 quantize + 1 dequant/publish round-trip; this chain = 2 gemm + 1 entry
+    # quantize + 1 fused tail (5 passes). The seam quantizes AND the half round-trip are
+    # gone -- producer owns the row, tail reads int8+scale directly (islands 3+4, one pass).
+    for h in (hsrc, hpk1, hsc1, hw1, hw2, hpk2, hns2, hcs1, hpk3, hns3, hcs2, hpub4, hpub3):
         lib.xmx_buf_destroy(h)
 
 # M=8192: v3's M%128 constraint; R8a-legal big M. K1=64 entry, two N=64 rq layers.

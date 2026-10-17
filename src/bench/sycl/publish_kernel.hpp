@@ -68,3 +68,21 @@ inline auto unary_kernel() {
         };
     };
 }
+
+// int8 -> float32 publish: dst[i] = publish(epilogue, f32(src[i]) * scale[i/cols]).
+// The chain tail: the producer's int8 output + its per-row new_scale dequantise back to
+// float (section 9 island-3, the scale multiply, done with cr_mul = fmul_rn so it is the
+// correctly-rounded multiply the shipped dequantise does) then the publish rounding chain
+// (island-4). This is the seam the OLD chain paid a quantize_row + a dequant pass for; in
+// the int8-straight-through chain it is ONE elementwise pass and it is the last one.
+inline auto unary_i8_kernel() {
+    return [](const signed char* src, const float* scale, float* dst,
+              unsigned count, unsigned cols, unsigned epilogue) {
+        return [=](sycl::item<1> it) {
+            unsigned i = (unsigned)it.get_id(0);
+            if (i >= count) return;
+            float v = cr_mul((float)src[i], scale[i / cols]);
+            dst[i] = qr_publish(epilogue, v);
+        };
+    };
+}

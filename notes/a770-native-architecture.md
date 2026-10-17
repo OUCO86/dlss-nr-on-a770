@@ -766,3 +766,27 @@ outproj/scores 族，QKV 的 N=3×channels(≥192) 与 FFN expand 的两半流�
 2. **N=192/384/768 的 QKV 形态 fused-requant**（真实 QKV N=3×channels，§28 钉死的语义）——
    不是脑补的 128，是从 weight 形状表取的。
 3. 链成形后进 graph 提交形态（§17）+ D3D12 接 daemon（§18/§21 门已全绿）。
+
+## 31. S2 链尾 publish 串入 GREEN（2026-10-17 11:5x）：5 趟链端到端，孤岛③④在链尾一次做完
+
+`xmx_rec_unary_i8(source,scale,dst,count,cols,epilogue)` + `unary_i8_kernel`：
+int8+row_scale → cr_mul(=fmul_rn，§9 孤岛③ scale 乘) → qr_publish 舍入链(孤岛④) → float32。
+链门控升级=**一次 begin/submit 5 趟**：quant → rq → rq(读 pk2) → tail epi=4(读 pk3) →
+tail epi=3(读 pk3)。两形状全绿：
+
+- q0/rq2/rq3：前辈有界判据（同 §30）；
+- **tail epi=4(half) 与 epi=3(gate+e4m3)：BIT-EXACT（0 differ）**——golden=
+  `int8_quant.dequantise` 的精确公式（packed.astype(f32)*scale 行广播）串 nr_model 舍入点，
+  两半都是出货权威（PUBLISH 门已各自 bit-exact 过），没造新 golden（§25 规则）。
+  输入=设备自己的 pk3/ns3 字节 → 链尾的输入身份也被验证。
+
+趟数账（结构，非性能测量）：旧链两 GEMM 层+publish 输出 = 2 gemm + 3 quantize +
+dequant/publish 往返；这条链 = 2 gemm + 1 入口 quantize + 1 融合链尾 = **5 趟**。
+缝上 quantize=0，half 往返=0（§29 清单 1、2 两条同时兑现）。
+
+坑（小）：门控函数参数 M(行数) 遮蔽 nr_model 别名 M → AttributeError；改 NM。
+教训：链门控里复用前辈模块别名时先查命名冲突。
+
+下一步（§30 清单续）：① K=32 单步 GEMM（scores 形态）串链中——rq 核约束 K%32==0 已含 32，
+v2 expand 先例证过单步合法，直接门控验证；② QKV 真实 N=3×channels 形态（从 weight 形状表取）；
+③ graph 提交形态 + D3D12 接 daemon。
