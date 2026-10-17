@@ -1072,3 +1072,31 @@ contract N=32 窄、expand K=32 浅，int8 实测慢——这是"消灭不了"�
 路 B 第一期=让 daemon 加载我的 libxmx_sycl.dll，把独立 GEMM 段换成 int8 直通链，
 attention/FFN 暂走原 coopmat 路径。先查 daemon 的 libxmx 调用面（Runtime 契约），
 评估最小改动。§17(graph)+§18(D3D12↔L0)+§21 门已为此绿。
+
+## 43. requant_i8 连接积木 GREEN（2026-10-17 16:0x）：N≠64 的 attention GEMM 出口回 int8 世界
+
+`requant_kernel.hpp` + `xmx_rec_requant_i8` + `gate_requant_i8.py`（build 第 14 门）。
+五组全绿（within-one worst 0.50000 step + scale≤1ulp）：scores 640x640 / attnV 640x1024 /
+outproj 640x1024 / scores-192 / scores-256（global attention 真实 N/K）。含 zero-row 路径
+（acc[0]=0 → inv=0 → out=0, scale=0）。
+
+**为什么需要它（§42 修正的直接后果）**：rq 核（v3）N==64 硬约束接不了 global attention 的
+scores(N=640)/attnV(N=1024)/outproj(N=channels)。这些走**通用 N 的 v1 int32 核**（已绿），
+出口用这个独立 requant pass 回 int8 直通世界（attended→outproj、scores→softmax_i8）。
+v1 GEMM 正确性已单独门控（§25 每段独立测），本门只喂 int32 acc 测 dequantise+requantize。
+
+**golden 严格照 gate_gemm_s8rq 的 v3 契约**（multiply-form inv=127/rmax、rint、clip±127、
+scale=rmax/127），**不用 int8_quant.quantise**——后者 zero-row 保 scale=1.0，v3 链用
+inv=0→out=0/scale=0，两者只在全零行不同，链的 requantize 是 v3 那个，golden 必须一致。
+（这个区别写进核注释，防下次抄错。）
+
+**路 B 积木全部就位**（attention 环每一段都有 int8 形态）：
+- QKV: V=gemm_qkv_v_i8 列量化(§41) / Q=cosine_norm_i8+learned scale(§39) / K=cosine_norm_i8(§39)
+- scores: v1 int32 GEMM(已绿) + requant_i8(本轮) → softmax_i8(§40)
+- attnV: v1 int32 GEMM + requant_i8(本轮)
+- outproj: v1 int32 GEMM + requant_i8(本轮)
+下一步=**整环串一次 submit**（gate_chain_attn: 真 QKV→scores→softmax→attnV→outproj 端到端
+对 nr_model.cosine_attention 有界门）。⚠ 待查衔接复杂度: scores=Q·K^T 的 K^T 布局
+（前辈 matmul_nt 注释: key 存 (tokens,32) coopmat 按列读=转置免费; 我 v1 pack_b 是行主序
+(K,N)，喂 K^T 需转置 pack 或 batched-per-head）+ global 是 per-head batched(4/32 heads)。
+然后接 daemon（用户进 LOP 必经路，95 函数 ABI + graph + D3D12）。

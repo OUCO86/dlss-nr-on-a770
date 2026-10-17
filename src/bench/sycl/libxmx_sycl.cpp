@@ -19,6 +19,7 @@
 #include "publish_kernel.hpp"
 #include "cosine_tree_kernel.hpp"
 #include "softmax_kernel.hpp"
+#include "requant_kernel.hpp"
 #include "gemm_s8_v1_kernel.hpp"
 #include "gemm_s8_v3_kernel.hpp"
 #include "gemm_s8_v5_kernel.hpp"
@@ -342,6 +343,32 @@ int xmx_rec_softmax_i8(int acc, int q_scale, int k_scale, int bias, int out8, in
         GQ->parallel_for(sycl::range(rows),
                          smax::softmax_i8_kernel()(ap, qp, kp, bp, scratch, op, scp, rows, cols)).wait();
         sycl::free(scratch, *GQ);
+    });
+    return 0;
+}
+
+// int xmx_rec_requant_i8(int acc, int a_scale, int b_scale, int out8, int scale,
+//                        unsigned rows, unsigned cols)
+// route-B connective tissue (section 42): the v1 int32 GEMM's accumulator -> int8 + row
+// scale, for the attention GEMMs whose N is not 64 (scores 640, attnV/outproj channels).
+// v3's exact requantize contract (multiply-form inv=127/rmax, rint, clip +-127,
+// scale=rmax/127) with the shipped left-to-right dequantise (acc*a_scale[row]*b_scale[col]).
+int xmx_rec_requant_i8(int acc, int a_scale, int b_scale, int out8, int scale,
+                       unsigned rows, unsigned cols) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!rows || !cols) FAILMSG("requant_i8 needs rows/cols");
+    auto ia = g_bufs.find(acc), ias = g_bufs.find(a_scale), ibs = g_bufs.find(b_scale);
+    auto io = g_bufs.find(out8), isc = g_bufs.find(scale);
+    if (ia == g_bufs.end() || ias == g_bufs.end() || ibs == g_bufs.end() ||
+        io == g_bufs.end() || isc == g_bufs.end()) FAILMSG("bad requant_i8 operand");
+    const int32_t* ap = (const int32_t*)ia->second.p;
+    const float* as = (const float*)ias->second.p;
+    const float* bs = (const float*)ibs->second.p;
+    signed char* op = (signed char*)io->second.p;
+    float* scp = (float*)isc->second.p;
+    g_cmds.push_back([=]() {
+        GQ->parallel_for(sycl::range(rows),
+                         requant::requant_i8_kernel()(ap, as, bs, op, scp, rows, cols)).wait();
     });
     return 0;
 }
