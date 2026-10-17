@@ -1127,3 +1127,29 @@ rec_gemm_int8_qkv/rec_gemm_int8_batched/...）。我的骨架只 25 导出。第
 libxmx.dll**，而是让 daemon 的独立 GEMM 段（QKV/outproj/downsample/upsample）走我的
 libxmx_sycl 链、attention/FFN 暂走原 coopmat——但两 dll 的 buffer 要跨设备共享（§18
 D3D12↔L0 互操作门已绿=这条路通）。这是接 daemon 前必须先设计的**双引擎共存**形态。
+
+## 45. attnV 真实形状=N=32（head_dim）钉死 + 路 B 的 M 门槛（2026-10-17 16:2x）
+
+读前辈 `window_attention.comp:163-174` PV 段坐实：`acc[j]=coopMatMulAdd(p,v)`，p=A(K=64
+步16)、v=B(16×8, 4 个 j) ⇒ **attnV = N=32(head_dim), K=64(tokens)**。§8 表印证
+（attnV N=32 K=64、outproj N=32 K=128）。**我 §43 门控写的 "attnV 640x1024" 是错的**——
+640×1024 是 merged 后喂 outproj 的 buffer（requant 对它成立=per-token 行 scale，outproj
+归约维=channels 沿 M ✓），但 attnV GEMM 本身是 per-head N=32。
+
+**硬冲突（决定剩余最大块工作方向）**：attnV/outproj 的 N=32，v1 核要 N%64==0、rq 核要
+N==64——**都接不了**。且 §8（用户让信的"早测好理论数据"）：`N=32 K≥64` 只有 **M≥32640
+走 int8，以下 fp16**。attention 真实 M（window 64、global 640）远小于 32640。
+
+⇒ **路 B 的诚实边界**：attnV/outproj 在真实 M 上 int8 比 fp16 慢（§8 实测）。把它们变
+int8 且变快的前提=**先把 M 做大**（megakernel 批窗口到 M≥32640, R8a）。所以
+**attention 的 int8 化是 megakernel 的产物，不是现在能独立换的段**；单独建 N=32 小 M
+int8 attnV 核=造 §8 已判更慢的东西（=照着错收益建，正是用户骂的反面）。
+
+**现在能合法消灭 fp16 的**=QKV（block 内 windows×tokens 已大 M, §41 绿）、downsample/
+upsample（大 M）。**决定（按裁定推进，不再问）**：
+1. 先接 daemon 跑通 LOP（用户验收路径）：已绿 int8 段（QKV 大 M、downsample/upsample）
+   接进去，attention/FFN 暂走 coopmat → 用户进游戏验 int8 直通链没坏画面。
+2. attention 的 int8 化留给 megakernel（M 做大后 §8 的 1.19-1.54× 才兑现）=重写大头。
+
+§44 的 scores 环集成仍有效（global scores N=640 满足 v1 N%64；window scores N=64 也满足），
+只是 attnV 环尾不能照 §44 设想硬串——它要 BN=32 变体且只在 megakernel 大 M 下才划算。
