@@ -270,6 +270,31 @@ int xmx_rec_cosine_norm_q(int source, int dst, int scale, unsigned rows, unsigne
     return 0;
 }
 
+// int xmx_rec_cosine_norm_i8(int source, int out8, int scale, unsigned rows, unsigned vit,
+//                            int qscale, unsigned heads)
+// route-B block 1 (section 38): cosine-normalise -> register row-max -> requantize to
+// int8 + per-row scale. The scores-GEMM seam's e4m3 publish + quantize_row both die here.
+// qscale=0 for K (no learned scale); a real buffer for Q (scale after the norm, VIT_ROOT
+// between when vit). rows = flattened (row,head) count, each row 32 channels.
+int xmx_rec_cosine_norm_i8(int source, int out8, int scale, unsigned rows, unsigned vit,
+                           int qscale, unsigned heads) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!rows) FAILMSG("cosine_norm_i8 needs rows>0");
+    auto s = g_bufs.find(source), o = g_bufs.find(out8), c = g_bufs.find(scale);
+    const float* qsp = nullptr;
+    if (qscale) { auto q = g_bufs.find(qscale); if (q == g_bufs.end()) FAILMSG("bad cosine_norm_i8 qscale"); qsp = (const float*)q->second.p; }
+    else if (heads) FAILMSG("heads without qscale");
+    if (s == g_bufs.end() || o == g_bufs.end() || c == g_bufs.end()) FAILMSG("bad cosine_norm_i8 operand");
+    const float* sp = (const float*)s->second.p;
+    signed char* op = (signed char*)o->second.p;
+    float* cp = (float*)c->second.p;
+    g_cmds.push_back([=]() {
+        GQ->parallel_for(sycl::range(rows),
+                         ctree::cosine_norm_i8_kernel()(sp, op, cp, rows, vit, qsp, heads)).wait();
+    });
+    return 0;
+}
+
 // int xmx_rec_softmax(int source, int dst, unsigned rows, unsigned cols)
 // island-1: the vendor's half bit-affine softmax, f32 logits (rows x cols, cols even) ->
 // e4m3 probability halves. Bit-exact gate vs nr_model.vendor_approximate_softmax (:211).

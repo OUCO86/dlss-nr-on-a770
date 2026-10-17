@@ -968,3 +968,23 @@ int8 GEMM 的 dequantise 要求 scale 沿**非归约维**（A 按行、B 按列�
 3. QKV V 支改列量化 int8（§35 核上加转置 rmax）。
 4. attnV=rq int8（K=tokens）→ attended → outproj 链。每步对 golden 链有界门；
    最终链形态进 daemon 让用户 LOP 看画质。
+
+## 39. 路 B 积木 1 GREEN：cosine_norm_i8（归一化+寄存器行-max+requantize→int8+scale）
+
+`cosine_norm_i8_kernel`（cosine_tree_kernel.hpp）+ `xmx_rec_cosine_norm_i8` +
+`gate_cosine_i8.py`（build 第 11 门）。六组全绿（within-one worst 0.50000 step +
+scale≤1ulp）：K-win/Q-win/Q8h-win/K-vit/Q-vit/Q16h-big(8192 行)。
+
+**这条缝在旧链里付两趟**（cosine publish e4m3-half → scores GEMM 前 quantize_row），
+新形态=归一化完 **寄存器里 h[32] 全在手 → 行-max 免费 → requantize→int8+scale 直出**
+（v3 的 fused-requant 契约搬到岛②出口）。requantize 逐 op 照 v3 :131-133
+（multiply-form inv=127/rmax、rnde、clip±127、ns=rmax/127）。
+
+**契约坑（修参照不修核，§25 第四次）**：首跑 vit 两组红（scale 差 16513 ulp）。根因=
+新门 sample 忘了先 `_half_rounded`——`_vit_norm` docstring(:683) 明说输入必须是 half
+值（它只 half_round 高 16 个平方），而核按 qkv_epilogue.glsl:50 先 half_round 再进树。
+§34 已绿的 gate_cosine sample 本来就有这步，新门漏抄。核与 GLSL 权威同构，修 golden。
+window 路径 vendor_cosine_normalize 内部自带 half_round(:243) 所以幂等无感。
+
+**下一步（§38 积木 2）**：scores GEMM=rq(K=32) 吃 int8 Q/K → dequantise+bias →
+f32 logits → softmax 直出 int8 probs+行 scale（岛①出口同样寄存器行-max 免费）。

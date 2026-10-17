@@ -89,4 +89,53 @@ inline auto cosine_norm_kernel() {
     };
 }
 
+// int8 requantize variant (route B, section 38 block 1): cosine-normalise -> the row's
+// absmax (FREE, all 32 channels are already in registers h[32]) -> requantize to int8 +
+// per-row scale. This is v3's fused-requantize contract applied to the cosine output
+// instead of a GEMM accumulator: fp = the normalised (and optionally scale-multiplied)
+// value; rmax = max|fp| over the row; out = clip(rnde(fp * 127/rmax), -127, 127);
+// new_scale = rmax/127. row_scale_A cancels in the int8-straight-through chain (v2 math),
+// so the scores rq GEMM eats these int8 Q/K directly -- the e4m3 publish + a quantize_row
+// the old chain paid at this seam both die.
+//
+// The normalised fp values are the SAME half-rounded products the f32 golden returns
+// (vendor_cosine_normalize / the vit chain), so the golden is that chain piped through
+// int8_quant.quantise -- both shipped authority, no new golden (section 25). Bounded gate
+// (within-one + scale<=1ulp), like the rq gate: requantize is lossy quantization.
+inline auto cosine_norm_i8_kernel() {
+    return [](const float* src, signed char* out8, float* scale, unsigned rows,
+              unsigned vit, const float* qscale, unsigned heads) {
+        return [=](sycl::item<1> it) {
+            unsigned r = (unsigned)it.get_id(0);
+            if (r >= rows) return;
+            float h[32];
+            const float* s = src + (size_t)r * 32u;
+            for (int i = 0; i < 32; ++i) h[i] = qr_half_round(s[i]);
+            float recip = vit ? vit_reciprocal(h) : cosine_reciprocal(h);
+            float sc = qscale ? qr_half_round(qscale[r % heads]) : 0.0f;
+            float fp[32], rmax = 0.0f;
+            for (int i = 0; i < 32; ++i) {
+                float v = cr_mul(h[i], recip);
+                if (qscale) {
+                    if (vit) v = qr_half_round(cr_mul(qr_half_round(v), VIT_ROOT));
+                    v = qr_half_round(cr_mul(qr_half_round(v), sc));
+                } else {
+                    v = qr_half_round(v);
+                }
+                fp[i] = v;
+                float a = v < 0.0f ? -v : v;
+                if (a > rmax) rmax = a;
+            }
+            float ns = rmax / 127.0f;
+            float inv = (rmax > 0.0f) ? 127.0f / rmax : 0.0f;
+            for (int i = 0; i < 32; ++i) {
+                float q = sycl::rint(fp[i] * inv);
+                q = sycl::min(sycl::max(q, -127.0f), 127.0f);
+                out8[(size_t)r * 32u + i] = (signed char)(int)q;
+            }
+            scale[r] = ns;
+        };
+    };
+}
+
 } // namespace ctree
