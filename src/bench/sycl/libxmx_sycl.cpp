@@ -54,9 +54,26 @@ const char* xmx_error(void) { return GERR; }
 
 int xmx_init(void) {
     try {
-        sycl::device dev;
+        std::fprintf(stderr, "[xmx_init] enumerated GPUs://n");
         for (auto& d : sycl::device::get_devices(sycl::info::device_type::gpu))
-            if (d.get_info<sycl::info::device::name>().find("Arc") != std::string::npos) { dev = d; break; }
+            std::fprintf(stderr, "   backend=%d name=%s\n", (int)d.get_backend(),
+                         d.get_info<sycl::info::device::name>().c_str());
+        std::fprintf(stderr, "[xmx_init] SYCL_DEVICE_FILTER now = %s\n",
+                     getenv("SYCL_DEVICE_FILTER") ? getenv("SYCL_DEVICE_FILTER") : "(unset)");
+        sycl::device dev;
+        // the gate pairing (section 60) runs this dll IN THE SAME PROCESS as the shipped
+        // Vulkan runtime: SYCL then enumerates the A770 through several adapters, and an
+        // OpenCL-backed Arc would make get_native<ext_oneapi_level_zero> throw "Backends
+        // mismatch". Pick the Arc that IS Level Zero-backed; fall back to name-only for
+        // the standalone gates (their filter pins level_zero anyway, both paths agree).
+        for (auto& d : sycl::device::get_devices(sycl::info::device_type::gpu))
+            if (d.get_backend() == sycl::backend::ext_oneapi_level_zero &&
+                d.get_info<sycl::info::device::name>().find("Arc") != std::string::npos) { dev = d; break; }
+        if (dev.get_backend() != sycl::backend::ext_oneapi_level_zero)
+            for (auto& d : sycl::device::get_devices(sycl::info::device_type::gpu))
+                if (d.get_info<sycl::info::device::name>().find("Arc") != std::string::npos) { dev = d; break; }
+        std::fprintf(stderr, "[xmx_init] chosen: backend=%d name=%s\n",
+                     (int)dev.get_backend(), dev.get_info<sycl::info::device::name>().c_str());
         GD = new sycl::device(dev);
         GQ = new sycl::queue(dev);
         GERR[0] = 0;
@@ -86,19 +103,39 @@ int xmx_buf_create(unsigned long long bytes) { return xmx_buf_create_kind(bytes,
 // usable, no duplication step; cross-PROCESS would DuplicateHandle first, the extmem
 // path already does exactly that dance for semaphores). The recorders then eat the
 // producer's bytes IN PLACE -- zero host copies, the single world at the buffer level.
+static ze_driver_handle_t g_zdrv = nullptr;
 static ze_context_handle_t g_zctx = nullptr;
 static ze_device_handle_t  g_zdev = nullptr;
 int xmx_buf_import_win32(unsigned long long handle, unsigned long long bytes, int esz) {
     if (!GQ) FAILMSG("not initialised");
     if (!handle || !bytes || esz <= 0) FAILMSG("bad import request");
     if (!g_zctx) {
-        // pull the Level Zero handles out of the SYCL objects (probe_sycl_ze's proven
-        // form: get_native<ext_oneapi_level_zero>; the queue native is a variant, [0]).
-        try {
-            g_zctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(GQ->get_context());
-            g_zdev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(GQ->get_device());
-        } catch (const std::exception& e) { FAILMSG("get_native: %s", e.what()); }
-        if (!g_zctx || !g_zdev) FAILMSG("SYCL queue is not Level Zero-backed");
+        // NOT via SYCL get_native: in a process that also carries the shipped Vulkan
+        // runtime, this toolchain's SYCL enumerates the Arc through the OpenCL adapter
+        // (the paired-import gate proved it: backend=1 = opencl, mismatch on level_zero)
+        // even though its kernels still run. Own the ze world directly instead -- the
+        // section-18/59 probes' form: zeInit(GPU_ONLY), pick the Intel device, create our
+        // context. Same physical card, same driver, one more context in the process.
+        ze_result_t r0 = zeInit(ZE_INIT_FLAG_GPU_ONLY);
+        if (r0 != ZE_RESULT_SUCCESS) FAILMSG("zeInit: 0x%x", (unsigned)r0);
+        uint32_t nd = 0; zeDriverGet(&nd, nullptr);
+        std::vector<ze_driver_handle_t> ds(nd);
+        if (nd) zeDriverGet(&nd, ds.data());
+        for (uint32_t i = 0; i < nd && !g_zdev; ++i) {
+            uint32_t m = 0; zeDeviceGet(ds[i], &m, nullptr);
+            std::vector<ze_device_handle_t> dd(m); zeDeviceGet(ds[i], &m, dd.data());
+            for (uint32_t j = 0; j < m; ++j) {
+                ze_device_properties_t p = { ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES };
+                zeDeviceGetProperties(dd[j], &p);
+                if (p.type == ZE_DEVICE_TYPE_GPU && p.vendorId == 0x8086 &&
+                    std::strstr(p.name, "Arc")) { g_zdrv = ds[i]; g_zdev = dd[j]; break; }
+            }
+        }
+        if (!g_zdev) FAILMSG("no Intel Arc GPU visible to Level Zero in this process");
+        ze_context_desc_t cd = { ZE_STRUCTURE_TYPE_CONTEXT_DESC };
+        ze_result_t rc = zeContextCreate(g_zdrv, &cd, &g_zctx);
+        if (rc != ZE_RESULT_SUCCESS || !g_zctx) FAILMSG("zeContextCreate: 0x%x", (unsigned)rc);
+        std::fprintf(stderr, "[import] own ze context live (driver+Arc device found)\n");
     }
     ze_external_memory_import_win32_handle_t mi = { ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_WIN32 };
     mi.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_WIN32;
