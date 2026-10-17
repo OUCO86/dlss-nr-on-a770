@@ -1297,3 +1297,40 @@ work/one_frame_pair.npz（source 1920x1080x4 + 8 个 answer 平面=出货最终�
 **据此修正 §49 的 P1 定性**：P1 唯一目的=建立对拍安全网（新旧同输入 diff 量化画质风险），
 做完即进 P2 单一世界：**attention 环 int8 全接（补 BN=32 attnV 变体）、数据从桥接第一刻
 int8、旧引擎退役**，不是"只换 QKV 段然后长期共存"。
+
+## 51. P1 对拍网 GREEN（2026-10-17 19:5x）：真实权重下我的链 vs 旧 coopmat int8 链，误差同量级
+
+`p1_qkv_diff.py`：同一组 int8 输入（真实 block qkv_weight 量化 + 前辈激活构造
+standard_normal*0.3）喂两条链（work/libxmx.dll Vulkan + oneapi/libxmx_sycl.dll L0 同进程），
+byte-diff 最终 e4m3-as-f16。三块（block5/62/65, C=64 heads=2 windows=12）：
+
+| | diff 率 | 最大 abs | rms-to-x 旧 | rms-to-x 我 |
+|---|---|---|---|---|
+| Q | 13-15% | 0.125-0.5 | 0.0194 | 0.0197 |
+| K | 12.8-13% | 0.03125 | 0.00468 | 0.00477 |
+| V | 16-17% | 0.0625 | 0.00792 | 0.00812 |
+
+**读法（这才是正确的问法，§48 教训兑现）**：
+- **within-one(int8*scale vs x) 三块全 True（0/49152 bad）** = 我的核数值完全对，
+  int8+scale 精确还原 x。
+- 两条链 **rms-to-x 差仅 ~1.5-2.5%**（Q 0.0194→0.0197、K 0.0047→0.0048、V 0.0079→0.0081）
+  ——**我的链没有明显更差**，过渡税是这个量级。
+- diff 率 13-17% = e4m3 只有 3 位尾数，requant→publish 双舍入 vs 直接 publish 在
+  tie 附近翻 1 个 e4m3 ULP——最大 abs 0.03-0.06（=1 ULP of e4m3 near 1.0）完全符合。
+- **这个 2% 是纯 P1 边界税**（publish→re-quantize 往返）。P2 终态 attnV 直接吃
+  int8 probs + int8 V（列量化），**没有这趟往返**，税=0。
+
+⇒ 画质风险量化答案：P1 阶段过渡税 rms 增量 <3%，下游 cosine+softmax 吸收后更小；
+终态 P2/P3 归零。**进 LOP 值得一验**（用户裁决）。对拍网=p1_qkv_diff.py（入库，可复跑）。
+
+**踩坑记录（§41 警告我重踩）**：首跑 V=97% diff/rms 0.42——我在对拍网里把 gemm_qkv_v_i8
+的 scattered 输出当行主序 reshape 了（正是 §41 记过的"散射 buffer 当行主序读"）。修=
+un-scatter 到 linear 再比（核 §41 早已绿，改的是对比层）。三块 Q/K/V 统一到 linear 空间。
+
+**旧 dll 已重建**（10-16 的 libxmx.dll 缺 xmx_int8_ffn_init，源码有=构建时 def 落后）：
+备份 work/libxmx.dll.bak-1016 → tools/build_fused.bat 的确切命令（E 盘 MSVC+SDK，
+VULKAN_SDK 用仓库内 tools/lib + work/vulkan-headers）→ 前辈 test_gemm_int8_qkv.py
+14 case bit-identical 绿=旧侧可用。
+
+**下一步（§50 point 3 点名的正解）**：建 BN=32 attnV 变体（把 N=32 head_dim 的 attnV/outproj
+吃进 int8 直通），不再推给 megakernel。这是 P2 的第一块核工作。
