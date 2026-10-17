@@ -130,8 +130,14 @@ int main() {
         if (bad) return 1;
     }
 
-    // ---- speed: the oneDNN 71.9 shape and one more ----
-    for (auto cfg : std::vector<std::array<int, 3>>{{8192, 1024, 1024}, {4096, 4096, 4096}}) {
+    // ---- speed: EVERY major frame GEMM shape (by GFLOP from the ledger) vs the
+    // merged ideal shapes.  This is the "swap the engine" per-shape verdict: does
+    // ESIMD beat coopmat on the shapes the network actually produces?  All M%16==0,
+    // N%16==0, K%32==0.  coopmat reference TOPS from notes/onednn-vs-coopmat.
+    for (auto cfg : std::vector<std::array<int, 3>>{
+             {192, 4096, 1024}, {640, 512, 512}, {2560, 256, 256}, {960, 512, 512},
+             {768, 512, 512}, {192, 1024, 1024}, {32640, 64, 64}, {8640, 128, 128},
+             {240, 4096, 1024}, {8192, 1024, 1024}, {4096, 4096, 4096}}) {
         int M = cfg[0], N = cfg[1], K = cfg[2];
         std::vector<int8_t> hA((size_t)M * K), hB((size_t)K * N), hBp((size_t)K * N);
         for (size_t i = 0; i < hA.size(); ++i) hA[i] = (int8_t)((i * 7 + 3) % 201 - 100);

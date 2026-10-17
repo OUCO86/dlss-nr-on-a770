@@ -217,7 +217,9 @@ int main() {
     // speed: the true fused-requantize int8 output (NOT truncated) vs v1's int32
     // (9216x128x128=4.1) and v1 truncated-int8 (13.1).  wide producer constrains
     // BN==N==128, so only N=128 shapes here; K is the reduction dim, free.
-    for (auto cfg : std::vector<std::array<int, 3>>{{9216, 128, 128}, {8640, 128, 128}, {4096, 128, 512}}) {
+    // 130560x128x64 = l4 QKV real shape (section 23: v1-int32 269.4us/7.9 TOPS);
+    // M=130560=64*2040 divides BM=64 exactly, so v2 covers it with zero padding.
+    for (auto cfg : std::vector<std::array<int, 3>>{{9216, 128, 128}, {8640, 128, 128}, {4096, 128, 512}, {130560, 128, 64}, {130560, 128, 128}}) {
         int M = cfg[0], N = cfg[1], K = cfg[2];
         std::vector<int8_t> hA((size_t)M * K), hB((size_t)K * N), hAp((size_t)M * K), hBp((size_t)K * N);
         std::vector<float> col_scale(N, 0.001f);
