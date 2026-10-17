@@ -845,6 +845,19 @@ class Runtime:
         self._ffn_groups_wanted = (os.environ.get("NR_INT8_FFN_GROUPS", "0") != "0"
                                    and hasattr(self.lib, "xmx_rec_gemm_int8_batched"))
         self.int8_ffn_groups = self.int8_project and self._ffn_groups_wanted
+        # TEMPORARY image-quality scaffold (user ruling 2026-10-17): if work/l0_qkv
+        # exists, swap the game's QKV door to my L0 int8 chain so the user can see it in
+        # Lies of P. Not the shipping design -- delete the marker and this is a no-op.
+        # Wrapped so ANY failure leaves the shipped path untouched; the game always has
+        # a picture. See src/gpu/l0_qkv_scaffold.py.
+        if (ROOT / "work" / "l0_qkv").exists():
+            try:
+                import l0_qkv_scaffold
+                l0_qkv_scaffold.install_l0_qkv(self)
+                self._l0_scaffold = l0_qkv_scaffold
+            except Exception as exc:
+                print(f"  [l0_qkv scaffold] install failed, running shipped path: {exc!r}",
+                      flush=True)
 
     def set_int8(self, on):
         """Turn the integer graph on or off, the way `nr_settings.json` asks for it.

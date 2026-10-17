@@ -1496,3 +1496,35 @@ test_forward 特征构造）**：
 本节排序信号（非新类破坏）给足,**下一步=接 daemon 进 LOP 让用户眼睛做最终裁决**（唯一
 能越过蝴蝶地板的裁判），验完立即回主线（BN=128 出口折叠、megakernel 批 window、双引擎
 buffer 互操作）。
+
+## 58. (-4) bounce 崩溃归因实验（V0/V1/V2，2026-10-17 22:4x，全部实跑贴出）
+
+问题：scaffold 的 bounce 在 window QKV 处 `rt.submit()` 报 `resident fence wait (-4)`
+（=VkResult -4 = VK_ERROR_DEVICE_LOST，libxmx.c:3582 处 vkWaitForFences 失败）。
+
+一次一个变量的三组对照（脚本 src/bench/_v0_bounce_test.py/_v2_senior_test.py）：
+- **V0**（无 L0、无 bounce 触发，fuse_partition=True→bounce 全 skip）：`survived, bounces=0`
+  = 基线没事，bounces 计数守卫有效（没触发=不冒充触发）。
+- **V1**（无 L0、真 bounce：fuse_partition=False、在 gemm_qkv 处 submit→host round→begin）：
+  **崩 (-4)** ——崩溃与我的 L0 dll/六趟链**无关**，纯出货管线内的 mid-graph bounce 就崩。
+- **V2**（前辈 int8_bottleneck 的 global-block bounce 原样跑今天的树）：
+  `survived, operands quantised=32, head finite=True` ——**同款 submit-round-begin 在
+  global 块(31-38) 位置完全合法**。
+
+⇒ 归因钉死：**mid-graph submit 在 window 块的 QKV record 点不被支持，在 global 块支持**。
+前辈从未在 window 块内 bounce 过（他们的 window int8 路走 quantize_window/gemm_int8_qkv
+记录路径，不 bounce）。原因候选（未钉，调试它=深挖 arena/scratch-role 语义，成本大）：
+window scratch 布局里 qkv 输入与 k16 共享 arena role（qkv_epilogue 注释 xmxres.py 原话
+"the projection's input shares a scratch-arena role with k16... this one does not [finish
+before the next starts]"）+ mid-submit 撞上正在跨块复用的 role。
+
+**判决（脚手架路线 A=host-bounce 进 window QKV：放弃）**。剩下两条真路：
+- B：**双引擎 buffer import**（§49 P1 真形态）：daemon 进程里我的 L0 runtime 直接吃出货
+  buffer——需 Vulkan→L0 external-memory import 探针（§18 只测了 D3D12→L0 方向）。
+- C：**P2 直写**：改 record_qkv_projection 让它记**我的 recorder**——前提同样是 B 的
+  buffer 共享（id 空间互不相通）。
+B/C 同根=先过 Vulkan→L0 import 探针这一门（一个新 gate，可测、前辈 D3D12 先例逐字可抄）。
+
+教训固化：scaffold 三小时撞结构墙——**host-bounce 不是万能注入**，前辈的先例只在
+global 块成立；进游戏的正确接法从第一天就该是 buffer import 路线（§18 的门本来就是
+为它建的）。marker 已删（游戏 100% 出货态，本轮 LOP 无风险）。
