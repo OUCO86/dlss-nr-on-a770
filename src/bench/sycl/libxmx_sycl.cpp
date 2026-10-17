@@ -159,8 +159,8 @@ int xmx_rec_gemm_s8(int a, int b, int c, unsigned M, unsigned N, unsigned K) {
 int xmx_rec_gemm_s8rq(int a, int b, int c8, int col_scale, int new_scale,
                       unsigned M, unsigned N, unsigned K) {
     if (!g_recording) FAILMSG("not recording");
-    if (!M || !N || !K || (M % 128u) || (N != 64u && N != 32u) || (K % 32u))
-        FAILMSG("gemm_s8rq needs M%%128==0, N in {32,64}, K%%32==0");
+    if (!M || !N || !K || (M % 128u) || (N != 64u) || (K % 32u))
+        FAILMSG("gemm_s8rq needs M%%128==0, N==64, K%%32==0");
     auto ia = g_bufs.find(a), ib = g_bufs.find(b), ic = g_bufs.find(c8);
     auto ics = g_bufs.find(col_scale), ins = g_bufs.find(new_scale);
     if (ia == g_bufs.end() || ib == g_bufs.end() || ic == g_bufs.end() ||
@@ -175,21 +175,55 @@ int xmx_rec_gemm_s8rq(int a, int b, int c8, int col_scale, int new_scale,
         std::vector<int8_t> hA(na), hB(nb), hAp(na), hBp(nb);
         GQ->memcpy(hA.data(), Araw, na).wait();
         GQ->memcpy(hB.data(), Braw, nb).wait();
-        if (N == 64u) {
-            s8v3::pack_a(hA.data(), hAp.data(), (int)M, (int)K);
-            s8v3::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
-        } else {
-            s8v7::pack_a(hA.data(), hAp.data(), (int)M, (int)K);
-            s8v7::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
-        }
+        s8v3::pack_a(hA.data(), hAp.data(), (int)M, (int)K);
+        s8v3::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
         int8_t* dAp = sycl::malloc_device<int8_t>(na, *GQ);
         int8_t* dCp = sycl::malloc_device<int8_t>(nb, *GQ);
         GQ->memcpy(dAp, hAp.data(), na).wait();
         GQ->memcpy(dCp, hBp.data(), nb).wait();
-        if (N == 64u)
-            s8v3::gemm_s8(*GQ, dAp, dCp, cs, C8, ns, (int)M, (int)N, (int)K).wait();
-        else
-            s8v7::gemm_s8rq32(*GQ, dAp, dCp, cs, C8, ns, (int)M, (int)N, (int)K).wait();
+        s8v3::gemm_s8(*GQ, dAp, dCp, cs, C8, ns, (int)M, (int)N, (int)K).wait();
+        sycl::free(dAp, *GQ); sycl::free(dCp, *GQ);
+    });
+    return 0;
+}
+
+// int xmx_rec_gemm_s8rq32(int a, int b, int c8, int a_scale, int col_scale, int new_scale,
+//                         unsigned M, unsigned N, unsigned K)
+// v7's BN=32 fused-requant GEMM (route-B attnV/outproj, sections 50 point 3 / 52). N==32
+// (head_dim) -- the shape xmx_rec_gemm_s8rq's v3 (N==64) cannot carry and v1 (N%64) rejects;
+// building it instead of deferring to the megakernel is section 50's "don't lower the bar".
+// FOLDS BOTH scales: fp = float(acc) * a_scale[row] * b_scale[col] (shipped left-to-right).
+// attnV's A row scale = softmax_i8's probs ps_q along M (non-reduction); it does NOT cancel
+// the way the S1 chain's does -- attended[q,ch] = ps_q*vs_ch*acc, and new_scale must carry
+// ps_q for the downstream outproj to see the true amplitude (section 52's a_scale analysis;
+// the int8 BYTES are invariant to ps_q, only new_scale scales -- proved in the gate).
+int xmx_rec_gemm_s8rq32(int a, int b, int c8, int a_scale, int col_scale, int new_scale,
+                        unsigned M, unsigned N, unsigned K) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!M || !N || !K || (M % 128u) || (N != 32u) || (K % 32u))
+        FAILMSG("gemm_s8rq32 needs M%%128==0, N==32, K%%32==0");
+    auto ia = g_bufs.find(a), ib = g_bufs.find(b), ic = g_bufs.find(c8);
+    auto ias = g_bufs.find(a_scale), ics = g_bufs.find(col_scale), ins = g_bufs.find(new_scale);
+    if (ia == g_bufs.end() || ib == g_bufs.end() || ic == g_bufs.end() ||
+        ias == g_bufs.end() || ics == g_bufs.end() || ins == g_bufs.end()) FAILMSG("bad gemm_s8rq32 operand");
+    int8_t* Araw = (int8_t*)ia->second.p;
+    int8_t* Braw = (int8_t*)ib->second.p;
+    int8_t* C8 = (int8_t*)ic->second.p;
+    float* as = (float*)ias->second.p;
+    float* cs = (float*)ics->second.p;
+    float* ns = (float*)ins->second.p;
+    g_cmds.push_back([=]() {
+        size_t na = (size_t)M * K, nb = (size_t)K * N;
+        std::vector<int8_t> hA(na), hB(nb), hAp(na), hBp(nb);
+        GQ->memcpy(hA.data(), Araw, na).wait();
+        GQ->memcpy(hB.data(), Braw, nb).wait();
+        s8v7::pack_a(hA.data(), hAp.data(), (int)M, (int)K);
+        s8v7::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
+        int8_t* dAp = sycl::malloc_device<int8_t>(na, *GQ);
+        int8_t* dCp = sycl::malloc_device<int8_t>(nb, *GQ);
+        GQ->memcpy(dAp, hAp.data(), na).wait();
+        GQ->memcpy(dCp, hBp.data(), nb).wait();
+        s8v7::gemm_s8rq32(*GQ, dAp, dCp, as, cs, C8, ns, (int)M, (int)N, (int)K).wait();
         sycl::free(dAp, *GQ); sycl::free(dCp, *GQ);
     });
     return 0;

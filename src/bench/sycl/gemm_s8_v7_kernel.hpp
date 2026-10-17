@@ -56,9 +56,15 @@ static inline void pack_b(const int8_t* B, int8_t* Bp, int K, int N) {
                             B[(size_t)(kk32 * 32 + kq * 4 + j) * N + (ntile * 8 + nl)];
 }
 
-// C8 = int8 (M*N), new_scale = float[M], col_scale = float[N].
+// C8 = int8 (M*N), new_scale = float[M], col_scale = float[N]. a_scale = float[M] folded
+// into the dequantise (attnV's A row scale = softmax_i8's probs ps_q -- section 52: it is
+// the real per-query amplitude and must reach new_scale; passing an all-ones a_scale
+// degenerates to the col-scale-only case the s8rq-N32 gate already proved = consistency).
+// fp = float(acc) * a_scale[row] * b_scale[col], shipped left-to-right (island-3, the
+// same order requant_i8/softmax_i8 use), then the v3 row-requantize contract.
 static inline sycl::event gemm_s8rq32(sycl::queue& q, const int8_t* Ap, const int8_t* Bp,
-                                      const float* col_scale, int8_t* C8, float* new_scale,
+                                      const float* a_scale, const float* col_scale,
+                                      int8_t* C8, float* new_scale,
                                       int M, int N, int K) {
     int wg = (M / BM) * (N / BN);
     return q.submit([&](handler& h) {
@@ -113,10 +119,11 @@ static inline sycl::event gemm_s8rq32(sycl::queue& q, const int8_t* Ap, const in
             esimd::simd<float, 8> cs_lo = esimd::block_load<float, 8>(col_scale + gc, esimd::overaligned_tag<16>{});
             esimd::simd<float, 8> cs_hi = esimd::block_load<float, 8>(col_scale + gc + 8, esimd::overaligned_tag<16>{});
             for (int r = 0; r < 8; ++r) {
-                esimd::simd<float, 8> f0 = esimd::convert<float>(c00.select<8,1>(r*8).read()) * cs_lo;
-                esimd::simd<float, 8> f1 = esimd::convert<float>(c01.select<8,1>(r*8).read()) * cs_hi;
-                esimd::simd<float, 8> g0 = esimd::convert<float>(c10.select<8,1>(r*8).read()) * cs_lo;
-                esimd::simd<float, 8> g1 = esimd::convert<float>(c11.select<8,1>(r*8).read()) * cs_hi;
+                float as0 = a_scale[gr + r], as1 = a_scale[gr + 8 + r];   // per-row A scale
+                esimd::simd<float, 8> f0 = esimd::convert<float>(c00.select<8,1>(r*8).read()) * as0 * cs_lo;
+                esimd::simd<float, 8> f1 = esimd::convert<float>(c01.select<8,1>(r*8).read()) * as0 * cs_hi;
+                esimd::simd<float, 8> g0 = esimd::convert<float>(c10.select<8,1>(r*8).read()) * as1 * cs_lo;
+                esimd::simd<float, 8> g1 = esimd::convert<float>(c11.select<8,1>(r*8).read()) * as1 * cs_hi;
                 float pm0 = esimd::max(esimd::hmax<float,float,8>(esimd::abs(f0)),
                                        esimd::hmax<float,float,8>(esimd::abs(f1)));
                 float pm1 = esimd::max(esimd::hmax<float,float,8>(esimd::abs(g0)),
@@ -135,15 +142,16 @@ static inline sycl::event gemm_s8rq32(sycl::queue& q, const int8_t* Ap, const in
                 float rm0 = rmaxv[r], rm1 = rmaxv[8 + r];
                 float inv0 = (rm0 > 0.f) ? 127.0f / rm0 : 0.f;
                 float inv1 = (rm1 > 0.f) ? 127.0f / rm1 : 0.f;
+                float as0 = a_scale[gr + r], as1 = a_scale[gr + 8 + r];
                 if (wi_col == 0) { new_scale[gr + r] = rm0 / 127.0f; new_scale[gr + 8 + r] = rm1 / 127.0f; }
-                esimd::simd<float, 8> q00 = esimd::min(esimd::max(esimd::rnde<float,8>(esimd::convert<float>(c00.select<8,1>(r*8).read()) * cs_lo * inv0), lo127), hi127);
-                esimd::simd<float, 8> q01 = esimd::min(esimd::max(esimd::rnde<float,8>(esimd::convert<float>(c01.select<8,1>(r*8).read()) * cs_hi * inv0), lo127), hi127);
+                esimd::simd<float, 8> q00 = esimd::min(esimd::max(esimd::rnde<float,8>(esimd::convert<float>(c00.select<8,1>(r*8).read()) * as0 * cs_lo * inv0), lo127), hi127);
+                esimd::simd<float, 8> q01 = esimd::min(esimd::max(esimd::rnde<float,8>(esimd::convert<float>(c01.select<8,1>(r*8).read()) * as0 * cs_hi * inv0), lo127), hi127);
                 esimd::simd<int8_t, 8> o00 = esimd::convert<int8_t>(esimd::convert<int>(q00));
                 esimd::simd<int8_t, 8> o01 = esimd::convert<int8_t>(esimd::convert<int>(q01));
                 esimd::simd<int8_t, 16> ob0; ob0.select<8, 1>(0) = o00; ob0.select<8, 1>(8) = o01;
                 esimd::block_store<int8_t, 16>(C8 + (size_t)(gr + r) * N + gc, ob0, esimd::overaligned_tag<16>{});
-                esimd::simd<float, 8> q10 = esimd::min(esimd::max(esimd::rnde<float,8>(esimd::convert<float>(c10.select<8,1>(r*8).read()) * cs_lo * inv1), lo127), hi127);
-                esimd::simd<float, 8> q11 = esimd::min(esimd::max(esimd::rnde<float,8>(esimd::convert<float>(c11.select<8,1>(r*8).read()) * cs_hi * inv1), lo127), hi127);
+                esimd::simd<float, 8> q10 = esimd::min(esimd::max(esimd::rnde<float,8>(esimd::convert<float>(c10.select<8,1>(r*8).read()) * as1 * cs_lo * inv1), lo127), hi127);
+                esimd::simd<float, 8> q11 = esimd::min(esimd::max(esimd::rnde<float,8>(esimd::convert<float>(c11.select<8,1>(r*8).read()) * as1 * cs_hi * inv1), lo127), hi127);
                 esimd::simd<int8_t, 8> o10 = esimd::convert<int8_t>(esimd::convert<int>(q10));
                 esimd::simd<int8_t, 8> o11 = esimd::convert<int8_t>(esimd::convert<int>(q11));
                 esimd::simd<int8_t, 16> ob1; ob1.select<8, 1>(0) = o10; ob1.select<8, 1>(8) = o11;

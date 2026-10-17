@@ -56,3 +56,4 @@ echo "built libxmx_sycl.dll; running the gates from $RUNDIR:"
 ( cd "$RUNDIR" && SYCL_DEVICE_FILTER=level_zero:gpu "C:/Users/wangz/.workbuddy/binaries/python/envs/default/Scripts/python.exe" "$HERE/gate_requant_i8.py" )
 ( cd "$RUNDIR" && SYCL_DEVICE_FILTER=level_zero:gpu "C:/Users/wangz/.workbuddy/binaries/python/envs/default/Scripts/python.exe" "$HERE/gate_chain_scores.py" )
 ( cd "$RUNDIR" && SYCL_DEVICE_FILTER=level_zero:gpu "C:/Users/wangz/.workbuddy/binaries/python/envs/default/Scripts/python.exe" "$HERE/gate_chain_qkv.py" )
+( cd "$RUNDIR" && SYCL_DEVICE_FILTER=level_zero:gpu "C:/Users/wangz/.workbuddy/binaries/python/envs/default/Scripts/python.exe" "$HERE/gate_gemm_s8rq32.py" )

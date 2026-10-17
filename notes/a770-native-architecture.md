@@ -1362,3 +1362,32 @@ probs 行 scale ps_q 沿 M（非归约, 可从求和外提出）、V 列 scale v
 ⇒ 下一步 attnV 环尾集成（gate_chain_attnv）走 v1+requant_i8（全绿积木），串
 softmax_i8→attnV→requant_i8→attended，对 nr_model.cosine_attention 有界门。v7 的
 a_scale 扩展（把 requant 折进 attnV GEMM store）=P1 之后第一个 perf 刀。
+
+## 53. attnV 正确形态=v7 双-scale fused-rq（§52 漏判纠正，build 第 17 门）
+
+`gate_gemm_s8rq32.py` 全绿：5 形状 within-one+scale≤1ulp+divide-form byte-equal，
+外加**强不变性验证**——row17 的 a_scale×3.7：int8 字节完全不变 ✓、其余行 new_scale
+bit-identical ✓、被缩行 new_scale 严格 ×3.7 ✓；row0 ×0.5 同。
+
+**纠正 §52 的一处漏判（记教训）**：§52 说"attnV 走 v1+requant_i8"——**v1 核 N%64 拒
+N=32（head_dim），根本做不了 attnV**！§52 的 a_scale 分析推对了（ps_q 必须进
+new_scale），但选错了路径。正解=**v7 带双-scale requant**（我第一反应是对的，中途
+被"不破坏已绿 ABI"的顾虑带偏去撤改动，其实独立 recorder 就是零破坏增量）：
+- xmx_rec_gemm_s8rq **回退 N==64-only**（前辈 v3 ABI 一字不动，SKELETON_GEMM_RQ 门回归绿）；
+- v7 = 独立 `xmx_rec_gemm_s8rq32(a,b,c8,a_scale,col_scale,new_scale,M,N,K)` N==32,
+  fp=acc*a_scale[row]*b_scale[col] 左到右（island-3 同序）, v3 requantize 契约。
+- **这比"v1+requant_i8"更健康**：requant 折进 attnV GEMM 出口=独立 requant pass 消失
+  （§50 point 3"消除它、争取 100%"的直接兑现），N=32 原生，零 fp16 缝。
+- invariance 性质正是 attnV 链的正确性契约：ps_q 只进 scale 向量不碰量化字节 ⇒
+  softmax_i8 的 probs（含 ps_q）→ v7 attnV → attended(int8+new_scale×ps_q 累积) →
+  outproj 的 b_scale=该 new_scale, 一路 int8 无缝。
+
+**attnV/outproj 现在都有 fused int8 出口**：attnV = xmx_rec_gemm_s8rq32（本轮，
+window M=64 仍待 megakernel 批大 M；global M=640 现在就能用）；outproj N=channels∈{32,64,128}
+→ N=32 走 v7、N=64 走 v3 rq、N=128 走 v1+requant_i8（或 BN=128 变体=下一把 perf 刀）。
+
+十七门全绿。**下一步**（按依赖序）：
+1. attnV 环尾集成门（gate_chain_attnv）：真实 probs(int8+ps_q) + V int8 → v7 rq32 →
+   attended int8+scale → 对 nr_model 有界门（串通即整条 attention int8 链 GREEN）。
+2. v1→v7 合并后 requant_i8 只留 N=128 出口一个用场；BN=128 变体=perf 刀。
+3. P1 对拍网扩到 attention 段（旧 coopmat attention vs 新 int8 链，同输入 byte-diff）。
