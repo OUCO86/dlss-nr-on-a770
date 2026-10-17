@@ -1563,3 +1563,20 @@ sem_export/import/xsem 设施）排序。GATE 2/3 要证的是"同卡 device 内
 xmxres buf_create_exportable 现成）导 OPAQUE_WIN32 → 我的 libxmx_sycl 加一个
 `xmx_buf_import_win32` 拿设备 ptr → recorder 直接吃。这是核心层改动（归我），桥接不动。
 marker(未放)/scaffold bounce 保留为画质 diff 备用路（但撞 window arena 墙, §58, 优先设备共享）。
+
+## 60. 骨架 `xmx_buf_import_win32` 落地（设备指针共享原语；门数纠正=17）
+
+libxmx_sycl.cpp：`xmx_buf_import_win32(handle, bytes, esz)` = `get_native<ext_oneapi_level_zero>`
+取 SYCL-owned ze ctx/dev（probe_sycl_ze 先例逐字）→ `zeMemAllocDevice pNext=import_win32{
+OPAQUE_WIN32}` → 设备指针存进 g_bufs（Buf 加 imported 标志，destroy 走 zeMemFree 而非
+sycl::free）。def +xmx_buf_import_win32（现 29 导出行含 LIBRARY/EXPORTS 头=27 函数），
+build_sycl_dll.sh 补 //link ze_loader.lib（编译+回归全绿=运行时解析没问题）。踩的坑照原文修：
+ze 结构 handle 字段=`void*`（ze_api.h:8132，不需要 windows.h/HANDLE）、get_native 不解引用。
+
+**门数纠正**：build 实跑 **17 门全绿**（我此前记忆/commit 说"18 门"是数错——列表见 build
+脚本；数字以脚本实际 tail 为准，§57 纪律）。
+
+**下一步（配对真接线门）**：同进程双 dll——旧 runtime `buf_create_exportable`+`xmx_buf_handle`
+拿 NT handle → `MY.xmx_buf_import_win32` 拿设备 id → 我的 recorder 直吃该 id 数据 → 结果
+download 对 numpy 期望 bit 级。这才是 §59 GATE2/3 该测的正确形态（全 GPU 侧, 无 host-map
+竞态）。过了=P1 设备共享通路成立, 可以谈进游戏真接法。

@@ -35,7 +35,7 @@ print(f"def: {len(names)} exports")
 PYEOF
 
 # 2. compile
-"$SY/Library/bin/icx.exe" //nologo //Qstd=c++17 //O2 //fsycl //EHsc //DD_CRT_SECURE_NO_WARNINGS //Fe:libxmx_sycl.dll //LD libxmx_sycl.cpp //link //DEF:libxmx_sycl.def
+"$SY/Library/bin/icx.exe" //nologo //Qstd=c++17 //O2 //fsycl //EHsc //DD_CRT_SECURE_NO_WARNINGS //Fe:libxmx_sycl.dll //LD libxmx_sycl.cpp //link //DEF:libxmx_sycl.def ze_loader.lib
 
 # 3. stage + gate from oneapi/ (the SYCL runtime chain lives there)
 RUNDIR="E:/WorkBuddy/2026-10-09-04-20-55/oneapi"

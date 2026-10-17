@@ -15,6 +15,7 @@
 // extern "C" + .def keep the C ABI intact for BOTH consumers (ctypes + nr_replay's
 // GetProcAddress function pointers). See §20 + the abibridge gate for the proven base.
 #include <sycl/sycl.hpp>
+#include <level_zero/ze_api.h>
 #include "quantize_row_kernel.hpp"
 #include "publish_kernel.hpp"
 #include "cosine_tree_kernel.hpp"
@@ -25,6 +26,7 @@
 #include "gemm_s8_v5_kernel.hpp"
 #include "gemm_s8_v7_kernel.hpp"
 #include <cstring>
+#include <cstdint>
 #include <cstdio>
 #include <vector>
 #include <unordered_map>
@@ -35,8 +37,10 @@ static sycl::device* GD = nullptr;
 static char GERR[256] = {0};
 #define FAILMSG(...) do { std::snprintf(GERR, sizeof GERR, __VA_ARGS__); return -1; } while (0)
 
-// buffer table: int handle -> {device ptr, bytes, dtype-size}
-struct Buf { void* p; size_t bytes; size_t esz; };
+// buffer table: int handle -> {device ptr, bytes, dtype-size, imported}. An imported
+// pointer (xmx_buf_import_win32) aliases a buffer owned by the OTHER engine -- freeing
+// our import releases only our reference, the producer keeps the allocation alive.
+struct Buf { void* p; size_t bytes; size_t esz; bool imported = false; };
 static std::unordered_map<int, Buf> g_bufs;
 static int g_nextbuf = 1;
 
@@ -73,6 +77,43 @@ int xmx_buf_create_kind(unsigned long long bytes, int esz) {
 }
 int xmx_buf_create(unsigned long long bytes) { return xmx_buf_create_kind(bytes, 2); }
 
+// int xmx_buf_import_win32(unsigned long long handle, unsigned long long bytes, int esz)
+// P1 wiring (sections 58/59): take the OTHER engine's allocation as OUR device pointer.
+// The shipped runtime already exports OPAQUE_WIN32 NT handles for its buffers (libxmx
+// xmx_buf_exported / the extmem path); the probe (probe_vk_l0_import, section 59) proved
+// GATE 1 -- zeMemAllocDevice with pNext=import_win32{OPAQUE_WIN32} returns a device
+// pointer on this box (same A770, same daemon process -> the NT handle is directly
+// usable, no duplication step; cross-PROCESS would DuplicateHandle first, the extmem
+// path already does exactly that dance for semaphores). The recorders then eat the
+// producer's bytes IN PLACE -- zero host copies, the single world at the buffer level.
+static ze_context_handle_t g_zctx = nullptr;
+static ze_device_handle_t  g_zdev = nullptr;
+int xmx_buf_import_win32(unsigned long long handle, unsigned long long bytes, int esz) {
+    if (!GQ) FAILMSG("not initialised");
+    if (!handle || !bytes || esz <= 0) FAILMSG("bad import request");
+    if (!g_zctx) {
+        // pull the Level Zero handles out of the SYCL objects (probe_sycl_ze's proven
+        // form: get_native<ext_oneapi_level_zero>; the queue native is a variant, [0]).
+        try {
+            g_zctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(GQ->get_context());
+            g_zdev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(GQ->get_device());
+        } catch (const std::exception& e) { FAILMSG("get_native: %s", e.what()); }
+        if (!g_zctx || !g_zdev) FAILMSG("SYCL queue is not Level Zero-backed");
+    }
+    ze_external_memory_import_win32_handle_t mi = { ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_WIN32 };
+    mi.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_WIN32;
+    mi.handle = (void*)(uintptr_t)handle;
+    mi.name = nullptr;
+    ze_device_mem_alloc_desc_t dad = { ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC };
+    dad.pNext = &mi; dad.ordinal = 0;
+    void* p = nullptr;
+    ze_result_t r = zeMemAllocDevice(g_zctx, &dad, bytes, 256, g_zdev, &p);
+    if (r != ZE_RESULT_SUCCESS || !p) FAILMSG("zeMemAllocDevice import: 0x%x", (unsigned)r);
+    int id = g_nextbuf++;
+    g_bufs[id] = { p, (size_t)bytes, (size_t)esz, true };
+    return id;
+}
+
 int xmx_buf_upload(int id, const void* src, unsigned long long off, unsigned long long n) {
     if (!GQ) FAILMSG("not initialised");
     auto it = g_bufs.find(id); if (it == g_bufs.end()) FAILMSG("no such buffer");
@@ -93,7 +134,10 @@ int xmx_buf_zero(int id) {
 }
 int xmx_buf_destroy(int id) {
     auto it = g_bufs.find(id); if (it == g_bufs.end()) return 0;
-    if (GQ) sycl::free(it->second.p, *GQ);
+    if (it->second.imported)
+        zeMemFree(g_zctx, it->second.p);       // drop OUR reference; producer owns the memory
+    else if (GQ)
+        sycl::free(it->second.p, *GQ);
     g_bufs.erase(it); return 0;
 }
 

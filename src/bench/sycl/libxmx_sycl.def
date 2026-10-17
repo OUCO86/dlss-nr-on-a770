@@ -4,6 +4,7 @@ EXPORTS
     xmx_init
     xmx_buf_create_kind
     xmx_buf_create
+    xmx_buf_import_win32
     xmx_buf_upload
     xmx_buf_download
     xmx_buf_zero
@@ -13,5 +14,17 @@ EXPORTS
     xmx_rec_quant
     xmx_rec_gemm_s8
     xmx_rec_gemm_s8rq
+    xmx_rec_gemm_s8rq32
     xmx_submit
     xmx_rec_unary32
+    xmx_rec_unary_i8
+    xmx_rec_cosine_norm
+    xmx_rec_cosine_norm_q
+    xmx_rec_cosine_norm_i8
+    xmx_rec_softmax
+    xmx_rec_softmax_i8
+    xmx_rec_requant_i8
+    xmx_rec_gemm_qkv_v
+    xmx_rec_gemm_qkv_v_i8
+    xmx_rec_gemm_qkv_deq
+    xmx_rec_qkv_scatter
