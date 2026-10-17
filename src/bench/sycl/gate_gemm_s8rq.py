@@ -69,8 +69,8 @@ def golden(a, b, col_scale):
 
 def run(M, N, K, label):
     global fails
-    assert N == 64
-    rng = np.random.default_rng(11 + M + K)
+    assert N in (32, 64)
+    rng = np.random.default_rng(11 + M + K + N)
     a = rng.integers(-127, 128, size=(M, K), dtype=np.int8)
     b = rng.integers(-127, 128, size=(K, N), dtype=np.int8)
     col_scale = (0.001 * (np.arange(N) % 37 + 1)).astype(np.float32)
@@ -108,6 +108,12 @@ run(256, 64, 64, "small")
 run(8192, 64, 64, "l2")
 run(32640, 64, 64, "l3")
 run(130560, 64, 128, "l4-outproj")
+# BN=32 variant (v7, section 50 point 3): attnV P.V per-head, M=padded tokens (global
+# blocks satisfy BM=128; window M=64 waits for the megakernel), K=tokens, N=head_dim=32.
+run(640, 32, 640, "attnV-global-640")    # the 1920x1088 global block's real attnV
+run(256, 32, 256, "attnV-720p")          # 720p global block
+run(128, 32, 128, "attnV-small")         # smallest M the v7 geometry admits
+run(640, 32, 128, "outproj-32")          # C=32 window-block output projection (N=32,K=128)
 
 print(f"\nSKELETON_GEMM_RQ {'GREEN' if not fails else 'RED'} ({fails} fails)")
 sys.exit(1 if fails else 0)

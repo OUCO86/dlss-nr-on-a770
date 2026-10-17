@@ -1334,3 +1334,31 @@ VULKAN_SDK 用仓库内 tools/lib + work/vulkan-headers）→ 前辈 test_gemm_i
 
 **下一步（§50 point 3 点名的正解）**：建 BN=32 attnV 变体（把 N=32 head_dim 的 attnV/outproj
 吃进 int8 直通），不再推给 megakernel。这是 P2 的第一块核工作。
+
+## 52. attnV BN=32 fused-rq 核 GREEN + attnV 串联的 a_scale 分析（2026-10-17 20:0x）
+
+`gemm_s8_v7_kernel.hpp` = v3 fused-requantize 的 BN=32/NT=16 参数化（BM=128 不变、
+WI 8×2、SLM 10752B）。`xmx_rec_gemm_s8rq` 扩到 N∈{32,64}（ABI 不变、门控复用）。rq 门
+新增四形状全绿：attnV-global-640(640×32×640) / attnV-720p(256×32×256) / attnV-small(128×
+32×128) / outproj-32(640×32×128)，within-one + scale≤1ulp。十六门全绿。
+
+**§50 point 3 兑现**：N=32 缺口不再推给 megakernel——建了 BN=32 变体。window 块 per-head
+M=64 仍 <BM=128（那是 megakernel 批 window 到 M≥32640 的活, 不是核的活），但 global 块
+per-head M=padded tokens(640) 满足，outproj 同理 ⇒ attnV/outproj 的 int8 直通**现在就能建**。
+
+**attnV 串联的 a_scale 关键分析（写死防错）**：attnV=Σ_t probs[q,t]·V[t,ch]。归约轴=tokens。
+probs 行 scale ps_q 沿 M（非归约, 可从求和外提出）、V 列 scale vs_ch 沿 N（非归约）。
+真实 attended[q,ch]=ps_q·(Σ_t int8P·int8V)·vs_ch = ps_q·raw·vs_ch。
+- **v7 fused rq32 只 fold col_scale(vs)**，出口 requant 对 raw·vs 做 ⇒ 缺 ps_q 因子
+  （下游 outproj 拿到的 scale 少了 ps_q）。要用它串 attnV，**v7 必须先加 a_scale 支持**
+  （folding raw·ps_q·vs 再 requant）。
+- **已绿路径=v1 int32 GEMM + requant_i8**（§43！它吃 acc+a_scale+b_scale 双 scale,
+  requant 对 ps_q·raw·vs 真实值做）⇒ probs int8+行scale → v1 GEMM → requant_i8 →
+  attended int8+行scale → outproj。**零 fp16、零额外量化开销、完全单一世界健康**。
+- requant_i8 是 GEMM 出口的固有 requant（§8: epilogue 内免费的孤岛④数学），不是"额外
+  量化趟"。v7 fused 的额外价值=省掉这独立 pass（perf），但要先加 a_scale——列为后续
+  perf 优化, 不阻塞串联。
+
+⇒ 下一步 attnV 环尾集成（gate_chain_attnv）走 v1+requant_i8（全绿积木），串
+softmax_i8→attnV→requant_i8→attended，对 nr_model.cosine_attention 有界门。v7 的
+a_scale 扩展（把 requant 折进 attnV GEMM store）=P1 之后第一个 perf 刀。
