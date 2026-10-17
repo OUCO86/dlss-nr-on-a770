@@ -1059,10 +1059,14 @@ outproj 端到端对 nr_model.cosine_attention 有界门），然后 graph+D3D12
 - **FFN 的 int8 化 §27 已否证**（contract N=32 窄、expand K=32 浅=int8 最不适用的形状；
   且 tiled/0 那 130 趟 fp16 GEMM 转 int8 实测慢 0.26ms）。FFN 的 fp16 是"消灭不了"的部分。
 
-⇒ **路 B 精确落点**：把**独立 GEMM 段**（QKV projection、outproj、downsample/upsample、
-split_ff 的 project）接成 int8 直通（已建 13 门积木覆盖），**attention 保留前辈融合核**
-（它已健康、无 fp16 往返），FFN 保留 fp16（§27 否证 int8）。"能消灭的 fp16 都消灭"=
-消灭独立段之间的 publish/quantize 往返趟，不是把融合核拆成 int8 再拼回去。
+⇒ **§42 的"保留 attention fp16"结论作废（用户裁定优先，我下保守了）**：attention 的
+GEMM 是**大形状**（global 640×640×32 scores、640×1024×640 attnV），int8 在宽区赢 2-3.5×
+（width-sweep），正是该消灭的 fp16——前辈用 coopmat fp16 只因当时没有手写 int8 DPAS 能力，
+不是 int8 不划算。路 B 落点=**保留融合结构（scores 不落显存、无往返）但把 GEMM 引擎换成
+int8 DPAS**，复用已建的 cosine_i8/softmax_i8/V 列量化积木。FFN 保留 fp16（§27 已否证：
+contract N=32 窄、expand K=32 浅，int8 实测慢——这是"消灭不了"的部分，非偷懒）。
+"能消灭的 fp16 都消灭"=attention 大 GEMM 进 int8（消灭得了）+ 独立段 publish/quantize 往返
+（消灭得了）；FFN 算术受限区（消灭不了，§27 实测）。
 
 **下一步=接 daemon（用户进 LOP 的必经路）**：daemon 加载 coopmat 的 libxmx.dll + spv；
 路 B 第一期=让 daemon 加载我的 libxmx_sycl.dll，把独立 GEMM 段换成 int8 直通链，
