@@ -18,6 +18,7 @@
 #include "quantize_row_kernel.hpp"
 #include "publish_kernel.hpp"
 #include "gemm_s8_v1_kernel.hpp"
+#include "gemm_s8_v3_kernel.hpp"
 #include <cstring>
 #include <cstdio>
 #include <vector>
@@ -139,6 +140,43 @@ int xmx_rec_gemm_s8(int a, int b, int c, unsigned M, unsigned N, unsigned K) {
         GQ->memcpy(dAp, hAp.data(), na).wait();
         GQ->memcpy(dCp, hBp.data(), nb).wait();
         s8v1::gemm_s8(*GQ, dAp, dCp, C32, (int)M, (int)N, (int)K).wait();
+        sycl::free(dAp, *GQ); sycl::free(dCp, *GQ);
+    });
+    return 0;
+}
+
+// int xmx_rec_gemm_s8rq(int a, int b, int c8, int col_scale, int new_scale,
+//                       unsigned M, unsigned N, unsigned K)
+// v3's fused-requantize int8 GEMM through the skeleton pipeline. a,b raw int8; c8 int8
+// out; col_scale float[N] (the b_scale dequant); new_scale float[M] (the per-row output
+// grid). N must be 64 (v3's BN=64 whole-row constraint, section 24). Same host-pack
+// simplification as xmx_rec_gemm_s8 (path gate, not the timed-loop design).
+int xmx_rec_gemm_s8rq(int a, int b, int c8, int col_scale, int new_scale,
+                      unsigned M, unsigned N, unsigned K) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!M || !N || !K || (M % 128u) || (N != 64u) || (K % 32u))
+        FAILMSG("gemm_s8rq needs M%%128==0, N==64, K%%32==0");
+    auto ia = g_bufs.find(a), ib = g_bufs.find(b), ic = g_bufs.find(c8);
+    auto ics = g_bufs.find(col_scale), ins = g_bufs.find(new_scale);
+    if (ia == g_bufs.end() || ib == g_bufs.end() || ic == g_bufs.end() ||
+        ics == g_bufs.end() || ins == g_bufs.end()) FAILMSG("bad gemm_s8rq operand");
+    int8_t* Araw = (int8_t*)ia->second.p;
+    int8_t* Braw = (int8_t*)ib->second.p;
+    int8_t* C8 = (int8_t*)ic->second.p;
+    float* cs = (float*)ics->second.p;
+    float* ns = (float*)ins->second.p;
+    g_cmds.push_back([=]() {
+        size_t na = (size_t)M * K, nb = (size_t)K * N;
+        std::vector<int8_t> hA(na), hB(nb), hAp(na), hBp(nb);
+        GQ->memcpy(hA.data(), Araw, na).wait();
+        GQ->memcpy(hB.data(), Braw, nb).wait();
+        s8v3::pack_a(hA.data(), hAp.data(), (int)M, (int)K);
+        s8v3::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
+        int8_t* dAp = sycl::malloc_device<int8_t>(na, *GQ);
+        int8_t* dCp = sycl::malloc_device<int8_t>(nb, *GQ);
+        GQ->memcpy(dAp, hAp.data(), na).wait();
+        GQ->memcpy(dCp, hBp.data(), nb).wait();
+        s8v3::gemm_s8(*GQ, dAp, dCp, cs, C8, ns, (int)M, (int)N, (int)K).wait();
         sycl::free(dAp, *GQ); sycl::free(dCp, *GQ);
     });
     return 0;

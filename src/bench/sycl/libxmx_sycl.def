@@ -2,8 +2,8 @@ LIBRARY libxmx_sycl
 EXPORTS
     xmx_error
     xmx_init
-    xmx_buf_create
     xmx_buf_create_kind
+    xmx_buf_create
     xmx_buf_upload
     xmx_buf_download
     xmx_buf_zero
@@ -11,4 +11,7 @@ EXPORTS
     xmx_begin
     xmx_abort
     xmx_rec_quant
+    xmx_rec_gemm_s8
+    xmx_rec_gemm_s8rq
     xmx_submit
+    xmx_rec_unary32

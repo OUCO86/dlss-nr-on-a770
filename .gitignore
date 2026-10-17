@@ -49,4 +49,10 @@ backups/
 # Build logs
 /logs/
 
+# Probe/bench run logs written beside sources, and linker byproducts of the SYCL dll builds.
+src/bench/**/*.txt
+*.exp
+*.lib
+*.pdb
+
 backups-plan-*/

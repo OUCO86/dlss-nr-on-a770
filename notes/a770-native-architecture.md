@@ -547,3 +547,26 @@ nearbyint(fp/ns) clip±127），v2 在 9216x128x128 已 PASS，v3 在 N=64 真�
 下一步:1) v3 接进骨架 xmx_rec_gemm_s8 的 requant 变体(带 col_scale/new_scale),门控走 ctypes→
 numpy;2) N=128 的 BN=128 变体(QKV/FFNexp);3) 形状合并(§7⑥)把 attnV+outproj 等共享 M 的拼进
 一个 kernel 省读;4) graph+D3D12 接 daemon。
+
+## 25. 骨架接 v3 requant 变体（2026-10-17 10:0x）：SKELETON_GEMM_RQ 四形状 GREEN
+
+`xmx_rec_gemm_s8rq(a,b,c8,col_scale,new_scale,M,N,K)`：a/b 原始 int8，c8 int8 输出，
+col_scale float[N]（b_scale 反量化）、new_scale float[M]（行输出 grid）。约束 M%128==0、
+**N==64**（v3 的 BN=64 整行约束）、K%32==0。host-pack 与 xmx_rec_gemm_s8 同（路 B 门控，
+不是计时环设计）。`build_sycl_dll.sh` 现在跑四道门：quantize/unary/gemm_s8/gemm_s8rq，
+复跑全绿（小 256x64x64、l2 8192x64x64、l3 32640x64x64、l4-outproj 130560x64x128——最后一条是
+M=130560、**N=64**、K=128 的深 K 形状，rq 门全部 N=64，v3-rq 的 N=128 要等 BN=128 变体）。
+
+**门控准则的教训（第二次"跟自己造的参照打架"）**：我一开始给 rq 门自造了一个 numpy
+golden（重新推导 requantize 公式），两轮假失败——都是我的 numpy 参照在 tie 舍入/1-ULP
+上和核不一致，而不是核错。权威算术在 `gemm_s8_v3_bench.cpp` 里已经对 v2 参照 BIT-EXACT
+证明过了（0 wrong/0 scale），骨架门只需要**有界判据**：requant 值 within-one（worst
+0.50001 step）、new_scale ≤1ulp（max 1）。这正是前辈在 §20/§21 用过的同一族判据。规则
+固化：**核的精确算术在 bench 里对前辈参照证明一次；骨架/集成门用前辈的有界判据，绝不再
+自造 golden**。自造 golden=第三次死循环风险（用户已点名两次）。
+
+顺带清库：`.gitignore` 补 `src/bench/**/*.txt`（探针临时日志）+ `*.exp *.lib *.pdb`
+（链接器产物），工作区恢复干净。
+
+下一步不变：1) BN=128 变体(QKV 130560x128x384 / FFNexp 8640x128x128 这类 N=128 形状);
+2) 形状合并(§7⑥)——先离线表+TOPS 投影,不动调度器;3) graph+D3D12 接 daemon。
