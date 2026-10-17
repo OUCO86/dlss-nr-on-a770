@@ -738,3 +738,31 @@ requant 折 epilogue + int8 直出）已接骨架四形状 GREEN；quantize_row 
 下一步（正确）：建 **int8 直通链垂直切片**——一个完整 transformer 子图（quant→GEMM→fused-requant
 →GEMM→...）全 int8 贯穿，证明"零 quantize 独立趟 + 零 fp16 中间值"端到端数值正确（对出货 golden）。
 性能不 bench 旧链路；健康链路的每个形状用已测好的 width-sweep/§8 预期值投影。
+
+## 30. S1 链垂直切片 GREEN（2026-10-17 11:1x）：int8 直通链第一次端到端跑通
+
+`gate_chain_s1.py`（build_sycl_dll.sh 第 6 门）：一个 transformer 子图 = **一次 begin/submit
+里 3 趟**：rec_quant(fp16→int8+scale，入口唯一一次) → rec_gemm_s8rq(int8→int8，producer
+拥有整行、requant 折 epilogue) → rec_gemm_s8rq(**直接读上一趟的 int8 输出 pk2**，零中间
+quantize)。两形状（8192x64x64 / 8192x64x128）全 GREEN：
+
+- q0 门：scale≤1ulp、packed≤1、within-one（对 `int8_quant.quantise` 出货契约）；
+- rq2/rq3 门：前辈有界判据（within-one worst 0.50000 step、scale≤1ulp），且 **rq3 的参照
+  acc 用设备自己的 pk2 字节算**——即"上游 int8 输出被下游原样吃掉"是实测成立的结构事实。
+
+**这就是 §29 要建的东西的最小垂直切片**：旧链每层缝付一次 quantize_row（276 趟 3.09ms 的来源），
+这条链缝上付 0——producer 拥有整行、requant 在 epilogue 里做完（v3 已证）。row_scale_A 在
+int8 直通世界内部抵消（v2 数学已证），链上不出现。
+
+诚实边界（切片≠全链）：① 链长只有 2 个 GEMM 层，真实 transformer 还有 attention（softmax
+fp32 岛）/layernorm（inversqrt 岛）/K=32 单步（scores）没串进来；② N=64 只覆盖 attnV/
+outproj/scores 族，QKV 的 N=3×channels(≥192) 与 FFN expand 的两半流式还没接；③ 这是数值
+结构门（对出货 golden），不是帧性能——帧账按 §29 用已测好的 width-sweep/§8 预期值投影，
+最终由用户 LOP 实测。
+
+下一步（按收益账本追，§29 清单顺序）：
+1. **链加长**：把 publish/unary 核（已 GREEN）串进链尾（int8→e4m3/half publish 是 §9 孤岛④），
+   再把 K=32 单步 GEMM（scores 形态，v2 expand 先例）串进链中段——fp32 岛只在 epilogue 内。
+2. **N=192/384/768 的 QKV 形态 fused-requant**（真实 QKV N=3×channels，§28 钉死的语义）——
+   不是脑补的 128，是从 weight 形状表取的。
+3. 链成形后进 graph 提交形态（§17）+ D3D12 接 daemon（§18/§21 门已全绿）。
