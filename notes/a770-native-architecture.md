@@ -797,3 +797,32 @@ v2 expand 先例证过单步合法，直接门控验证；② QKV 真实 N=3×ch
 单迭代——§8 表"attn scores N=64 K=32"与 §9"K=32 是 coopmat 原生单步（TK=32 一条 MMA），
 staged 拒 K=32 是旧闸门非硬件"的断言，在**新核**上兑现：rq2 8192x64x32 within-one、
 q0/tail 全绿。v2 expand 先例（coopmat 侧）+ 本条（ESIMD 侧）= K=32 单步两端都有实测。
+
+## 33. QKV epilogue 移植前的参考核查（2026-10-17 12:0x，用户提醒"查 Intel 工程师参考没"）
+
+**查了，三层权威都在场**：
+1. **Blackwood 前辈 skill 包**（refs/a770-skill/）：techniques.md 有 **f32 RMSNorm ladder**
+   （:191，row 归约 champion=每 work-item 一行、256B block_load、SIMD32 无跨 lane reduce）
+   和 **f32 Softmax ladder**（:225，一 workgroup 一行+SLM staging，group reduce）——
+   Intel 侧 ESIMD 归约/归一化的已验证形态。⚠ 但那些是**性能阶梯**，出货 cosine 是
+   **bit-exact fragment tree**（vendor 定义），不能套 rsqrt 近似——前辈注释明说
+   "the only way to be sure they agree is one copy of the arithmetic"。
+2. **出货 GLSL 权威**：`qkv_epilogue.glsl`（77 行，逐行可搬）+ `cosine_tree.glsl`（58 行，
+   cosine_reciprocal/vit_reciprocal 的 half hfma/hadd 蝶形树+floor+half_round(inversesqrt)）。
+   关键结构事实（epilogue 头注）：列块 BN=32 对齐 ⇒ **一个 32 列块=恰好一个 head**，
+   归一化在 workgroup 内完成，无需跨组——BN=64 的 v3 主循环天然含 2 个完整 head ✓。
+3. **前辈的 numpy bit-exact golden**：`nr_model.vendor_cosine_normalize`（:242，同树逐 op）、
+   `vendor_cosine_publish`（:282，scale 乘+e4m3）、`_vit_norm`（:683）；
+   门控先例=`test_gemm_int8_qkv.py`——**网格技巧：整数×2^-8 让 int8 与 fp16 的 acc 精确相等
+   ⇒ epilogue 可以 bit-exact 门控**（不碰精度问题，精度另有 qkv_scale_spread/int8_quality）。
+   帧内 QKV 形状全表在其 :34（(windows,tokens,channels) 7 组）。
+
+**移植设计（照三层权威，不发明）**：
+- `cosine_tree_kernel.hpp`：SYCL 逐字搬 cosine_reciprocal/vit_reciprocal——hmul/hadd/hfma
+  = cr_mul/cr_add/qr_half_round（publish_kernel 现成，precise=无收缩 ✓）；
+  inversesqrt=fdiv_rn(1.0f, sycl::sqrt(norm))（sqrt IEEE 精确 + fdiv_rn 正确舍入，
+  对 golden 的 1/sqrt 再 half_round；icx 降级坑已知→必须 fdiv_rn）；VIT_ROOT=5.65625 常量照搬。
+- 先做 **cosine 独立 bit-exact 门**（(rows,32) f32→归一化 f32，对 vendor_cosine_normalize，
+  纯 SYCL 每 WI 一行=RMSNorm ladder 形态）——这是 attention 岛②的积木，QKV/attention 共用。
+- 再 QKV epilogue 进 v3 主循环：BN=64=2 head ✓；三输出 (window,head,token,32) 布局按
+  epilogue :60-75 的 at 公式；门用前辈网格技巧（int×2^-8）+ vendor_cosine_publish bit-exact。
