@@ -1217,3 +1217,25 @@ absmax/127（非常数）**。纪律=下游 golden 必须用**设备自己的上
 QKV→(attention 暂走 coopmat)→outproj** 用我的 int8 链跑通，对出货 golden 数值门控，用户在
 LOP 里看这一块画质。验证"int8 直通链在真实网络里跑起来且不坏画面"后，再逐块扩。
 这比路 A 的 95 函数全重写快得多地到达"用户能进游戏验"的目标，且不碰桥接层。
+
+## 48. 真实权重 int8 代价诊断（2026-10-17 16:5x）——诚实解读，不是判决
+
+用 `work/mlxw/dlssnr-logical.safetensors` 真实 block10 qkv_weight (128,384) 跑 int8-GEMM
+vs float-GEMM：**合成激活** normal(0,1)，非真实帧激活。结果：
+- QKV product rel-err: mean 0.085 / p50 0.0098 / p99 0.63（max 6948=近零分母伪影）
+- proj abs-err / proj rms = **0.0079**（这个才是下游 cosine 归一化后真正相关的量）
+- 对照：e4m3 容器 rel-err mean 0.024（旧链 publish 已经在付的）
+
+**为什么这不能当"路 B 伤画质"的结论（防我第六次乱推翻）**：
+1. **激活是合成的**——真实帧激活分布不同（有 layernorm、有特定动态范围），误差不能外推。
+2. **出货帧本来就在跑 int8 QKV**（frame-ledger: gemm_int8_qkv 16 行，NR_INT8_QKV 开）——
+   int8-GEMM 的误差**旧链已经在付**，不是我链新增的。我链与旧链的差别只在**缝上形态**
+   （int8→int8 requant vs int8→e4m3→int8），不是 int8-GEMM vs float-GEMM。
+3. 这个诊断比的是"int8-GEMM vs float-GEMM"，**问错了问题**。真正要比的是
+   "我的 requant-at-seam vs 旧链的 e4m3-at-seam"——两者都是 int8-GEMM，只差中间容器。
+4. **画质判决=用户 LOP 实测**（用户明说"我得进游戏确认画质"）。合成诊断只能定方向、
+   不能定画质。
+
+⇒ 正确用法：abs-err/rms=0.0079 说明 int8 直通链的**绝对误差量级**在 1% 内（相对投影
+rms），与旧链 e4m3 容器同量级——**没有明显更差**，值得进 LOP 验。下一步不是继续
+合成诊断（会误导），是**接 daemon 跑真实帧**（真实激活 + 用户看画面）。
