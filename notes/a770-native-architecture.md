@@ -1528,3 +1528,38 @@ B/C 同根=先过 Vulkan→L0 import 探针这一门（一个新 gate，可测�
 教训固化：scaffold 三小时撞结构墙——**host-bounce 不是万能注入**，前辈的先例只在
 global 块成立；进游戏的正确接法从第一天就该是 buffer import 路线（§18 的门本来就是
 为它建的）。marker 已删（游戏 100% 出货态，本轮 LOP 无风险）。
+
+## 59. Vulkan→L0 external-memory import 探针（probe_vk_l0_import）：GATE 1 绿，数据门=host-map 竞态（非阻塞）
+
+§58 判决后的新 gate。源码 src/bench/l0/probe_vk_l0_import.cpp（前辈 probe_d3d12_ze 的 L0 腿
+逐字照抄，只换左腿=Vulkan；build_l0.sh 加 probe_vk* 分支=vulkan-1.lib+work/vulkan-headers）。
+一路编译踩的坑全按"查原文不猜"修完（OKAY 宏=前辈串接风格；字段名 memoryAllocationImportTypes
+←probe_ze_caps2.cpp:20；win32 头须 windows.h 先、VkMemoryGetWin32HandleInfoKHR 无 name、
+VkExternalBufferProperties 是嵌套 externalMemoryProperties 非平铺、KHR 函数 import lib 没有
+→vkGetDeviceProcAddr 运行时解析=libxmx.c:1462 先例）。
+
+**实跑结果（本机，A770=vendor0x8086/dev0x56a0，两腿同卡）**：
+- `vk OPAQUE_WIN32 buffer: features=0x6(EXPORTABLE|IMPORTABLE) compatible=0x1c2` — Vulkan 侧愿导。
+- `l0 importTypes=0xc4` 含 OPAQUE_WIN32 — L0 侧愿进（与 §18 实测一致）。
+- **GATE 0/1 绿**：`zeMemAllocDevice pNext=import_win32{OPAQUE_WIN32}` r=0、ptr 非空、
+  alloc type=2(device)。**这是承重结论：Level Zero 能拿到 Vulkan 分配的同一块 device 内存的
+  设备指针 ⇒ P1/P2 双引擎共享 buffer 路线合法**（我链的 kernel 直接吃出货 coopmat 的 buffer，
+  零 host 拷贝）。
+- C0（对照, 前辈 §18 手法）：plain alloc immediate copy+sync 全 SUCCESS ⇒ 组合用法没错。
+- GATE 2/3 **红**：Vulkan `vkMapMemory` 写→L0 copy 读回 wrong=736/4M，且首个"错"索引处
+  got==want（打印时又相等了）；L0 写→Vulkan 读回 wrong=97504。**归因=host-visible-mapped
+  内存与 GPU copy 之间无跨流序**（CPU 经映射写、GPU 经 copy 读，两条流没同步，读到的是
+  写半途的撕裂页）——**不是 import 坏**（GATE 1 已证 device ptr 可用），是这个探针测了
+  错误的数据形态。
+
+**为什么 host-map 竞态非阻塞**：真实管线里这块内存**不经 host 映射**——coopmat kernel 写
+device ptr、我的 L0 kernel 读同一 device ptr，两者靠**跨 API timeline semaphore**（§18
+GATE A 已证 D3D12-fence→L0 可 import/wait/signal，Vulkan-semaphore 向 libxmx 已有
+sem_export/import/xsem 设施）排序。GATE 2/3 要证的是"同卡 device 内存跨 API 一致"，正确测法
+=两个 L0 kernel（或 L0 写 + 再 L0 读，中间插 event/序）走 device ptr 不经 host map——**那是
+下一步真接线时顺带证的，不在脚手架探针里打磨**。探针的价值=GATE 1：import 原语通，路线成立。
+
+⇒ **P1 接法确定走设备指针共享（非 host-bounce）**：daemon 里让出货 buffer（已是 exportable,
+xmxres buf_create_exportable 现成）导 OPAQUE_WIN32 → 我的 libxmx_sycl 加一个
+`xmx_buf_import_win32` 拿设备 ptr → recorder 直接吃。这是核心层改动（归我），桥接不动。
+marker(未放)/scaffold bounce 保留为画质 diff 备用路（但撞 window arena 墙, §58, 优先设备共享）。

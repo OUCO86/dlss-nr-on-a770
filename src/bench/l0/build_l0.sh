@@ -19,8 +19,18 @@ export LIBPATH="$LIB"
 
 src="$1"; out="$2"; shift 2 2>/dev/null || true
 [ -f "$src" ] || { echo "no such src: $src"; exit 1; }
+# the Vulkan leg's headers (work/vulkan-headers) join INCLUDE only when the source
+# names vulkan.h; the import library is repo-local (tools/lib/vulkan-1.lib, the same
+# one build_fused.bat links libxmx against -- no Vulkan SDK required).
+VKROOT="E:/WorkBuddy/2026-10-09-04-20-55"
+case "$src" in *probe_vk*)
+    export INCLUDE="$VKROOT/work/vulkan-headers/include;$INCLUDE"
+    export LIB="$VKROOT/tools/lib;$LIB"; export LIBPATH="$LIB"
+    ;;
+esac
 libs="d3d12.lib dxgi.lib ze_loader.lib"
 case "$src" in *caps*) libs="ze_loader.lib";; esac
+case "$src" in *probe_vk*) libs="vulkan-1.lib ze_loader.lib";; esac
 echo "icx -> $out ($libs)"
 "$SY/Library/bin/icx.exe" //nologo //Qstd=c++17 //O2 //EHsc "//Fe:$out" "$src" //link $libs
 
