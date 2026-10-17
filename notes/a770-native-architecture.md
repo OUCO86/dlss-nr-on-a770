@@ -1182,3 +1182,38 @@ absmax/127（非常数）**。纪律=下游 golden 必须用**设备自己的上
 
 下一步=**接 daemon**（用户进 LOP 必经路）：双引擎共存形态（§44 末：95 函数 ABI vs 25 导出，
 第一期只把 QKV 段换 int8 链、其余走 coopmat，buffer 跨设备共享=§18 门已绿）。
+
+## 47. 接 daemon 的 ABI 现实（2026-10-17 16:4x，读 xmxres.py Runtime:719-849）
+
+读出货 Runtime.__init__ 坐实三件事，它们决定接入方式：
+
+1. **xmxres.py 调 95 个 libxmx 函数**，全是 **Vulkan coopmat** 实现：graph_capture/graph_run、
+   buf_create_exportable、sem_export/import、extmem_wait、各 *_init（int8/staged32/tiled32/
+   tiled8/ffn/global_attention/quant/residual）、rec_gemm_int8_qkv/_batched/_residual、
+   rec_copy/rec_quant_window。我的 libxmx_sycl.dll 只 25 导出，且**函数语义不同**
+   （我的是多趟 int8 直通链，出货的是单 coopmat 核）。
+
+2. **出货 int8 路径默认 OFF**（`NR_INT8_PROJECT=0`，:849）——前辈已把 coopmat int8 做出来
+   但默认关，注释："Off until its accuracy bill is paid for at this extent"。游戏里开不开
+   由 nr_settings.json（面板）决定。**这不是推翻路 B**——前辈的 coopmat int8 和我的 ESIMD
+   int8 直通链是不同实现，画质代价不同，用户要验的正是我的链。但它说明：接 daemon 时
+   "int8 开不开"是既有开关，我的链要接进这个开关体系。
+
+3. **两套设备上下文**：出货=Vulkan（graph/sem/exportable buffer），我=SYCL/Level Zero。
+   §18 门已绿=D3D12↔L0 互操作（fence+mem import BIT-EXACT）可行，即两引擎 buffer 可共享。
+
+⇒ **接 daemon 两条路（需用户定）**：
+- **路 A（C 侧全重写，Python 不动）**：让 libxmx_sycl.dll 实现出货 xmxres.py 期望的 95 个
+   旧函数名（Vulkan→L0 逐个换实现），保持 xmxres.py/nr_resident.py 一字不改。符合"桥接层
+   不动"最严格解读。代价：要把我的多趟 int8 链红利**塞进旧单核函数语义**（rec_gemm_int8_qkv
+   一个函数=我 6 趟链），且补 70 个 buffer/graph/sem 的 L0 实现。工作量最大、最保守。
+- **路 B（Python 核心层也重写，调我的新链函数）**：xmxres.py 是"核心层"（工作记忆：核心层
+   完全归我重写），改它调我的 rec_gemm_qkv_v_i8/cosine_norm_i8/softmax_i8/requant_i8 等新
+   函数，直接兑现 int8 直通链。桥接层（dxgi.dll/OptiScaler）仍不动。代价：要重建整个网络
+   的 Python 记录逻辑（不只 QKV），且接 graph(§17)+D3D12 互操作(§18) 让输入输出跨进程传。
+   工作量集中在"把 16 门链拼成整网络 + 接进程边界"，不重复造 buffer/graph 轮子。
+
+**我的推荐=路 B 的最小切片**：先让 daemon 加载 libxmx_sycl.dll，把**一个真实 block 的
+QKV→(attention 暂走 coopmat)→outproj** 用我的 int8 链跑通，对出货 golden 数值门控，用户在
+LOP 里看这一块画质。验证"int8 直通链在真实网络里跑起来且不坏画面"后，再逐块扩。
+这比路 A 的 95 函数全重写快得多地到达"用户能进游戏验"的目标，且不碰桥接层。
