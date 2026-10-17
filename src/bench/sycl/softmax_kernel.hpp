@@ -75,4 +75,66 @@ inline auto softmax_kernel() {
     };
 }
 
+// route-B block 2 (section 38/39): the scores seam's softmax, int8 all the way out.
+// Input = the int32 accumulator of Q.K^T (the v1 GEMM's C), per-row q_scale, per-column
+// (key) k_scale, and the attention bias -- the dequantise (island-3, cr_mul left-to-right
+// like the shipped store path) and the bias add (the senior's f32 tile add,
+// window_attention.comp:94-103) happen at island-1's entrance, then the SAME affine +
+// bit-pair + sequential-sum + reciprocal chain as the gated softmax kernel above (line
+// by line identical), then instead of the e4m3 container: x = half_round(w*recip) (the
+// golden's pre-e4m3 value, exact in f16 -- scratch re-used), rmax over the row from
+// REGISTERS (free), and v3's requantize contract (inv=127/rmax, rint, clip +-127,
+// scale=rmax/127) -> int8 probs + row scale straight into the attnV rq GEMM. The e4m3
+// publish + the quantize_row before attnV both die at this seam.
+inline auto softmax_i8_kernel() {
+    return [](const int32_t* acc, const float* qs, const float* ks, const float* bias,
+              sycl::half* scratch, signed char* out8, float* scale,
+              unsigned rows, unsigned cols) {
+        return [=](sycl::item<1> it) {
+            unsigned r = (unsigned)it.get_id(0);
+            if (r >= rows) return;
+            const int32_t* arow = acc + (size_t)r * cols;
+            const float* brow = bias + (size_t)r * cols;
+            sycl::half* wrow = scratch + (size_t)r * cols;
+            float qsr = qs[r];
+            float total = 0.0f;
+            for (unsigned c = 0; c < cols; c += 2u) {
+                float l0 = cr_add(cr_mul(cr_mul((float)arow[c], qsr), ks[c]), brow[c]);
+                float l1 = cr_add(cr_mul(cr_mul((float)arow[c + 1u], qsr), ks[c + 1u]), brow[c + 1u]);
+                float a0 = cr_add(cr_mul(qr_half_round(l0), SOFT_SCALE), SOFT_BIAS);
+                float a1 = cr_add(cr_mul(qr_half_round(l1), SOFT_SCALE), SOFT_BIAS);
+                a0 = sycl::min(sycl::max(a0, SOFT_LO), SOFT_HI);
+                a1 = sycl::min(sycl::max(a1, SOFT_LO), SOFT_HI);
+                uint16_t b0 = sycl::bit_cast<uint16_t>(sycl::half(a0));
+                uint16_t b1 = sycl::bit_cast<uint16_t>(sycl::half(a1));
+                uint32_t packed = (uint32_t)b0 | ((uint32_t)b1 << 16);
+                uint32_t tr = (packed << 5) + SOFT_MAGIC;
+                sycl::half h0 = sycl::bit_cast<sycl::half>((uint16_t)(tr & 0xFFFFu));
+                sycl::half h1 = sycl::bit_cast<sycl::half>((uint16_t)((tr >> 16) & 0xFFFFu));
+                total += (float)h0;
+                total += (float)h1;
+                wrow[c] = h0; wrow[c + 1u] = h1;
+            }
+            float trh = (float)sycl::half(total);
+            float recip = (float)sycl::half(sycl::ext::intel::math::fdiv_rn(1.0f, trh));
+            float rmax = 0.0f;
+            for (unsigned c = 0; c < cols; ++c) {
+                float x = qr_half_round(cr_mul((float)wrow[c], recip));
+                wrow[c] = sycl::half(x);
+                float aa = x < 0.0f ? -x : x;
+                if (aa > rmax) rmax = aa;
+            }
+            float ns = rmax / 127.0f;
+            float inv = (rmax > 0.0f) ? 127.0f / rmax : 0.0f;
+            signed char* orow = out8 + (size_t)r * cols;
+            for (unsigned c = 0; c < cols; ++c) {
+                float x = (float)wrow[c];
+                float q = sycl::min(sycl::max(sycl::rint(x * inv), -127.0f), 127.0f);
+                orow[c] = (signed char)(int)q;
+            }
+            scale[r] = ns;
+        };
+    };
+}
+
 } // namespace smax

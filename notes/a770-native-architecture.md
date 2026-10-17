@@ -988,3 +988,26 @@ window 路径 vendor_cosine_normalize 内部自带 half_round(:243) 所以幂等
 
 **下一步（§38 积木 2）**：scores GEMM=rq(K=32) 吃 int8 Q/K → dequantise+bias →
 f32 logits → softmax 直出 int8 probs+行 scale（岛①出口同样寄存器行-max 免费）。
+
+## 40. 路 B 积木 2 GREEN：softmax_i8（scores 缝端到端 int8 直出，五组有界全绿）
+
+`softmax_i8_kernel`（softmax_kernel.hpp）+ `xmx_rec_softmax_i8` + `gate_softmax_i8.py`
+（build 第 12 门）。五组全绿（within-one worst 0.50000 step + scale≤1ulp）：
+256x64 无/有 bias（window）、128x128（global）、64x256（vit）、2048x64 有 bias（R8a 大 M）。
+
+**这条缝的完整形态**（旧链=QKV publish e4m3-half → scores fp16 coopmat → dequant f32 →
+softmax → e4m3 容器 → attnV 前 quantize_row；新链）：
+int32 acc(QK^T, rq 核 §32 已绿) + q_scale[rows] + k_scale[cols] + bias
+→ dequantise(cr_mul 左到右, 岛③) + bias f32 tile add(前辈 :94-103 先例)
+→ **已绿 softmax 链逐行复用**（affine/bit-pair/顺序 f32 求和/倒数, §37 对 vendor bit-exact）
+→ x=half_round(w·recip)（golden 的 e4m3 前值——路 B 删掉 e4m3 容器本身）
+→ 寄存器行-max 免费 → v3 requantize 契约 → **int8 probs + 行 scale 直出**喂 attnV rq GEMM。
+
+golden=vendor_approximate_softmax 链重放到 e4m3 前（用 nr_model 自己的 _half_rounded/
+位变换/f16-dtype 行和/f32 倒数——§37 权威步骤，无新造）。网格技巧(q8,k8 整数×2^-8 ⇒
+deq=acc·2^-16 精确) ⇒ 只有末端 requantize 有损 ⇒ 有界判据（同 rq/cosine_i8 门）。
+
+**路 B 进度**：积木 1=cosine_norm_i8(§39) ✓ 积木 2=softmax_i8(本轮) ✓。
+下一步=积木 3：QKV V 支改**列量化** int8（§38 钉死的坑：attnV 归约维=tokens，V 的
+per-token scale 进不了累加和 ⇒ V 必须按 (window,channel) 列量化；v3 的 SLM atomic-fmax
+转置版，每列跨行归约组内完成）。然后积木 4=attnV rq GEMM 串整环。

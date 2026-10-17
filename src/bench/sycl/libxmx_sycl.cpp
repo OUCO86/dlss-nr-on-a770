@@ -311,6 +311,41 @@ int xmx_rec_softmax(int source, int dst, unsigned rows, unsigned cols) {
     return 0;
 }
 
+// int xmx_rec_softmax_i8(int acc, int q_scale, int k_scale, int bias, int out8, int scale,
+//                        unsigned rows, unsigned cols)
+// route-B block 2 (section 38): scores seam -- int32 accumulator + row/col scales + bias
+// -> dequantise+bias (island-3/4 at island-1's entrance) -> the gated affine/bit-pair/
+// sum/recip chain -> register row-max -> int8 probs + row scale (v3's requantize contract).
+// acc is int32 (the v1 GEMM's C), q_scale float[rows], k_scale float[cols], bias f32
+// rows x cols (pass a zero buffer when the head has no bias), out8 int8 rows x cols,
+// scale float[rows]. cols even.
+int xmx_rec_softmax_i8(int acc, int q_scale, int k_scale, int bias, int out8, int scale,
+                       unsigned rows, unsigned cols) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!rows || !cols || (cols & 1u)) FAILMSG("softmax_i8 needs rows>0, even cols");
+    auto ia = g_bufs.find(acc), iq = g_bufs.find(q_scale), ik = g_bufs.find(k_scale);
+    auto ib = g_bufs.find(bias), io = g_bufs.find(out8), isc = g_bufs.find(scale);
+    if (ia == g_bufs.end() || iq == g_bufs.end() || ik == g_bufs.end() ||
+        ib == g_bufs.end() || io == g_bufs.end() || isc == g_bufs.end()) FAILMSG("bad softmax_i8 operand");
+    const int32_t* ap = (const int32_t*)ia->second.p;
+    const float* qp = (const float*)iq->second.p;
+    const float* kp = (const float*)ik->second.p;
+    const float* bp = (const float*)ib->second.p;
+    signed char* op = (signed char*)io->second.p;
+    float* scp = (float*)isc->second.p;
+    g_cmds.push_back([=]() {
+        // scratch holds each row's pre-requantize half values between the sum pass and the
+        // row-max/requantize pass; every work-item touches only its own row, so no barrier.
+        // (The megakernel form keeps them in registers; this is the correctness-first path
+        // gate, same staged rhythm as the rest of the skeleton.)
+        sycl::half* scratch = (sycl::half*)sycl::malloc_shared((size_t)rows * cols * 2, *GQ);
+        GQ->parallel_for(sycl::range(rows),
+                         smax::softmax_i8_kernel()(ap, qp, kp, bp, scratch, op, scp, rows, cols)).wait();
+        sycl::free(scratch, *GQ);
+    });
+    return 0;
+}
+
 // int xmx_rec_gemm_qkv_v(int a, int b, int v, int a_scale, int b_scale,
 //                        unsigned M, unsigned channels, unsigned heads, unsigned tokens)
 // QKV V-branch fused epilogue (section 33/35): int8 GEMM -> dequantise (island-3) ->
