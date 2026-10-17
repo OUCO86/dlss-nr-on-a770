@@ -1445,3 +1445,24 @@ int8；mine 再对 attention 环加 requant——这才对齐"游戏今天 vs �
 下一步（按用户批准的顺序，接 daemon=临时画质脚手架）：
 1. 重做 damage 实验到真实 scope（半天级，给我方一个可引用的先验数字），
 2. 然后 host-bounce 接 LOP（用户双击游戏看实况）——这才是裁定性的。
+
+## 56. 真实 scope 网络级画质 damage GREEN（2026-10-17 21:0x）：换缝代价=网络输出 0.30/255
+
+`chain_damage.py`（§55 废版重写）：只把**游戏真实 int8 scope** 注进 71 块网络
+（=16 C=256 块 QKV[15-21,49-55] + 8 global 块 FFN pair[31-38] = 32 个 GEMM，
+scope 断言 10..40 强制），输入=真实捕获帧 capture.nrn 重采样 448²，前辈
+test_forward 的 16 通道特征构造。三模式 float/game/mine（mine=game+缝上 requant
+往返=我的链 currency+P1 边界 publish，正是 §51 测的那个 2%）。
+
+**结果（项目的裁判指标，damage=|diff|×255 逐像素 max 通道）**：
+- **MINE vs GAME（换缝代价）：mean 0.296、p99 1.30、>2:0.035%、>4:0.003%** ⇒
+  **99.997% 像素纹丝不动**（<0.5/255 亚 LSB 噪声以下；过 4/255 的=蝴蝶效应到边界的
+  0.003%）。
+- GAME vs FLOAT（游戏今天已付的 int8 税，全网络）：mean 6.4、>8:23%——
+  这印证旧链注释"integer projections pay some of the network's own effect"。
+
+⇒ **画质答案（离线可引用的先验）**：换我的缝=对游戏当前画面几乎不可见（0.30/255 mean,
+0.003% 过 4/255）；而 int8 本身相对 float 的"网络自身效应"才是那个要 LOP 裁决的既存问题
+——我的链在**不新增**这个问题的意义上安全。**裁定仍属用户 LOP 实看**（离线只除焦虑）。
+
+数字可信度自检：int8 GEMM 趟数=32（scope 断言防 §55 复发）；head 全部 finite。
