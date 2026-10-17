@@ -17,6 +17,7 @@
 #include <sycl/sycl.hpp>
 #include "quantize_row_kernel.hpp"
 #include "publish_kernel.hpp"
+#include "gemm_s8_v1_kernel.hpp"
 #include <cstring>
 #include <cstdio>
 #include <vector>
@@ -105,6 +106,40 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
     float* sc = (float*)c->second.p;
     g_cmds.push_back([=]() {
         qr_launch(*GQ, *GD, qr_kernel(), a, pk, sc, M, K, 0u, 0u, 0u, 0u, 0u, nullptr, nullptr);
+    });
+    return 0;
+}
+
+// int xmx_rec_gemm_s8(int a, int b, int c, unsigned M, unsigned N, unsigned K)
+// PATH-VALIDATION cut: runs the senior's proven v1 ESIMD int8 GEMM (exact int32 out)
+// through this skeleton's begin->rec->submit pipeline. a,b are RAW int8 matrices
+// (M*K, K*N); c is int32 (M*N). The closure host-packs (VNNI) then launches — a
+// faithful-but-slow simplification for the path gate; the real design packs static
+// weights once at init and has the producer emit pre-packed activations (§9 single
+// world), so packing is not in the timed loop. Shapes must satisfy M%128==0,
+// N%64==0, K%32==0 (v1's constraint).
+int xmx_rec_gemm_s8(int a, int b, int c, unsigned M, unsigned N, unsigned K) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!M || !N || !K || (M % 128u) || (N % 64u) || (K % 32u))
+        FAILMSG("gemm_s8 needs M%%128==0, N%%64==0, K%%32==0");
+    auto ia = g_bufs.find(a), ib = g_bufs.find(b), ic = g_bufs.find(c);
+    if (ia == g_bufs.end() || ib == g_bufs.end() || ic == g_bufs.end()) FAILMSG("bad gemm operand");
+    int8_t* Araw = (int8_t*)ia->second.p;
+    int8_t* Braw = (int8_t*)ib->second.p;
+    int32_t* C32 = (int32_t*)ic->second.p;
+    g_cmds.push_back([=]() {
+        size_t na = (size_t)M * K, nb = (size_t)K * N;
+        std::vector<int8_t> hA(na), hB(nb), hAp(na), hBp(nb);
+        GQ->memcpy(hA.data(), Araw, na).wait();
+        GQ->memcpy(hB.data(), Braw, nb).wait();
+        s8v1::pack_a(hA.data(), hAp.data(), (int)M, (int)K);
+        s8v1::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
+        int8_t* dAp = sycl::malloc_device<int8_t>(na, *GQ);
+        int8_t* dCp = sycl::malloc_device<int8_t>(nb, *GQ);
+        GQ->memcpy(dAp, hAp.data(), na).wait();
+        GQ->memcpy(dCp, hBp.data(), nb).wait();
+        s8v1::gemm_s8(*GQ, dAp, dCp, C32, (int)M, (int)N, (int)K).wait();
+        sycl::free(dAp, *GQ); sycl::free(dCp, *GQ);
     });
     return 0;
 }

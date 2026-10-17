@@ -43,3 +43,4 @@ cp -f libxmx_sycl.dll "$RUNDIR/"
 echo "built libxmx_sycl.dll; running the gates from $RUNDIR:"
 ( cd "$RUNDIR" && SYCL_DEVICE_FILTER=level_zero:gpu "C:/Users/wangz/.workbuddy/binaries/python/envs/default/Scripts/python.exe" "$HERE/gate_libxmx_sycl.py" )
 ( cd "$RUNDIR" && SYCL_DEVICE_FILTER=level_zero:gpu "C:/Users/wangz/.workbuddy/binaries/python/envs/default/Scripts/python.exe" "$HERE/gate_unary.py" )
+( cd "$RUNDIR" && SYCL_DEVICE_FILTER=level_zero:gpu "C:/Users/wangz/.workbuddy/binaries/python/envs/default/Scripts/python.exe" "$HERE/gate_gemm_s8.py" )

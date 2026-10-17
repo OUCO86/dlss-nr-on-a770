@@ -466,3 +466,30 @@ local-mem+barrier，shuffle/ESIMD 提速留第 2 期。精确除法用 ext::inte
 记录器(row/history/unary2 带 publish epilogue)，然后 ESIMD GEMM ladder(第2期性能)，
 再 graph+D3D12 import 接进出货 daemon。铁律不变：链路只走 int8 宽直通，窄形状/fp16
 残留=我代码的错。
+
+## 22. 路 B·GEMM 通路验证（2026-10-17 08:4x）：v1 ESIMD int8 GEMM 接进骨架，三形状 int32 BIT-EXACT
+用户选 B（性能兑现是重写的唯一理由）。按"复用前辈已验证案例、一次一个变量"：
+- gemm_s8_v1_kernel.hpp：前辈 esimd_gemm_s8_v1.cpp 的核+pack **原样抽出**（单一事实源）。
+  BM128/BN64/BK32/NT32，双缓冲 SLM(12KB)，4×dpas<8,8,int32>/步，int32 精确输出。
+  前辈的坑保留：s8 累加必须 int32（float 累加器硬件返 NaN，见 v1 头注）。
+- libxmx_sycl.cpp 加 xmx_rec_gemm_s8(a,b,c,M,N,K)：record 排队一个闭包
+  (host pack VNNI→upload packed→s8v1 launch→int32 C)。通路验证的忠实简化——真实管线
+  权重 init 时 pack 一次、激活由 producer emit pre-packed（§9），pack 不在计时循环；
+  本刀只证管道，不测速。
+- gate_gemm_s8.py：golden=numpy `a.astype(int32) @ b.astype(int32)`，判据 wrong==0
+  （整数精确，无需容差——test_gemm_int8.py:68 同款）。256³ / 512x128x96 /
+  1024x256x512 三形状 **0 wrong** → GEMM_S8 GREEN。build_sycl_dll.sh 现跑三门
+  (quantize/unary/gemm) 一键可复现全绿。
+
+⚠ 命中铁律的关键实测（v1 benchmark，本机 A770）：
+- 宽形状：4096³=**47.0 TOPS**、8192x1024x1024=40.4（v1，未上满 ladder）。
+- 真实管线形状是**窄的**（§8 B1 表：QKV N=96、attnV/outproj N=32、scores N=64）：
+  v1 跑 32640x64x64=2.1、9216x128x128=8.4 TOPS——**光接核跑不出性能**。
+⇒ 结论：性能主战场=§7⑥/§15 的**形状合并**（把碎小 GEMM 拼成大 M/大 N）+ requant
+  (int8 out，§9 单一世界)。通路已证，合并是下一步且是重写价值的兑现点。
+  这不是"我代码造成的窄形状"——是 DLSS transformer 架构的 channel 维度天生小，
+  合并让它变宽正是重写的核心红利。
+
+下一刀顺序（各带门）：1) requant epilogue（int32→int8+new_scale，对前辈 v2 的
+fused-requant golden，bit-exact）；2) 形状合并设计（先离线算合并后形状表，对 §8 实测
+TOPS 预估收益，再落计划器）；3) graph 提交形态接 §17；4) D3D12 import 接 daemon 端到端。
