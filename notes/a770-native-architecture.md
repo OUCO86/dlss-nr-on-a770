@@ -1040,7 +1040,7 @@ golden=反散射 gu[w,t,c]=got[at(w,t,c)] 后再对 deq4。另：ESIMD `simd[j]`
 scores rq GEMM(K=32, §32 已绿) → softmax_i8(int8 probs+行scale, §40) → attnV rq GEMM
 (K=tokens=64, 吃 int8 P 行 scale + int8 V 列 scale——rq 核现成) → attended → outproj。
 下一步=积木 4：**整环串一次 submit**（gate_chain_attn：真 QKV→scores→softmax→attnV→
-outproj 端到端对 nr_model.cosine_attention 有界门），然后 graph+D3D12 接 daemon 进 LOP。
+outproj 端到端对 nr_model.cosine_attention 有界门），然后 graph+D3D12 接 daemon 进 LOP。  [10-18: daemon 路作废, 游戏内是 C++ 路, 见 §63]
 
 ## 42. 方向澄清（15:5x）：路 B 的落点=独立 GEMM 段，attention 融合核已是健康形态
 
@@ -1416,7 +1416,7 @@ invariance 强性质（§53）在集成门里复现：ps_q 只进 new_scale 不�
 
 **十八门**。P2 单一世界核工作**已基本完成**（除 window 块 M=64<BM128 待 megakernel
 批大 M——那是性能放大器，不是链正确性的阻塞）。余下按依赖：
-1. **接 daemon 进 LOP**（用户验收路径，§49/50）：P1 对拍已证明 int8 链 rms 代价 <3%；
+1. **接 daemon 进 LOP**（用户验收路径，§49/50）：P1 对拍已证明 int8 链 rms 代价 <3%；  [10-18: daemon 路作废, 游戏内是 C++ 路, 见 §63]
    现在把 QKV+attention 的 int8 链接进真实帧，用户看画面。双引擎共存 buffer 共享=§18 门。
 2. BN=128 变体（outproj N=128、把 v1+requant 也折进 GEMM 出口）=perf 刀。
 3. megakernel 批 window（M=64→大 M，§7⑥/R8a）=perf 放大器 + window attention 的 int8 化。
@@ -1493,7 +1493,7 @@ test_forward 特征构造）**：
    不是本节。** 网络级代理到此为止, 不再投入。
 
 ⇒ 按用户指示（"验证画质没问题立即继续剩下的任务"）：离线先验已由 §51（<3% stage rms）+
-本节排序信号（非新类破坏）给足,**下一步=接 daemon 进 LOP 让用户眼睛做最终裁决**（唯一
+本节排序信号（非新类破坏）给足,**下一步=接 daemon 进 LOP 让用户眼睛做最终裁决**（唯一  [10-18: daemon 路作废, 游戏内是 C++ 路, 见 §63]
 能越过蝴蝶地板的裁判），验完立即回主线（BN=128 出口折叠、megakernel 批 window、双引擎
 buffer 互操作）。
 
@@ -1620,7 +1620,50 @@ NR_L0_SHADOW=1 把出货门(orig())与我的链在**同一已 flush 输入**上�
   **L0-chain vs SHIPPED: mean 0.61/255, p99 2.6, >2: 2.70%, >4: 0.15%, >8: 0.002%**。
   12.3/255 作废(它测的是我的 bug, 不是链)。
 ⇒ 与 §51 的 <3% 阶段级先验一致。17 门全绿(今早 import 函数没弄坏回归)。
-**下一步=放 work/l0_qkv marker, 用户进游戏 A/B 看 vit 门(69% 参数区)的画面**——这是
-三条进游戏路里唯一活的, 且这次 bounce 的每条腿都在已门控 pass 上。
+~~下一步=放 work/l0_qkv marker, 用户进游戏 A/B~~ **10-18 作废(见 §63)**: marker 只有
+Python daemon 读, 而**游戏里根本没有 daemon**——此路不存在。marker 已删。进游戏的正确
+落点改走 C++ 核心件(libxmx.dll / plan), 见 §63。
 教训(影子模式的普遍价值): "A 与 B 输出全等"类断言(§55 的 swapped=0 同族)必须先给 B 注入
 已知错(影子)验证探测器会红——本次探测器的字节分布+幅值打印立刻区分了"bug"与"代价"。
+
+
+## 63. 🚩 架构交接事故更正（2026-10-18 下午, 用户发火点破; 全部代码核实）
+
+**事实（代码原文为证, 本轮 grep/读行号）**：游戏里的 NR = **C++ 路, 没有任何 Python
+daemon**。链条: 游戏目录 `dxgi.dll`(我们的 OptiScaler, 仓库 `src/OptiScaler/`) →
+`NrPipeline.cpp:312-316` 进程内 LoadLibrary `work/libnr_image.dll`+`work/nr_net.dll` →
+`nr_net.dll` = `nr_replay.c` + **plan 静态编进二进制**(`build_fused.bat:37`:
+`plan_960x544.c`) → 网络每趟经 `work/libxmx.dll`(`nr_net_open` 第一参, `NrPipeline.cpp:462`)。
+开关: 游戏内面板 Insert 键(`Config.h:289`) → `Enable Neural Rendering`
+(`menu_common.cpp:4573`), 每帧读(`NrBridge.cpp:2182`)当帧生效, 写回 ini(`Config.cpp:1225`)。
+`nr_trigger`/`NR*.bat`: 全仓库 grep **nrbridge 不读**——旧 Python 路产物, 对游戏无效。
+日志: 游戏目录 `OptiScaler.log`(每帧 `gap run took/work`, 10-18 实测 work≈49-50ms);
+`work/nr_daemon.log` 停更(最后一次 10-12, 且今晚我误拿它当"这局"的证据——它 21MB 是旧文)。
+
+**错误怎么进来的**：`HANDOFF.md`(根, **不在 git 里**——交接文档不受版本控制本身就是事故面,
+改动无法追溯) 10-16 写的"由它 spawn daemon、管道 nr_lop、监测 nr_daemon.log"是 10-13 前旧
+路描述; 10-14 切 C++ 回放(`nr_net-oldplan-newreplay.dll` 时间戳 10-14 20:17, plan_960x544.bin
+10-14 21:06 可证)后没人更新它。**正确事实其实也在盘上**: `notes/toolchain-map.md:26`
+(OUCO86, 10-16 21:49 提交)"出货 C(libxmx/nr_net): tools/build_fused.bat"。两处打架,
+我(后续窗口)没先读代码核实就按 HANDOFF 接——§58-§62 整个"daemon bounce/marker"方向因此
+建立在错误前提上。**注意: §58-§62 的离线结论(ResidentBackend bounce、影子对照、0.61/255、
+import 探针、17 门)本身全部有效**——错的只是"游戏里有个 daemon 能让它 bounce"的接法假设。
+
+**已替换(非追加)的位置**: 根 `HANDOFF.md`(14 处行级替换: 启动/开关/日志/清理/职责/基线标注);
+工作记忆 `MEMORY.md`(5 个块整体替换: 出货段/画质红线开关/§58-62 块/接 LOP 块/断点块);
+本日志尾部 3 处"下一步放 marker/接 daemon"改作废标记; `work/l0_qkv` marker 已删。
+未动: `notes/HANDOFF.md`(仓库内, 无游戏-daemon 错误说法, 其 daemon 提及均为 vkcube/layer
+历史事实)。
+
+**给新架构的路线（"进 LOP 验画质"的正确版本, 取代 §55-§62 的 marker 方案）**：
+- (a) **换 `work/libxmx.dll` 的实现**=最贴"桥接不动核心归我"的做法: 让游戏用到的那批
+  `xmx_rec_gemm_*` 走我的链(或先做混合导出: 同名 ABI、内部转投 libxmx_sycl), 重启游戏生效,
+  plan 不用重录。风险=27 vs 95 函数集缺口 + 我的核形状集要覆盖 plan 实际用到的 GEMM。
+- (b) **重录 plan**: dump 时让记录层调我的 recorder, 产出新 plan_*.c 编进 nr_net.dll。
+  改动集中在离线侧(我们有全套门保护), 游戏侧件仍是那三件套。
+- 两条都保持: 面板 Insert→Enable Neural Rendering 做当帧 A/B, 用户眼睛=终审。
+- 铁律不变: 游戏只许用户双击; 换 work/ 件前后离线门必须绿; 数字①实跑②贴③才报。
+
+**流程规矩（防再犯, 已写进 MEMORY.md 断点段）**：凡"游戏怎么跑/开关在哪/日志在哪/进程在不在"
+这类**环境事实**, 动手前先 grep 出货代码拿行号, **不采信任何交接文档的记忆**; 交接文档
+(HANDOFF)与代码打架时, 以代码为准并**立即替换文档**, 不许两头并存。
