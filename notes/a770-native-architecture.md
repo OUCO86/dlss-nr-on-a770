@@ -1782,3 +1782,27 @@ upload 全在**同一个 SYCL-owned ze context**, 无跨 runtime 访问, fused �
 剩下 = **3 recorder 换芯**(把 plan 实际调的 coopmat xmx_rec_gemm_* 逐个改成我已绿 int8 链,
 每步 §51 对拍 + 对应门), 然后 4 合成游戏级门(出货 plan opcode 表喂我 dll 出整帧 diff)。
 下一步先枚举 plan_960x544.c 实际调了哪些 xmx_rec_* 及次序(dump 的真图, 不是猜), 按那个清单排换芯顺序。
+
+## 68. 出货 plan 的 op 直方图（5254 步全量实数, notes/plan-op-histogram-960x544.txt 入仓）
+
+**更正自己旧口径**: "188 趟 gemm_int8"不对——plan 级实测(awk 切 nr_plan_steps 全数组):
+- GEMM 族共 **636 步**: INT8_BATCHED 144 + INT8_RESIDUAL 136 + INT8_QKV 120 +
+  WINDOW_INT8_RESIDUAL 104 + INT8 48 + 纯 fp16 coopmat GEMM 只 **84**。
+  ⇒ 出货图里 int8 GEMM 早已是大头(552/636), 换芯=换执行器不换数据语义(§28 靶子不存在再确认)。
+- **quantize 族 552 步**(REC_QUANT 448 + QUANT_WINDOW 104)——几乎与 GEMM 等量, 趟数墙
+  比 tile 宽度账大得多(§9/R8a 优先级再确认; 非性能测量, 只是账本口径)。
+- init 族 1268 步 = **幂等空转**(libxmx.c 原文: quant_init/int8_init 都有 `if (g.rquant)
+  return 0`, 首次注册 spv 后全 no-op) → 我的 dll 里做成"登记一次"的壳, 成本近零。
+- BUF 1313 + BUF_PTR 1278 + BEGIN 2 + GRAPH_CAPTURE 1 + GRAPH_RUN 1 + ABORT 1(scratch
+  那次) + SYNC 0 + **EXTMEM/SEM 在 step 流里没有**(0 计数!)——数据腿的 fence/wait 不在
+  plan 内, 是 nr_replay 直接调 ABI(:263-284), 所以第 4 步 harness 要自己补调用(游戏同款
+  次序), 不能指望 plan 触发。
+- attention 120 (WINDOW_ATTENTION 104 + GLOBAL_ATTENTION 16)、ffn 系 22、unary 34、
+  window_block 20。
+
+**换芯清单(第 3 步, 按 plan 计数排)**: xmx_rec_quant(448, 我已导出同名!)、
+quant_window(104)、gemm_int8 族(552)、gemm(84, coopmat fp16 的照旧语义先直通再优化)、
+window_attention(104)+global_attention(16)、ffn(16+2+2)、unary(32+2)、window_block(20)、
+copy(0 在 capture 内? OP_XMX_REC_COPY 计数=0——capture 期间没调)。
+第 3 步工具=**plan-walk harness**(下一步): python 读 nr_plan_steps, 逐 op 喂我的 dll
+(ctypes 游戏 ABI 名), 第一失败 op+计数=进度 scoreboard, 全 5254 走通+帧 diff=第 4 步。
