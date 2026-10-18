@@ -25,6 +25,7 @@
 #include "gemm_s8_v3_kernel.hpp"
 #include "gemm_s8_v5_kernel.hpp"
 #include "gemm_s8_v7_kernel.hpp"
+#include "gemm_s8_v8_kernel.hpp"
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
@@ -359,7 +360,62 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
 int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projection, int out, int cosine, int height, int width, int source_width, int flags) { (void)source; (void)skip; (void)sincos; (void)expand; (void)projection; (void)out; (void)cosine; (void)height; (void)width; (void)source_width; (void)flags; NOT_YET("xmx_rec_ffn_merge"); }
 int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int out, int cosine, int M, int flags) { (void)features; (void)adapter; (void)expand; (void)projection; (void)out; (void)cosine; (void)M; (void)flags; NOT_YET("xmx_rec_ffn_stem"); }
 int xmx_rec_gemm(int a, int b, int c, int M, int N, int K, int batch, int sa, int sb, int sc, int bt, int lda, int ldb, int ldc, int oa, int ob, int oc) { (void)a; (void)b; (void)c; (void)M; (void)N; (void)K; (void)batch; (void)sa; (void)sb; (void)sc; (void)bt; (void)lda; (void)ldb; (void)ldc; (void)oa; (void)ob; (void)oc; NOT_YET("xmx_rec_gemm"); }
-int xmx_rec_gemm_int8(int a, int b, int c, int a_scale, int b_scale, int M, int N, int K, int flags) { (void)a; (void)b; (void)c; (void)a_scale; (void)b_scale; (void)M; (void)N; (void)K; (void)flags; NOT_YET("xmx_rec_gemm_int8"); }
+// int xmx_rec_gemm_int8(int a, int b, int c, int a_scale, int b_scale,
+//                       unsigned M, unsigned N, unsigned K, unsigned flags)
+// route(a) swap-in #1 (sections 70-71, the user-approved two-pass plan): the plan's
+// first GEMM family -- (A,B) int8 with B STORED TRANSPOSED (N x K, libxmx.c:2877), C
+// the PUBLISHED answer: float32(acc) * a_scale[row] * b_scale[col] -> publish(epi) ->
+// f16 (bit 0x1000 narrow) or f32, exactly gemm_staged_int8.comp's non-residual branch
+// (:288-297). Pass 1 = the v8 fork (v1's proven loop, transposed pack_b, M padded to a
+// whole BM block -- padded rows are garbage we never publish); pass 2 = the gated
+// publish arithmetic (qr_publish, bit-exact) elementwise. The multiply chain is two
+// cr_mul links, never a contracted fma (publish_kernel's standing rule).
+// flags: bits 8-11 epilogue, 0x1000 narrow-half (xmxres._publish); both plan families
+// set narrow: 4352=e4m3+half, 4864=gate->e4m3+half (section 71).
+static inline int l0_ceil_bm(unsigned M) { return (int)(((M + 127u) / 128u) * 128u); }
+int xmx_rec_gemm_int8(int a, int b, int c, int a_scale, int b_scale,
+                      unsigned M, unsigned N, unsigned K, unsigned flags) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!M || !N || !K || (N % 64u) || (K % 32u))
+        FAILMSG("gemm_int8 needs N%%64==0, K%%32==0 (our tile; shipped guard is N%%32/K%%64)");
+    auto ia = g_bufs.find(a), ib = g_bufs.find(b), ic = g_bufs.find(c);
+    auto ias = g_bufs.find(a_scale), ibs = g_bufs.find(b_scale);
+    if (ia == g_bufs.end() || ib == g_bufs.end() || ic == g_bufs.end() ||
+        ias == g_bufs.end() || ibs == g_bufs.end()) FAILMSG("bad gemm_int8 operand");
+    const int8_t* Araw = (const int8_t*)ia->second.p;
+    const int8_t* Braw = (const int8_t*)ib->second.p;
+    void* Cout = ic->second.p;
+    const float* as = (const float*)ias->second.p;
+    const float* bs = (const float*)ibs->second.p;
+    const unsigned epi = (flags >> 8) & 0xFu;
+    const bool narrow = (flags & 0x1000u) != 0u;
+    const int Mp = l0_ceil_bm(M);
+    const size_t na = (size_t)Mp * K, nb = (size_t)N * K;
+    g_cmds.push_back([=]() {
+        std::vector<int8_t> hA((size_t)M * K), hApad(na, 0), hB(nb), hAp(na), hBp(nb);
+        GQ->memcpy(hA.data(), Araw, (size_t)M * K).wait();
+        std::memcpy(hApad.data(), hA.data(), (size_t)M * K);   // pad rows stay zero
+        GQ->memcpy(hB.data(), Braw, nb).wait();
+        s8v8::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
+        s8v8::pack_b(hB.data(), hBp.data(), (int)N, (int)K);   // B arrives TRANSPOSED
+        int8_t* dAp = (int8_t*)sycl::malloc_device(na, *GQ);
+        int8_t* dBp = (int8_t*)sycl::malloc_device(nb, *GQ);
+        int32_t* dC = (int32_t*)sycl::malloc_device((size_t)Mp * N * 4, *GQ);
+        GQ->memcpy(dAp, hAp.data(), na).wait();
+        GQ->memcpy(dBp, hBp.data(), nb).wait();
+        s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K).wait();
+        GQ->parallel_for(sycl::range((size_t)M * N),
+                         [=](sycl::item<1> it) {
+            size_t i = it.get_id(0);
+            unsigned r = (unsigned)(i / N), col = (unsigned)(i % N);
+            float v = cr_mul(cr_mul((float)dC[(size_t)r * N + col], as[r]), bs[col]);
+            if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, v));
+            else        ((float*)Cout)[i] = qr_publish(epi, v);
+        }).wait();
+        sycl::free(dAp, *GQ); sycl::free(dBp, *GQ); sycl::free(dC, *GQ);
+    });
+    return 0;
+}
 int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale, int M, int N, int K, int batch, int sa, int sb, int sc, int lda, int ldb, int ldc, int scale_stride, int flags) { (void)a; (void)b; (void)c; (void)a_scale; (void)b_scale; (void)M; (void)N; (void)K; (void)batch; (void)sa; (void)sb; (void)sc; (void)lda; (void)ldb; (void)ldc; (void)scale_stride; (void)flags; NOT_YET("xmx_rec_gemm_int8_batched"); }
 int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_scale, int qkv_scale, int M, int channels, int heads, int tokens, int flags) { (void)a; (void)b; (void)q; (void)k; (void)v; (void)a_scale; (void)b_scale; (void)qkv_scale; (void)M; (void)channels; (void)heads; (void)tokens; (void)flags; NOT_YET("xmx_rec_gemm_int8_qkv"); }
 int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale, int skip, int cosine, int M, int N, int K, int flags) { (void)a; (void)b; (void)c; (void)a_scale; (void)b_scale; (void)skip; (void)cosine; (void)M; (void)N; (void)K; (void)flags; NOT_YET("xmx_rec_gemm_int8_residual"); }

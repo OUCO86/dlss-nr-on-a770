@@ -1891,3 +1891,31 @@ int8 N×K"→ pack_b 输入按 (N,K) 行主序读, 与我现有 pack_b(K,N) 不�
 两段落盘后再谈融成一趟。门=对 numpy `publish(e4m3, (a8@b8ᵀ)f32 * ascale ⊗ bscale)`→f16,
 形状用两族真尺寸(M=640,N=512,K=512 + M=192,N=4096,K=1024), **within-one 界**(§51 定义, 不是
 绝对<=2, §69 教训)。**这是第一个真·新 kernel(非组合已绿件)**——写代码前按规矩⑤先报设计待你点头。
+
+## 72. swap-in #1 gemm_int8 = GREEN（两族真形状 f16 逐字节相等）+ permissive passes 224→248 自洽命中
+
+新核 `gemm_s8_v8_kernel.hpp`（v1 主循环**逐字不动**, 只改 host pack: `pack_b` 按转置 N×K 读
+出货权重布局 libxmx.c:2877; `pad_m` 把 M 补到 BM=128 整块, 尾块垃圾行 publish 步不读——
+M=192 那族的真约束落地, 不动已绿 v1）。recorder `xmx_rec_gemm_int8(a,b,c16,as,bs,M,N,K,flags)`:
+v8→int32 暂存 → elementwise `qr_publish(epi)` 腿（`cr_mul(cr_mul(f32(acc),as[row]),bs[col])`,
+与已绿 requant_kernel:39 逐字同构, 禁 fma 收缩; epi 来自 flags>>8, narrow=0x1000）→ f16。
+
+**gate_gemm_int8（新门）**: 三形状 f16 **OUT BITS EQUAL, 0 bad bytes**:
+- planA 640×512×512 flags4352(e4m3+half): 0/655360 ✓
+- planB 192×4096×1024 flags4864(gate→e4m3+half): 0/1572864 ✓（padded-M 尾块也对）
+- tiny 128×64×32: 0/16384 ✓
+golden=出货 numpy 权威(`NM.e4m3`/`quadratic_gate_activation`, publish 门已证位精确同一套),
+f32 三步乘链用 numpy float32 写死对齐 cr_mul。判据=位相等(publish 族标准), 非 bounded。
+
+**§70 自洽检查点命中**: permissive walk passes **224→248**（+24=gemm_int8 captured 调用数,
+§71 实测）。⇒ 新 recorder 确被 captured 图调用+真 push, walk 仍全 5254 步 exit=0。
+
+**⚠ run 95ms 不得作性能引用**: 这是离线 walk 脚手架 host-pack+memcpy 开销(不健康链路形态),
+违反 §58/§69 禁性能对照。唯一合法读数=passes 计数(功能/接线证据), 帧时间由用户在游戏 LOP 测。
+
+**permissive 模式的战略价值(本轮显形)**: captured 段里第一个未实现 recorder 其实是
+ffn_stem(step 2534, 前辈否证"不进 int8"的 coopmat 融合 pass, §71 待决)——按 plan 顺序它卡在所有
+无争议 int8 族前面, 游戏面(fail-loud)走不到后面。permissive 绕开位置问题: 让我先接**无争议
+int8 族**(gemm_int8✓, 还 batched72/residual68/qkv60/window_int8_residual52 + quant✓/quant_window52),
+passes 累积可测; ffn/window_block/unary/copy 那族留到有真数字再与你讨论(§71 未拍板)。
+gate 数 19→**20**(GEMM_INT8)。
