@@ -20,7 +20,7 @@ import pathlib
 import numpy as np
 
 MARKER = "l0_qkv"
-_C = {"swapped": 0, "fellback": 0, "printed": 0}
+_C = {"swapped": 0, "fellback": 0, "printed": 0, "entered": 0, "guard": 0}
 _LIB = {"dll": None}
 
 
@@ -77,12 +77,30 @@ def install_l0_qkv(rt):
 
     def bounce(a, weight, q, k, v, scale, rows, channels, heads, tokens, *,
                window=None, image_half=False, publish_image=False, vit=False):
-        if vit or window is not None or tokens != 64 or (rows % 128) or (channels % 64):
+        # the ONLY door this scaffold takes over = the global blocks' vit QKV
+        # (vit=True, window=None, channels%64==0, rows%128==0 -- padded 640 is).
+        # The window-block door bounces illegally there (section 58 V1: pure shipped
+        # mid-graph submit CRASHES -4 at the window QKV; V2: same pattern legal at the
+        # globals), so it stays shipped.
+        _C["entered"] += 1
+        _C.setdefault("seen", []).append((rows, channels, heads, tokens, bool(vit),
+                                          window is not None))
+        if not vit or window is not None or (rows % 128) or (channels % 64):
+            _C["guard"] += 1
+            return orig(a, weight, q, k, v, scale, rows, channels, heads, tokens,
+                        window=window, image_half=image_half, publish_image=publish_image,
+                        vit=vit)
+        # the scratch plan's discovery pass records a frame once and never runs it --
+        # the senior's own guard from int8_bottleneck.py:104, copied verbatim.
+        if getattr(a, "_stand_ins", [None])[0] is not None:
             return orig(a, weight, q, k, v, scale, rows, channels, heads, tokens,
                         window=window, image_half=image_half, publish_image=publish_image,
                         vit=vit)
         try:
-            rt.submit()                     # the int8_bottleneck.py int8_rows pattern
+            rt.submit()                     # flush upstream: `a`/`weight` current; old
+                                            # recording is OFF now (int8_rows pattern)
+            shadow = os.environ.get("NR_L0_SHADOW", "0") != "0"
+            sh = {}
             av = xmxres.host_view(a, np.float16, shape=(rows, channels))
             a8, asc = int8_quant.quantise(av.astype(np.float32), axis=1)   # §30: bit-exact
             # resident weight layout is (C, 3C) row-major (input-major), the LOGICAL
@@ -119,12 +137,17 @@ def install_l0_qkv(rt):
             def call(fn, *args):
                 if fn(*args) != 0:
                     raise RuntimeError(fn.__name__ + ": " + dll.xmx_error().decode())
-            call(dll.xmx_rec_gemm_qkv_v_i8, ma, mV, mv8, mvs, mas, mVs,
-                 rows, channels, heads, tokens)
+            # V: the v_i8 recorder assumes 64-token windows (section 61), vit is w=1/
+            # tokens=640 -> use deq GEMM + HOST requantise. mvf is a recorded pass, so its
+            # value only exists AFTER xmx_submit; the host round-trip therefore runs below,
+            # after submit (this was the all-zero-V bug shadow mode caught: it used to sit
+            # before submit, downloading mvf while still zero).
+            mvf = mb(rows * channels * 4, 4)
+            call(dll.xmx_rec_gemm_qkv_deq, ma, mV, mvf, mas, mVs, rows, channels)
             call(dll.xmx_rec_gemm_qkv_deq, ma, mQ, mqf, mas, mQs, rows, channels)
-            call(dll.xmx_rec_cosine_norm_i8, mqf, mq8, mqs, rows * heads, 0, mqkvs, heads)
+            call(dll.xmx_rec_cosine_norm_i8, mqf, mq8, mqs, rows * heads, 1, mqkvs, heads)
             call(dll.xmx_rec_gemm_qkv_deq, ma, mK, mkf, mas, mKs, rows, channels)
-            call(dll.xmx_rec_cosine_norm_i8, mkf, mk8, mks, rows * heads, 0, 0, 0)
+            call(dll.xmx_rec_cosine_norm_i8, mkf, mk8, mks, rows * heads, 1, 0, 0)
             if dll.xmx_submit() != 0:
                 raise RuntimeError("submit: " + dll.xmx_error().decode())
             def dlf(h, n, dt):
@@ -134,11 +157,20 @@ def install_l0_qkv(rt):
                 return arr
             q8 = dlf(mq8, rows * channels, np.int8).reshape(rows * heads, 32)
             k8 = dlf(mk8, rows * channels, np.int8).reshape(rows * heads, 32)
-            v8 = dlf(mv8, rows * channels, np.int8)          # already scattered (section 41)
+            # V host requantise AFTER submit, where mvf (deq output) is real:
+            vflat = dlf(mvf, rows * channels, np.float32)
+            vq, vsc_col = int8_quant.quantise(vflat.reshape(rows, channels), axis=0)
+            if dll.xmx_buf_upload(mv8, np.ascontiguousarray(vq).ctypes.data, 0,
+                                  rows * channels) != 0:
+                raise RuntimeError("upload v8: " + dll.xmx_error().decode())
+            if dll.xmx_buf_upload(mvs, np.ascontiguousarray(vsc_col).ctypes.data,
+                                  0, channels * 4) != 0:
+                raise RuntimeError("upload vs: " + dll.xmx_error().decode())
+            v8 = dlf(mv8, rows * channels, np.int8)           # (tokens, channels) here
             qsc = dlf(mqs, rows * heads, np.float32)[:, None]
             ksc = dlf(mks, rows * heads, np.float32)[:, None]
             vsc = dlf(mvs, windows * channels, np.float32)
-            for h in (ma, mQ, mK, mV, mas, mQs, mKs, mVs, mqf, mkf, mq8, mk8, mv8,
+            for h in (ma, mQ, mK, mV, mas, mQs, mKs, mVs, mqf, mkf, mvf, mq8, mk8, mv8,
                       mqs, mks, mvs, mqkvs):
                 dll.xmx_buf_destroy(h)
             # boundary publish: e4m3(int8 * scale) -> the shipped f16 container
@@ -148,9 +180,37 @@ def install_l0_qkv(rt):
             # shipped scatter (w,h,t,c) contiguous -- one transpose, no per-element loop.
             qp = qp.reshape(windows, tokens, heads, 32).transpose(0, 2, 1, 3).ravel()
             kp = kp.reshape(windows, tokens, heads, 32).transpose(0, 2, 1, 3).ravel()
-            vs3 = vsc.reshape(windows, heads, 32)[:, :, None, :]       # (w,h,1,32) over v8's (w,h,t,c)
-            vp = NM.e4m3(v8.reshape(windows, heads, tokens, 32).astype(np.float32)
-                         * vs3).astype(np.float16)
+            # (t, h*32+c) -> (h, t, c): the shipped consumer order at windows=1.
+            vsh = v8.reshape(tokens, heads, 32).transpose(1, 0, 2)
+            # the per-channel scale indexes (h*32+c) -> shape it along the channel axis.
+            vp = NM.e4m3(vsh.astype(np.float32)
+                         * vsc.reshape(heads, 32)[:, None, :]).astype(np.float16)
+            # SHADOW: record + snapshot the SHIPPING door (the old runtime's own answer at
+            # this gate, same flushed input) -- orig() while recording resumes, then flush.
+            if shadow:
+                rt.begin()
+                orig(a, weight, q, k, v, scale, rows, channels, heads, tokens,
+                     window=window, image_half=image_half, publish_image=publish_image,
+                     vit=vit)
+                rt.submit()
+                for tag, buf in (("q", q), ("k", k), ("v", v)):
+                    sh[tag] = xmxres.host_view(buf, np.float16,
+                                               shape=(rows * channels,)).copy()
+                mine = {"q": qp, "k": kp, "v": vp.ravel()}
+                for tag in ("q", "k", "v"):
+                    g = mine[tag].view(np.uint16).astype(np.int32)
+                    w = sh[tag].view(np.uint16).astype(np.int32)
+                    dif = int((g != w).sum())
+                    gf = mine[tag].astype(np.float64); wf = sh[tag].astype(np.float64)
+                    ad = np.abs(gf - wf)
+                    both0 = float((ad == 0).mean() * 100.0)
+                    print(f"  SHADOW {tag} magnitudes: mine maxabs {np.abs(gf).max():.4f} "
+                          f"meanabs {np.abs(gf).mean():.4f} | shipped maxabs {np.abs(wf).max():.4f} "
+                          f"meanabs {np.abs(wf).mean():.4f}")
+                    print(f"  SHADOW {tag}: bytes differ {dif}/{rows * channels} "
+                          f"({dif * 100.0 / (rows * channels):5.2f}%)  exact-equal {both0:5.2f}%  "
+                          f"mean|f16 diff| {ad.mean():.4e} p99 {np.percentile(ad, 99):.4e}",
+                          flush=True)
             xmxres.host_write(q, qp)
             xmxres.host_write(k, kp)
             xmxres.host_write(v, vp.ravel())
@@ -175,5 +235,16 @@ def install_l0_qkv(rt):
 
 
 def report():
-    print(f"  [l0_qkv scaffold] totals: swapped={_C['swapped']} fellback={_C['fellback']}",
-          flush=True)
+    print(f"  [l0_qkv scaffold] totals: entered={_C['entered']} guard-out={_C['guard']} "
+          f"swapped={_C['swapped']} fellback={_C['fellback']}", flush=True)
+    from collections import Counter
+    for shape, n in sorted(Counter(_C.get("seen", [])).items()):
+        r, c, h, t, v, wn = shape
+        why = []
+        if not v: why.append("not vit")
+        if wn: why.append("window")
+        if r % 128: why.append(f"rows%128={r % 128}")
+        if c % 64: why.append(f"C%64={c % 64}")
+        print(f"    x{n}: rows={r} C={c} heads={h} tokens={t} vit={v} "
+              f"window={wn}" + (f"  GUARD:{','.join(why)}" if why else "  WOULD-SWAP"),
+              flush=True)

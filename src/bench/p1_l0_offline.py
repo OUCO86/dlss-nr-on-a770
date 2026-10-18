@@ -37,8 +37,12 @@ def frame_colour():
     w, h = int(raw[4:8].view("<i4")[0]), int(raw[8:12].view("<i4")[0])
     body = raw[16:].reshape(h, w, 4)
     rgb = np.ascontiguousarray(body[:, :, [2, 1, 0]]).astype(np.float32) / 255.0
-    # the game's network extent at render_scale 0.4 (work/int8_quality.py uses 448x768)
-    return np.ascontiguousarray(nr_daemon.resample(rgb, (448, 768)), np.float32)
+    # THE GAME'S REAL PIPELINE: run_head takes the OUTPUT-resolution frame and computes
+    # the network extent itself (network_geometry, scale 0.4 -> 768x448 at 1920x1080 --
+    # what the daemon log prints). Pre-resampling here (the earlier 448x768 version) made
+    # the global blocks' rows=96 instead of the game's 640, i.e. it tested a pipeline the
+    # game does not run -- section 55's wrong-scope trap wearing a new hat.
+    return np.ascontiguousarray(rgb, np.float32)
 
 
 def render(l0):

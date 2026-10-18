@@ -1604,3 +1604,23 @@ scale≤1ulp 绿**。⇒ 我的 int8 核（v_i8/deq/cosine_norm_i8）在 global 
 **下一步（真 vit 接线的门）**：给 v_i8 加 windows==1（scatter 的 window 维退化，token
 维=tokens）的支持 + C=1024/rows=640 的 V 列量化门（对 numpy 有界门），bounce 改用
 门控后的 V 路，再重跑 p1_l0_offline——那时的 diff 才可引用、才可放 marker 进游戏。
+
+## 62. 影子对照钉死 12/255=我 bounce 的时序 bug; V 修好后可引用数字 mean 0.61/255（17 门全绿不变）
+
+NR_L0_SHADOW=1 把出货门(orig())与我的链在**同一已 flush 输入**上跑两遍、比 q16/k16/v16
+字节（引擎对引擎，无 numpy 中间人）。三轮实跑收敛：
+- 第一轮: Q 79.8% 字节相同+meanabs 0.8361 vs 0.8362(纯量化噪声), K 79.5% 同,
+  **V meanabs 0.0000 vs 1.7259 = 全零**。
+- 归因(一次一个变量, 非猜): V 的 host 往返(download mvf→requant→upload mv8)写在
+  xmx_submit() **之前**——mvf 是 recorded pass, submit 前还没执行=读到零。Q/K 无恙因为
+  它们的 requantize 是设备内 recorded pass(cosine_norm_i8)。
+- 修: V 往返挪到 submit 后。重跑影子: V maxabs 24.0==24.0、meanabs 1.7299 vs 1.7259、
+  71-76% 字节相同(=e4m3 publish 网格噪声+§51 边界税, 正常)。
+- **干净 P1 offline 数字(可引用)**: swapped=8 fellback=0,
+  **L0-chain vs SHIPPED: mean 0.61/255, p99 2.6, >2: 2.70%, >4: 0.15%, >8: 0.002%**。
+  12.3/255 作废(它测的是我的 bug, 不是链)。
+⇒ 与 §51 的 <3% 阶段级先验一致。17 门全绿(今早 import 函数没弄坏回归)。
+**下一步=放 work/l0_qkv marker, 用户进游戏 A/B 看 vit 门(69% 参数区)的画面**——这是
+三条进游戏路里唯一活的, 且这次 bounce 的每条腿都在已门控 pass 上。
+教训(影子模式的普遍价值): "A 与 B 输出全等"类断言(§55 的 swapped=0 同族)必须先给 B 注入
+已知错(影子)验证探测器会红——本次探测器的字节分布+幅值打印立刻区分了"bug"与"代价"。
