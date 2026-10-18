@@ -106,49 +106,83 @@ int xmx_buf_create(unsigned long long bytes) { return xmx_buf_create_kind(bytes,
 static ze_driver_handle_t g_zdrv = nullptr;
 static ze_context_handle_t g_zctx = nullptr;
 static ze_device_handle_t  g_zdev = nullptr;
-int xmx_buf_import_win32(unsigned long long handle, unsigned long long bytes, int esz) {
-    if (!GQ) FAILMSG("not initialised");
-    if (!handle || !bytes || esz <= 0) FAILMSG("bad import request");
-    if (!g_zctx) {
-        // NOT via SYCL get_native: in a process that also carries the shipped Vulkan
-        // runtime, this toolchain's SYCL enumerates the Arc through the OpenCL adapter
-        // (the paired-import gate proved it: backend=1 = opencl, mismatch on level_zero)
-        // even though its kernels still run. Own the ze world directly instead -- the
-        // section-18/59 probes' form: zeInit(GPU_ONLY), pick the Intel device, create our
-        // context. Same physical card, same driver, one more context in the process.
-        ze_result_t r0 = zeInit(ZE_INIT_FLAG_GPU_ONLY);
-        if (r0 != ZE_RESULT_SUCCESS) FAILMSG("zeInit: 0x%x", (unsigned)r0);
-        uint32_t nd = 0; zeDriverGet(&nd, nullptr);
-        std::vector<ze_driver_handle_t> ds(nd);
-        if (nd) zeDriverGet(&nd, ds.data());
-        for (uint32_t i = 0; i < nd && !g_zdev; ++i) {
-            uint32_t m = 0; zeDeviceGet(ds[i], &m, nullptr);
-            std::vector<ze_device_handle_t> dd(m); zeDeviceGet(ds[i], &m, dd.data());
-            for (uint32_t j = 0; j < m; ++j) {
-                ze_device_properties_t p = { ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES };
-                zeDeviceGetProperties(dd[j], &p);
-                if (p.type == ZE_DEVICE_TYPE_GPU && p.vendorId == 0x8086 &&
-                    std::strstr(p.name, "Arc")) { g_zdrv = ds[i]; g_zdev = dd[j]; break; }
-            }
+// bring up OUR OWN ze world once (never SYCL get_native: the paired-process opencl-adapter
+// trap of section 60 only bites when borrowing SYCL handles). The section-18/59 probes'
+// form: zeInit(GPU_ONLY), pick the Intel Arc, create our context. Same card, same driver,
+// one more context in the process -- and gate_coexist proved it comes up fine even with a
+// LIVE D3D12 device in the process (section 66), which is the game's actual condition.
+static int ensure_ze_world() {
+    if (g_zctx) return 0;
+    // FIRST try to adopt SYCL's OWN Level-Zero context: import + upload/download then all
+    // live in one runtime (the section-60 paired-Vulkan crash was exactly SYCL-queue-touching-
+    // foreign-ze-memory). get_native<level_zero> only works if SYCL selected the L0 backend
+    // here; section 60 saw OpenCL (backend=1) under Vulkan pairing -- gate_coexist's census
+    // said the same under D3D12, so this probe records which it actually is.
+    try {
+        auto& q = *GQ;
+        g_zctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_context());
+        g_zdev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_device());
+        if (g_zctx && g_zdev) {
+            std::fprintf(stderr, "[import] adopted SYCL's native L0 context (one runtime)\n");
+            return 0;
         }
-        if (!g_zdev) FAILMSG("no Intel Arc GPU visible to Level Zero in this process");
-        ze_context_desc_t cd = { ZE_STRUCTURE_TYPE_CONTEXT_DESC };
-        ze_result_t rc = zeContextCreate(g_zdrv, &cd, &g_zctx);
-        if (rc != ZE_RESULT_SUCCESS || !g_zctx) FAILMSG("zeContextCreate: 0x%x", (unsigned)rc);
-        std::fprintf(stderr, "[import] own ze context live (driver+Arc device found)\n");
+    } catch (...) {
+        std::fprintf(stderr, "[import] get_native<level_zero> unavailable in this process "
+                             "(SYCL on another backend); falling back to own ze context\n");
     }
+    if (!GQ) FAILMSG("not initialised");
+    ze_result_t r0 = zeInit(ZE_INIT_FLAG_GPU_ONLY);
+    if (r0 != ZE_RESULT_SUCCESS) FAILMSG("zeInit: 0x%x", (unsigned)r0);
+    uint32_t nd = 0; zeDriverGet(&nd, nullptr);
+    std::vector<ze_driver_handle_t> ds(nd);
+    if (nd) zeDriverGet(&nd, ds.data());
+    for (uint32_t i = 0; i < nd && !g_zdev; ++i) {
+        uint32_t m = 0; zeDeviceGet(ds[i], &m, nullptr);
+        std::vector<ze_device_handle_t> dd(m); zeDeviceGet(ds[i], &m, dd.data());
+        for (uint32_t j = 0; j < m; ++j) {
+            ze_device_properties_t p = { ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES };
+            zeDeviceGetProperties(dd[j], &p);
+            if (p.type == ZE_DEVICE_TYPE_GPU && p.vendorId == 0x8086 &&
+                std::strstr(p.name, "Arc")) { g_zdrv = ds[i]; g_zdev = dd[j]; break; }
+        }
+    }
+    if (!g_zdev) FAILMSG("no Intel Arc GPU visible to Level Zero in this process");
+    ze_context_desc_t cd = { ZE_STRUCTURE_TYPE_CONTEXT_DESC };
+    ze_result_t rc = zeContextCreate(g_zdrv, &cd, &g_zctx);
+    if (rc != ZE_RESULT_SUCCESS || !g_zctx) FAILMSG("zeContextCreate: 0x%x", (unsigned)rc);
+    std::fprintf(stderr, "[import] own ze context live (driver+Arc device found)\n");
+    return 0;
+}
+static int import_handle(unsigned long long handle, unsigned long long bytes, int esz,
+                         ze_external_memory_type_flags_t kind) {
+    if (ensure_ze_world() != 0) return -1;
+    if (!handle || !bytes || esz <= 0) FAILMSG("bad import request");
     ze_external_memory_import_win32_handle_t mi = { ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_WIN32 };
-    mi.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_WIN32;
+    mi.flags = kind;
     mi.handle = (void*)(uintptr_t)handle;
     mi.name = nullptr;
     ze_device_mem_alloc_desc_t dad = { ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC };
     dad.pNext = &mi; dad.ordinal = 0;
     void* p = nullptr;
     ze_result_t r = zeMemAllocDevice(g_zctx, &dad, bytes, 256, g_zdev, &p);
-    if (r != ZE_RESULT_SUCCESS || !p) FAILMSG("zeMemAllocDevice import: 0x%x", (unsigned)r);
+    if (r != ZE_RESULT_SUCCESS || !p) FAILMSG("zeMemAllocDevice import(kind 0x%x): 0x%x",
+                                              (unsigned)kind, (unsigned)r);
     int id = g_nextbuf++;
     g_bufs[id] = { p, (size_t)bytes, (size_t)esz, true };
     return id;
+}
+int xmx_buf_import_win32(unsigned long long handle, unsigned long long bytes, int esz) {
+    return import_handle(handle, bytes, esz, ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_WIN32);
+}
+// int xmx_buf_import(handle, bytes) -- the GAME's ABI name (notes/game-abi-80.txt, grabbed
+// by nr_replay.c:263; the shipping libxmx.c:3318 imports the bridge's D3D12 resource).
+// Ours takes the SAME D3D12_RESOURCE kind into our own ze context: section 18's probe
+// measured D3D12-resource -> L0 import with two-way BIT-EXACT data in one process -- the
+// fused path's exact shape (the bridge holds the game's D3D12 objects; we import them),
+// and NOT the Vulkan-export direction section 59 killed. esz=2 (half): the plan's
+// feature/head buffers are half-width, like the shipped import's buffers.
+int xmx_buf_import(unsigned long long handle, unsigned long long bytes) {
+    return import_handle(handle, bytes, 2, ZE_EXTERNAL_MEMORY_TYPE_FLAG_D3D12_RESOURCE);
 }
 
 int xmx_buf_upload(int id, const void* src, unsigned long long off, unsigned long long n) {

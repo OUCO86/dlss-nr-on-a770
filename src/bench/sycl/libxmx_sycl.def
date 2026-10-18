@@ -5,6 +5,7 @@ EXPORTS
     xmx_buf_create_kind
     xmx_buf_create
     xmx_buf_import_win32
+    xmx_buf_import
     xmx_buf_upload
     xmx_buf_download
     xmx_buf_zero
