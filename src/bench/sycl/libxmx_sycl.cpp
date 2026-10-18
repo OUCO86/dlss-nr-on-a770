@@ -181,6 +181,45 @@ int xmx_buf_destroy(int id) {
 int xmx_begin(void) { g_recording = true; g_cmds.clear(); return 0; }
 int xmx_abort(void) { g_recording = false; g_cmds.clear(); return 0; }
 
+// int xmx_graph_capture(void) -> id ; int xmx_graph_run(int id) -> passes ; destroy(id)
+// Route (a) step 1 (section 64): the plan says which graph ran "as the number it had
+// that once" (nr_replay.c:505-507 -- r->graph = the capture's return, run/destroy use
+// it), so the slot NUMBER returned by capture is replayed verbatim; an ordinary
+// sequential slot id matches the shipped convention (first capture -> 0). The frozen
+// cmds run the SAME device buffers they captured pointers for, so operands written
+// after capture are read fresh at replay -- exactly the shipped command-buffer
+// semantics (ops frozen, memory live). The lambdas still carry the host pack/upload
+// of today's recorders; the pack moves device-side when the chains themselves
+// fuse -- step 1 only has to prove freeze/replay identity and the ordering.
+static std::vector<std::vector<std::function<void()>>> g_graphs;
+int xmx_graph_capture(void) {
+    if (!g_recording) FAILMSG("not recording");
+    g_graphs.push_back(std::move(g_cmds));
+    g_cmds.clear();
+    g_recording = false;
+    return (int)g_graphs.size() - 1;
+}
+int xmx_graph_run(int id) {
+    if (g_recording) FAILMSG("cannot replay during recording");
+    if (id < 0 || id >= (int)g_graphs.size() || g_graphs[id].empty())
+        FAILMSG("graph is not live");
+    int passes = (int)g_graphs[id].size();
+    try {
+        for (auto& fn : g_graphs[id]) fn();     // same order, wait-per-kernel like submit
+    } catch (const std::exception& e) { FAILMSG("graph_run: %s", e.what()); }
+    return passes;
+}
+int xmx_graph_destroy(int id) {
+    if (id < 0 || id >= (int)g_graphs.size()) return 0;
+    g_graphs[id].clear();
+    return 0;
+}
+int xmx_idle(void) {
+    if (!GQ) FAILMSG("no device");
+    try { GQ->wait(); } catch (const std::exception& e) { FAILMSG("idle: %s", e.what()); }
+    return 0;
+}
+
 // int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K)
 // libxmx.c:2471 shape ([c_int]*3 + [c_uint]*2). Appends the proven SYCL kernel.
 int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {

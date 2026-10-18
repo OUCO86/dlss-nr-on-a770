@@ -1709,3 +1709,27 @@ xmx_sem_import_fence, nr_replay.c:149-158/267-284/421）——**§18 早测过 D
    work/libxmx.dll(备份在位)+重启游戏, 用户面板 Insert 当帧 A/B。
 规矩不变: 数字①实跑②贴③才报; 桥接层(src/OptiScaler/)零改动(用户明令);
 marker/nr_trigger/daemon-bounce 类旧脚手架在 2/4 步后删除退役。
+
+## 65. route (a) 第 1 步 = graph 机器 GREEN（gate_graph 第 18 门）
+
+libxmx_sycl.cpp 加 `xmx_graph_capture/run/destroy`（+`xmx_idle`）：capture=把当前
+recorded cmds `std::move` 进 g_graphs 冻结槽、返槽号；run(id)=按冻结顺序重放同一批
+设备指针；destroy=清槽。id 语义对齐出货（nr_replay.c:505 "the number it had that once"：
+第一次 capture→0，第二次→1；plan 存的 r->graph 就是它）。
+
+**gate_graph.py 实跑（GRAPH GREEN, 0 fails）**，两条契约 + 三状态机:
+- `B: replay-1 == sequential-1 byte-exact`（同一 rq GEMM, 顺序 submit vs capture+run,
+  c8+new_scale 逐字节同）
+- `B: replay-2 == sequential-2`（**capture 之后改权重再 run → 读到新值** = 出货
+  command-buffer 契约 "ops frozen, memory live" 在 L0 骨架成立; 这正是游戏每帧换 features
+  后重放同一 graph 能工作的根）
+- run-during-recording refuses / destroy 后 run refuses / 二次 capture→id 1 / run(1) by number.
+形状用已绿 s8rq 的 (M=256,N=64,K=256)（s8rq N==64-only guard, 照 §52 教训核各核 N 约束）。
+
+build 门数 17→**18**(加 gate_graph)。全回归 18/18 GREEN（今早 import+这次 graph 都没弄坏）。
+诚实计数: 我此前把"17"当固定值也数错过一次(§60 说18), 这次以脚本实跑 tail 为准=18。
+
+**下一步(第 2 步 D3D12 数据腿, §64 序 2)**: xmx_extmem_wait/sem_import_fence/buf 走
+D3D12 import（§18 probe_d3d12_ze 原语逐字: D3D12 heap/resource + fence → zeMemAllocDevice
+/ zeDeviceImportExternalSemaphoreExt）, 门=离线双进程游戏形态 D3D12 buffer+fence 读写
+bit-exact + 排序。这条是干净的（§59 死的是 Vulkan 方向, §18 活的正是 D3D12 方向）。

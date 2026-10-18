@@ -11,6 +11,10 @@ EXPORTS
     xmx_buf_destroy
     xmx_begin
     xmx_abort
+    xmx_graph_capture
+    xmx_graph_run
+    xmx_graph_destroy
+    xmx_idle
     xmx_rec_quant
     xmx_rec_gemm_s8
     xmx_rec_gemm_s8rq
