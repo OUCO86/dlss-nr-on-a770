@@ -1841,3 +1841,21 @@ kind**（xmxres.py:283 GRAPH=0/HOST_READ=1/HOST_WRITE=2）→ 放宽 guard（esz
 讨论的架构决策, 不是我能偷偷选的。先按 plan 顺序实现**无争议的 int8 族**
 (gemm_int8/batched/residual/qkv: 552 步, 恰是我已绿链的形态), 把 ffn/window_block 决策
 留到有数字时。
+
+## 70. permissive walk = 全部 5254 步走通, 且 224-pass 自洽证明 ABI 接线正确
+
+NOT_YET 占位加第二面（NR_L0_PERMISSIVE=1, 仅离线 scoreboard）: 未实现 pass 计数跳过继续走;
+**游戏面保持 fail-loud 默认**（换进游戏的 dll 撞未实现=拒绝出帧, 永不静默跳 pass, 画面不会
+骗人; banner 打印哪面活着）。permissive 跑: **exit=0, 5254/5254 全走通**。
+
+**自洽验证（不是巧合）**: 控制组(旧 dll 全实现) graph_run=**691 passes**; 我的 dll
+permissive=**224 passes**。691-224=**467**=captured 图里 15 个未实现 recorder 的调用次数
+(691 总 - quant 224)。我骨架里唯一真身 recorder 恰是 `xmx_rec_quant`(224 次/plan)——
+**passes 数恰好等于已实现 recorder 的 plan 调用次数**, 同时证明: (a) 全部 5254 步 ABI/arg
+数被接受 (b) 1277 blob 灌入成功 (c) capture→run 机器在 L0 上工作 (d) recorder 的 push/
+不 push 与 g_cmds 语义一致。(head 全零 = 未实现 pass 被跳, 合法且预期, permissive 面只量
+ABI 不量画质。)
+
+**选 1 开工序（用户 18:54 拍板）**: 接真身从 gemm_int8 族起(无争议=已绿链形态), 每个换芯:
+读出货语义(libxmx.c body + replay case + .comp 注释) → 映射到已绿链/组合 → gate+§51 对拍
+→ permissive walk 里把它摘掉再跑, passes 应 +该 op 的 plan 次数(下一个自洽检查点)。

@@ -324,7 +324,25 @@ int xmx_extmem_wait_pending(void) { return 0; }
    because it shares one prepare() with the game's fused mode). NOT fakes: the moment the
    walk or a fused run calls one, it fails loudly with a named reason, so a green walk
    never hides a pass that would have been silently skipped. */
-#define NOT_YET(name) do { FAILMSG("%s not implemented on the Level-Zero engine (walk must not call it; fused-path leg, section 64 step 3)", name); return -1; } while(0)
+/* Two faces of the placeholders (section 64 step 3, the user's sequence option 1):
+   GAME face (default): fail LOUD -- a swapped-in dll that hit an unimplemented pass
+   refuses the frame instead of silently skipping it, so no image can ever lie.
+   WALK face (NR_L0_PERMISSIVE=1, offline scoreboard only): count the call, skip it,
+   keep walking -- the ruler then measures ABI/shape acceptance across all 5254 steps
+   while the per-recorder numerics keep their own section-51 gates. The two faces are
+   one getenv apart and the banner prints which is live, so a permissive run can never
+   be mistaken for a game run. */
+static int l0_permissive() {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("NR_L0_PERMISSIVE") ? 1 : 0;
+    return cached;
+}
+#define NOT_YET(name) do { \
+    if (l0_permissive()) { static int warned = 0; if (!warned) { warned = 1; \
+        std::fprintf(stderr, "[permissive] walk scoreboard mode: unimplemented passes are counted and SKIPPED -- offline ABI ruler only, never the game face\n"); } \
+        g_skipped[name[4]] = (g_skipped[name[4]] + 1) % 100000; return 0; } \
+    FAILMSG("%s not implemented on the Level-Zero engine (walk must not call it; fused-path leg, section 64 step 3)", name); return -1; } while(0)
+static int g_skipped[256];
 int xmx_rec_pre(int c,int m,int h,int f,int pl,unsigned px,unsigned ht,unsigned wd,unsigned pt,unsigned sh,unsigned sw,unsigned fl,int tb) { (void)c;(void)m;(void)h;(void)f;(void)pl;(void)px;(void)ht;(void)wd;(void)pt;(void)sh;(void)sw;(void)fl;(void)tb; NOT_YET("xmx_rec_pre"); }
 int xmx_rec_post(int c,int hd,int h,int rs,int tb,int nl,unsigned px,unsigned ht,unsigned wd,unsigned pt,unsigned sh,unsigned sw) { (void)c;(void)hd;(void)h;(void)rs;(void)tb;(void)nl;(void)px;(void)ht;(void)wd;(void)pt;(void)sh;(void)sw; NOT_YET("xmx_rec_post"); }
 int xmx_rec_gemm_qkv(int a,int w,int q,int k,int v,int sc,unsigned M,unsigned ch,unsigned hd,unsigned tk,unsigned vt) { (void)a;(void)w;(void)q;(void)k;(void)v;(void)sc;(void)M;(void)ch;(void)hd;(void)tk;(void)vt; NOT_YET("xmx_rec_gemm_qkv"); }
