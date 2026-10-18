@@ -31,6 +31,7 @@ esac
 libs="d3d12.lib dxgi.lib ze_loader.lib"
 case "$src" in *caps*) libs="ze_loader.lib";; esac
 case "$src" in *probe_vk*) libs="vulkan-1.lib ze_loader.lib";; esac
+case "$src" in *gate_d3d_import*) libs="d3d12.lib dxgi.lib";; esac
 echo "icx -> $out ($libs)"
 "$SY/Library/bin/icx.exe" //nologo //Qstd=c++17 //O2 //EHsc "//Fe:$out" "$src" //link $libs
 

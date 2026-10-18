@@ -1756,3 +1756,29 @@ D3D12 数据腿(import buffer + sem fence + extmem_wait; §18 probe_d3d12_ze 单
 D3D12 heap/resource + fence → L0 的 import 与**双向 bit-exact 数据**——正是 fused 路 bridge
 进程内游戏持 D3D12 对象、我 L0 在同进程 import 的形状, §18 先例可直接复用)。
 门数 18→**19**（gate_graph + gate_coexist 两门今加, 以脚本 tail 为准）。
+
+## 67. route(a) 第 2 步 = D3D12 数据腿 GREEN（gate_d3d_import, 独立 exe, 非 py 门）
+
+用 nr_replay 驱动 libxmx 的同款方式（LoadLibrary 我 dll + GetProcAddress 游戏 ABI 名）测
+**游戏 fused 路的真实数据形态**：D3D12(前辈 probe_d3d12_ze 建立段逐字: EnumAdapters1 选
+0x8086、CreateCommittedResource+SHARED、GENERIC_ALL handle、16MB floor、GPU 写 pattern) →
+我的 `xmx_buf_import(handle,bytes)`（D3D12_RESOURCE kind）→ 我 SYCL queue 读回 **BIT-EXACT**
+(wrong=0) + 向 imported buffer **upload** A 后**回读无 stale** → 绿色 recorder `xmx_rec_gemm_s8rq`
+**以 imported buffer 作操作数 A 计算**, within-one 界内(0 rows exceed; 我第一版把容差写死
+绝对 <=2 是错的, 已绿门定义是相对 0.5*new_scale≈600, 34 远在内 —— 改测试不改核, §25 纪律)。
+
+**决定性诊断**: `[import] adopted SYCL's native L0 context (one runtime)` —— ensure_ze_world
+先试 get_native<level_zero>, **在 D3D12 共存下成功拿到 L0 native context**（§60 的 opencl
+降级只在 Vulkan 配对时发生; D3D12 配对 SYCL 仍走 level_zero）。⇒ import / kernel /
+upload 全在**同一个 SYCL-owned ze context**, 无跨 runtime 访问, fused 数据腿合法的根本原因。
+这同时验证了骨架 ensure_ze_world 的"先 adopt 后自建"顺序是对的（自建那条只在 SYCL 无 L0
+后端时兜底, §60 Vulkan 配对才会走到）。
+
+**gate 形态**: 这是 C++ exe（build_l0.sh 加 *gate_d3d_import* libs 分支=d3d12.lib dxgi.lib,
+不链 ze_loader——它只经我 dll 间接用 ze）。它**不进 build_sycl_dll.sh 的 py 门序列**
+（那些是 python ctypes 驱动), 但脚本+exe 都在仓库可复跑（oneapi/gate_d3d_import.exe）。
+
+**route(a) 四步进度**: 0 共存 GREEN(§66), 1 graph 机器 GREEN(§65), 2 D3D12 数据腿 GREEN(本节)。
+剩下 = **3 recorder 换芯**(把 plan 实际调的 coopmat xmx_rec_gemm_* 逐个改成我已绿 int8 链,
+每步 §51 对拍 + 对应门), 然后 4 合成游戏级门(出货 plan opcode 表喂我 dll 出整帧 diff)。
+下一步先枚举 plan_960x544.c 实际调了哪些 xmx_rec_* 及次序(dump 的真图, 不是猜), 按那个清单排换芯顺序。
