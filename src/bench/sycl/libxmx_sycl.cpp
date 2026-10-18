@@ -850,7 +850,94 @@ int xmx_rec_quant_window(int source, int packed, int scale, unsigned M, unsigned
     });
     return 0;
 }
-int xmx_rec_unary(int kind, int a, int b, int c, int d, int n, int channels, int p0, int batch, int sa, int sb, int sc, int k) { (void)kind; (void)a; (void)b; (void)c; (void)d; (void)n; (void)channels; (void)p0; (void)batch; (void)sa; (void)sb; (void)sc; (void)k; NOT_YET("xmx_rec_unary"); }
+// int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
+//                   unsigned channels, float p0, unsigned batch, unsigned sa,
+//                   unsigned sb, unsigned sc, unsigned k)
+// swap-in #7 (section 79). The captured graph's 16 unary calls are FOUR elementwise /
+// geometric kinds (resident.comp:44-55 enum): E4M3_HALF(18)x5, POOL2(12)x5,
+// UPSAMPLE_ADD(21)x4, PAD_END(16)x2 -- NOT the section-71 coopmat-fused family (I
+// mis-grouped unary there; corrected). All read the generic load_a/load_b/store
+// (resident.comp:79-93): a/b narrow iff flags bit 15/16, store applies the epilogue
+// (bits 8-11) then writes half iff bit 12. qr_publish is the already-gated rounding
+// chain. kind = flags & 0xFF; the plan carries the FULL flags word in arg0 (e.g. 4364
+// = 0x110C = POOL2 | narrow | b-half), so `kind` here is really the whole flags.
+int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
+                  unsigned channels, float p0, unsigned batch, unsigned sa,
+                  unsigned sb, unsigned sc, unsigned k) {
+    if (!g_recording) FAILMSG("not recording");
+    const unsigned flags = kind;                 // the plan's arg0 IS the flags word
+    const unsigned sub = flags & 0xFFu;
+    auto ia = g_bufs.find(a), ic = g_bufs.find(c);
+    if (ia == g_bufs.end() || ic == g_bufs.end()) FAILMSG("bad unary operand (a/c)");
+    const void* A = ia->second.p; void* C = ic->second.p;
+    const void* B = nullptr; if (b >= 0) { auto it = g_bufs.find(b); if (it != g_bufs.end()) B = it->second.p; }
+    const float* D = nullptr; if (d >= 0) { auto it = g_bufs.find(d); if (it != g_bufs.end()) D = (const float*)it->second.p; }
+    const bool a_half = (flags & 0x8000u) != 0u, b_half = (flags & 0x10000u) != 0u;
+    const bool narrow = (flags & 0x1000u) != 0u;
+    const unsigned epi = (flags >> 8) & 0xFu;
+    const unsigned N = n, CH = channels;
+    const unsigned SA = sa, SB = sb, SC = sc, KK = k, P0bits = 0; (void)P0bits;
+    const float P0 = p0; (void)P0; (void)batch; (void)sub;
+    // each branch is ONE device kernel with the load/store logic INLINE (a host helper
+    // lambda captured by reference is not a legal kernel parameter -- the first cut's
+    // compile error); scalars/pointers are captured by value.
+    if (sub == 18u) {   // E4M3_HALF: value=a.f32; e4m3; write half (no gate, no epilogue)
+        g_cmds.push_back([=]() {
+            GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
+                size_t i = it.get_id(0);
+                ((sycl::half*)C)[i] = sycl::half(qr_e4m3(((const float*)A)[i]));
+            }).wait();
+        });
+    } else if (sub == 12u) {   // POOL2: 2x2 average NHWC, column-first order (.comp:529-531)
+        g_cmds.push_back([=]() {
+            GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
+                size_t index = it.get_id(0);
+                unsigned ch = CH, width = SB;
+                unsigned cc = (unsigned)(index % ch), rest = (unsigned)(index / ch);
+                unsigned x = rest % (width / 2u), y = rest / (width / 2u);
+                size_t base = ((size_t)(2u * y) * width + 2u * x) * ch + cc;
+                auto ld = [&](size_t j) -> float { return a_half ? (float)((const sycl::half*)A)[j] : ((const float*)A)[j]; };
+                float total = cr_add(cr_add(cr_add(ld(base), ld(base + (size_t)width * ch)),
+                                            ld(base + ch)), ld(base + (size_t)(width + 1u) * ch));
+                float value = qr_publish(epi, cr_mul(total, 0.25f));
+                if (narrow) ((sycl::half*)C)[index] = sycl::half(value); else ((float*)C)[index] = value;
+            }).wait();
+        });
+    } else if (sub == 21u) {   // UPSAMPLE_ADD: a[nearest2x] + (b*sine[c]), publish
+        g_cmds.push_back([=]() {
+            GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
+                size_t index = it.get_id(0);
+                unsigned ch = CH, target = SA, source = SB;
+                unsigned cc = (unsigned)(index % ch), rest = (unsigned)(index / ch);
+                unsigned x = rest % target, y = rest / target;
+                float bval = b_half ? (float)((const sycl::half*)B)[index] : ((const float*)B)[index];
+                float aval = a_half ? (float)((const sycl::half*)A)[((size_t)(y / 2u) * source + (x / 2u)) * ch + cc]
+                                    : ((const float*)A)[((size_t)(y / 2u) * source + (x / 2u)) * ch + cc];
+                float merged = cr_add(aval, cr_mul(bval, D[cc]));
+                float value = qr_publish(epi, merged);
+                if (narrow) ((sycl::half*)C)[index] = sycl::half(value); else ((float*)C)[index] = value;
+            }).wait();
+        });
+    } else if (sub == 16u) {   // PAD_END: extend with zeros
+        g_cmds.push_back([=]() {
+            GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
+                size_t index = it.get_id(0);
+                unsigned ch = CH, height = SA, width = SB, padded = SC;
+                unsigned cc = (unsigned)(index % ch), rest = (unsigned)(index / ch);
+                unsigned x = rest % padded, y = rest / padded;
+                float value = (y < height && x < width)
+                    ? (a_half ? (float)((const sycl::half*)A)[((size_t)y * width + x) * ch + cc]
+                              : ((const float*)A)[((size_t)y * width + x) * ch + cc])
+                    : 0.0f;
+                value = qr_publish(epi, value);
+                if (narrow) ((sycl::half*)C)[index] = sycl::half(value); else ((float*)C)[index] = value;
+            }).wait();
+        });
+    } else {
+        FAILMSG("unary kind not implemented on Level-Zero (section 79 covers 12/16/18/21)");
+    }
+    return 0;
+}
 int xmx_rec_unary2(int kind, int a, int b, int c, int d, int second, int n, int channels, int p0, int batch, int sa, int sb, int sc, int k) { (void)kind; (void)a; (void)b; (void)c; (void)d; (void)second; (void)n; (void)channels; (void)p0; (void)batch; (void)sa; (void)sb; (void)sc; (void)k; NOT_YET("xmx_rec_unary2"); }
 int xmx_rec_window_attention(int q, int k, int v, int bias, int out, int batches, int heads, int merged) { (void)q; (void)k; (void)v; (void)bias; (void)out; (void)batches; (void)heads; (void)merged; NOT_YET("xmx_rec_window_attention"); }
 int xmx_rec_window_block(int image, int qkv, int projection, int target, int bias, int cosine, int scale, int pooled, int windows, int height, int width, int across, int pad, int flags) { (void)image; (void)qkv; (void)projection; (void)target; (void)bias; (void)cosine; (void)scale; (void)pooled; (void)windows; (void)height; (void)width; (void)across; (void)pad; (void)flags; NOT_YET("xmx_rec_window_block"); }

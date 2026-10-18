@@ -2065,3 +2065,27 @@ captured 图里第一个 recorder 就是 §71 待决的 coopmat 融合族。perm
 **关键**: 游戏面要真出帧, ffn_stem(step 2534, 第一个 recorder)必须先有实现(哪怕组合/
 过渡), 否则 fail-loud 永远走不到后面。这是 §71 那个"要不要一步到位 vs 过渡执行器"的
 决策, 现在到必须回答的时点了。
+
+## 79. swap-in #7 unary(4 kind) GREEN + passes 568 + 纠正 §78 分类错误
+
+**纠正**: §78 把 unary 归进"§71 待决 coopmat 融合族"是错的。captured unary 16 步的 kind
+(resident.comp:44-55 枚举, flags 全词在 arg0): E4M3_HALF(18)×5 + POOL2(12)×5 +
+UPSAMPLE_ADD(21)×4 + PAD_END(16)×2 = **纯 elementwise/几何**, 用通用 load_a/load_b/store
+(resident.comp:79-93, a/b narrow iff bit15/16, store 走 epilogue bits8-11 + narrow bit12)。
+我已绿 qr_publish 直接映射。→ 无争议族其实比 §78 说的多 16 步。
+
+实现=4 分支各一个 device kernel, load/store **内联**(第一版把 host helper lambda 按引用
+捕获传进 parallel_for = SYCL 拒"const bool&/const void* const& as kernel parameter", 编译错;
+教训=SYCL 设备核里不能调按引用捕获的 host lambda, 标量/指针按值捕获+逻辑内联)。POOL2 列优先
+加序(.comp:529-531 precise 三步), UPSAMPLE_ADD 两非融合 precise 步(.comp:598-600), PAD_END
+in-bounds 测试(.comp:607-609)。
+
+门=resident.comp 各分支逐字转录 numpy golden, 4 kind 全 OUT BITS EQUAL 0 bad。三个测试
+bug 当场钉: 输出 buffer 尺寸(n=总元素不是 n*ch; channels 只是 POOL2/UPSAMPLE/PAD 的模数
+stride)、E4M3_HALF 传 channels=0(plan 实测)、UPSAMPLE_ADD a dtype 随 flags bit15(f32 非 f16)。
+
+passes 链: 224→248→320→388→448→500→552→**568**。build 实数 **26 全绿**。
+captured 691 已换 568=**82%**。剩 123 = window_attention 52 + gemm fp16 42 + window_block
+10 + ffn 10 + global_attention 8 + unary2 1。**这 123 全是 §71/§78 待决族**(融合 attention
++ coopmat ffn/window_block + fp16 gemm)——无争议族已接完, 终点线(游戏出帧)现在硬卡在
+step 2534 ffn_stem 上, 必须你定 §78 那三条路怎么走。
