@@ -1667,3 +1667,45 @@ import 探针、17 门)本身全部有效**——错的只是"游戏里有个 da
 **流程规矩（防再犯, 已写进 MEMORY.md 断点段）**：凡"游戏怎么跑/开关在哪/日志在哪/进程在不在"
 这类**环境事实**, 动手前先 grep 出货代码拿行号, **不采信任何交接文档的记忆**; 交接文档
 (HANDOFF)与代码打架时, 以代码为准并**立即替换文档**, 不许两头并存。
+
+## 64. 路线 (a) 定案（用户 17:07 "a。这样工作目标明确干净"+ "桥接现在不许动"）：把游戏核心件换成 Level-Zero 引擎, 桥接/plan 源码一概不动
+
+**结构事实（本轮代码读全, 推翻"要重录 plan"的担心）**: plan_960x544.c 是
+**opcode 表**（nr_plan.h: 每行=一次 libxmx 调用, 函数名以字符串表引用,
+nr_replay.c:223 GetProcAddress 驱动）。⇒ **换掉 `work/libxmx.dll` 的引擎实现, 现有
+plan 一行不改就在我的 Level-Zero 引擎上重放**——它只认 ABI 名字。游戏帧的进入=
+D3D12 共享 buffer + 游戏 D3D12 fence, libxmx 侧 import（xmx_extmem_wait /
+xmx_sem_import_fence, nr_replay.c:149-158/267-284/421）——**§18 早测过 D3D12→L0
+的 fence+memory import 是 bit-exact 干净的**（§59 死的是 Vulkan 导出方向; 游戏这条
+恰好是干净方向）。
+
+**游戏 ABI 面 = 80 个函数**（notes/game-abi-80.txt, 本轮 grep nr_replay.c+plan_*.c
+并集实数, 已入仓）。分解:
+- **机器类(必补, 语义要在 L0 上重建)**: xmx_init/device/error + buf 族(create_kind/
+  upload/download/zero/destroy/ptr/import) + begin/abort/submit/sync/idle +
+  **graph_capture/graph_run/graph_destroy** + extmem_wait/sem_import/sem_import_fence/
+  sem_value + specialize/specialized_count + profile 族(4)+time 族(3) + *_init 12 个
+  (res/rows/staged32/tiled32/tiled8/window/ffn/int8/int8_fused/int8_residual/quant/
+  global_attention/window_block/prepost)——大多是着色器/布局装载, L0 侧多为我已有核
+  的注册, 可先做 no-op+按 plan 用到的真补。
+- **recorder 类(plan 实际调的 ~20)**: xmx_rec_* 里 coopmat 的 gemm 族正是**要用我已绿
+  int8 链顶掉的目标**(xmx_rec_gemm_qkv/_window/_int8/_ffn...), 其余 copy/quant/pre/post/
+  history/unary/row 是已绿积木(publish/cosine/softmax/quantize/requant 已门控)。
+
+**执行序(每步一个可门控增量, 桥接不碰)**:
+1. **graph 机器**: libxmx_sycl 加 xmx_graph_capture/run/destroy——capture=把后续
+   recorded cmds 封成一张可重放 L0 command list(我的 g_cmds 机制已经是这个雏形),
+   run=一次 zeCommandQueueExecuteCommandLists。门: 用 chain 门形状 capture 后
+   replay N 次与逐个 submit **逐字节同** + 计时(gate 合法: 这是健康链路自己的形态,
+   不是不健康 coopmat 对照)。
+2. **游戏数据腿**: xmx_extmem_wait/sem_import_fence/buf_import → **D3D12 导入路**
+   (§18 原语逐字可用, 与 §60 的 Vulkan-import 死路无关)。门: 离线双进程——游戏侧
+   形态的 D3D12 buffer+fence, 我 dll import, 读写 bit-exact+排序正确(§18 GATE A/C 同族)。
+3. **recorder 换芯**: 把 coopmat xmx_rec_gemm_* 逐个改成我的已绿链(v_i8/deq/cosine/
+   softmax/scores/attnV...), 每个改完跑对应门+对拍(§51 网)。init 族按 plan 用到补真身、
+   其余 no-op。
+4. **合成游戏级门**: 用**出货 plan 本身**(opcode 表逐行喂我的 dll, 离线)出整帧 →
+   与 ResidentBackend-shipped 帧 diff(=p1_l0_offline 的 graph 版)。绿 → 换
+   work/libxmx.dll(备份在位)+重启游戏, 用户面板 Insert 当帧 A/B。
+规矩不变: 数字①实跑②贴③才报; 桥接层(src/OptiScaler/)零改动(用户明令);
+marker/nr_trigger/daemon-bounce 类旧脚手架在 2/4 步后删除退役。
