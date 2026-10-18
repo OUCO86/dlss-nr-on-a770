@@ -1919,3 +1919,25 @@ ffn_stem(step 2534, 前辈否证"不进 int8"的 coopmat 融合 pass, §71 待�
 int8 族**(gemm_int8✓, 还 batched72/residual68/qkv60/window_int8_residual52 + quant✓/quant_window52),
 passes 累积可测; ffn/window_block/unary/copy 那族留到有真数字再与你讨论(§71 未拍板)。
 gate 数 19→**20**(GEMM_INT8)。
+
+## 73. swap-in #2 gemm_int8_batched = GREEN（四变体 OUT BITS EQUAL 0 bad）+ 三个自己写错的 bug 当场钉死
+
+plan 实测 batched 六个真变体(72 次): batch∈{2,4,8}, sa∈{0(广播),K..}, sb=整块权重,
+sc=N, lda=0|batchK(列切片!), ldb=K, ldc=0|batchN(宽行并列), scale_stride=0(全组共享行 scale,
+= .comp:140-143 "一次 quantise 覆盖整个宽激活"), flags∈{4352,4864}。实现=host 按 .comp
+扁平映射 gather 每组 dense 切片 → v8 BN=64 列块 + **gemm32**(v7 循环几何去掉 fused requant、
+raw int32 存, 进 v8 头) 处理 N=32 尾块 → 已门控 publish 腿写 ldc-strided 槽。
+
+本轮连续钉死**三个我自己的 bug**（都不是核/链的错, 全部改测试或改 host 代码, 符合 §25"修参照不修核"当参照错时）:
+1. **golden 与设备映射漂移**: 第一版 golden 用 numpy 2-D `Awide[:,g*sa:]`(=行 r*(lda')+k+g*sa)
+   ≠ .comp 扁平 `flat[g*sa + r*lda + k]`——strides 全零时两者巧合相同(所以 D1 绿), 非零即分叉。
+   把 .comp:136-138 读死再写 golden 后四变体全绿。教训: 多组 stride 语义必须先把出货公式抄成
+   注释钉住, 两侧都照它写（已抄进 recorder 注释）。
+2. **std::memcpy 直接读设备指针**: stride gather 第一版在 host 上 memcpy(Araw+..) =
+   access violation(崩)——设备内存必须经 GQ->memcpy 先搬回 host 再 gather。修。
+3. **over-read**: aw_b=M*lda+(batch-1)*sa 在 lda>K 时比实际 max-touched 多 lda-K 字节。
+   修成 (M-1)*lda+(batch-1)*sa+K。
+
+判据=OUT BITS EQUAL(4/4 变体 0 bad bytes), 含 batch1 锚(D1, 必须等于已绿 plain gemm_int8)
++P1 广播/P2 列切片+gemm32/T1 scale_stride=M 压力变体。**passes 自洽检查点见本节末 walk**。
+gate 数 20→**21**(GEMM_INT8_BATCHED, 入 build)。

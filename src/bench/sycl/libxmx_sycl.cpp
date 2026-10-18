@@ -416,7 +416,105 @@ int xmx_rec_gemm_int8(int a, int b, int c, int a_scale, int b_scale,
     });
     return 0;
 }
-int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale, int M, int N, int K, int batch, int sa, int sb, int sc, int lda, int ldb, int ldc, int scale_stride, int flags) { (void)a; (void)b; (void)c; (void)a_scale; (void)b_scale; (void)M; (void)N; (void)K; (void)batch; (void)sa; (void)sb; (void)sc; (void)lda; (void)ldb; (void)ldc; (void)scale_stride; (void)flags; NOT_YET("xmx_rec_gemm_int8_batched"); }
+// int xmx_rec_gemm_int8_batched(a,b,c,a_scale,b_scale,M,N,K,batch,sa,sb,sc,
+//                               lda,ldb,ldc,scale_stride,flags)
+// swap-in #2 (section 71 two-pass plan): batched = `batch` INDEPENDENT GROUPS, each a
+// dense (M,K)x(N,K-transposed) product whose operands are COL SLICES of wider buffers.
+// The group math is read straight from gemm_staged_int8.comp:132-147 and verified
+// against the plan's six real variants (section 73):
+//   A row r of group g : Araw + r*lda + g*sa   (lda==0 -> K; sa bytes, sa==0 broadcasts A)
+//   B row n of group g : Braw + n*ldb + g*sb   (ldb==0 -> K; sb==0 shares the weights)
+//   C row r of group g :  Cout + g*sc + r*ldc + col   (ldc==0 -> N, sc ELEMENTS)
+//   a_scale index r    : as + g*scale_stride           (.comp roff, 0 = groups share row scales)
+//   b_scale index col  : sb!=0 ? bs + g*N : bs         (.comp soff)
+// Group slices are gathered DENSE on the host (this is the path gate; the stride gathers
+// die when the producer owns the layout, section 9's single world), then each group runs
+// v8's BN=64 loop in column blocks of 64 with a BN=32 tail (gemm32: v7's loop geometry,
+// raw int32 store), then the gated elementwise publish lands at the ldc-strided slot.
+int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
+                              unsigned M, unsigned N, unsigned K, unsigned batch,
+                              unsigned sa, unsigned sb, unsigned sc,
+                              unsigned lda, unsigned ldb, unsigned ldc,
+                              unsigned scale_stride, unsigned flags) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!M || !N || !K || !batch) FAILMSG("gemm_int8_batched needs M,N,K,batch nonzero");
+    if ((N % 32u) || (K % 32u)) FAILMSG("gemm_int8_batched needs N%%32==0, K%%32==0");
+    const unsigned lda_ = lda ? lda : K, ldb_ = ldb ? ldb : K, ldc_ = ldc ? ldc : N;
+    auto ia = g_bufs.find(a), ib = g_bufs.find(b), ic = g_bufs.find(c);
+    auto ias = g_bufs.find(a_scale), ibs = g_bufs.find(b_scale);
+    if (ia == g_bufs.end() || ib == g_bufs.end() || ic == g_bufs.end() ||
+        ias == g_bufs.end() || ibs == g_bufs.end()) FAILMSG("bad gemm_int8_batched operand");
+    const int8_t* Araw = (const int8_t*)ia->second.p;
+    const int8_t* Braw = (const int8_t*)ib->second.p;
+    void* Cout = ic->second.p;
+    const float* as = (const float*)ias->second.p;
+    const float* bs = (const float*)ibs->second.p;
+    const unsigned epi = (flags >> 8) & 0xFu;
+    const bool narrow = (flags & 0x1000u) != 0u;
+    const int Mp = l0_ceil_bm(M);
+    g_cmds.push_back([=]() {
+        const size_t a_slice = (size_t)M * K, b_slice = (size_t)N * K;
+        const unsigned lda_e = lda ? lda : K, ldb_e = ldb ? ldb : K;
+        // Copy the WIDE buffers back whole (device->host via the queue -- std::memcpy on a
+        // device pointer is the access violation the first batched gate run hit, my stride
+        // fix's own bug), then the group slice-gather is plain HOST arithmetic.
+        // EXACT max-touched sizes ((rows-1)*stride + advance + row), NOT rows*stride --
+        // with lda>K the old form over-read the buffer by lda-K bytes (caught reading my
+        // own gather back against the gate harness sizes).
+        const size_t aw_b = (size_t)(M - 1) * lda_e + (size_t)(batch - 1) * sa + K;
+        const size_t bw_b = (size_t)(N - 1) * ldb_e + (size_t)(batch - 1) * sb + K;
+        std::vector<int8_t> hAw(aw_b), hBw(bw_b);
+        GQ->memcpy(hAw.data(), Araw, aw_b).wait();
+        GQ->memcpy(hBw.data(), Braw, bw_b).wait();
+        for (unsigned g = 0; g < batch; ++g) {
+            const size_t ce = (size_t)g * sc;                       // C advance (elements)
+            // GATHER the group's COL-SLICED operands dense (the stride lesson of section
+            // 73's first gate run: rows are lda bytes apart, the group advances sa BYTES):
+            std::vector<int8_t> hA(a_slice), hB(b_slice);
+            for (unsigned r = 0; r < M; ++r)
+                std::memcpy(hA.data() + (size_t)r * K, hAw.data() + (size_t)r * lda_e + (size_t)g * sa, K);
+            for (unsigned n = 0; n < N; ++n)
+                std::memcpy(hB.data() + (size_t)n * K, hBw.data() + (size_t)n * ldb_e + (size_t)g * sb, K);
+            std::vector<int8_t> hApad((size_t)Mp * K, 0), hAp((size_t)Mp * K), hBp(b_slice);
+            std::memcpy(hApad.data(), hA.data(), a_slice);
+            s8v8::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
+            // column blocks: 64 each plus a 32 tail if N%64
+            int nb64 = (int)(N / 64u);
+            unsigned nrem = N % 64u;
+            float* gas = (float*)as + (size_t)g * scale_stride;   // roff (.comp:143)
+            float* gbs = (sb != 0u) ? ((float*)bs + (size_t)g * N) : (float*)bs;  // soff (.comp:147)
+            for (int blk = 0; blk <= ((nrem && nb64 >= 0) ? nb64 : nb64 - 1); ++blk) {
+                unsigned c0 = (unsigned)blk * 64u;
+                unsigned n64 = (nrem && blk == nb64) ? nrem : 64u;
+                // dense (M,K)x(N,64-slice) at this group's slice, packed per block
+                std::vector<int8_t> Bt((size_t)n64 * K), Bp((size_t)n64 * K);
+                for (unsigned r = 0; r < n64; ++r)
+                    std::memcpy(Bt.data() + (size_t)r * K, hB.data() + (size_t)(c0 + r) * K, K);
+                if (n64 == 64u) s8v8::pack_b(Bt.data(), Bp.data(), (int)n64, (int)K);
+                else            s8v8::pack_b32(Bt.data(), Bp.data(), (int)n64, (int)K);
+                int8_t* dAp = (int8_t*)sycl::malloc_device((size_t)Mp * K, *GQ);
+                int8_t* dBp = (int8_t*)sycl::malloc_device((size_t)n64 * K, *GQ);
+                int32_t* dC = (int32_t*)sycl::malloc_device((size_t)Mp * n64 * 4, *GQ);
+                GQ->memcpy(dAp, hAp.data(), (size_t)Mp * K).wait();
+                GQ->memcpy(dBp, Bp.data(), (size_t)n64 * K).wait();
+                if (n64 == 64u) s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)n64, (int)K).wait();
+                else            s8v8::gemm32(*GQ, dAp, dBp, dC, Mp, (int)n64, (int)K).wait();
+                // publish this block into the ldc-strided output (only real M rows)
+                GQ->parallel_for(sycl::range((size_t)M * n64),
+                                 [=](sycl::item<1> it) {
+                    size_t i = it.get_id(0);
+                    unsigned r = (unsigned)(i / n64), col = (unsigned)(i % n64);
+                    float v = cr_mul(cr_mul((float)dC[(size_t)r * n64 + col], gas[r]), gbs[c0 + col]);
+                    size_t out = ce + (size_t)r * ldc_ + (c0 + col);
+                    if (narrow) ((sycl::half*)Cout)[out] = sycl::half(qr_publish(epi, v));
+                    else        ((float*)Cout)[out] = qr_publish(epi, v);
+                }).wait();
+                sycl::free(dAp, *GQ); sycl::free(dBp, *GQ); sycl::free(dC, *GQ);
+            }
+        }
+    });
+    return 0;
+}
 int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_scale, int qkv_scale, int M, int channels, int heads, int tokens, int flags) { (void)a; (void)b; (void)q; (void)k; (void)v; (void)a_scale; (void)b_scale; (void)qkv_scale; (void)M; (void)channels; (void)heads; (void)tokens; (void)flags; NOT_YET("xmx_rec_gemm_int8_qkv"); }
 int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale, int skip, int cosine, int M, int N, int K, int flags) { (void)a; (void)b; (void)c; (void)a_scale; (void)b_scale; (void)skip; (void)cosine; (void)M; (void)N; (void)K; (void)flags; NOT_YET("xmx_rec_gemm_int8_residual"); }
 int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_scale, int skip, int cosine, int M, int N, int K, int flags, int height, int width, int across, int pad) { (void)a; (void)b; (void)c; (void)a_scale; (void)b_scale; (void)skip; (void)cosine; (void)M; (void)N; (void)K; (void)flags; (void)height; (void)width; (void)across; (void)pad; NOT_YET("xmx_rec_gemm_window_int8_residual"); }
