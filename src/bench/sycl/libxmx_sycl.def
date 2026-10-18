@@ -16,6 +16,51 @@ EXPORTS
     xmx_graph_run
     xmx_graph_destroy
     xmx_idle
+    xmx_device
+    xmx_buf_ptr
+    xmx_sync
+    xmx_res_init
+    xmx_rows_init
+    xmx_staged32_init
+    xmx_tiled32_init
+    xmx_tiled8_init
+    xmx_window_init
+    xmx_ffn_init
+    xmx_int8_init
+    xmx_int8_fused_init
+    xmx_int8_residual_init
+    xmx_quant_init
+    xmx_global_attention_init
+    xmx_window_block_init
+    xmx_prepost_init
+    xmx_specialize
+    xmx_sem_import
+    xmx_sem_import_fence
+    xmx_extmem_wait
+    xmx_extmem_wait_clear
+    xmx_extmem_wait_pending
+    xmx_rec_pre
+    xmx_rec_post
+    xmx_rec_gemm_qkv
+    xmx_rec_gemm_qkv_window
+    xmx_rec_gemm_residual
+    xmx_rec_gemm_window_residual
+    xmx_rec_gemm_int8_fused
+    xmx_rec_ffn
+    xmx_rec_ffn_merge
+    xmx_rec_ffn_stem
+    xmx_rec_gemm
+    xmx_rec_gemm_int8
+    xmx_rec_gemm_int8_batched
+    xmx_rec_gemm_int8_qkv
+    xmx_rec_gemm_int8_residual
+    xmx_rec_gemm_window_int8_residual
+    xmx_rec_global_attention
+    xmx_rec_quant_window
+    xmx_rec_unary
+    xmx_rec_unary2
+    xmx_rec_window_attention
+    xmx_rec_window_block
     xmx_rec_quant
     xmx_rec_gemm_s8
     xmx_rec_gemm_s8rq

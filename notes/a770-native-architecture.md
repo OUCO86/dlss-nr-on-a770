@@ -1806,3 +1806,38 @@ window_attention(104)+global_attention(16)、ffn(16+2+2)、unary(32+2)、window_
 copy(0 在 capture 内? OP_XMX_REC_COPY 计数=0——capture 期间没调)。
 第 3 步工具=**plan-walk harness**(下一步): python 读 nr_plan_steps, 逐 op 喂我的 dll
 (ctypes 游戏 ABI 名), 第一失败 op+计数=进度 scoreboard, 全 5254 走通+帧 diff=第 4 步。
+
+## 69. route(a) 第 3 步进度尺成立 = 前辈 replayer 驱动我的 dll, walk 停在 step 2534
+
+工具=复用前辈的离线 replay（**不是另起 walk 脚本**, §61 教训: 别重造已验证的翻译逻辑）。
+`tools/build_replay_standalone.bat`（新入仓, 照 build_fused.bat:37 去 -LD 加
+-DNR_REPLAY_STANDALONE）建 `work/nr_replay_now.exe`——它内嵌**当前 5254 步 plan**
+（旧的 nr_replay_960x544.exe 是 10-13 建的、内嵌 2314 步旧 plan, 不能用, 时间戳+step 计数
+当场对质钉死: plan_960x544.c/.json/.bin=10-14 21:06 的 5254 步, 就是游戏那张）。
+
+**控制组（对旧 libxmx.dll）**: 5254 steps / 1302 buffers / 1277 blobs, **691 passes**,
+run 44.9ms ×4 稳定, head `-0.5119 -0.7471 -0.6607 7.5215`（691 与 frame-ledger 对上了）。
+exe 本身可信。
+
+**对我的 libxmx_sycl.dll（在 oneapi/ 跑, 依赖齐）**:
+- census: SYCL 枚举到**两台 Arc, backend=2(level_zero) + backend=1(opencl)**, **选了
+  backend=2** —— D3D12 共存（无 Vulkan 污染）下 SYCL 走对 L0; §60 的 opencl-only 降级是
+  **Vulkan 配对**特有的。ensure_ze_world 的 get_native 采纳路径这次能成立。
+- prepare() GRAB 全过（机器壳 27 + prepare-only 占位 7 + swap-in 目标占位 15, 全 fail-loud
+  或幂等壳, **没有一个假装算对**）。
+- **walk 走过全部 2534 步机器层（1302 create + buf_ptr no-op + init/specialize/begin +
+  blob upload 1277 全成功）**, 停在 `step 2534 (xmx_rec_ffn_stem): not implemented`——
+  正是 §68 从 .c 里读到的 plan 第一个真 recorder。进度尺精确到位。
+
+修的一处真语义分歧: 骨架 create_kind 第二参当 esz 且 `!esz` 拒 0, 而**游戏 ABI 第二参是
+kind**（xmxres.py:283 GRAPH=0/HOST_READ=1/HOST_WRITE=2）→ 放宽 guard（esz 确认无任何寻址
+路径读它, 只存作字段）, 19 门仍全绿。这是 ABI 对齐修正, 非 hack。
+
+**下一步(step 3 开做)= 实现 step 2534 起的 recorder, 从 ffn_stem 起逐个换芯**。但
+**必须先诚实面对一个真问题**: ffn_stem/window_block/ffn 这几个是前辈 §否证里明确
+"不进 int8 GEMM"的 coopmat 融合 pass——纯 Level-Zero 上没有 Vulkan coopmat 的等价物。
+换芯语义="同字节行为", 所以这几族要么 (i) 用已绿的 int8/ESIMD 链复现其**输入输出字节契约**
+(§51 网验收), 要么 (ii) 承认它们不是 GEMM-bound、暂时保留在某个过渡执行器里。这是要跟你
+讨论的架构决策, 不是我能偷偷选的。先按 plan 顺序实现**无争议的 int8 族**
+(gemm_int8/batched/residual/qkv: 552 步, 恰是我已绿链的形态), 把 ffn/window_block 决策
+留到有数字时。

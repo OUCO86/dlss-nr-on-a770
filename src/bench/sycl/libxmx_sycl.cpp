@@ -83,13 +83,20 @@ int xmx_init(void) {
 
 // int xmx_buf_create(unsigned long long bytes) — libxmx.c:96 shape. esz defaults 2 (half);
 // the gate uses create_kind to set element size for int8/f32 outputs.
-int xmx_buf_create_kind(unsigned long long bytes, int esz) {
+// int xmx_buf_create_kind(unsigned long long bytes, int kind) -- the GAME ABI's second
+// argument is the buffer KIND (xmxres.py:283 GRAPH=0/HOST_READ=1/HOST_WRITE=2), which is
+// what a walk of the plan feeds and what the shipped libxmx.c takes. It is metadata only
+// for us: nothing addresses by it (every kernel gets explicit byte counts or plan args --
+// checked), so the guard no longer rejects kind==0. esz was the old gate's misuse of the
+// slot; kept as a stored field so buf_download sizing and import bookkeeping still have a
+// width for the gates that pass one.
+int xmx_buf_create_kind(unsigned long long bytes, int kind) {
     if (!GQ) FAILMSG("not initialised");
-    if (!bytes || !esz) FAILMSG("bad buffer request");
+    if (!bytes) FAILMSG("bad buffer request");
     void* p = sycl::malloc_device<unsigned char>(bytes, *GQ);
     if (!p) FAILMSG("out of device memory");
     int id = g_nextbuf++;
-    g_bufs[id] = { p, (size_t)bytes, (size_t)esz };
+    g_bufs[id] = { p, (size_t)bytes, (size_t)(kind == 0 ? 2 : kind) };
     return id;
 }
 int xmx_buf_create(unsigned long long bytes) { return xmx_buf_create_kind(bytes, 2); }
@@ -253,6 +260,98 @@ int xmx_idle(void) {
     try { GQ->wait(); } catch (const std::exception& e) { FAILMSG("idle: %s", e.what()); }
     return 0;
 }
+
+/* ---------------------------------------------------------------------------
+ * route(a) step 3 (section 68): the MACHINERY face of the game ABI. nr_replay's
+ * prepare() GRABs these names, and the shipped plan's first 2534 steps are all of
+ * them -- buf/buf_ptr/begin/init/specialize. The inits register .spv pipelines in the
+ * shipping library; we have ESIMD kernels compiled in, so each init is a one-time
+ * registration (the shipped ones are idempotent exactly the same way: libxmx.c
+ * `if (g.rquant) return 0`), and the spv PATHS are recorded for honesty but never
+ * loaded. specialize keeps the shipped guard (mask 0..7, not during recording).
+ * ------------------------------------------------------------------------- */
+static int g_specialize = 0;
+static unsigned g_init_seen = 0;         // bitset, one bit per init family
+const char* xmx_device(void) { return GD ? GD->get_info<sycl::info::device::name>().c_str() : ""; }
+// int xmx_buf_ptr(int id) -- the shipped entry hands the host a MAPPED pointer; the
+// replayer never uses it (nr_replay.c:473-478: the blobs go in by xmx_buf_upload, "the
+// same bytes, into the same buffer"), and our walk follows that precedent: return 0 and
+// let the harness upload. Buffers here are unmapped device memory by design (P3).
+int xmx_buf_ptr(int id) { (void)id; return 0; }
+int xmx_sync(int on) { (void)on; return 0; }   // ours is synchronous per pass; nothing to gate
+
+static int init_once(unsigned bit) {
+    g_init_seen |= bit;
+    return 0;   // one-time registration of a compiled-in kernel, like the shipped guard
+}
+int xmx_res_init(const char* a, const char* b, const char* c, const char* d, const char* e, const char* f) { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; return init_once(1u<<0); }
+int xmx_rows_init(const char* path) { (void)path; return init_once(1u<<1); }
+int xmx_staged32_init(const char* a, const char* b) { (void)a;(void)b; return init_once(1u<<2); }
+int xmx_tiled32_init(const char* path) { (void)path; return init_once(1u<<3); }
+int xmx_tiled8_init(const char* path) { (void)path; return init_once(1u<<4); }
+int xmx_window_init(const char* path, unsigned merged) { (void)path; if (merged > 1) FAILMSG("invalid window attention output mode"); return init_once(1u<<5); }
+int xmx_ffn_init(const char* path) { (void)path; return init_once(1u<<6); }
+int xmx_int8_init(const char* path) { (void)path; return init_once(1u<<7); }
+int xmx_int8_fused_init(const char* path) { (void)path; return init_once(1u<<8); }
+int xmx_int8_residual_init(const char* path) { (void)path; return init_once(1u<<9); }
+int xmx_quant_init(const char* path) { (void)path; return init_once(1u<<10); }
+int xmx_global_attention_init(const char* path) { (void)path; return init_once(1u<<11); }
+int xmx_window_block_init(const char* path) { (void)path; return init_once(1u<<12); }
+int xmx_prepost_init(const char* a, const char* b) { (void)a;(void)b; return init_once(1u<<13); }
+int xmx_specialize(unsigned mask) {
+    if (g_recording) FAILMSG("cannot switch specialization during recording");
+    if (mask > 7) FAILMSG("specialization mask must be in 0..7");
+    g_specialize = (int)mask;
+    return 0;
+}
+unsigned xmx_specialized_count(void) { return 0; }
+unsigned xmx_specialization(void) { return (unsigned)g_specialize; }
+
+// extmem/sem stubs (the walk calls none of them: the fence leg lives in nr_replay's
+// direct ABI path, section 68's finding; the gate in step 4 drives the game-shaped
+// two-import flow through the section-18 primitives -- these keep prepare() from
+// failing at GRAB time so a real nr_replay can load my dll).
+static int g_xsem = 0;
+int xmx_sem_import(unsigned long long handle, int timeline) { (void)handle; (void)timeline; return ++g_xsem; }
+int xmx_sem_import_fence(unsigned long long handle) { (void)handle; return ++g_xsem; }
+unsigned long long xmx_sem_value(int id) { (void)id; return 0; }
+int xmx_extmem_wait(int id, unsigned long long value) { (void)id; (void)value; return 0; }
+int xmx_extmem_wait_clear(void) { return 0; }
+int xmx_extmem_wait_pending(void) { return 0; }
+
+/* prepare()-required recorder names the CURRENT plan does NOT walk (section 68's split:
+   15 swap-in targets the plan DOES walk, vs these fused-path names nr_replay GRABs only
+   because it shares one prepare() with the game's fused mode). NOT fakes: the moment the
+   walk or a fused run calls one, it fails loudly with a named reason, so a green walk
+   never hides a pass that would have been silently skipped. */
+#define NOT_YET(name) do { FAILMSG("%s not implemented on the Level-Zero engine (walk must not call it; fused-path leg, section 64 step 3)", name); return -1; } while(0)
+int xmx_rec_pre(int c,int m,int h,int f,int pl,unsigned px,unsigned ht,unsigned wd,unsigned pt,unsigned sh,unsigned sw,unsigned fl,int tb) { (void)c;(void)m;(void)h;(void)f;(void)pl;(void)px;(void)ht;(void)wd;(void)pt;(void)sh;(void)sw;(void)fl;(void)tb; NOT_YET("xmx_rec_pre"); }
+int xmx_rec_post(int c,int hd,int h,int rs,int tb,int nl,unsigned px,unsigned ht,unsigned wd,unsigned pt,unsigned sh,unsigned sw) { (void)c;(void)hd;(void)h;(void)rs;(void)tb;(void)nl;(void)px;(void)ht;(void)wd;(void)pt;(void)sh;(void)sw; NOT_YET("xmx_rec_post"); }
+int xmx_rec_gemm_qkv(int a,int w,int q,int k,int v,int sc,unsigned M,unsigned ch,unsigned hd,unsigned tk,unsigned vt) { (void)a;(void)w;(void)q;(void)k;(void)v;(void)sc;(void)M;(void)ch;(void)hd;(void)tk;(void)vt; NOT_YET("xmx_rec_gemm_qkv"); }
+int xmx_rec_gemm_qkv_window(int im,int w,int q,int k,int v,int sc,unsigned M,unsigned ch,unsigned hd,unsigned tk,unsigned wd,unsigned ht,unsigned ac,unsigned pd,unsigned im2) { (void)im;(void)w;(void)q;(void)k;(void)v;(void)sc;(void)M;(void)ch;(void)hd;(void)tk;(void)wd;(void)ht;(void)ac;(void)pd;(void)im2; NOT_YET("xmx_rec_gemm_qkv_window"); }
+int xmx_rec_gemm_residual(int a,int b,int c,int sk,int co,unsigned M,unsigned N,unsigned K,unsigned fl) { (void)a;(void)b;(void)c;(void)sk;(void)co;(void)M;(void)N;(void)K;(void)fl; NOT_YET("xmx_rec_gemm_residual"); }
+int xmx_rec_gemm_window_residual(int a,int b,int c,int sk,int co,unsigned M,unsigned N,unsigned K,unsigned fl,unsigned ht,unsigned wd,unsigned ac,unsigned pd) { (void)a;(void)b;(void)c;(void)sk;(void)co;(void)M;(void)N;(void)K;(void)fl;(void)ht;(void)wd;(void)ac;(void)pd; NOT_YET("xmx_rec_gemm_window_residual"); }
+int xmx_rec_gemm_int8_fused(int a,int b,int c,int as,int bs,unsigned M,unsigned N,unsigned K,unsigned fl) { (void)a;(void)b;(void)c;(void)as;(void)bs;(void)M;(void)N;(void)K;(void)fl; NOT_YET("xmx_rec_gemm_int8_fused"); }
+
+/* swap-in TARGETS (section 68 A-list): names exist so prepare() GRABs them; every one
+   fails loudly if reached. As each is implemented (a green chain gated + diffed), its
+   stub is replaced by the real recorder -- the scoreboard is "the first target that still
+   answers NOT_YET", which walks down the plan as we implement. */
+int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine, int M, int cin, int hidden, int groups, int flags) { (void)a; (void)expand; (void)projection; (void)out; (void)skip; (void)cosine; (void)M; (void)cin; (void)hidden; (void)groups; (void)flags; NOT_YET("xmx_rec_ffn"); }
+int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projection, int out, int cosine, int height, int width, int source_width, int flags) { (void)source; (void)skip; (void)sincos; (void)expand; (void)projection; (void)out; (void)cosine; (void)height; (void)width; (void)source_width; (void)flags; NOT_YET("xmx_rec_ffn_merge"); }
+int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int out, int cosine, int M, int flags) { (void)features; (void)adapter; (void)expand; (void)projection; (void)out; (void)cosine; (void)M; (void)flags; NOT_YET("xmx_rec_ffn_stem"); }
+int xmx_rec_gemm(int a, int b, int c, int M, int N, int K, int batch, int sa, int sb, int sc, int bt, int lda, int ldb, int ldc, int oa, int ob, int oc) { (void)a; (void)b; (void)c; (void)M; (void)N; (void)K; (void)batch; (void)sa; (void)sb; (void)sc; (void)bt; (void)lda; (void)ldb; (void)ldc; (void)oa; (void)ob; (void)oc; NOT_YET("xmx_rec_gemm"); }
+int xmx_rec_gemm_int8(int a, int b, int c, int a_scale, int b_scale, int M, int N, int K, int flags) { (void)a; (void)b; (void)c; (void)a_scale; (void)b_scale; (void)M; (void)N; (void)K; (void)flags; NOT_YET("xmx_rec_gemm_int8"); }
+int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale, int M, int N, int K, int batch, int sa, int sb, int sc, int lda, int ldb, int ldc, int scale_stride, int flags) { (void)a; (void)b; (void)c; (void)a_scale; (void)b_scale; (void)M; (void)N; (void)K; (void)batch; (void)sa; (void)sb; (void)sc; (void)lda; (void)ldb; (void)ldc; (void)scale_stride; (void)flags; NOT_YET("xmx_rec_gemm_int8_batched"); }
+int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_scale, int qkv_scale, int M, int channels, int heads, int tokens, int flags) { (void)a; (void)b; (void)q; (void)k; (void)v; (void)a_scale; (void)b_scale; (void)qkv_scale; (void)M; (void)channels; (void)heads; (void)tokens; (void)flags; NOT_YET("xmx_rec_gemm_int8_qkv"); }
+int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale, int skip, int cosine, int M, int N, int K, int flags) { (void)a; (void)b; (void)c; (void)a_scale; (void)b_scale; (void)skip; (void)cosine; (void)M; (void)N; (void)K; (void)flags; NOT_YET("xmx_rec_gemm_int8_residual"); }
+int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_scale, int skip, int cosine, int M, int N, int K, int flags, int height, int width, int across, int pad) { (void)a; (void)b; (void)c; (void)a_scale; (void)b_scale; (void)skip; (void)cosine; (void)M; (void)N; (void)K; (void)flags; (void)height; (void)width; (void)across; (void)pad; NOT_YET("xmx_rec_gemm_window_int8_residual"); }
+int xmx_rec_global_attention(int q, int k, int v, int merged, int rows, int tokens, int heads) { (void)q; (void)k; (void)v; (void)merged; (void)rows; (void)tokens; (void)heads; NOT_YET("xmx_rec_global_attention"); }
+int xmx_rec_quant_window(int source, int packed, int scale, int M, int K, int height, int width, int across, int pad) { (void)source; (void)packed; (void)scale; (void)M; (void)K; (void)height; (void)width; (void)across; (void)pad; NOT_YET("xmx_rec_quant_window"); }
+int xmx_rec_unary(int kind, int a, int b, int c, int d, int n, int channels, int p0, int batch, int sa, int sb, int sc, int k) { (void)kind; (void)a; (void)b; (void)c; (void)d; (void)n; (void)channels; (void)p0; (void)batch; (void)sa; (void)sb; (void)sc; (void)k; NOT_YET("xmx_rec_unary"); }
+int xmx_rec_unary2(int kind, int a, int b, int c, int d, int second, int n, int channels, int p0, int batch, int sa, int sb, int sc, int k) { (void)kind; (void)a; (void)b; (void)c; (void)d; (void)second; (void)n; (void)channels; (void)p0; (void)batch; (void)sa; (void)sb; (void)sc; (void)k; NOT_YET("xmx_rec_unary2"); }
+int xmx_rec_window_attention(int q, int k, int v, int bias, int out, int batches, int heads, int merged) { (void)q; (void)k; (void)v; (void)bias; (void)out; (void)batches; (void)heads; (void)merged; NOT_YET("xmx_rec_window_attention"); }
+int xmx_rec_window_block(int image, int qkv, int projection, int target, int bias, int cosine, int scale, int pooled, int windows, int height, int width, int across, int pad, int flags) { (void)image; (void)qkv; (void)projection; (void)target; (void)bias; (void)cosine; (void)scale; (void)pooled; (void)windows; (void)height; (void)width; (void)across; (void)pad; (void)flags; NOT_YET("xmx_rec_window_block"); }
 
 // int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K)
 // libxmx.c:2471 shape ([c_int]*3 + [c_uint]*2). Appends the proven SYCL kernel.
