@@ -1965,3 +1965,27 @@ GEMM_INT8_BATCHED + GEMM_INT8_RESIDUAL。walk run 1.1s 仍是脚手架开销禁�
 
 剩余无争议族: int8_qkv(60)、window_int8_residual(52, 0x80000 window 索引 map)、
 quant_window(52)、gemm 纯 coopmat(84)。qkv 三输出=我已绿 §46 六趟链的现成形态。
+
+## 75. swap-in #4 gemm_int8_qkv GREEN（5 配置×Q/K/V 全 OUT BITS EQUAL, 含 plan 真 vit 族 exact 尺寸）+ passes 448
+
+int8_qkv(60 次, 10 变体): guard 按出货口径(channels%64, channels==heads*32, tokens|M,
+flags 只有 0x2000=vit —— 我第一版守卫抄成 ~0x2002 又被"守卫要按 ABI 层读"教训逮一次)。
+b_scale=3*channels 每列(不是每 head, xmxres:1334-1337 有 WHY: per-head 方向误差翻倍)。
+
+实现=**纯组合已绿件**(.comp 0x100000 分支 + qkv_epilogue.glsl 逐字钉注释先写): v8 GEMM
+(转置 pack_b, Mp padding)→dC int32; stage2 deq+in-place Q/K 每 head 归一化(cosine_reciprocal
+/ vit_reciprocal + Q 的 VIT_ROOT→learned scale 顺序, 与 cosine_norm_kernel 逐字同);
+stage3 publish=qr_e4m3(无额外 half_round, QKV_READ 已持 half 值)→scatter (w*heads+h)*tokens+t
+三目标。一个 recorder push=3 device launches(g_cmds 每 plan 步仍 +1 pass)。"bit-identical
+to the three passes BY CONSTRUCTION"(qkv_epilogue.glsl:14-18)+test_gemm_qkv.py=出货侧见证。
+
+门=§36 权威门同款 golden(vendor_cosine_publish/_vit_norm+VIT_ROOT+learned, scatter4)
++V 族=e4m3(deq)(§35 形态)。VIT-192x1024x32 用 plan **exact 尺寸**(padded-M 192→256)。
+**vit 数据带教训**: 首轮 VIT Q/K 0.7-0.8% 单-ULP 红、V 绿——不是我链错, 是 §36 前辈门
+`lim=3 if vit else 40` 早有记载: vit 树 half 域累加 vs nr_model f64 求和, bit-exact 只在
+小带成立(window 树 40 带也全绿, 只有 vit 树紧)。照前辈带修门(第三次"修参照": 参照=前辈
+已证域, 不是我的新造域), 全绿。**这条要写进后续所有碰 vit 归一化的门的模板注释里**。
+
+passes 自洽第四点: 224→248→320→388→**448** (+60=qkv captured, 精确)。build 实数 **23 门**。
+剩余无争议: window_int8_residual(52, 要 0x80000 window 索引 map), quant_window(52),
+纯 coopmat gemm(84)。之后 ffn/window_block/unary=§71 待决须用户定。

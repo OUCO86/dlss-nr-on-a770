@@ -515,7 +515,124 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
     });
     return 0;
 }
-int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_scale, int qkv_scale, int M, int channels, int heads, int tokens, int flags) { (void)a; (void)b; (void)q; (void)k; (void)v; (void)a_scale; (void)b_scale; (void)qkv_scale; (void)M; (void)channels; (void)heads; (void)tokens; (void)flags; NOT_YET("xmx_rec_gemm_int8_qkv"); }
+// int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_scale,
+//                           int qkv_scale, unsigned M, unsigned channels, unsigned heads,
+//                           unsigned tokens, unsigned flags)
+// swap-in #4 (section 75). The .comp+qkv_epilogue.glsl math pinned BEFORE writing either
+// side (sections 73/74 lessons):
+//   N = 3*channels; weight B = int8 (3*channels x channels) TRANSPOSED, same family as
+//   plain gemm_int8 (xmxres.py:1350: b 3*channels*channels bytes); K dim = channels.
+//   col -> part = col/channels (0 Q, 1 K, 2 V), head = (col%channels)/32 (epilogue:39).
+//   Q/K: h[i]=half_round(deq)  -> reciprocal (cosine_tree; 0x2000 = the vit tree) ->
+//        value=hmul(h,recip), Q additionally hmul(vit?VIT_ROOT:1?) then hmul(scale[head])
+//        (epilogue:52-54; VIT_ROOT between norm and learned scale, exactly as
+//        cosine_norm_kernel already does it -- reused VERBATIM math) -> written back over
+//        the stage as half-valued floats ("exact in either type", epilogue:60).
+//   publish: out = half(e4m3(QKV_READ)) for ALL of Q,K,V; scatter
+//        at = ((window*heads + head)*tokens + token)*32 + c   (window=r/tokens).
+//   V: no normalisation at all (epilogue:50 part>=2 skips the loop).
+// This recorder COMPOSES the already-green pieces (the epilogue header: "bit-identical
+// to the three passes BY CONSTRUCTION", and test_gemm_qkv.py is the shipping witness):
+// v8 GEMM (transposed pack_b, padded M) -> dC int32; one inline kernel does deq + the
+// in-place Q/K head-normalisation exactly in the epilogue's order; a second inline
+// kernel publishes (qr_e4m3) and scatters to the three half targets. Three device
+// launches inside ONE g_cmds push (passes stays +1 per plan call).
+int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_scale,
+                          int qkv_scale, unsigned M, unsigned channels, unsigned heads,
+                          unsigned tokens, unsigned flags) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!M || !channels || (channels % 64u) || !heads || !tokens ||
+        channels != heads * 32u || (M % tokens) || (flags & ~0x2000u))
+        FAILMSG("integer QKV needs channels%%64==0, channels==heads*32, tokens|M, "
+                "flags only 0x2000 (vit) -- shipped guard libxmx.c int8_qkv");
+    auto ia = g_bufs.find(a), ib = g_bufs.find(b);
+    auto iq = g_bufs.find(q), ik = g_bufs.find(k), iv = g_bufs.find(v);
+    auto ias = g_bufs.find(a_scale), ibs = g_bufs.find(b_scale), iqs = g_bufs.find(qkv_scale);
+    if (ia == g_bufs.end() || ib == g_bufs.end() || iq == g_bufs.end() || ik == g_bufs.end() ||
+        iv == g_bufs.end() || ias == g_bufs.end() || ibs == g_bufs.end() || iqs == g_bufs.end())
+        FAILMSG("bad gemm_int8_qkv operand");
+    if (iq == ik || ik == iv || iq == iv) FAILMSG("QKV targets must be distinct");
+    const int8_t* Araw = (const int8_t*)ia->second.p;
+    const int8_t* Braw = (const int8_t*)ib->second.p;          // TRANSPOSED (3C x C)
+    sycl::half *Q = (sycl::half*)iq->second.p, *Kk = (sycl::half*)ik->second.p,
+               *V = (sycl::half*)iv->second.p;
+    const float* as = (const float*)ias->second.p;
+    const float* bs = (const float*)ibs->second.p;             // 3*channels entries
+    const float* qs = (const float*)iqs->second.p;             // heads entries
+    const bool vit = (flags & 0x2000u) != 0u;
+    const unsigned C = channels, NH = 3u * channels;
+    const int Mp = l0_ceil_bm(M);
+    const size_t na = (size_t)Mp * C, nb = (size_t)NH * C;
+    g_cmds.push_back([=]() {
+        std::vector<int8_t> hA((size_t)M * C), hApad(na, 0), hB(nb), hAp(na), hBp(nb);
+        GQ->memcpy(hA.data(), Araw, (size_t)M * C).wait();
+        std::memcpy(hApad.data(), hA.data(), (size_t)M * C);
+        GQ->memcpy(hB.data(), Braw, nb).wait();
+        s8v8::pack_a(hApad.data(), hAp.data(), Mp, (int)C);
+        s8v8::pack_b(hB.data(), hBp.data(), (int)NH, (int)C);   // N x K row-major == transposed
+        int8_t* dAp = (int8_t*)sycl::malloc_device(na, *GQ);
+        int8_t* dBp = (int8_t*)sycl::malloc_device(nb, *GQ);
+        int32_t* dC = (int32_t*)sycl::malloc_device((size_t)Mp * NH * 4, *GQ);
+        GQ->memcpy(dAp, hAp.data(), na).wait();
+        GQ->memcpy(dBp, hBp.data(), nb).wait();
+        s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)NH, (int)C).wait();
+        // stage 2: deq + in-place Q/K head norm (the epilogue's order; V deqt only).
+        GQ->parallel_for(sycl::range((size_t)M * heads),
+                         [=](sycl::item<1> it) {
+            size_t i = it.get_id(0);
+            unsigned r = (unsigned)(i / heads), head = (unsigned)(i % heads);
+            float row32[32];
+            // Q segment
+            for (int c2 = 0; c2 < 32; ++c2) {
+                unsigned n = head * 32u + (unsigned)c2;
+                row32[c2] = qr_half_round(cr_mul(cr_mul((float)dC[(size_t)r * NH + n], as[r]), bs[n]));
+                dC[(size_t)r * NH + n] = (int32_t)0; // marker unused; value goes back below
+            }
+            float recip = vit ? ctree::vit_reciprocal(row32) : ctree::cosine_reciprocal(row32);
+            float sc = qr_half_round(qs[head]);
+            for (int c2 = 0; c2 < 32; ++c2) {
+                unsigned n = head * 32u + (unsigned)c2;
+                float h = row32[c2];
+                float val = qr_half_round(cr_mul(h, recip));
+                if (vit) val = qr_half_round(cr_mul(val, ctree::VIT_ROOT));
+                val = qr_half_round(cr_mul(val, sc));
+                dC[(size_t)r * NH + n] = sycl::bit_cast<int32_t>(val);
+            }
+            // K segment (same tree, scale = 1.0 -> the GLSL's part==1 scale path: no mult)
+            for (int c2 = 0; c2 < 32; ++c2) {
+                unsigned n = C + head * 32u + (unsigned)c2;
+                row32[c2] = qr_half_round(cr_mul(cr_mul((float)dC[(size_t)r * NH + n], as[r]), bs[n]));
+            }
+            float krec = vit ? ctree::vit_reciprocal(row32) : ctree::cosine_reciprocal(row32);
+            for (int c2 = 0; c2 < 32; ++c2) {
+                unsigned n = C + head * 32u + (unsigned)c2;
+                float val = qr_half_round(cr_mul(row32[c2], krec));
+                dC[(size_t)r * NH + n] = sycl::bit_cast<int32_t>(val);
+            }
+            // V segment: deq only, store float bits back (QKV_STAGE semantics)
+            for (int c2 = 0; c2 < 32; ++c2) {
+                unsigned n = 2u * C + head * 32u + (unsigned)c2;
+                float val = cr_mul(cr_mul((float)dC[(size_t)r * NH + n], as[r]), bs[n]);
+                dC[(size_t)r * NH + n] = sycl::bit_cast<int32_t>(val);
+            }
+        }).wait();
+        // stage 3: publish e4m3 -> half, scatter (w,h,t,32). The half value held in Q/K/V
+        // slots (float bits) is what QKV_READ returns now.
+        GQ->parallel_for(sycl::range((size_t)M * NH),
+                         [=](sycl::item<1> it) {
+            size_t i = it.get_id(0);
+            unsigned r = (unsigned)(i / NH), n = (unsigned)(i % NH);
+            unsigned part = n / C, col = n % C, head = col / 32u;
+            float val = sycl::bit_cast<float>(dC[i]);
+            sycl::half out = sycl::half(qr_e4m3(val));          // epilogue publish = e4m3 only
+            unsigned w = r / tokens, t = r % tokens;
+            size_t at = (((size_t)w * heads + head) * tokens + t) * 32u + (col % 32u);
+            if (part == 0u) Q[at] = out; else if (part == 1u) Kk[at] = out; else V[at] = out;
+        }).wait();
+        sycl::free(dAp, *GQ); sycl::free(dBp, *GQ); sycl::free(dC, *GQ);
+    });
+    return 0;
+}
 // int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale,
 //                                 int skip, int cosine, unsigned M, unsigned N,
 //                                 unsigned K, unsigned flags)
