@@ -2035,3 +2035,33 @@ captured 691 已换芯 552=**80%**。剩 139 = window_attention 52 + gemm(fp16) 
 unary 17 + window_block 10 + ffn 10 + global_attention 8。其中 attention 族(60)要看
 ABI 能否映射我已绿 attnV/softmax_i8 链; gemm 42=fp16 语义(需 dpas fp16 或走 int8 契约
 讨论); unary/window_block/ffn=§71 待决族。
+
+## 78. 换芯 80% 后的战略分叉（须用户定，非我可偷选）
+
+permissive walk passes=552/691(80%)。但**游戏面(fail-loud)仍停在 step 2534=ffn_stem**——
+captured 图里第一个 recorder 就是 §71 待决的 coopmat 融合族。permissive 尺子让我先接完
+无争议 int8 族(6 族 552 步全 bit-exact), 但**终点线(游戏能出帧)绕不开那 139 步**。
+
+剩 139 分三类, 代价/性质不同:
+- **window_attention 52 + global_attention 8 = 60**: 出货是**整块融合 attention**
+  (window_attention.comp: QK^T→softmax→attnV 全在 shared memory 一趟 coopmat, "scores
+  and probabilities never leave shared memory")。我已绿的 softmax_i8/attnV v7/scores 链
+  正是它**拆开**的三段。换芯要么 (i) 写一个全新 ESIMD 融合 attention 大核(最大单体新核,
+  非组合), 要么 (ii) 用我已绿三段**组合**复现其输入输出字节契约(每段已门控, 但融合核的
+  shared-memory 中间态与三段 global 往返是否 bit-identical 要证——.comp 注释称"bit for
+  bit the same"是它自己 vs 旧拆分的说法, 不是我 vs 它)。
+- **gemm 纯 fp16 42**: dpas 支持 fp16(common.hpp:47 fp16=10), 需新 f16 dpas 核(前辈
+  esimd_dpas_peak 有 dpas<8,8,float> f32 累加先例, f16 操作数未写过)。或按 §9 单一 int8
+  世界把这 42 步也走 int8 契约(但那是改数据语义, §28 靶子, 需谨慎)。
+- **ffn 10 + window_block 10 + unary 17 = 37**: §71 前辈否证"不进 int8 GEMM"的 coopmat
+  融合 pass。unary 我已导出同名(32 步里 17 在 captured), 是 elementwise publish——最轻。
+
+**我的建议(按代价排序)**: 先接 unary(17, 我已绿 qr_publish 链直接映射, 最轻, 且它卡住
+游戏面 step 顺序里靠前的位置要看)→ 再 window_attention 用**三段组合**先出字节契约(不写
+大融合核, 融合留给主线 megakernel 阶段)→ ffn/window_block 37 步单独讨论(前辈否证过,
+最可能"保留过渡执行器"或走 int8 契约需你定)→ fp16 gemm 42 最后(新 dpas-f16 核或 int8
+化, 是性能题不是正确性题, 可留到换 dll 进游戏后再优化)。
+
+**关键**: 游戏面要真出帧, ffn_stem(step 2534, 第一个 recorder)必须先有实现(哪怕组合/
+过渡), 否则 fail-loud 永远走不到后面。这是 §71 那个"要不要一步到位 vs 过渡执行器"的
+决策, 现在到必须回答的时点了。
