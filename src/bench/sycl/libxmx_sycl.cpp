@@ -825,7 +825,31 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
     return 0;
 }
 int xmx_rec_global_attention(int q, int k, int v, int merged, int rows, int tokens, int heads) { (void)q; (void)k; (void)v; (void)merged; (void)rows; (void)tokens; (void)heads; NOT_YET("xmx_rec_global_attention"); }
-int xmx_rec_quant_window(int source, int packed, int scale, int M, int K, int height, int width, int across, int pad) { (void)source; (void)packed; (void)scale; (void)M; (void)K; (void)height; (void)width; (void)across; (void)pad; NOT_YET("xmx_rec_quant_window"); }
+// int xmx_rec_quant_window(int source, int packed, int scale, unsigned M, unsigned K,
+//                          unsigned height, unsigned width, unsigned across, unsigned pad)
+// swap-in #6 (section 77): the SAME proven qr_kernel the plain xmx_rec_quant runs, with
+// the 0x400000 gather flag and the four geometry words -- the kernel already carries the
+// shipped branch (quantize_row.comp:195-208: token=held%64, window=held/64, y/x from
+// across and pad, OUTSIDE -> zero row and scale 1.0, base=(y*width+x)*words in IMAGE
+// layout), and the standalone probe proved the gather path 0-differ vs numpy. Guard per
+// the shipped one (libxmx.c: K % 64 for the gathered form -- a token's words must be
+// whole and 16-byte aligned however the image rows lie).
+int xmx_rec_quant_window(int source, int packed, int scale, unsigned M, unsigned K,
+                         unsigned height, unsigned width, unsigned across, unsigned pad) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!M || !K || (K % 64u)) FAILMSG("a gathered quantiser needs K a multiple of 64");
+    if (!across || !height || !width) FAILMSG("a gathered quantiser needs the image extent and windows per row");
+    auto s = g_bufs.find(source), p2 = g_bufs.find(packed), c = g_bufs.find(scale);
+    if (s == g_bufs.end() || p2 == g_bufs.end() || c == g_bufs.end()) FAILMSG("bad quant_window operand");
+    sycl::half* a = (sycl::half*)s->second.p;
+    sycl::uint2* pk = (sycl::uint2*)p2->second.p;
+    float* sc = (float*)c->second.p;
+    g_cmds.push_back([=]() {
+        qr_launch(*GQ, *GD, qr_kernel(), a, pk, sc, M, K, 0x400000u,
+                  height, width, across, pad, nullptr, nullptr);
+    });
+    return 0;
+}
 int xmx_rec_unary(int kind, int a, int b, int c, int d, int n, int channels, int p0, int batch, int sa, int sb, int sc, int k) { (void)kind; (void)a; (void)b; (void)c; (void)d; (void)n; (void)channels; (void)p0; (void)batch; (void)sa; (void)sb; (void)sc; (void)k; NOT_YET("xmx_rec_unary"); }
 int xmx_rec_unary2(int kind, int a, int b, int c, int d, int second, int n, int channels, int p0, int batch, int sa, int sb, int sc, int k) { (void)kind; (void)a; (void)b; (void)c; (void)d; (void)second; (void)n; (void)channels; (void)p0; (void)batch; (void)sa; (void)sb; (void)sc; (void)k; NOT_YET("xmx_rec_unary2"); }
 int xmx_rec_window_attention(int q, int k, int v, int bias, int out, int batches, int heads, int merged) { (void)q; (void)k; (void)v; (void)bias; (void)out; (void)batches; (void)heads; (void)merged; NOT_YET("xmx_rec_window_attention"); }

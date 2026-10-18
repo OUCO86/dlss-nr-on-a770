@@ -98,7 +98,14 @@ inline auto qr_kernel() {
             float full = 0.0f;
             for (unsigned i = 0; i < per_row; ++i) full = sycl::fmax(full, la[base_lane + i]);
             peak = full;
-            float scale = (peak == 0.0f) ? 1.0f : peak / 127.0f;
+            // fdiv_rn here too (section 77): `peak / 127.0f` is a division by a
+            // NOT-exactly-representable constant, and icx lowers it to an approximate
+            // reciprocal -- one ULP off on some peaks, which flips an X.5 tie in the
+            // v/scale roundEven downstream (caught by the quant_window gate at row 119:
+            // scale 1 ULP low -> 63.499996 vs 63.5 -> dev 64 vs gold 63). The header's
+            // own rule ("ONE correctly-rounded division") applies to BOTH divisions;
+            // the earlier gates' data simply never hit a bad peak.
+            float scale = (peak == 0.0f) ? 1.0f : sycl::ext::intel::math::fdiv_rn(peak, 127.0f);
             if (row >= m) return;
             if (within == 0u) { scales[row] = scale; if (recips) recips[row] = sycl::ext::intel::math::fdiv_rn(1.0f, scale); }
             auto grid = [&](float v) {

@@ -2013,3 +2013,25 @@ passes 自洽第五点: 224→248→320→388→448→**500**(+52=window_int8_re
 gemm(84); 待决族(ffn 系 20+window_block 20+unary 34+attention 系 120)=194 步, 其中
 window_attention/global_attention 120 步我已绿 attnV/softmax_i8 链能否直接映射要看它们
 的 ABI 参数(下轮先读 window_attention 语义再报要不要扩到待决)。
+
+## 77. swap-in #6 quant_window GREEN（5 变体 packed 0-differ + scales bits-equal）+ passes 552
+
+纯组合: 已绿 qr_kernel(§20 门, plain/tiny/gather 三形态 0-differ 已证) + 0x400000 gather
+flag + 四几何词(height,width,across,pad)——SYCL 核里 gather 分支(quantize_row_kernel.hpp
+:195-208 转录)早已存在且出货探针证过, recorder 只是把出货 libxmx.c 的同款 push 喂进去。
+guard 按出货(K%64 gathered 形态)。
+
+本轮抓到**两个真东西**:
+1. **fdiv_rn 家族第二坑(核侧, 已修)**: `peak / 127.0f` 是除以非精确可表示常数, icx 降级
+   近似倒数→某些 peak 差 1 ULP→下游 v/scale 的 X.5 tie 翻(roundEven 变 64 vs 63)。
+   之前 quant 门没踩中=数据没撞上坏 peak, 不是代码对。修=fdiv_rn(peak,127.0f), 头注释
+   的"ONE correctly-rounded division"规矩对**两个除法**都成立。教训: 已绿件也可能带
+   未触发的坑, 新门数据更宽就会掀开——这是好事。
+2. **harness 第四 bug(形状)**: gp flat (M*K,) vs packed (M,K) 2-D, array_equal 光形状就
+   False——device 其实 768/768 全对(探针先证)。修=reshape 比较。
+
+passes 链: 224→248→320→388→448→500→**552**。build 实数 **25 门全绿**。
+captured 691 已换芯 552=**80%**。剩 139 = window_attention 52 + gemm(fp16) 42 +
+unary 17 + window_block 10 + ffn 10 + global_attention 8。其中 attention 族(60)要看
+ABI 能否映射我已绿 attnV/softmax_i8 链; gemm 42=fp16 语义(需 dpas fp16 或走 int8 契约
+讨论); unary/window_block/ffn=§71 待决族。
