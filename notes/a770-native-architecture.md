@@ -1859,3 +1859,35 @@ ABI 不量画质。)
 **选 1 开工序（用户 18:54 拍板）**: 接真身从 gemm_int8 族起(无争议=已绿链形态), 每个换芯:
 读出货语义(libxmx.c body + replay case + .comp 注释) → 映射到已绿链/组合 → gate+§51 对拍
 → permissive walk 里把它摘掉再跑, passes 应 +该 op 的 plan 次数(下一个自洽检查点)。
+
+## 71. gemm_int8 换芯语义（读全 libxmx.c + gemm_staged_int8.comp + publish.glsl + plan 真形状）
+
+**captured 图里 gemm_int8 只有两族**（plan 实测, 24 次调用）:
+- A: M=640 N=512 K=512, flags=**4352** ×16  (epi=1=E4M3, 0x1000=half-out; M%128=0 ✓)
+- B: M=192 N=4096 K=1024, flags=**4864** ×8  (epi=3=GATE_E4M3, half-out; M=192 **非 128 倍数**)
+operand buffer 实测: A 侧 buf1272 是**上游 pass 产出的活数据**(非 blob, blob 灌不进),
+b_scale/a_scale 权重 buf 由 blob 灌(426/427=blob, 1273/1275 是上游产)。⇒ 换芯必须吃**活的
+int8 A + 转置存权重 B + 两个 f32 scale**, 输出 **f16**(half-out)。
+
+**权威数据流(.comp:288-290 非 residual 分支, 无 fma)**:
+`out4[q] = publish(epilogue, float(int32acc) * row_scale[r] * column_scale[c])` → `f16 store`
+- 乘序 = acc→f32, ×a_scale[row], ×b_scale[col]（**左到右三次 fmul, 禁 FMA 收缩**——.comp 用
+  precise; publish_kernel 已立规矩 cr_mul=fmul_rn 不收缩, §25/icx 降级倒数坑同源）。
+- publish(epi,v): epi==1→e4m3(v); epi==3→gate_activation(e4m3? no: gate THEN e4m3)
+  实际 publish.glsl:57-58: epi∈{2,3}先 gate, epi∈{1,3}再 e4m3 ⇒ **epi=3 = gate→e4m3**;
+  epi=1 = e4m3。qr_publish 已逐字对齐(门控 BIT-EXACT)。
+- 最后 half_round? epilogue==4 才 half_round; 这里 half 是**存储宽度**(0x1000), publish 后直接
+  f16 存(不额外 half_round, e4m3 已含定点舍入)。
+
+**v1 复用障碍(真约束, 非猜)**: (1) M=192 非 BM128 倍数→主循环 grid 会漏/越界, 需 **row<M guard**
+变体(正是 §8 "小 M 独立趟"的具体形态, 但这里是被迫处理 plan 真调用, 不是性能选择)。(2) 两族
+N×K 非方阵(v5 deq 假设方阵 channels×channels, pack_b(K=channels,N=channels)) → 需要**非方阵
+pack_b** 或通用 int8 GEMM recorder。(3) B 转置存: libxmx 注释"B the weights stored transposed,
+int8 N×K"→ pack_b 输入按 (N,K) 行主序读, 与我现有 pack_b(K,N) 不同, 需新 pack 或转置喂。
+
+**实现设计(正确优先, 可后融)**: 新 recorder `xmx_rec_gemm_int8(a,b,c16,a_scale,b_scale,M,N,K,flags)`
+= **v1 ESIMD 主循环加 row-guard(BM 尾块) + 非方阵 pack_a/b(按 N×K 转置语义)** 产 int32 暂存
+→ **第二段已门控 elementwise** `qr_publish(epi)→f16 store`(新小核, 对 numpy publish 位精确门)。
+两段落盘后再谈融成一趟。门=对 numpy `publish(e4m3, (a8@b8ᵀ)f32 * ascale ⊗ bscale)`→f16,
+形状用两族真尺寸(M=640,N=512,K=512 + M=192,N=4096,K=1024), **within-one 界**(§51 定义, 不是
+绝对<=2, §69 教训)。**这是第一个真·新 kernel(非组合已绿件)**——写代码前按规矩⑤先报设计待你点头。
