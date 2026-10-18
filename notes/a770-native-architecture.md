@@ -1941,3 +1941,27 @@ raw int32 存, 进 v8 头) 处理 N=32 尾块 → 已门控 publish 腿写 ldc-s
 判据=OUT BITS EQUAL(4/4 变体 0 bad bytes), 含 batch1 锚(D1, 必须等于已绿 plain gemm_int8)
 +P1 广播/P2 列切片+gemm32/T1 scale_stride=M 压力变体。**passes 自洽检查点见本节末 walk**。
 gate 数 20→**21**(GEMM_INT8_BATCHED, 入 build)。
+
+## 74. swap-in #3 gemm_int8_residual GREEN（5 变体 OUT BITS EQUAL, 含 plan 真尺寸 640x512）+ harness f64 提升坑记档
+
+residual 族(68 次, 6 变体全 flags=0x41100=epi1+narrow+half_skip): 语义钉死 .comp:257-297
+`total = fma(sk, cp[c], stage)` 单次融合舍入(注释明说"written as the fused multiply-add...
+否则差 ulp"), skip dtype 随 0x40000(half/f32), cosine f32[N]。设备 sycl::fma; golden
+f64 精确技巧(35 位积+24 位和, gap<=18 断言, 逐 run 审计)。守卫修正: 0x20000 是 Vulkan
+包装器内部 OR 的(libxmx.c:2988), plan 层 flags 不带——我照守卫照错了层(记档, 教训=守卫
+要按 ABI 层读, 不按内部实现层)。
+
+**门红三轮全是 HARNESS 自己的 bug, 不是 recorder**（A=0 手算探针 256/256 行全对 +
+sk=1/co=0.5 →6.0 + ramp 逐列全对, 三连探针先证设备干净）:
+`rng.choice([-1.0,1.0])` 返回 **float64**, `f32数组 * f64` numpy **静默提升成 f64**——
+按 nbytes 上传 8B/元素进 4B buffer = 越界写坏邻居内存, kernel 读到垃圾 cosine(448 饱和)。
+修=所有上传数组显式 astype + up() 断言 dtype in (f32,f16,int8)。教训: **上传前 dtype
+审计要成为门模板的固定段**(batched 门也照此补过 assert)。
+
+passes 自洽第三点: 224→248→320→**388** (+68=residual captured 次数, 精确)。
+build 补挂 GEMM_INT8/GEMM_INT8_BATCHED(之前跑了但没入 build——清单数出来才发现,
+数门必须看脚本实际清单不是记忆)。门清单现 22: 原 17 + GRAPH + COEXIST + GEMM_INT8 +
+GEMM_INT8_BATCHED + GEMM_INT8_RESIDUAL。walk run 1.1s 仍是脚手架开销禁引(§58/69)。
+
+剩余无争议族: int8_qkv(60)、window_int8_residual(52, 0x80000 window 索引 map)、
+quant_window(52)、gemm 纯 coopmat(84)。qkv 三输出=我已绿 §46 六趟链的现成形态。

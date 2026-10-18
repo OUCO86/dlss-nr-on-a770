@@ -516,7 +516,80 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
     return 0;
 }
 int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_scale, int qkv_scale, int M, int channels, int heads, int tokens, int flags) { (void)a; (void)b; (void)q; (void)k; (void)v; (void)a_scale; (void)b_scale; (void)qkv_scale; (void)M; (void)channels; (void)heads; (void)tokens; (void)flags; NOT_YET("xmx_rec_gemm_int8_qkv"); }
-int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale, int skip, int cosine, int M, int N, int K, int flags) { (void)a; (void)b; (void)c; (void)a_scale; (void)b_scale; (void)skip; (void)cosine; (void)M; (void)N; (void)K; (void)flags; NOT_YET("xmx_rec_gemm_int8_residual"); }
+// int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale,
+//                                 int skip, int cosine, unsigned M, unsigned N,
+//                                 unsigned K, unsigned flags)
+// swap-in #3 (section 74). .comp:257-281 is the authority, read before writing either
+// side (section 73's lesson: pin the shipping formula in the comment, golden and device
+// both follow it):
+//   at = r*N + c (non-window; the window variant is its own op, 0x80000 rejected here)
+//   stage = f32(acc) * row_scale  * col_scale    (two f32 muls, .comp:279)
+//   total = fma( skipped, cosine[c], stage )    -- ONE fused rounding (.comp:278), and
+//           the comment says why: "Written as the fused multiply-add... contracted the
+//           other way and missed by an ulp" is exactly the failure mode this fma is
+//           immune to. Device: sycl::fma (HW FMA). Golden: f64-exact sum (f16x f32 <=
+//           35 bits, + f32 term: exact iff exponent gap <= 18, asserted per element).
+//   skip dtype: half iff 0x40000 (half_skip), else f32 (.comp:274-275). cosine: f32[N].
+//   (The push-word aliasing -- skip riding the a_scale slot, cosine the b_scale slot,
+//    real scales at .d/.residual_cos, libxmx.c:2985-2992 -- is a Vulkan detail: the ABI
+//    hands us separate buffer ids, so we just read them.)
+int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale,
+                               int skip, int cosine,
+                               unsigned M, unsigned N, unsigned K, unsigned flags) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!M || !N || !K || (N % 64u) || (K % 32u))
+        FAILMSG("gemm_int8_residual needs N%%64==0, K%%32==0 (our tile; shipped N%%32/K%%64)");
+    if (flags & 0x80000u) FAILMSG("window variant belongs to xmx_rec_gemm_window_int8_residual");
+    // 0x20000 (adding) is OR'd INSIDE the Vulkan wrapper (libxmx.c:2988 `flags | 0x20000`);
+    // the plan/Python layer flags never carry it (266496 = 0x41100 has 0x40000+0x1000+epi1).
+    // This op IS the adding variant, so there is nothing to require -- and nothing to copy
+    // the wrapper bit into: the data semantics below always fuse skip*cosine.
+    if (flags & 0x100000u) FAILMSG("the integer QKV and residual epilogues read the same two push words");
+    auto ia = g_bufs.find(a), ib = g_bufs.find(b), ic = g_bufs.find(c);
+    auto ias = g_bufs.find(a_scale), ibs = g_bufs.find(b_scale);
+    auto isk = g_bufs.find(skip), ico = g_bufs.find(cosine);
+    if (ia == g_bufs.end() || ib == g_bufs.end() || ic == g_bufs.end() ||
+        ias == g_bufs.end() || ibs == g_bufs.end() ||
+        isk == g_bufs.end() || ico == g_bufs.end()) FAILMSG("bad gemm_int8_residual operand");
+    const int8_t* Araw = (const int8_t*)ia->second.p;
+    const int8_t* Braw = (const int8_t*)ib->second.p;   // TRANSPOSED (N x K), section 71
+    void* Cout = ic->second.p;
+    const float* as = (const float*)ias->second.p;
+    const float* bs = (const float*)ibs->second.p;
+    const void* skp = isk->second.p;
+    const float* cp = (const float*)ico->second.p;
+    const unsigned epi = (flags >> 8) & 0xFu;
+    const bool narrow = (flags & 0x1000u) != 0u;
+    const bool half_skip = (flags & 0x40000u) != 0u;
+    const int Mp = l0_ceil_bm(M);
+    const size_t na = (size_t)Mp * K, nb = (size_t)N * K;
+    g_cmds.push_back([=]() {
+        std::vector<int8_t> hA((size_t)M * K), hApad(na, 0), hB(nb), hAp(na), hBp(nb);
+        GQ->memcpy(hA.data(), Araw, (size_t)M * K).wait();
+        std::memcpy(hApad.data(), hA.data(), (size_t)M * K);
+        GQ->memcpy(hB.data(), Braw, nb).wait();
+        s8v8::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
+        s8v8::pack_b(hB.data(), hBp.data(), (int)N, (int)K);
+        int8_t* dAp = (int8_t*)sycl::malloc_device(na, *GQ);
+        int8_t* dBp = (int8_t*)sycl::malloc_device(nb, *GQ);
+        int32_t* dC = (int32_t*)sycl::malloc_device((size_t)Mp * N * 4, *GQ);
+        GQ->memcpy(dAp, hAp.data(), na).wait();
+        GQ->memcpy(dBp, hBp.data(), nb).wait();
+        s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K).wait();
+        GQ->parallel_for(sycl::range((size_t)M * N),
+                         [=](sycl::item<1> it) {
+            size_t i = it.get_id(0);
+            unsigned r = (unsigned)(i / N), col = (unsigned)(i % N);
+            float stage = cr_mul(cr_mul((float)dC[i], as[r]), bs[col]);
+            float sk = half_skip ? (float)((const sycl::half*)skp)[i] : ((const float*)skp)[i];
+            float total = sycl::fma(sk, cp[col], stage);
+            if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
+            else        ((float*)Cout)[i] = qr_publish(epi, total);
+        }).wait();
+        sycl::free(dAp, *GQ); sycl::free(dBp, *GQ); sycl::free(dC, *GQ);
+    });
+    return 0;
+}
 int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_scale, int skip, int cosine, int M, int N, int K, int flags, int height, int width, int across, int pad) { (void)a; (void)b; (void)c; (void)a_scale; (void)b_scale; (void)skip; (void)cosine; (void)M; (void)N; (void)K; (void)flags; (void)height; (void)width; (void)across; (void)pad; NOT_YET("xmx_rec_gemm_window_int8_residual"); }
 int xmx_rec_global_attention(int q, int k, int v, int merged, int rows, int tokens, int heads) { (void)q; (void)k; (void)v; (void)merged; (void)rows; (void)tokens; (void)heads; NOT_YET("xmx_rec_global_attention"); }
 int xmx_rec_quant_window(int source, int packed, int scale, int M, int K, int height, int width, int across, int pad) { (void)source; (void)packed; (void)scale; (void)M; (void)K; (void)height; (void)width; (void)across; (void)pad; NOT_YET("xmx_rec_quant_window"); }
