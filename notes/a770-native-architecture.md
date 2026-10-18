@@ -1733,3 +1733,26 @@ build 门数 17→**18**(加 gate_graph)。全回归 18/18 GREEN（今早 import
 D3D12 import（§18 probe_d3d12_ze 原语逐字: D3D12 heap/resource + fence → zeMemAllocDevice
 / zeDeviceImportExternalSemaphoreExt）, 门=离线双进程游戏形态 D3D12 buffer+fence 读写
 bit-exact + 排序。这条是干净的（§59 死的是 Vulkan 方向, §18 活的正是 D3D12 方向）。
+
+## 66. route(a) 第 0 步（前置命门）= 共存 GREEN: D3D12 device 活跃时 L0 引擎照常算对
+
+route(a) 的真正命门不是 extmem 四函数, 而是一个从没测过的前提: 游戏进程在加载我 dll 前
+**已经持有活跃 D3D12 device**（bridge/game 建的, 默认适配器=AMD 渲染卡）。§60 在 Vulkan 配对
+下暴露过"SYCL 把 Arc 枚举成 opencl backend"的病——若 D3D12 配对也犯, ESIMD 核进不了正确设备,
+整条 route(a) 直接死。**先测这个, 再写数据腿。**
+
+gate_coexist.py（第 19 门, 已入 build）实跑:
+- `D3D12CreateDevice(default adapter) hr=0 dev=live`（用 SDK d3d12.h:35712 真 GUID
+  `189819f1-…`; 第一版手写 IUnknown 得 E_NOINTERFACE 0x80004002 → 门会静默跳过共存条件,
+  正是 §61"不手写猜 IID"教训救了它——修好后 device 真建起来, 后面才作数）。
+- `xmx_init`（D3D12 已在进程）+ `s8rq 链 within-one True, scale<=1ulp` **BIT-CORRECT**
+- `graph capture id 0 / run / replay 逐字节 == sequential`（§65 契约在共存下仍成立）
+⇒ **COEXIST GREEN, 0 fails**。引擎级无 blocker。SYCL census 在 D3D12 配对下仍选到 A770
+（xmx_init 走 device::get_devices 名字匹配 Arc, 不靠 get_native 的 backend 检查——§60 那个坑
+只在借 SYCL 句柄时踩; 自建 ze context 的 import 腿绕开它）。
+
+**route(a) 四步全部前置解锁**: 1 graph 机器 GREEN(§65), 0 共存 GREEN(本节), 下一步 2 =
+D3D12 数据腿(import buffer + sem fence + extmem_wait; §18 probe_d3d12_ze 单进程已测过同款
+D3D12 heap/resource + fence → L0 的 import 与**双向 bit-exact 数据**——正是 fused 路 bridge
+进程内游戏持 D3D12 对象、我 L0 在同进程 import 的形状, §18 先例可直接复用)。
+门数 18→**19**（gate_graph + gate_coexist 两门今加, 以脚本 tail 为准）。
