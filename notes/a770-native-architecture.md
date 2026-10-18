@@ -1580,3 +1580,27 @@ ze 结构 handle 字段=`void*`（ze_api.h:8132，不需要 windows.h/HANDLE）�
 拿 NT handle → `MY.xmx_buf_import_win32` 拿设备 id → 我的 recorder 直吃该 id 数据 → 结果
 download 对 numpy 期望 bit 级。这才是 §59 GATE2/3 该测的正确形态（全 GPU 侧, 无 host-map
 竞态）。过了=P1 设备共享通路成立, 可以谈进游戏真接法。
+
+## 61. vit 门大形状 kernel 验证（§46 已绿链加 C=1024 用例，全绿）+ P1 mean 12/255 不可引用
+
+**决定性实验**（一次变量，用已绿的 §46 链，不是新写脚本）：gate_chain_qkv.py 加
+`run(4,64,1024,0/1)` 两个 C=1024/heads=32 用例（win+vit 变体）→ **Q/K/V 全 within-one +
+scale≤1ulp 绿**。⇒ 我的 int8 核（v_i8/deq/cosine_norm_i8）在 global 块的 C=1024 形状上
+**正确，无 big-C bug**。
+
+**v_i8 的真形状约束（钉死，进游戏前必须补）**：v_i8 的 scatter 写死 64-token 窗口
+(gemm_s8_v5_kernel.hpp:252)，**vit 门是 windows=1/tokens=640，落在它形状外**——我
+从没为 vit 门门控过 V。scaffold 里我用 `deq+host-requant` 临时绕过（无门保护）。
+
+**P1 offline 的 mean 12.3/255 作废，不可引用**：那条 V 走的是未门控旁路 + 我手写
+诊断门有 bug（输入腿 download 全 False=上传/读环节错，非 kernel——同 dll §46 绿）。
+§57 纪律：无门保护的数字不进结论。
+
+**诚实教训（我自己再犯一次 §55 型的变体）**：我不该另起一个 `gate_chain_vitqkv.py`
+从头搭（重复 §46 已验证的东西，还在新脚本里引入 bug 烧了十几轮）。正确做法一开始就是
+"给 §46 已绿门加用例"——一步拿到答案。**规矩补一条：验证新形状/新参数 = 在已绿门上加
+用例，不另起脚本；新脚本只在没有可复用的已绿门时才建。**
+
+**下一步（真 vit 接线的门）**：给 v_i8 加 windows==1（scatter 的 window 维退化，token
+维=tokens）的支持 + C=1024/rows=640 的 V 列量化门（对 numpy 有界门），bounce 改用
+门控后的 V 路，再重跑 p1_l0_offline——那时的 diff 才可引用、才可放 marker 进游戏。

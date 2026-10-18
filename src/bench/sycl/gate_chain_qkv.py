@@ -218,6 +218,10 @@ run(2, 64, 64, 0, "qkv-win-2h")
 run(2, 64, 256, 0, "qkv-win-8h")
 run(4, 64, 128, 0, "qkv-win-4h")
 run(2, 64, 64, 1, "qkv-vit-2h")
+# section-58 follow-up: the shipped vit door is C=1024 (blocks 31-38). The proven chain,
+# unchanged, at that channel count (rows=256, heads=32) -- the decisive shape test:
+run(4, 64, 1024, 0, "qkv-win-C1024")
+run(4, 64, 1024, 1, "qkv-vit-C1024")
 
 print(f"\nCHAIN_QKV {'GREEN' if not fails else 'RED'} ({fails} fails)")
 sys.exit(1 if fails else 0)
