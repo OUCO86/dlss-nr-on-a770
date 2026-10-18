@@ -31,6 +31,8 @@
 #include <cstdio>
 #include <vector>
 #include <unordered_map>
+#include <stdexcept>
+#include <string>
 #include <functional>
 
 static sycl::queue* GQ = nullptr;
@@ -707,7 +709,121 @@ int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale,
     });
     return 0;
 }
-int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_scale, int skip, int cosine, int M, int N, int K, int flags, int height, int width, int across, int pad) { (void)a; (void)b; (void)c; (void)a_scale; (void)b_scale; (void)skip; (void)cosine; (void)M; (void)N; (void)K; (void)flags; (void)height; (void)width; (void)across; (void)pad; NOT_YET("xmx_rec_gemm_window_int8_residual"); }
+// int xmx_rec_gemm_window_int8_residual(a,b,c,a_scale,b_scale,skip,cosine,
+//        M,N,K,flags, height,width,across,pad)
+// swap-in #5 (section 76). = the plain int8 residual's math PLUS the unpadded-image
+// index map of residual_epilogue.glsl:4-15, read through .comp:257-261 CAREFULLY:
+//   block position: r = window*64 + token (window-major over the 8x8 token grid),
+//     stage uses dC[r*N+c], a_scale[r], b_scale[c];
+//   map: y = (window/across)*8 + token/8, x = (window%across)*8 + token%8,
+//     top = pad>>16, left = pad & 0xffff; OUT OF RANGE (cropped padding) -> the element
+//     is skipped ENTIRELY (.comp:258 `continue` before any read or write);
+//   residual_output_index is `inout`: after the map, at = ((y-top)*width + x-left)*N + c
+//     and it is the REMAPPED index that reads the skip buffer (.comp:261-262, so the
+//     skip branch lives in IMAGE layout, size height*width*N -- "the skip lives where
+//     the answer goes") while cosine is read at at % n = c (the map preserves %n).
+// Output C is the image buffer: needs height*width*N elements -- CHECKED against the
+// buffer table (fail loud, section 70's face).
+// plan-layer flags carry no 0x20000/0x80000 (the wrapper ORs them, libxmx.c:2988 --
+// the section 74 guard-layer lesson, applied from the start this time): the plan uses
+// 0x41100 (half-out) and 0x40100 (f32-out), both half-skip (0x40000).
+int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_scale,
+                                      int skip, int cosine,
+                                      unsigned M, unsigned N, unsigned K, unsigned flags,
+                                      unsigned height, unsigned width, unsigned across,
+                                      unsigned pad) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!height || !width || !across) FAILMSG("invalid window residual");
+    if (!M || !N || !K || (N % 64u) || (K % 32u) || (M % 64u))
+        FAILMSG("window_int8_residual needs N%%64==0,K%%32==0,M%%64==0 (our tile)");
+    auto ia = g_bufs.find(a), ib = g_bufs.find(b), ic = g_bufs.find(c);
+    auto ias = g_bufs.find(a_scale), ibs = g_bufs.find(b_scale);
+    auto isk = g_bufs.find(skip), ico = g_bufs.find(cosine);
+    if (ia == g_bufs.end() || ib == g_bufs.end() || ic == g_bufs.end() ||
+        ias == g_bufs.end() || ibs == g_bufs.end() ||
+        isk == g_bufs.end() || ico == g_bufs.end()) FAILMSG("bad window_int8_residual operand");
+    const unsigned epi = (flags >> 8) & 0xFu;
+    const bool narrow = (flags & 0x1000u) != 0u;
+    const bool half_skip = (flags & 0x40000u) != 0u;
+    const size_t wsz = narrow ? 2u : 4u;
+    const size_t img_elems = (size_t)height * width * N;
+    const size_t blk_elems = (size_t)M * N;
+    const size_t c_need = img_elems * wsz, k_need = img_elems * (half_skip ? 2u : 4u);
+    const int c_id = c, k_id = skip, co_id = cosine;
+    // SIZE validation happens AT RUN TIME, not at capture (the step-2588 lesson, section
+    // 76): the plan's FIRST recording (the scratch the dump made, begin@2529..abort@3902)
+    // recreates the same plan indices as TINY placeholders -- buf 1267 is 256 B there and
+    // 66,846,720 B in the captured recording (step 3916). The shipping guard checks only
+    // that the addresses are live (libxmx.c record_gemm_int8_residual: `skip < 0 || cosine
+    // < 0`), never the bytes -- capture-then-abort never touches memory, so a size check
+    // at capture time is STRICTER than shipping and trips the walk's scratch leg. The
+    // scratch commands never run here either (abort clears g_cmds), so the honest place
+    // for the image-bounds check is inside the run closure: the captured graph executes it
+    // for real, the discarded scratch never does.
+    int8_t* Araw = (int8_t*)ia->second.p;      // re-looked at run time (see above)
+    int8_t* Braw = (int8_t*)ib->second.p;      // TRANSPOSED (N x K)
+    void* Cout = ic->second.p;
+    const float* as = (const float*)ias->second.p;
+    const float* bs = (const float*)ibs->second.p;
+    const void* skp = isk->second.p;
+    const float* cp = (const float*)ico->second.p;
+    const int Mp = l0_ceil_bm(M);
+    const size_t na = (size_t)Mp * K, nb = (size_t)N * K;
+    const unsigned top = pad >> 16, left = pad & 0xffffu;
+    g_cmds.push_back([=]() {
+        // RUN-TIME fresh lookups shadowing the capture-time pointers (see the lesson
+        // above): sizes are checked HERE because the scratch recording's placeholder
+        // buffers are destroyed before the captured graph runs. Throwing is loud:
+        // xmx_submit/xmx_graph_run catch and fail the whole frame (section 70's face).
+        auto sized = [&](int id, size_t bytes, const char* what) -> void* {
+            auto it = g_bufs.find(id);
+            if (it == g_bufs.end())
+                throw std::runtime_error(std::string("window residual: ") + what + " not live at run");
+            if (it->second.bytes < bytes)
+                throw std::runtime_error(std::string("window residual: ") + what + " smaller than the image at run");
+            return it->second.p;
+        };
+        // A is read for its REAL M*K bytes only -- the padded rows live in our OWN host
+        // vector (hApad), never the caller's buffer, so demanding Mp*K here was my bug
+        // (W3 M=960 -> Mp=1024: false "A smaller than" at run).
+        int8_t*  Araw  = (int8_t*)sized(a,       (size_t)M * K, "A");
+        int8_t*  Braw  = (int8_t*)sized(b,       nb,          "B");
+        void*    Cout  = sized(c,        c_need,     "C");
+        const float* as = (const float*)sized(a_scale, (size_t)M * 4u, "a_scale");
+        const float* bs = (const float*)sized(b_scale, (size_t)N * 4u, "b_scale");
+        const void*  skp = sized(skip,   k_need,     "skip");
+        const float* cp  = (const float*)sized(cosine, (size_t)N * 4u, "cosine");
+        std::vector<int8_t> hA((size_t)M * K), hApad(na, 0), hB(nb), hAp(na), hBp(nb);
+        GQ->memcpy(hA.data(), Araw, (size_t)M * K).wait();
+        std::memcpy(hApad.data(), hA.data(), (size_t)M * K);
+        GQ->memcpy(hB.data(), Braw, nb).wait();
+        s8v8::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
+        s8v8::pack_b(hB.data(), hBp.data(), (int)N, (int)K);
+        int8_t* dAp = (int8_t*)sycl::malloc_device(na, *GQ);
+        int8_t* dBp = (int8_t*)sycl::malloc_device(nb, *GQ);
+        int32_t* dC = (int32_t*)sycl::malloc_device((size_t)Mp * N * 4, *GQ);
+        GQ->memcpy(dAp, hAp.data(), na).wait();
+        GQ->memcpy(dBp, hBp.data(), nb).wait();
+        s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K).wait();
+        GQ->parallel_for(sycl::range(blk_elems),
+                         [=](sycl::item<1> it) {
+            size_t i = it.get_id(0);
+            unsigned r = (unsigned)(i / N), col = (unsigned)(i % N);
+            unsigned window = r / 64u, token = r % 64u;
+            unsigned y = (window / across) * 8u + token / 8u;
+            unsigned x = (window % across) * 8u + token % 8u;
+            if (y < top || x < left || y - top >= height || x - left >= width) return;
+            size_t out = ((size_t)(y - top) * width + (x - left)) * N + col;
+            float stage = cr_mul(cr_mul((float)dC[i], as[r]), bs[col]);
+            float sk = half_skip ? (float)((const sycl::half*)skp)[out] : ((const float*)skp)[out];
+            float total = sycl::fma(sk, cp[col], stage);
+            if (narrow) ((sycl::half*)Cout)[out] = sycl::half(qr_publish(epi, total));
+            else        ((float*)Cout)[out] = qr_publish(epi, total);
+        }).wait();
+        sycl::free(dAp, *GQ); sycl::free(dBp, *GQ); sycl::free(dC, *GQ);
+    });
+    return 0;
+}
 int xmx_rec_global_attention(int q, int k, int v, int merged, int rows, int tokens, int heads) { (void)q; (void)k; (void)v; (void)merged; (void)rows; (void)tokens; (void)heads; NOT_YET("xmx_rec_global_attention"); }
 int xmx_rec_quant_window(int source, int packed, int scale, int M, int K, int height, int width, int across, int pad) { (void)source; (void)packed; (void)scale; (void)M; (void)K; (void)height; (void)width; (void)across; (void)pad; NOT_YET("xmx_rec_quant_window"); }
 int xmx_rec_unary(int kind, int a, int b, int c, int d, int n, int channels, int p0, int batch, int sa, int sb, int sc, int k) { (void)kind; (void)a; (void)b; (void)c; (void)d; (void)n; (void)channels; (void)p0; (void)batch; (void)sa; (void)sb; (void)sc; (void)k; NOT_YET("xmx_rec_unary"); }

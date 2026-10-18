@@ -1989,3 +1989,27 @@ to the three passes BY CONSTRUCTION"(qkv_epilogue.glsl:14-18)+test_gemm_qkv.py=�
 passes 自洽第四点: 224→248→320→388→**448** (+60=qkv captured, 精确)。build 实数 **23 门**。
 剩余无争议: window_int8_residual(52, 要 0x80000 window 索引 map), quant_window(52),
 纯 coopmat gemm(84)。之后 ffn/window_block/unary=§71 待决须用户定。
+
+## 76. swap-in #5 window_int8_residual GREEN（4 变体含真裁几何时, 0 bad）+ passes 500 + 时序教训
+
+window 索引 map=residual_epilogue.glsl:4-15 逐字(权威 .glsl 转录进 recorder 注释+golden
+numpy 同款转录——§34 从 .glsl 搬的先例): r=window*64+token(window-major); y=(w/across)*8+
+token/8, x=(w%across)*8+token%8; pad>>16/0xffff=top/left; 越界像素=整元素跳过(不读不写,
+.comp:258 continue); **inout remap**: 映射后 at 读 skip(IMAGE 布局 h*w*N)+写 C, cosine 读
+at%n=c。skip 尺寸校验按出货口径=图像布局(.comp:261 "skip lives where the answer goes")。
+
+**新时序事实(step-2588 课, 重要)**: plan 的 scratch 记录(2529..3902)把同一批 plan buffer
+号先建成 256B 占位(buf 1267 scratch=256B, captured@3916=66.8MB!)。出货 libxmx 在 capture
+时只校验"地址 live"从不校验字节(capture 不触内存, abort 丢弃); 我在 capture 时做 image
+尺寸校验=**比出货更严, 撞死 scratch leg**。修=尺寸校验挪进 run closure(捕获后 graph 真
+执行时才查, 抛 runtime_error→submit/graph_run catch→-1, 游戏面仍 fail-loud)。这也证明
+walk 的 scratch 命令确实被 abort 清掉不执行(§65 g_cmds 语义)。
+第二个我写的 bug: sized(A) 误要求 padded na=Mp*K——padded 行活在我们自己的 hApad, 从不
+要求 caller buffer 有它(W3 M=960→Mp=1024 假红)。修成 M*K。
+
+passes 自洽第五点: 224→248→320→388→448→**500**(+52=window_int8_residual captured, 精确;
+224+24+72+68+60+52=500 ✓)。build 清单实数 **24 全绿**。
+换芯已接 5 族 = captured 691 里的 **476**(69%), 剩无争议 = quant_window(52)+纯 coopmat
+gemm(84); 待决族(ffn 系 20+window_block 20+unary 34+attention 系 120)=194 步, 其中
+window_attention/global_attention 120 步我已绿 attnV/softmax_i8 链能否直接映射要看它们
+的 ABI 参数(下轮先读 window_attention 语义再报要不要扩到待决)。
