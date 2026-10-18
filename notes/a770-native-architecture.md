@@ -2089,3 +2089,17 @@ captured 691 已换 568=**82%**。剩 123 = window_attention 52 + gemm fp16 42 +
 10 + ffn 10 + global_attention 8 + unary2 1。**这 123 全是 §71/§78 待决族**(融合 attention
 + coopmat ffn/window_block + fp16 gemm)——无争议族已接完, 终点线(游戏出帧)现在硬卡在
 step 2534 ffn_stem 上, 必须你定 §78 那三条路怎么走。
+
+## 80. 用户裁定(07:15): 待决族走 (b) 过渡执行器, 但**放最后**; 进游戏前备份, 画面明显差就退回
+
+顺序定死: ①window_attention 60 + ②fp16 gemm 42(两者共享**新 f16 dpas 核**——
+window_attention.comp 的 Q/K/V 输入是 e4m3-published f16(正是我 int8_qkv 出口形态),
+scores/attnV 都是 f16×f16→f32 coopmat; 我已绿 softmax_kernel 对 vendor_approximate_
+softmax bit-exact 可直接用) → ③ffn/window_block/unary2=**过渡执行器**(最后做, 不赌 int8
+契约) → ④步4 整帧门 → ⑤**备份 work/libxmx.dll(照 .bak-1016 先例)+换 dll 进游戏面板 A/B**;
+画面明显有问题→退回备份。过渡执行器的具体形态(调旧 Vulkan coopmat? 还是 host 参考实现?)
+到 ③ 时再定, 原则=先出帧、字节契约可后换。
+
+**关键路径洞察(本轮实测)**: window_attention 的输入 buffer 就是 int8_qkv 的输出
+(buf 1275/1274/1276 = Q/K/V halves, batches×64×32×2B 对账吻合)——换芯链里
+int8_qkv→window_attention 的字节契约天然衔接, 只差 f16 dpas 一块地基。
