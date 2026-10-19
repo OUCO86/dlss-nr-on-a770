@@ -2127,3 +2127,29 @@ dpas 参数序 (acc, B, A) 同前辈 esimd_dpas_peak.cpp:45。探针入仓可复
 逐行 store(simd<float,64>=8x8 行主序, v1 的 store 形态)。pack 照 §81: A 行主序,
 B 交错 (k/2)*16+jl*2+(k%2)。host 对 f32 点积 within-one(累加序硬件定义, maxrel 1.6e-5
 远小于容差)。这是 window_attention(scores/attnV 都是 f16 gemm)与 fp16 gemm 族(42)共用地基。
+
+## 82. swap-in #8 gemm fp16 GREEN（5 变体 acc within-one + publish 自洽）+ passes 610 (88%)
+
+fp16 gemm 族(42 次, bt∈{4352=epi1+narrow, 4608=epi2+narrow, 0=f32}, batch∈{1,8},
+lda=batchK 列切片, **transposed bit 全 0**=B 是 (K,N) 行主序配 f16v1 pack_b)。
+地基=§81 探针钉死 f16 dpas 布局 + §81.5 tile standalone GREEN。sa/sb/sc 是**元素**
+(.comp:14 `ao=batch*pc.sa` 无 /16, 与 int8 push 不同——读死再写, §73 教训)。
+
+**判据按 §25 正确拆分(本轮立起来的新门模板)**: GEMM 的活=f32 累加器, publish 链已由
+PUBLISH 门独立 bit-exact 保证 → gemm 判据=**acc within-one**(f32-out 路径测), 不拿
+publish 后 bit 当 gemm 判据(1-ULP 累加序差会合法落在 e4m3/gate 舍入边界另一侧, 显示成
+1-2 half-ulp, 那是已门控链的边界放大不是 gemm 错)。narrow 变体再跑一遍 bt=0 拿设备自己的
+acc, 验 publish(epi, device_acc)==device narrow 输出(**两腿自洽**, publish 腿正确性继承
+其门)。
+
+**signed-zero 发现(记档, 数值无关)**: gate clamp 饱和区(|acc|>4) linear 项归 +0.0
+(IEEE x+(-x)=+0.0), wide·+0.0 numpy 给 -0.0(0x8000) 设备 fmul_rn 给 +0.0(0x0000)——
+编译器符号零差, +0.0==−0.0 下游全当零。PUBLISH 门用 np.array_equal(==语义)从未暴露;
+本门字节比较暴露 → 豁免=half 层 (gh==wh)|((gh&0x7fff==0)&(wh&0x7fff==0))。
+设备 qr_gate_activation 与出货 publish.glsl:43-53 逐字一致(本轮再核对)。
+
+passes 链: 224→248→320→388→448→500→552→568→**610**。build **27 门全绿**。
+captured 691 已换 **610=88%**。剩 81 全待决族: window_attention 52 + global_attention 8
++ window_block 10 + ffn 10 + unary2 1 → §80 裁定=过渡执行器放最后。
+下一步按 §80 顺序: window_attention 用三段组合(地基 f16 gemm 已就位: scores=gemm(Q,K^T),
+softmax=已绿 softmax_kernel, attnV=gemm(P,V))——先读它的 bias/merged 语义再写 recorder。

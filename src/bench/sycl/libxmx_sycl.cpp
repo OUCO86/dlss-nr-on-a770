@@ -26,6 +26,7 @@
 #include "gemm_s8_v5_kernel.hpp"
 #include "gemm_s8_v7_kernel.hpp"
 #include "gemm_s8_v8_kernel.hpp"
+#include "gemm_f16_v1_kernel.hpp"
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
@@ -361,7 +362,77 @@ int xmx_rec_gemm_int8_fused(int a,int b,int c,int as,int bs,unsigned M,unsigned 
 int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine, int M, int cin, int hidden, int groups, int flags) { (void)a; (void)expand; (void)projection; (void)out; (void)skip; (void)cosine; (void)M; (void)cin; (void)hidden; (void)groups; (void)flags; NOT_YET("xmx_rec_ffn"); }
 int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projection, int out, int cosine, int height, int width, int source_width, int flags) { (void)source; (void)skip; (void)sincos; (void)expand; (void)projection; (void)out; (void)cosine; (void)height; (void)width; (void)source_width; (void)flags; NOT_YET("xmx_rec_ffn_merge"); }
 int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int out, int cosine, int M, int flags) { (void)features; (void)adapter; (void)expand; (void)projection; (void)out; (void)cosine; (void)M; (void)flags; NOT_YET("xmx_rec_ffn_stem"); }
-int xmx_rec_gemm(int a, int b, int c, int M, int N, int K, int batch, int sa, int sb, int sc, int bt, int lda, int ldb, int ldc, int oa, int ob, int oc) { (void)a; (void)b; (void)c; (void)M; (void)N; (void)K; (void)batch; (void)sa; (void)sb; (void)sc; (void)bt; (void)lda; (void)ldb; (void)ldc; (void)oa; (void)ob; (void)oc; NOT_YET("xmx_rec_gemm"); }
+// int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
+//                  unsigned batch, unsigned sa, unsigned sb, unsigned sc, unsigned bt,
+//                  unsigned lda, unsigned ldb, unsigned ldc,
+//                  unsigned oa, unsigned ob, unsigned oc)
+// swap-in #8 (section 82): the plain fp16 GEMM, the LAST undisputed family (42 captured
+// calls). Math pinned from gemm_staged.comp:14-18 + the epilogue tail BEFORE writing:
+//   per group g: A[r][k] = Araw[oa + g*sa + r*lda + k] (lda==0 -> K)
+//                B[k][j] = Braw[ob + g*sb + k*ldb + j] (ldb==0 -> N; transposed bit 0
+//                  in EVERY captured call, so B is (K,N) row-major -- matches f16v1 pack_b)
+//                C[r][j] = Cout[oc + g*sc + r*ldc + j] (ldc==0 -> N)
+//   out = publish(epi, acc) -> sycl::half iff 0x1000 else f32 (epi = bt>>8 & 0xF; captured bt
+//         in {4352=epi1+narrow, 4608=epi2+narrow, 0=f32}). No scales, no residual (the
+//         plain xmx_rec_gemm passes skip=cosine=-1).
+// The f16v1 tile (section 81/81.5) computes acc = A@B in f32; M is padded to 16 (the
+// tile side) and padded rows are never published. Host-gather per group (the section-73
+// stride lesson: copy the WIDE buffers back device->host once, then plain host slicing).
+int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
+                 unsigned batch, unsigned sa, unsigned sb, unsigned sc, unsigned bt,
+                 unsigned lda, unsigned ldb, unsigned ldc,
+                 unsigned oa, unsigned ob, unsigned oc) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!M || !N || !K || (N % 16u) || (K % 16u))
+        FAILMSG("gemm f16 needs N%%16==0, K%%16==0 (our tile)");
+    if (bt & 1u) FAILMSG("transposed B not used by the captured graph (section 82)");
+    if (bt & 0x800000u) FAILMSG("pooled window residual belongs to the window_block family");
+    auto ia = g_bufs.find(a), ib = g_bufs.find(b), ic = g_bufs.find(c);
+    if (ia == g_bufs.end() || ib == g_bufs.end() || ic == g_bufs.end()) FAILMSG("bad gemm operand");
+    const sycl::half* Araw = (const sycl::half*)ia->second.p;
+    const sycl::half* Braw = (const sycl::half*)ib->second.p;
+    void* Cout = ic->second.p;
+    const unsigned epi = (bt >> 8) & 0xFu;
+    const bool narrow = (bt & 0x1000u) != 0u;
+    const unsigned lda_e = lda ? lda : K, ldb_e = ldb ? ldb : N, ldc_e = ldc ? ldc : N;
+    const int Mp = (int)(((M + 15u) / 16u) * 16u);
+    g_cmds.push_back([=]() {
+        const size_t a_slice = (size_t)M * K, b_slice = (size_t)K * N;
+        const size_t aw_b = (size_t)(M - 1) * lda_e + (size_t)(batch - 1) * sa + K + oa;
+        const size_t bw_b = (size_t)(K - 1) * ldb_e + (size_t)(batch - 1) * sb + N + ob;
+        std::vector<sycl::half> hAw(aw_b), hBw(bw_b);
+        GQ->memcpy(hAw.data(), Araw, aw_b * 2).wait();
+        GQ->memcpy(hBw.data(), Braw, bw_b * 2).wait();
+        for (unsigned g = 0; g < (batch ? batch : 1u); ++g) {
+            std::vector<sycl::half> hA(a_slice), hB(b_slice), hAp((size_t)Mp * K), hBp(b_slice);
+            for (unsigned r = 0; r < M; ++r)
+                std::memcpy(hA.data() + (size_t)r * K, hAw.data() + oa + (size_t)g * sa + (size_t)r * lda_e, K * 2);
+            for (unsigned k = 0; k < K; ++k)
+                std::memcpy(hB.data() + (size_t)k * N, hBw.data() + ob + (size_t)g * sb + (size_t)k * ldb_e, N * 2);
+            std::vector<sycl::half> hApad((size_t)Mp * K, sycl::half(0.f));
+            std::memcpy(hApad.data(), hA.data(), a_slice * 2);
+            f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
+            f16v1::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
+            sycl::half* dAp = (sycl::half*)sycl::malloc_device((size_t)Mp * K * 2, *GQ);
+            sycl::half* dBp = (sycl::half*)sycl::malloc_device(b_slice * 2, *GQ);
+            float* dC = (float*)sycl::malloc_device((size_t)Mp * N * 4, *GQ);
+            GQ->memcpy(dAp, hAp.data(), (size_t)Mp * K * 2).wait();
+            GQ->memcpy(dBp, hBp.data(), b_slice * 2).wait();
+            f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K).wait();
+            GQ->parallel_for(sycl::range((size_t)M * N),
+                             [=](sycl::item<1> it) {
+                size_t i = it.get_id(0);
+                unsigned r = (unsigned)(i / N), col = (unsigned)(i % N);
+                float value = qr_publish(epi, dC[i]);
+                size_t out = oc + (size_t)g * sc + (size_t)r * ldc_e + col;
+                if (narrow) ((sycl::half*)Cout)[out] = sycl::half(value);
+                else        ((float*)Cout)[out] = value;
+            }).wait();
+            sycl::free(dAp, *GQ); sycl::free(dBp, *GQ); sycl::free(dC, *GQ);
+        }
+    });
+    return 0;
+}
 // int xmx_rec_gemm_int8(int a, int b, int c, int a_scale, int b_scale,
 //                       unsigned M, unsigned N, unsigned K, unsigned flags)
 // route(a) swap-in #1 (sections 70-71, the user-approved two-pass plan): the plan's
