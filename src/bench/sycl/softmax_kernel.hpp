@@ -32,12 +32,19 @@ static const float SOFT_HI        = 1.5693359375f;
 static const uint32_t SOFT_MAGIC  = 0x7FF88000u;
 
 inline auto softmax_kernel() {
-    return [](const float* src, sycl::half* dst, unsigned rows, unsigned cols) {
+    return [](const float* src, sycl::half* dst, unsigned rows, unsigned cols,
+              const float* bias, unsigned heads) {
         return [=](sycl::item<1> it) {
             unsigned r = (unsigned)it.get_id(0);
             if (r >= rows) return;
             const float* row = src + (size_t)r * cols;
             sycl::half* outr = dst + (size_t)r * cols;
+            // bias (attention.comp:223 `prepared`: logit += pc.b.v[bias_index] BEFORE the
+            // half_round of the bit-affine; flags 0x2000 selects it, p0 clamp unused here).
+            // bias_offset (attention.comp:240): scores (windows*heads, n, n), bias
+            // (heads, n, n): ((row/n) % heads)*n*n + (row%n)*n.
+            size_t boff = bias ? ((size_t)((r / cols) % (heads ? heads : 1u)) * cols * cols
+                                  + (size_t)(r % cols) * cols) : 0;
             // affine + bit-pair transform -> weights (kept as f16 for the two passes).
             // cols is even (golden :215 requires it); process pairs like the shipped kernel.
             float total = 0.0f;
@@ -45,8 +52,10 @@ inline auto softmax_kernel() {
                 // golden :216-220: half_round(value) then *= scale then += bias, ALL in
                 // f32 with NO intermediate half-round; the single round to half is the
                 // final astype (the bit-pack below). clamp is f32 (bounds exact in half).
-                float a0 = cr_add(cr_mul(qr_half_round(row[c]),     SOFT_SCALE), SOFT_BIAS);
-                float a1 = cr_add(cr_mul(qr_half_round(row[c + 1]), SOFT_SCALE), SOFT_BIAS);
+                float l0 = bias ? row[c] + bias[boff + c] : row[c];
+                float l1 = bias ? row[c + 1] + bias[boff + c + 1] : row[c + 1];
+                float a0 = cr_add(cr_mul(qr_half_round(l0),     SOFT_SCALE), SOFT_BIAS);
+                float a1 = cr_add(cr_mul(qr_half_round(l1),     SOFT_SCALE), SOFT_BIAS);
                 a0 = sycl::min(sycl::max(a0, SOFT_LO), SOFT_HI);
                 a1 = sycl::min(sycl::max(a1, SOFT_LO), SOFT_HI);
                 uint16_t b0 = sycl::bit_cast<uint16_t>(sycl::half(a0));   // the one f16 round

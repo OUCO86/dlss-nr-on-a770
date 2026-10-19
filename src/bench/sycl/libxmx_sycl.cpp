@@ -1020,6 +1020,38 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
     }
     return 0;
 }
+// int xmx_rec_merge_heads(int source, int dst, unsigned windows, unsigned tokens,
+//                         unsigned channels, unsigned heads, unsigned epilogue,
+//                         unsigned narrow)
+// merge_heads foundation (section 84): resident.comp:626-641 MERGE_HEADS, the 4th leg of
+// window_attention's four-pass golden (test_window_attention.py:55). (windows,heads,
+// tokens,32) -> (windows,tokens,C): for output index (c, rest): token=rest%tokens,
+// window=rest/tokens, at=(window*heads + c/32)*tokens + token, value=load_a(at*32 + c%32),
+// then store (publish(epi) + narrow iff bit12). No 0x20000 scale leg (window_attention
+// uses the plain merge; the ViT's vit_softmax normalisation is global_attention's path).
+int xmx_rec_merge_heads(int source, int dst, unsigned windows, unsigned tokens,
+                        unsigned channels, unsigned heads, unsigned epilogue,
+                        unsigned narrow) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!windows || !tokens || !channels || !heads || (channels % 32u)) FAILMSG("bad merge_heads dims");
+    auto s = g_bufs.find(source), d = g_bufs.find(dst);
+    if (s == g_bufs.end() || d == g_bufs.end()) FAILMSG("bad merge_heads operand");
+    const float* sp = (const float*)s->second.p;
+    void* dp = d->second.p;
+    const unsigned n = windows * tokens * channels;
+    g_cmds.push_back([=]() {
+        GQ->parallel_for(sycl::range((size_t)n), [=](sycl::item<1> it) {
+            unsigned index = (unsigned)it.get_id(0);
+            unsigned c = index % channels, rest = index / channels;
+            unsigned token = rest % tokens, window = rest / tokens;
+            size_t at = ((size_t)window * heads + c / 32u) * tokens + token;
+            float value = qr_publish(epilogue, sp[at * 32u + (c % 32u)]);
+            if (narrow) ((sycl::half*)dp)[index] = sycl::half(value);
+            else        ((float*)dp)[index] = value;
+        }).wait();
+    });
+    return 0;
+}
 int xmx_rec_unary2(int kind, int a, int b, int c, int d, int second, int n, int channels, int p0, int batch, int sa, int sb, int sc, int k) { (void)kind; (void)a; (void)b; (void)c; (void)d; (void)second; (void)n; (void)channels; (void)p0; (void)batch; (void)sa; (void)sb; (void)sc; (void)k; NOT_YET("xmx_rec_unary2"); }
 int xmx_rec_window_attention(int q, int k, int v, int bias, int out, int batches, int heads, int merged) { (void)q; (void)k; (void)v; (void)bias; (void)out; (void)batches; (void)heads; (void)merged; NOT_YET("xmx_rec_window_attention"); }
 int xmx_rec_window_block(int image, int qkv, int projection, int target, int bias, int cosine, int scale, int pooled, int windows, int height, int width, int across, int pad, int flags) { (void)image; (void)qkv; (void)projection; (void)target; (void)bias; (void)cosine; (void)scale; (void)pooled; (void)windows; (void)height; (void)width; (void)across; (void)pad; (void)flags; NOT_YET("xmx_rec_window_block"); }
@@ -1266,6 +1298,13 @@ int xmx_rec_cosine_norm_i8(int source, int out8, int scale, unsigned rows, unsig
 // int xmx_rec_softmax(int source, int dst, unsigned rows, unsigned cols)
 // island-1: the vendor's half bit-affine softmax, f32 logits (rows x cols, cols even) ->
 // e4m3 probability halves. Bit-exact gate vs nr_model.vendor_approximate_softmax (:211).
+// int xmx_rec_softmax(int source, int dst, unsigned rows, unsigned cols)
+// int xmx_rec_softmax_bias(int source, int dst, int bias, unsigned rows, unsigned cols,
+//                          unsigned heads)
+// The island-1 softmax (my translation, NOT a game ABI name -- the game routes softmax
+// through xmx_rec_row). The bias variant adds attention.comp:223 `prepared` (logit +=
+// bias[boff] before the bit-affine's half_round) with bias_offset (:240) for scores
+// (windows*heads, n, n) and bias (heads, n, n). window_attention's recorder composes it.
 int xmx_rec_softmax(int source, int dst, unsigned rows, unsigned cols) {
     if (!g_recording) FAILMSG("not recording");
     if (!rows || !cols || (cols & 1u)) FAILMSG("softmax needs rows>0, even cols");
@@ -1274,7 +1313,21 @@ int xmx_rec_softmax(int source, int dst, unsigned rows, unsigned cols) {
     const float* sp = (const float*)s->second.p;
     sycl::half* dp = (sycl::half*)d->second.p;
     g_cmds.push_back([=]() {
-        GQ->parallel_for(sycl::range(rows), smax::softmax_kernel()(sp, dp, rows, cols)).wait();
+        GQ->parallel_for(sycl::range(rows), smax::softmax_kernel()(sp, dp, rows, cols, nullptr, 0)).wait();
+    });
+    return 0;
+}
+int xmx_rec_softmax_bias(int source, int dst, int bias, unsigned rows, unsigned cols,
+                         unsigned heads) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!rows || !cols || (cols & 1u) || !heads || (rows % heads)) FAILMSG("softmax_bias needs rows%%heads==0, even cols, heads>0");
+    auto s = g_bufs.find(source), d = g_bufs.find(dst), b = g_bufs.find(bias);
+    if (s == g_bufs.end() || d == g_bufs.end() || b == g_bufs.end()) FAILMSG("bad softmax_bias operand");
+    const float* sp = (const float*)s->second.p;
+    sycl::half* dp = (sycl::half*)d->second.p;
+    const float* bp = (const float*)b->second.p;
+    g_cmds.push_back([=]() {
+        GQ->parallel_for(sycl::range(rows), smax::softmax_kernel()(sp, dp, rows, cols, bp, heads)).wait();
     });
     return 0;
 }

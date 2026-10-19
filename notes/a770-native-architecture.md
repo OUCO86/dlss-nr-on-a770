@@ -2169,3 +2169,20 @@ merge_heads(EPI_E4M3,narrow)。依赖链拆成地基件逐个门控(§55):
   出货走 xmx_rec_row resident.comp row-family), merge_heads(EPI_E4M3,narrow)。
 
 gemm_f16 门现 7 变体(含 scores 形状 64x64x32 batch1/8 transposed)全 ACC WITHIN-ONE。
+
+## 84. window_attention 四腿地基全就位（softmax bias + merge_heads 门控 GREEN）
+
+§83 拆的四趟 golden 依赖链逐个独立门控(§55):
+- f16 gemm 非转置(attnV) ✓ §82; f16 gemm 转置(scores) ✓ §83。
+- **softmax bias** ✓: softmax_kernel 加 bias/heads(attention.comp:223 `prepared` logit+=bias
+  在 bit-affine half_round 前; bias_offset :240 scores(windows*heads,n,n) bias(heads,n,n)
+  =((row/n)%heads)*n*n+(row%n)*n)。门 3 变体 BIT-EXACT vs vendor_approximate_softmax(scores+bias)。
+  新 recorder xmx_rec_softmax_bias(我的 island-1 翻译, 非游戏 ABI——游戏走 xmx_rec_row)。
+- **merge_heads** ✓: resident.comp:626-641 逐字转录, (w,h,t,32)→(w,t,C) at=(w*heads+c/32)*t+token,
+  publish+narrow。门 4 变体 OUT BITS EQUAL(含 window_attention 真形状 2x64x128)。新 recorder
+  xmx_rec_merge_heads。0x20000 ViT scale 腿不接(global_attention 才用, window 用 plain merge)。
+
+四腿全绿 → 下一步 window_attention recorder = 组合(scores=f16gemm_t(Q,K)→softmax_bias→
+attnV=f16gemm(P,V)→merge_heads), 门=对四趟 golden 端到端(test_window_attention.py:52-55 的
+rt.gemm/softmax/gemm/merge_heads 序列), 判据 within-one(f16 gemm 腿) + 各腿自洽。
+build 现 28 门。

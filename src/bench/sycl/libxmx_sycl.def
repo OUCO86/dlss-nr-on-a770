@@ -58,6 +58,7 @@ EXPORTS
     xmx_rec_global_attention
     xmx_rec_quant_window
     xmx_rec_unary
+    xmx_rec_merge_heads
     xmx_rec_unary2
     xmx_rec_window_attention
     xmx_rec_window_block
@@ -72,6 +73,7 @@ EXPORTS
     xmx_rec_cosine_norm_q
     xmx_rec_cosine_norm_i8
     xmx_rec_softmax
+    xmx_rec_softmax_bias
     xmx_rec_softmax_i8
     xmx_rec_requant_i8
     xmx_rec_gemm_qkv_v

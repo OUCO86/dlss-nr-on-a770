@@ -45,6 +45,7 @@ for nm, at in (
     ("xmx_buf_zero", [ctypes.c_int]), ("xmx_buf_destroy", [ctypes.c_int]),
     ("xmx_begin", []), ("xmx_abort", []), ("xmx_submit", []),
     ("xmx_rec_softmax", [ctypes.c_int] * 2 + [ctypes.c_uint] * 2),
+    ("xmx_rec_softmax_bias", [ctypes.c_int] * 3 + [ctypes.c_uint] * 3),
 ):
     if hasattr(lib, nm):
         getattr(lib, nm).argtypes = at
@@ -107,6 +108,49 @@ run(64, 64, "w64")        # window attention: 64 tokens
 run(256, 64, "w64-big")
 run(64, 128, "w128")      # global attention: 128 tokens
 run(128, 256, "w256")     # vit path token count
+
+def run_bias(windows, heads, cols, label):
+    global fails
+    rows = windows * heads
+    assert cols % 2 == 0
+    rng = np.random.default_rng(91 + rows + cols)
+    vals = rng.uniform(-6, 6, size=(rows, cols)).astype(np.float32)
+    bias = rng.uniform(-3, 3, size=(heads, cols, cols)).astype(np.float32)
+    hs = lib.xmx_buf_create_kind(rows * cols * 4, 4)
+    hd = lib.xmx_buf_create_kind(rows * cols * 2, 2)
+    hb = lib.xmx_buf_create_kind(heads * cols * cols * 4, 4)
+    ok(hs > 0 and hd > 0 and hb > 0, f"{label}: buffers")
+    lib.xmx_buf_upload(hs, np.ascontiguousarray(vals).ctypes.data, 0, rows * cols * 4)
+    lib.xmx_buf_upload(hb, np.ascontiguousarray(bias).ctypes.data, 0, heads * cols * cols * 4)
+    lib.xmx_buf_zero(hd)
+    ok(lib.xmx_begin() == 0, f"{label}: begin")
+    rc = lib.xmx_rec_softmax_bias(hs, hd, hb, rows, cols, heads)
+    ok(rc == 0, f"{label}: rec" + ("" if rc == 0 else " err=" + lib.xmx_error().decode(errors="replace")))
+    ok(lib.xmx_submit() == 0, f"{label}: submit")
+    got = np.zeros(rows * cols, np.float16); lib.xmx_buf_download(hd, got.ctypes.data, 0, rows * cols * 2)
+    # golden: scores + bias (bias_offset: row r -> head r%heads, bias[head, r%cols? no:
+    # (row/n)%heads picks the head-plane, (row%n) the query row within the window's n rows].
+    # scores are (windows*heads, n, n) flattened row-major: row index r, cols=n. The head
+    # for row r is (r / cols) % heads (attention.comp:240). bias is (heads, n, n).
+    head_of = (np.arange(rows) // cols) % heads
+    qrow = np.arange(rows) % cols
+    sb = vals.copy()
+    for r in range(rows):
+        sb[r] = vals[r] + bias[head_of[r], qrow[r], :]
+    want = NM.vendor_approximate_softmax(sb)
+    want16 = np.asarray(want, np.float32).astype(np.float16)
+    exact = np.array_equal(got.view(np.uint16), want16.ravel().view(np.uint16))
+    if not exact:
+        d = np.flatnonzero(got.view(np.uint16) != want16.ravel().view(np.uint16))
+        e = int(d[0]); print(f"        first diff elem {e} (row {e//cols} col {e%cols}): got {got[e]} want {want16.ravel()[e]}")
+        print(f"        nbad={d.size}")
+    ok(exact, f"{label} {windows}x{heads}x{cols}: BIT-EXACT vs vendor_approximate_softmax(scores+bias) "
+              f"({int((got.view(np.uint16)!=want16.ravel().view(np.uint16)).sum()) if not exact else 0} differ)")
+    lib.xmx_buf_destroy(hs); lib.xmx_buf_destroy(hd); lib.xmx_buf_destroy(hb)
+
+run_bias(2, 4, 64, "bias-win2h4")
+run_bias(1, 16, 64, "bias-win1h16")
+run_bias(3, 2, 64, "bias-win3h2")
 
 print(f"\nSOFTMAX {'GREEN' if not fails else 'RED'} ({fails} fails)")
 sys.exit(1 if fails else 0)
