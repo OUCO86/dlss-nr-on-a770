@@ -422,7 +422,108 @@ int xmx_rec_gemm_int8_fused(int a,int b,int c,int as,int bs,unsigned M,unsigned 
    fails loudly if reached. As each is implemented (a green chain gated + diffed), its
    stub is replaced by the real recorder -- the scoreboard is "the first target that still
    answers NOT_YET", which walks down the plan as we implement. */
-int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine, int M, int cin, int hidden, int groups, int flags) { (void)a; (void)expand; (void)projection; (void)out; (void)skip; (void)cosine; (void)M; (void)cin; (void)hidden; (void)groups; (void)flags; NOT_YET("xmx_rec_ffn"); }
+// int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine,
+//                 unsigned M, unsigned cin, unsigned hidden, unsigned groups, unsigned flags)
+// swap-in #12 (section 88 route): the fused feed-forward, composed from the two green f16
+// legs. ffn_fused.comp's own header says it is "Bit-identical to the two GEMMs by
+// construction", and test_ffn_fused.py:65-69 is the shipping witness for exactly that
+// decomposition (pinned here BEFORE writing, section 73's discipline):
+//   pass 1 (expand):  gemm(a, expand -> hidden16, M, N=hidden, K=cin, batch=1, dense,
+//                          epilogue=EPI_GATE_E4M3(3), narrow=True)   -- hidden is ALWAYS
+//                          the gated e4m3 half (the ffn structure, not the caller's flags)
+//   pass 2 (project): gemm_residual(hidden16, projection -> out, skip, cosine,
+//                          M, N=cin, K=hidden, epilogue=epi, narrow, skip_half)
+// where epi=(flags>>8)&0xF, narrow=flags&0x1000, half_skip=flags&0x40000 (libxmx.c:3115
+// mask 0x41f00; residual=skip>=0||cosine>=0 -> the 0x20000 the wrapper ORs). captured ffn
+// is ALL groups==1, cin==32, hidden==128 (the narrow staged blocks): 8 calls, M=130560,
+// flags in {0x40000 half-skip, 0x0 f32-skip}, both epi=0 f32-out. The branched (groups>1,
+// no residual) path is NOT in the captured graph -- rejected loudly so the game face never
+// silently mis-runs it (section 70's fail-loud rule).
+// Composition = one g_cmds push (one plan step -> +1 pass), two device GEMMs with a host
+// round-trip of hidden16 between them (the window_attention/global_attention pattern,
+// section 85/86): the expand publishes hidden16 on device, we download it, pack it as the
+// projection's A, and the projection adds the residual in its epilogue. The host round-trip
+// is the offline/gate form; folding it is the megakernel stage's job (section 85's note).
+int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine,
+                unsigned M, unsigned cin, unsigned hidden, unsigned groups, unsigned flags) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!M || (M % 16u) || !cin || (cin % 16u) || !hidden || (hidden % 32u))
+        FAILMSG("ffn needs M%%16, cin%%16, hidden%%32 (libxmx.c:3118)");
+    if (flags & ~0x41f00u) FAILMSG("ffn takes an epilogue, a half output and a half skip only");
+    if (groups != 1u || cin != 32u)
+        FAILMSG("the captured ffn is the narrow groups==1 cin==32 path only (branched not in plan)");
+    const bool residual = (skip >= 0) || (cosine >= 0);
+    if (residual && (skip < 0 || cosine < 0)) FAILMSG("ffn residual needs both skip and cosine");
+    if (!residual && (flags & 0x40000u)) FAILMSG("a half skip without a residual");
+    auto ia = g_bufs.find(a), ib = g_bufs.find(expand), ip = g_bufs.find(projection),
+         ic = g_bufs.find(out);
+    if (ia == g_bufs.end() || ib == g_bufs.end() || ip == g_bufs.end() || ic == g_bufs.end())
+        FAILMSG("bad ffn operand");
+    const sycl::half* Araw = (const sycl::half*)ia->second.p;
+    const sycl::half* Eraw = (const sycl::half*)ib->second.p;   // expand (cin x hidden) row-major
+    const sycl::half* Praw = (const sycl::half*)ip->second.p;   // projection (hidden x cin) row-major
+    void* Cout = ic->second.p;
+    const void* skp = residual ? g_bufs.find(skip)->second.p : nullptr;
+    const float* cp = residual ? (const float*)g_bufs.find(cosine)->second.p : nullptr;
+    const unsigned epi = (flags >> 8) & 0xFu;
+    const bool narrow = (flags & 0x1000u) != 0u;
+    const bool half_skip = (flags & 0x40000u) != 0u;
+    const int Mp = (int)(((M + 15u) / 16u) * 16u);
+    g_cmds.push_back([=]() {
+        // ---- pass 1: expand, publish(3)=gate->e4m3, narrow f16 -> hidden16 ----
+        {
+            std::vector<sycl::half> hA((size_t)M * cin), hApad((size_t)Mp * cin, sycl::half(0.f)),
+                hE((size_t)cin * hidden), hAp((size_t)Mp * cin), hEp((size_t)cin * hidden),
+                hH((size_t)M * hidden);   // host hidden16: its OWN buffer (M*hidden > M*cin, reusing hA overruns it -- the section-73 size lesson)
+            GQ->memcpy(hA.data(), Araw, (size_t)M * cin * 2).wait();
+            std::memcpy(hApad.data(), hA.data(), (size_t)M * cin * 2);
+            GQ->memcpy(hE.data(), Eraw, (size_t)cin * hidden * 2).wait();
+            f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)cin);
+            f16v1::pack_b(hE.data(), hEp.data(), (int)cin, (int)hidden);
+            sycl::half* dAp = (sycl::half*)sycl::malloc_device((size_t)Mp * cin * 2, *GQ);
+            sycl::half* dEp = (sycl::half*)sycl::malloc_device((size_t)cin * hidden * 2, *GQ);
+            float* dC1 = (float*)sycl::malloc_device((size_t)Mp * hidden * 4, *GQ);
+            GQ->memcpy(dAp, hAp.data(), (size_t)Mp * cin * 2).wait();
+            GQ->memcpy(dEp, hEp.data(), (size_t)cin * hidden * 2).wait();
+            f16v1::gemm(*GQ, dAp, dEp, dC1, Mp, (int)hidden, (int)cin).wait();
+            // publish(3) on device, store as f16 hidden16, then download for the host pack.
+            sycl::half* dH = (sycl::half*)sycl::malloc_device((size_t)M * hidden * 2, *GQ);
+            GQ->parallel_for(sycl::range((size_t)M * hidden), [=](sycl::item<1> it) {
+                size_t i = it.get_id(0);
+                dH[i] = sycl::half(qr_publish(3u, dC1[i]));
+            }).wait();
+            GQ->memcpy(hH.data(), dH, (size_t)M * hidden * 2).wait();   // host hidden16
+            sycl::free(dAp, *GQ); sycl::free(dEp, *GQ); sycl::free(dC1, *GQ); sycl::free(dH, *GQ);
+            // ---- pass 2: projection gemm_residual(hidden16, projection -> out) ----
+            std::vector<sycl::half> hP((size_t)hidden * cin), hHp((size_t)Mp * hidden),
+                hPp((size_t)hidden * cin);
+            std::vector<sycl::half> hHpad((size_t)Mp * hidden, sycl::half(0.f));
+            std::memcpy(hHpad.data(), hH.data(), (size_t)M * hidden * 2);
+            GQ->memcpy(hP.data(), Praw, (size_t)hidden * cin * 2).wait();
+            f16v1::pack_a(hHpad.data(), hHp.data(), Mp, (int)hidden);
+            f16v1::pack_b(hP.data(), hPp.data(), (int)hidden, (int)cin);
+            sycl::half* dHp = (sycl::half*)sycl::malloc_device((size_t)Mp * hidden * 2, *GQ);
+            sycl::half* dPp = (sycl::half*)sycl::malloc_device((size_t)hidden * cin * 2, *GQ);
+            float* dC2 = (float*)sycl::malloc_device((size_t)Mp * cin * 4, *GQ);
+            GQ->memcpy(dHp, hHp.data(), (size_t)Mp * hidden * 2).wait();
+            GQ->memcpy(dPp, hPp.data(), (size_t)hidden * cin * 2).wait();
+            f16v1::gemm(*GQ, dHp, dPp, dC2, Mp, (int)cin, (int)hidden).wait();
+            GQ->parallel_for(sycl::range((size_t)M * cin), [=](sycl::item<1> it) {
+                size_t i = it.get_id(0);
+                unsigned col = (unsigned)(i % cin);
+                float total = dC2[i];
+                if (residual) {
+                    float sk = half_skip ? (float)((const sycl::half*)skp)[i] : ((const float*)skp)[i];
+                    total = sycl::fma(sk, cp[col], total);
+                }
+                if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
+                else        ((float*)Cout)[i] = qr_publish(epi, total);
+            }).wait();
+            sycl::free(dHp, *GQ); sycl::free(dPp, *GQ); sycl::free(dC2, *GQ);
+        }
+    });
+    return 0;
+}
 int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projection, int out, int cosine, int height, int width, int source_width, int flags) { (void)source; (void)skip; (void)sincos; (void)expand; (void)projection; (void)out; (void)cosine; (void)height; (void)width; (void)source_width; (void)flags; NOT_YET("xmx_rec_ffn_merge"); }
 int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int out, int cosine, int M, int flags) { (void)features; (void)adapter; (void)expand; (void)projection; (void)out; (void)cosine; (void)M; (void)flags; NOT_YET("xmx_rec_ffn_stem"); }
 // int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
