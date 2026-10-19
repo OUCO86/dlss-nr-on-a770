@@ -351,7 +351,70 @@ int xmx_rec_pre(int c,int m,int h,int f,int pl,unsigned px,unsigned ht,unsigned 
 int xmx_rec_post(int c,int hd,int h,int rs,int tb,int nl,unsigned px,unsigned ht,unsigned wd,unsigned pt,unsigned sh,unsigned sw) { (void)c;(void)hd;(void)h;(void)rs;(void)tb;(void)nl;(void)px;(void)ht;(void)wd;(void)pt;(void)sh;(void)sw; NOT_YET("xmx_rec_post"); }
 int xmx_rec_gemm_qkv(int a,int w,int q,int k,int v,int sc,unsigned M,unsigned ch,unsigned hd,unsigned tk,unsigned vt) { (void)a;(void)w;(void)q;(void)k;(void)v;(void)sc;(void)M;(void)ch;(void)hd;(void)tk;(void)vt; NOT_YET("xmx_rec_gemm_qkv"); }
 int xmx_rec_gemm_qkv_window(int im,int w,int q,int k,int v,int sc,unsigned M,unsigned ch,unsigned hd,unsigned tk,unsigned wd,unsigned ht,unsigned ac,unsigned pd,unsigned im2) { (void)im;(void)w;(void)q;(void)k;(void)v;(void)sc;(void)M;(void)ch;(void)hd;(void)tk;(void)wd;(void)ht;(void)ac;(void)pd;(void)im2; NOT_YET("xmx_rec_gemm_qkv_window"); }
-int xmx_rec_gemm_residual(int a,int b,int c,int sk,int co,unsigned M,unsigned N,unsigned K,unsigned fl) { (void)a;(void)b;(void)c;(void)sk;(void)co;(void)M;(void)N;(void)K;(void)fl; NOT_YET("xmx_rec_gemm_residual"); }
+// int xmx_rec_gemm_residual(int a, int b, int c, int skip, int cosine,
+//                           unsigned M, unsigned N, unsigned K, unsigned flags)
+// f16 gemm_residual FOUNDATION (section 88, the f16 twin of the green int8 residual
+// swap-in #3). libxmx.c:2365 pins the ABI: record_gemm(a,b,c,M,N,K, batch=1, dense,
+// NO scales, flags|0x20000, skip, cosine). The ONLY difference from the int8 residual is
+// that the f16 acc is already the true value -- there is no cr_mul(row)*cr_mul(col)
+// dequantise step. residual_epilogue.glsl:18-23 (add_gemm_residual) + gemm_staged.comp:346
+// pin the math, copied here BEFORE writing either side (section 73's discipline):
+//   total = fma( skipped, cosine[c], acc )   ONE fused rounding (the .comp comment says
+//           the contraction policy is what keeps it bit-identical to the two-pass path;
+//           device = sycl::fma = HW FMA = correctly-rounded single rounding)
+//   out   = publish(epi, total) -> f16 iff 0x1000 else f32
+//   skipped = half iff 0x40000 else f32; cosine f32[N]; at = r*N+c (non-window; the
+//           window variant is xmx_rec_gemm_window_residual, its own op).
+// B is (K,N) row-major (record_gemm default transposed=0) -> f16v1::pack_b. M padded to
+// the 16-row tile; padded rows never published. 0x20000 is OR'd inside the Vulkan
+// wrapper (libxmx.c:2365), the plan-layer flags never carry it -- this op IS the adding
+// variant, so there is nothing to require and nothing to copy (section 74's guard lesson).
+int xmx_rec_gemm_residual(int a, int b, int c, int skip, int cosine,
+                          unsigned M, unsigned N, unsigned K, unsigned flags) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!M || !N || !K || (N % 16u) || (K % 16u))
+        FAILMSG("gemm_residual f16 needs N%%16==0, K%%16==0 (our tile)");
+    if (flags & 0x80000u) FAILMSG("window residual belongs to xmx_rec_gemm_window_residual");
+    auto ia = g_bufs.find(a), ib = g_bufs.find(b), ic = g_bufs.find(c);
+    auto isk = g_bufs.find(skip), ico = g_bufs.find(cosine);
+    if (ia == g_bufs.end() || ib == g_bufs.end() || ic == g_bufs.end() ||
+        isk == g_bufs.end() || ico == g_bufs.end()) FAILMSG("bad gemm_residual operand");
+    const sycl::half* Araw = (const sycl::half*)ia->second.p;
+    const sycl::half* Braw = (const sycl::half*)ib->second.p;   // (K,N) row-major
+    void* Cout = ic->second.p;
+    const void* skp = isk->second.p;
+    const float* cp = (const float*)ico->second.p;
+    const unsigned epi = (flags >> 8) & 0xFu;
+    const bool narrow = (flags & 0x1000u) != 0u;
+    const bool half_skip = (flags & 0x40000u) != 0u;
+    const int Mp = (int)(((M + 15u) / 16u) * 16u);
+    const size_t na = (size_t)Mp * K, nb = (size_t)K * N;
+    g_cmds.push_back([=]() {
+        std::vector<sycl::half> hA((size_t)M * K), hApad(na, sycl::half(0.f)), hB(nb), hAp(na), hBp(nb);
+        GQ->memcpy(hA.data(), Araw, (size_t)M * K * 2).wait();
+        std::memcpy(hApad.data(), hA.data(), (size_t)M * K * 2);
+        GQ->memcpy(hB.data(), Braw, nb * 2).wait();
+        f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
+        f16v1::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
+        sycl::half* dAp = (sycl::half*)sycl::malloc_device(na * 2, *GQ);
+        sycl::half* dBp = (sycl::half*)sycl::malloc_device(nb * 2, *GQ);
+        float* dC = (float*)sycl::malloc_device((size_t)Mp * N * 4, *GQ);
+        GQ->memcpy(dAp, hAp.data(), na * 2).wait();
+        GQ->memcpy(dBp, hBp.data(), nb * 2).wait();
+        f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K).wait();
+        GQ->parallel_for(sycl::range((size_t)M * N),
+                         [=](sycl::item<1> it) {
+            size_t i = it.get_id(0);
+            unsigned col = (unsigned)(i % N);
+            float sk = half_skip ? (float)((const sycl::half*)skp)[i] : ((const float*)skp)[i];
+            float total = sycl::fma(sk, cp[col], dC[i]);
+            if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
+            else        ((float*)Cout)[i] = qr_publish(epi, total);
+        }).wait();
+        sycl::free(dAp, *GQ); sycl::free(dBp, *GQ); sycl::free(dC, *GQ);
+    });
+    return 0;
+}
 int xmx_rec_gemm_window_residual(int a,int b,int c,int sk,int co,unsigned M,unsigned N,unsigned K,unsigned fl,unsigned ht,unsigned wd,unsigned ac,unsigned pd) { (void)a;(void)b;(void)c;(void)sk;(void)co;(void)M;(void)N;(void)K;(void)fl;(void)ht;(void)wd;(void)ac;(void)pd; NOT_YET("xmx_rec_gemm_window_residual"); }
 int xmx_rec_gemm_int8_fused(int a,int b,int c,int as,int bs,unsigned M,unsigned N,unsigned K,unsigned fl) { (void)a;(void)b;(void)c;(void)as;(void)bs;(void)M;(void)N;(void)K;(void)fl; NOT_YET("xmx_rec_gemm_int8_fused"); }
 
