@@ -525,7 +525,130 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
     return 0;
 }
 int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projection, int out, int cosine, int height, int width, int source_width, int flags) { (void)source; (void)skip; (void)sincos; (void)expand; (void)projection; (void)out; (void)cosine; (void)height; (void)width; (void)source_width; (void)flags; NOT_YET("xmx_rec_ffn_merge"); }
-int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int out, int cosine, int M, int flags) { (void)features; (void)adapter; (void)expand; (void)projection; (void)out; (void)cosine; (void)M; (void)flags; NOT_YET("xmx_rec_ffn_stem"); }
+// int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int out,
+//                      int cosine, unsigned M, unsigned flags)
+// swap-in #13 (section 88 route): block 0's feed-forward with its input made in the same
+// pass (ffn_fused.comp flag 0x2000000, libxmx.c:3191). The stem GEMM's ONE K step is made
+// once into the A fragments, published, and made AGAIN raw where the residual needs it
+// (ffn_fused.comp:46-50: "the stem, the 16 feature channels times the adapter, which the
+// stem GEMM wrote as float32 and published for the same two readers"). Decomposition,
+// pinned from the .comp before writing (section 73's discipline), test_glue.py's
+// `ffn_fused_stem` against `gemm_dual` + the fused feed-forward is the shipping witness:
+//   pass A (stem):    gemm(features, adapter -> dStem f32, M, 32, 16)
+//                     hidden16 = e4m3(dStem) as half          -- the .comp stem branch is
+//                     `stem[e] = e4m3(stem[e])` then narrow: publish = E4M3 ONLY (epi=1),
+//                     NOT the gate. dStem (the RAW f32, before e4m3) is kept: it is the
+//                     residual's skip.
+//   pass B (expand):  gemm(hidden16, expand -> f32, M, 128, 32) -> publish(3)=gate->e4m3
+//                     -> half hidden (the ffn structure's always-gated hidden, section 88)
+//   pass C (project): gemm(hidden, projection -> dProj f32, M, 32, 128)
+//                     total = fma( dStem[i], cosine[col], dProj[i] )   -- skip is the RAW
+//                     stem in FLOAT32: libxmx.c:3191's mask is 0x1f00 (no 0x40000), so
+//                     add_gemm_residual reads pc.d as FloatBuf (residual_epilogue.glsl:20).
+//                     out = publish(epi, total) -> f16 iff 0x1000 else f32.
+// captured ffn_stem (section 88's plan dump): 1 call, M=522240, flags=0 (epi=0, f32-out).
+// It is the FIRST recorder in the captured graph (step 2534) -- the game face's hard gate.
+// Composition = one g_cmds push (one plan step -> +1 pass); three device GEMMs with host
+// round-trips of the two intermediates (the ffn/window_attention pattern, section 85/88).
+int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int out,
+                     int cosine, unsigned M, unsigned flags) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!M || (M % 16u)) FAILMSG("the stem feed-forward needs 16-row blocks (libxmx.c:3195)");
+    if (flags & ~0x1f00u) FAILMSG("the stem feed-forward takes an epilogue and a half output only");
+    auto ift = g_bufs.find(features), iad = g_bufs.find(adapter), iex = g_bufs.find(expand),
+         ipr = g_bufs.find(projection), ic = g_bufs.find(out), ico = g_bufs.find(cosine);
+    if (ift == g_bufs.end() || iad == g_bufs.end() || iex == g_bufs.end() ||
+        ipr == g_bufs.end() || ic == g_bufs.end() || ico == g_bufs.end())
+        FAILMSG("bad ffn_stem operand");
+    const sycl::half* Fraw = (const sycl::half*)ift->second.p;   // features (M x 16)
+    const sycl::half* Arw  = (const sycl::half*)iad->second.p;   // adapter (16 x 32)
+    const sycl::half* Eraw = (const sycl::half*)iex->second.p;   // expand (32 x 128)
+    const sycl::half* Praw = (const sycl::half*)ipr->second.p;   // projection (128 x 32)
+    void* Cout = ic->second.p;
+    const float* cp = (const float*)ico->second.p;               // cosine f32[32]
+    const unsigned epi = (flags >> 8) & 0xFu;
+    const bool narrow = (flags & 0x1000u) != 0u;
+    const int Mp = (int)(((M + 15u) / 16u) * 16u);
+    g_cmds.push_back([=]() {
+        // ---- pass A: stem gemm(features, adapter -> f32), publish e4m3 -> hidden16 ----
+        std::vector<sycl::half> hF((size_t)M * 16), hAd((size_t)16 * 32),
+            hFp((size_t)Mp * 16), hAdp((size_t)16 * 32);
+        std::vector<sycl::half> hH16((size_t)M * 32);            // published hidden16 (host copy for pack_a)
+        GQ->memcpy(hF.data(), Fraw, (size_t)M * 16 * 2).wait();
+        GQ->memcpy(hAd.data(), Arw, (size_t)16 * 32 * 2).wait();
+        std::vector<sycl::half> hFpad((size_t)Mp * 16, sycl::half(0.f));
+        std::memcpy(hFpad.data(), hF.data(), (size_t)M * 16 * 2);
+        f16v1::pack_a(hFpad.data(), hFp.data(), Mp, 16);
+        f16v1::pack_b(hAd.data(), hAdp.data(), 16, 32);
+        sycl::half* dA = (sycl::half*)sycl::malloc_device((size_t)Mp * 16 * 2, *GQ);
+        sycl::half* dB = (sycl::half*)sycl::malloc_device((size_t)16 * 32 * 2, *GQ);
+        float* dS = (float*)sycl::malloc_device((size_t)Mp * 32 * 4, *GQ);
+        GQ->memcpy(dA, hFp.data(), (size_t)Mp * 16 * 2).wait();
+        GQ->memcpy(dB, hAdp.data(), (size_t)16 * 32 * 2).wait();
+        f16v1::gemm(*GQ, dA, dB, dS, Mp, 32, 16).wait();
+        sycl::free(dA, *GQ); sycl::free(dB, *GQ);
+        // the publish happens on DEVICE (a device kernel cannot write a host std::vector --
+        // the section-79 lesson). dS stays the RAW f32 stem and is NOT freed: pass C reads
+        // it as the residual's skip straight off the device (no host round-trip needed).
+        {
+            sycl::half* dH16 = (sycl::half*)sycl::malloc_device((size_t)M * 32 * 2, *GQ);
+            GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
+                size_t i = it.get_id(0);
+                dH16[i] = sycl::half(qr_e4m3(dS[i]));            // publish = E4M3 only
+            }).wait();
+            GQ->memcpy(hH16.data(), dH16, (size_t)M * 32 * 2).wait();   // host copy for pack_a
+            sycl::free(dH16, *GQ);
+        }
+        // ---- pass B: expand gemm(hidden16, expand -> f32), publish(3) -> half hidden ----
+        std::vector<sycl::half> hE((size_t)32 * 128), hHp((size_t)Mp * 32), hEp((size_t)32 * 128),
+            hHid((size_t)M * 128);
+        GQ->memcpy(hE.data(), Eraw, (size_t)32 * 128 * 2).wait();
+        {
+            std::vector<sycl::half> hHpad((size_t)Mp * 32, sycl::half(0.f));
+            std::memcpy(hHpad.data(), hH16.data(), (size_t)M * 32 * 2);
+            f16v1::pack_a(hHpad.data(), hHp.data(), Mp, 32);
+            f16v1::pack_b(hE.data(), hEp.data(), 32, 128);
+            sycl::half* dA2 = (sycl::half*)sycl::malloc_device((size_t)Mp * 32 * 2, *GQ);
+            sycl::half* dB2 = (sycl::half*)sycl::malloc_device((size_t)32 * 128 * 2, *GQ);
+            float* dC1 = (float*)sycl::malloc_device((size_t)Mp * 128 * 4, *GQ);
+            GQ->memcpy(dA2, hHp.data(), (size_t)Mp * 32 * 2).wait();
+            GQ->memcpy(dB2, hEp.data(), (size_t)32 * 128 * 2).wait();
+            f16v1::gemm(*GQ, dA2, dB2, dC1, Mp, 128, 32).wait();
+            sycl::half* dHid = (sycl::half*)sycl::malloc_device((size_t)M * 128 * 2, *GQ);
+            GQ->parallel_for(sycl::range((size_t)M * 128), [=](sycl::item<1> it) {
+                size_t i = it.get_id(0);
+                dHid[i] = sycl::half(qr_publish(3u, dC1[i]));    // gate -> e4m3
+            }).wait();
+            GQ->memcpy(hHid.data(), dHid, (size_t)M * 128 * 2).wait();   // host copy for pack_a
+            sycl::free(dA2, *GQ); sycl::free(dB2, *GQ); sycl::free(dC1, *GQ); sycl::free(dHid, *GQ);
+        }
+        // ---- pass C: projection gemm(hidden, projection -> f32) + raw-stem residual ----
+        std::vector<sycl::half> hP((size_t)128 * 32), hXp((size_t)Mp * 128), hPp((size_t)128 * 32);
+        GQ->memcpy(hP.data(), Praw, (size_t)128 * 32 * 2).wait();
+        {
+            std::vector<sycl::half> hXpad((size_t)Mp * 128, sycl::half(0.f));
+            std::memcpy(hXpad.data(), hHid.data(), (size_t)M * 128 * 2);
+            f16v1::pack_a(hXpad.data(), hXp.data(), Mp, 128);
+            f16v1::pack_b(hP.data(), hPp.data(), 128, 32);
+            sycl::half* dA3 = (sycl::half*)sycl::malloc_device((size_t)Mp * 128 * 2, *GQ);
+            sycl::half* dB3 = (sycl::half*)sycl::malloc_device((size_t)128 * 32 * 2, *GQ);
+            float* dC2 = (float*)sycl::malloc_device((size_t)Mp * 32 * 4, *GQ);
+            GQ->memcpy(dA3, hXp.data(), (size_t)Mp * 128 * 2).wait();
+            GQ->memcpy(dB3, hPp.data(), (size_t)128 * 32 * 2).wait();
+            f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128).wait();
+            GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
+                size_t i = it.get_id(0);
+                unsigned col = (unsigned)(i % 32u);
+                float total = sycl::fma(dS[i], cp[col], dC2[i]);   // skip = RAW f32 stem (device)
+                if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
+                else        ((float*)Cout)[i] = qr_publish(epi, total);
+            }).wait();
+            sycl::free(dA3, *GQ); sycl::free(dB3, *GQ); sycl::free(dC2, *GQ);
+        }
+        sycl::free(dS, *GQ);
+    });
+    return 0;
+}
 // int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
 //                  unsigned batch, unsigned sa, unsigned sb, unsigned sc, unsigned bt,
 //                  unsigned lda, unsigned ldb, unsigned ldc,
