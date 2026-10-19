@@ -2259,3 +2259,68 @@ test_ffn_fused.py:65-70 与 test_window_block.py:70-79 已证 **fused == 多趟 
 
 结论: 最后 20 步的正确路线是**补 2 个 f16 地基 + 组合 ffn/window_block recorder**, 不是
 §80 设想的 host 过渡。这是决策前提的实质变化, 必须让用户重新知情再定, 不擅自推翻 b。
+
+## 89. 换芯 100% 达成 + step4 整帧门 + fence(a) + pre/post 新阶段范围（2026-10-20 00:5x）
+
+**换芯终点线（§88 路线走完）**：swap-in #12-17 接完最后 20 步——ffn(8)/ffn_stem(1)/ffn_merge(1)/
+window_block plain(8)/pool(1)/head(1)，每步 walk 自洽精确命中（671→679→680→681→689→690→691）。
+**captured 691/691=100%**；游戏面（fail-loud，非 permissive）走通全部 5254 步、691 passes、零 NOT_YET。
+build 39 门全绿。提交链 35a553b→cf8f79a→ffb34e6→9f96cfa→08a9c60→e2e5ff9→fc0deb7→f4f92cd→20494d8→4d22ee3。
+已推 origin/mochi-rewrite（6a81534..20494d8）。
+
+**§88 路线兑现**：ffn/window_block 确实用 f16 腿组合复现（非 int8 赌、非 host 过渡）。补的两地基
+f16 gemm_residual(§88 预言) + f16 gemm_qkv_window + f16 gemm_window_residual + f16 gemm_window_residual_pool
+全是已绿腿同构变体，各自独立门控（§55）。**§55 纪律兑现**：residual_pool 独立门抓到 inline==chain
+会掩盖的真 bug（pool pass pixel 索引 e/N 在展平 windows*16*N 上没 %16，单 window 侥幸对多 window 错）。
+
+**step4 整帧门（§64 序 4）**：给 nr_replay.c standalone main 加 NR_DUMP_OUT（仅离线工具内，
+不碰游戏 nr_net_run/桥接），dump 完整 buffer 1301(960x544x4=8.36MB 最终帧)。控制组(旧 coopmat)
+vs 我引擎全帧 diff: 无 NaN, 同分布(mean7.42/std14.14 vs 7.52/14.29), mean-absdiff/值域=**0.94%**,
+p50=0.21 p99=3.9 max=11.5, bit-exact=0%(§57 蝴蝶地板非结构破坏)——与 §51 stage 配对 <3% 先验一致。
+**确定性 check(§62 影子)**: 我 dll 两次 dump bit-exact=100% → 0.94% 是真实链间差非引擎竞态。
+
+**fence 腿 = 选项 (a)（用户"无损耗就用哪个"裁定）**：xmx_sem_value 用 D3D12 GetCompletedValue 真查
+计数器（对齐出货 vkGetSemaphoreCounterValue），非 (b) 的 last-waited 假值（(b) 让预检形同虚设=健壮性损耗）。
+xmx_sem_import_fence: OpenSharedHandle 游戏 D3D12 fence（为查值开一个 D3D12 device，§66 证 D3D12 device
+与 L0 共存=游戏实况；优先 Arc adapter 匹配 L0 侧 vendor）+ zeDeviceImportExternalSemaphoreExt
+(D3D12_FENCE flag, §18 GATE A 原语)。xmx_extmem_wait 记 (id,value) 供 graph wait。build 链 d3d12.lib+dxgi.lib,
+NOMINMAX + #undef OUT/IN（windows.h SAL 宏吃掉我们的 `float* OUT` 变量名）。def 正则加 unsigned long long
+（否则 xmx_sem_value 被漏导出→f_sem_value null→预检静默跳过）。39 门无退化。
+
+## 90. 🚩 pre/post = 新阶段（不是"最后 20 步"）：游戏走 fused 路，build() 无回退
+
+**范围事实（代码读死）**：游戏日志证明跑 **fused**（features/net/compose=0.000 全零 + fence/wait 活跃）。
+nr_replay.c:870-879: fused 被请求时若 pre/post 没记录，build() 返回 -1，**无自动回退**。桥接 NrPipeline.cpp:578
+无条件要 netFuse/netWait。⇒ 我 dll 进游戏必须实现 pre/post（网络本身 691 passes 已换芯，pre/post 是网络
+**外面**的接口胶水：把游戏原始 colour/motion 喂进网络、把答案写回游戏 result buffer）。
+
+**pre/post 身份（读死）**：游戏 fused 加载的是 **nr_pre.comp(263行)/nr_post.comp(201行)**（work/nr_pre.spv/nr_post.spv，
+xmx_prepost_init 传路径），**不是** resident.comp 的 PRE_INNER/PRE_FEATURES 分支（那是另一套 kind 23-26，
+非 fused 路用）。ABI: xmx_rec_pre(colour,motion,history,features,plan,pixels,height,width,pitch,source_h,source_w,flags,table)
+push: a=colour(R11G11B10 words,sa words/row) b=motion(f32 src_h×src_w×2) c=prev output(k,batch,3) d=features(k,batch,16 fp16)
+m=pixels n=16 k=netH batch=netW sa=pitch sb=srcH sc=srcW; p0/p1=plan 地址(bits!) p2/p3=table 地址。
+xmx_rec_post(colour,head,history,result,table,neural,...): a=colour b=head(k,batch,4) c=prev out d=result R11G11B10;
+p0/p1=gate table p2/p3=kept prediction(neural)。
+
+**nr_pre 数学**：decode11/10(R11G11B10) → /exposure(table[65538]) → to_proxy(luminance knee 0.75/5.770780,
+scale=rolled/lit) → Catmull-Rom 5-tap 折叠 bilinear 重投影 history(flags=0 时 motion 是 offset/extent,
+=1 时是 uv) → 16 通道 pack: [0..2]=noise(plan) [3]=1 [4..6]=scaled colour(half_×3: half_round(v-0.5)*0.125)
+[7..9]=fresh? scaled : scaled history [10..14]=controls(plan) [15]=0 → packHalf2x16 8 words/pixel。
+**nr_post 数学**：decode colour → /exposure → to_proxy → gate=table[half_(head[3]) bits]×confidence →
+predicted=clamp(rgb+half_(head[ch])*0.25,0,1); predicted+=alpha*(history-predicted) → neural=truncate_half(predicted)
+(kept 前于 blend) → predicted=clamp(rgb+intensity*(predicted-rgb),0,1) → resolve: ratio=predicted/proxy,
+out=max(shown*ratio,0) → *exposure → encode11/10 回 R11G11B10。
+
+**golden 策略（下一步定）**：pre 的 decode/proxy/pack 部分 = nr_image.c feature_pixel（nr_image.py features() 包它）
+是 host 权威；Catmull-Rom 重投影 = history.comp 的 catmull/bilinear（nr_pre 注释"moved here unchanged"）。
+post = nr_image.c temporal_pixel/finish_pixel + nr_display.py encode/resolve。**最干净的门 = fused 离线 walk**
+（§62 影子）：nr_replay 设 fuse.asked，旧 dll 的 pre/post vs 我的，同 imported buffer，比 composed result 帧
+bit-identical（旧 pre/post 与我要移植的是同一 GLSL ⇒ 应 bit-identical；网络腿 0.94% 差是另一回事，pre/post 只须
+对参考图像数学正确）。需给 standalone main 加 fused 触发（读 D3D12 imported colour/motion/result handle 或 host 造）。
+
+**下一步序**：1) 移植 nr_pre→SYCL pre_kernel.hpp + xmx_rec_pre（先 decode/proxy/pack 对 nr_image.py features() 门，
+再 catmull 重投影对 history.comp 门）；2) 移植 nr_post→post_kernel.hpp + xmx_rec_post（对 nr_image.py compose_temporal 门）；
+3) graph 侧 wait 集成（immediate-list WaitExternalSemaphoreExt 在读 imported buffer 的 kernel 前）；
+4) fused 离线 walk 端到端（旧 vs 我，比 result 帧）；5) 备份 work/libxmx.dll + 换 dll 进游戏面板 A/B（画面差退回）。
+⚠ pre/post 是纯 elementwise/几何（无 GEMM/coopmat），同我已绿 unary 核族，但 `precise` 收缩政策是 bit-exact 命门
+（§21 FMA/§74 fdiv_rn 教训同源）——写前把 .comp 逐 op 抄进注释钉死，golden 与设备两侧照它写。
