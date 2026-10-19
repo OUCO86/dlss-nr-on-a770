@@ -2044,8 +2044,8 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
     if (!g_recording) FAILMSG("not recording");
     if (!windows || !height || !width || !across || windows % across)
         FAILMSG("invalid window block geometry (libxmx.c:2637)");
-    if (flags & 0x1000000u) NOT_YET("xmx_rec_window_block head form (needs the compact head GEMM)");
     const bool pooling = (flags & 0x800000u) != 0u;
+    const bool head = (flags & 0x1000000u) != 0u;   // block 70: its output feeds the compact head GEMM, never stored as the image
     auto im = g_bufs.find(image), iq = g_bufs.find(qkv), ipr = g_bufs.find(projection),
          itg = g_bufs.find(target), ib = g_bufs.find(bias), ico = g_bufs.find(cosine),
          isc = g_bufs.find(scale);
@@ -2070,7 +2070,8 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
     const size_t wsz = (narrow || pooling) ? 2u : 4u;   // the pool's target is half by definition
     const size_t img_elems = (size_t)height * width * C;
     const size_t blk_elems = (size_t)rows * C;
-    const size_t c_need = img_elems * wsz, k_need = img_elems * (image_half ? 2u : 4u);
+    const size_t c_need = head ? (size_t)height * width * 4u * 4u : img_elems * wsz;   // head: compact float32 target (pixels x 4)
+    const size_t k_need = img_elems * (image_half ? 2u : 4u);
     const int image_id = image, target_id = target;
     g_cmds.push_back([=]() {
         auto sized = [&](int id, size_t bytes, const char* what) -> void* {
@@ -2087,6 +2088,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         const float* Bp = (const float*)sized(bias, (size_t)64u * 64u * 4, "bias");
         const float* cp = (const float*)sized(cosine, (size_t)C * 4, "cosine");
         const float* qs = (const float*)sized(scale, 4, "scale");
+        const sycl::half* HeadW = head ? (const sycl::half*)sized(pooled, (size_t)C * 16u * 2, "head weights") : nullptr;
         // ---- LEG 1: gather + gemm + qkv_epilogue -> dQ,dK,dV (device scratch) ----
         // the image is DEVICE memory: download it whole to host before the gather (the
         // section-73 trap -- reading a device pointer from host code = access violation).
@@ -2197,6 +2199,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         GQ->memcpy(dBp3, hPpr.data(), (size_t)C * C * 2).wait();
         f16v1::gemm(*GQ, dAp3, dBp3, dC3, Mp, (int)C, (int)C).wait();
         float* dStage = pooling ? (float*)sycl::malloc_device((size_t)rows * C * 4, *GQ) : nullptr;
+        sycl::half* dOut16 = head ? (sycl::half*)sycl::malloc_device(img_elems * 2, *GQ) : nullptr;
         GQ->parallel_for(sycl::range(blk_elems), [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             unsigned r = (unsigned)(i / C), col = (unsigned)(i % C);
@@ -2207,7 +2210,11 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             size_t out = ((size_t)(y - top) * width + (x - left)) * C + col;
             float sk = image_half ? (float)ImgH[out] : ImgF[out];
             float total = sycl::fma(sk, cp[col], dC3[i]);
-            if (pooling) {
+            if (head) {
+                // the head form's leg3 output is the raw total as half (epi=0, narrow --
+                // test_window_block.py:148-150 gemm_residual narrow=True), fed to leg4.
+                dOut16[out] = sycl::half(total);
+            } else if (pooling) {
                 // skip_out (target) = e4m3(total) as half; the raw total goes to the stage
                 // for the pool (gemm_staged.comp:346-353).
                 ((sycl::half*)Tgt)[out] = sycl::half(qr_e4m3(total));
@@ -2237,6 +2244,33 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                 Pl[out] = sycl::half(qr_e4m3(cr_mul(total, 0.25f)));
             }).wait();
             sycl::free(dStage, *GQ);
+        }
+        if (head) {
+            // LEG 4: the compact head GEMM (test_window_block.py:151-152). out16 (pixels x
+            // 32 half) @ head weights (32 x 16 half) -> f32; store only the first four
+            // columns (compact_output, xmxres gemm leading=(0,0,4)) into the float32 target.
+            const unsigned pixels = height * width;
+            const int MpH = (int)(((pixels + 15u) / 16u) * 16u);
+            std::vector<sycl::half> hO((size_t)pixels * C), hOpad((size_t)MpH * C, sycl::half(0.f)),
+                hOp((size_t)MpH * C), hW((size_t)C * 16u), hWp((size_t)C * 16u);
+            GQ->memcpy(hO.data(), dOut16, (size_t)pixels * C * 2).wait();
+            std::memcpy(hOpad.data(), hO.data(), (size_t)pixels * C * 2);
+            GQ->memcpy(hW.data(), HeadW, (size_t)C * 16u * 2).wait();
+            f16v1::pack_a(hOpad.data(), hOp.data(), MpH, (int)C);
+            f16v1::pack_b(hW.data(), hWp.data(), (int)C, 16);
+            sycl::half* dA4 = (sycl::half*)sycl::malloc_device((size_t)MpH * C * 2, *GQ);
+            sycl::half* dB4 = (sycl::half*)sycl::malloc_device((size_t)C * 16u * 2, *GQ);
+            float* dH4 = (float*)sycl::malloc_device((size_t)MpH * 16u * 4, *GQ);
+            GQ->memcpy(dA4, hOp.data(), (size_t)MpH * C * 2).wait();
+            GQ->memcpy(dB4, hWp.data(), (size_t)C * 16u * 2).wait();
+            f16v1::gemm(*GQ, dA4, dB4, dH4, MpH, 16, (int)C).wait();
+            GQ->parallel_for(sycl::range((size_t)pixels * 4u), [=](sycl::item<1> it) {
+                size_t i = it.get_id(0);
+                unsigned pixel = (unsigned)(i / 4u), c = (unsigned)(i % 4u);
+                ((float*)Tgt)[i] = dH4[(size_t)pixel * 16u + c];   // compact: first four columns
+            }).wait();
+            sycl::free(dA4,*GQ); sycl::free(dB4,*GQ); sycl::free(dH4,*GQ);
+            sycl::free(dOut16, *GQ);
         }
         sycl::free(dAp3,*GQ); sycl::free(dBp3,*GQ); sycl::free(dC3,*GQ); sycl::free(dAttended,*GQ);
     });

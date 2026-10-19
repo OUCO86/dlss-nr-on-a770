@@ -72,6 +72,7 @@ echo "built libxmx_sycl.dll; running the gates from $RUNDIR:"
 ( cd "$RUNDIR" && SYCL_DEVICE_FILTER=level_zero:gpu "C:/Users/wangz/.workbuddy/binaries/python/envs/default/Scripts/python.exe" "$HERE/gate_gemm_f16_qkv_window.py" )
 ( cd "$RUNDIR" && SYCL_DEVICE_FILTER=level_zero:gpu "C:/Users/wangz/.workbuddy/binaries/python/envs/default/Scripts/python.exe" "$HERE/gate_gemm_f16_window_residual_pool.py" )
 ( cd "$RUNDIR" && SYCL_DEVICE_FILTER=level_zero:gpu "C:/Users/wangz/.workbuddy/binaries/python/envs/default/Scripts/python.exe" "$HERE/gate_window_block.py" )
+( cd "$RUNDIR" && SYCL_DEVICE_FILTER=level_zero:gpu "C:/Users/wangz/.workbuddy/binaries/python/envs/default/Scripts/python.exe" "$HERE/gate_window_block_head.py" )
 ( cd "$RUNDIR" && SYCL_DEVICE_FILTER=level_zero:gpu "C:/Users/wangz/.workbuddy/binaries/python/envs/default/Scripts/python.exe" "$HERE/gate_merge_heads.py" )
 ( cd "$RUNDIR" && SYCL_DEVICE_FILTER=level_zero:gpu "C:/Users/wangz/.workbuddy/binaries/python/envs/default/Scripts/python.exe" "$HERE/gate_window_attention.py" )
 ( cd "$RUNDIR" && SYCL_DEVICE_FILTER=level_zero:gpu "C:/Users/wangz/.workbuddy/binaries/python/envs/default/Scripts/python.exe" "$HERE/gate_vit_softmax.py" )
