@@ -2103,3 +2103,20 @@ softmax bit-exact 可直接用) → ③ffn/window_block/unary2=**过渡执行器
 **关键路径洞察(本轮实测)**: window_attention 的输入 buffer 就是 int8_qkv 的输出
 (buf 1275/1274/1276 = Q/K/V halves, batches×64×32×2B 对账吻合)——换芯链里
 int8_qkv→window_attention 的字节契约天然衔接, 只差 f16 dpas 一块地基。
+
+## 81. f16 dpas 布局钉死（探针 esimd_f16_dp_probe.cpp, LAYOUT TRUE 0/64）
+
+写任何 f16 GEMM 核之前先测真东西(§55)。dpas.hpp:110-131 给 f16: OpsPerChannel=32/16=2
+→ _K=SystolicDepth(8)*2=16, _M=RepeatCount=8, _N=ExecSize=8; A/B=simd<half,128>,
+C=simd<float,64>。头文件 static_assert 只钉**尺寸**不钉**元素顺序**。delta 探针
+(A[e]=1,B=1→C 行; A=1,B[e]=1→C 列)反推出:
+  A_simd[i*16 + k]                      行主序 (probe1: e/16=行, 每行 16 连续)
+  B_simd[(k/2)*16 + j*2 + (k%2)]        交错: 每 dword 打包相邻 k,k+1 同一 j (OpsPerChannel=2)
+  C[i*8 + j]                            行主序 8x8
+v4 确认探针(按此 pack A/B, 一次 dpas, 对 host 点积)= **LAYOUT TRUE (0/64 bad)**。
+dpas 参数序 (acc, B, A) 同前辈 esimd_dpas_peak.cpp:45。探针入仓可复跑。
+
+**累加顺序 vs 出货 coopmat**: 前辈 test_gemm_qkv.py 的 golden 是 rt.gemm(旧 libxmx coopmat)
+不是 numpy——f16×f16→f32 的 K 累加顺序是硬件定义。我的 ESIMD f16 核门用 numpy f32 golden +
+**within-one 判据**(§51, 非 bit-equal): 输入是精确 half, f32 累加 16 项误差极小, within-one
+轻松满足; 若将来要 bit-exact 对 coopmat 走 §51 双后端配对。
