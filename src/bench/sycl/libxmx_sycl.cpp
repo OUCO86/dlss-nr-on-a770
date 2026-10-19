@@ -28,6 +28,7 @@
 #include "gemm_s8_v8_kernel.hpp"
 #include "gemm_f16_v1_kernel.hpp"
 #include "pre_kernel.hpp"
+#include "post_kernel.hpp"
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
@@ -464,7 +465,39 @@ int xmx_rec_pre(int colour, int motion, int history, int features, int plan,
     });
     return 0;
 }
-int xmx_rec_post(int c,int hd,int h,int rs,int tb,int nl,unsigned px,unsigned ht,unsigned wd,unsigned pt,unsigned sh,unsigned sw) { (void)c;(void)hd;(void)h;(void)rs;(void)tb;(void)nl;(void)px;(void)ht;(void)wd;(void)pt;(void)sh;(void)sw; NOT_YET("xmx_rec_post"); }
+// int xmx_rec_post(int colour, int head, int history, int result, int table, int neural,
+//                  unsigned pixels, unsigned height, unsigned width,
+//                  unsigned pitch, unsigned source_h, unsigned source_w)
+// route(a) step 5 (section 90): the fused image OUTPUT, SYCL port of nr_post.comp. The
+// other half of nr_pre: compose the network's head back into the game's colour format.
+// nr_replay.c:693 passes (colour, head, history, result, table, neural=history) -- the
+// kept prediction writes back into the SAME history buffer the next frame reads (the
+// per-work-item read-then-write of prev[network*3+ch] then neural[network*3+ch] is safe:
+// same index, ordered within one item). m=pixels on the SOURCE extent, k=network height,
+// batch=network width, sa=pitch, sb=source_h, sc=source_w (nr_post:115 width=pc.sc).
+int xmx_rec_post(int colour, int head, int history, int result, int table, int neural,
+                 unsigned pixels, unsigned height, unsigned width,
+                 unsigned pitch, unsigned source_h, unsigned source_w) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!pixels || !height || !width) FAILMSG("invalid fused output extent");
+    auto ic = g_bufs.find(colour), ihd = g_bufs.find(head), ih = g_bufs.find(history);
+    auto irs = g_bufs.find(result), itb = g_bufs.find(table), inl = g_bufs.find(neural);
+    if (ic == g_bufs.end() || ihd == g_bufs.end() || ih == g_bufs.end() ||
+        irs == g_bufs.end() || itb == g_bufs.end() || inl == g_bufs.end())
+        FAILMSG("bad fused output operand");
+    const unsigned* Col = (const unsigned*)ic->second.p;
+    const float* Hd = (const float*)ihd->second.p;
+    const float* His = (const float*)ih->second.p;
+    unsigned* Res = (unsigned*)irs->second.p;
+    const float* Tb = (const float*)itb->second.p;
+    float* Neu = (float*)inl->second.p;
+    postpass::PostArgs A{ Col, Hd, His, Res, Tb, Neu, pixels, height, width,
+                          pitch, source_h, source_w };
+    g_cmds.push_back([=]() {
+        GQ->parallel_for(sycl::range((size_t)pixels), postpass::post_kernel(A)).wait();
+    });
+    return 0;
+}
 int xmx_rec_gemm_qkv(int a,int w,int q,int k,int v,int sc,unsigned M,unsigned ch,unsigned hd,unsigned tk,unsigned vt) { (void)a;(void)w;(void)q;(void)k;(void)v;(void)sc;(void)M;(void)ch;(void)hd;(void)tk;(void)vt; NOT_YET("xmx_rec_gemm_qkv"); }
 // int xmx_rec_gemm_qkv_window(int image, int weight, int q, int k, int v, int scale,
 //                             unsigned M, unsigned channels, unsigned heads, unsigned tokens,
