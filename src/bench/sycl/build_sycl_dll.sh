@@ -28,14 +28,14 @@ import re, sys
 src, out = sys.argv[1], sys.argv[2]
 s = open(src, encoding='utf-8', errors='replace').read()
 block = re.search(r'extern "C" \{(.*?)\n\} // extern "C"', s, re.S).group(1)
-names = re.findall(r'^(?:const char\*|int)\s+(xmx_\w+)\s*\(', block, re.M)
+names = re.findall(r'^(?:const char\*|int|unsigned long long)\s+(xmx_\w+)\s*\(', block, re.M)
 data = "\r\n".join(["LIBRARY libxmx_sycl", "EXPORTS"] + ["    " + n for n in names]) + "\r\n"
 open(out, 'wb').write(data.encode('ascii'))
 print(f"def: {len(names)} exports")
 PYEOF
 
 # 2. compile
-"$SY/Library/bin/icx.exe" //nologo //Qstd=c++17 //O2 //fsycl //EHsc //DD_CRT_SECURE_NO_WARNINGS //Fe:libxmx_sycl.dll //LD libxmx_sycl.cpp //link //DEF:libxmx_sycl.def ze_loader.lib
+"$SY/Library/bin/icx.exe" //nologo //Qstd=c++17 //O2 //fsycl //EHsc //DD_CRT_SECURE_NO_WARNINGS //Fe:libxmx_sycl.dll //LD libxmx_sycl.cpp //link //DEF:libxmx_sycl.def ze_loader.lib d3d12.lib dxgi.lib
 
 # 3. stage + gate from oneapi/ (the SYCL runtime chain lives there)
 RUNDIR="E:/WorkBuddy/2026-10-09-04-20-55/oneapi"

@@ -35,6 +35,15 @@
 #include <stdexcept>
 #include <string>
 #include <functional>
+#ifdef _WIN32
+#define NOMINMAX
+#include <d3d12.h>
+#include <dxgi1_6.h>
+// windows.h (pulled by d3d12.h) defines OUT/IN as empty SAL macros -- our recorders
+// use `float* OUT` as a variable name, so undo the macro clash.
+#undef OUT
+#undef IN
+#endif
 
 static sycl::queue* GQ = nullptr;
 static sycl::device* GD = nullptr;
@@ -311,10 +320,82 @@ int xmx_specialize(unsigned mask) {
 unsigned xmx_specialized_count(void) { return 0; }
 unsigned xmx_specialization(void) { return (unsigned)g_specialize; }
 
-// extmem/sem stubs (the walk calls none of them: the fence leg lives in nr_replay's
-// direct ABI path, section 68's finding; the gate in step 4 drives the game-shaped
-// two-import flow through the section-18 primitives -- these keep prepare() from
-// failing at GRAB time so a real nr_replay can load my dll).
+// extmem/sem: the game's D3D12 fence, imported once (nr_replay.c:397 "a semaphore
+// imported again every frame is a semaphore leaked every frame"). Option (a) -- the
+// user's "no-loss" ruling: xmx_sem_value reads the REAL counter via D3D12
+// GetCompletedValue, mirroring the shipped vkGetSemaphoreCounterValue (libxmx.c:3318's
+// fence leg). The wait itself is the L0 external-semaphore (section 18 GATE A proved
+// D3D12-fence -> ze import + wait blocks/signals correctly); the value query is the
+// anti-hang precheck nr_net_wait does before it. A D3D12 device is opened just to
+// OpenSharedHandle the game's fence -- section 66 proved a live D3D12 device coexists
+// with our L0 engine (the game's actual condition).
+#ifdef _WIN32
+static ID3D12Device* g_d3d = nullptr;
+struct XSem { ID3D12Fence* d3d; ze_external_semaphore_ext_handle_t l0; };
+static XSem g_xsems[64];
+static int xsem_slot() { for (int i = 0; i < 64; ++i) if (!g_xsems[i].d3d && !g_xsems[i].l0) return i; return -1; }
+static int ensure_d3d() {
+    if (g_d3d) return 0;
+    IDXGIFactory1* fac = nullptr;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&fac)))) FAILMSG("CreateDXGIFactory1");
+    // any adapter works to OPEN a shared fence (the counter is adapter-independent);
+    // prefer the Intel Arc so the device matches the L0 side's vendor (section 18's
+    // EnumAdapters1 + vendor 0x8086 pick).
+    for (UINT i = 0; i < 8 && !g_d3d; ++i) {
+        IDXGIAdapter1* ad = nullptr;
+        if (fac->EnumAdapters1(i, &ad) == DXGI_ERROR_NOT_FOUND) break;
+        DXGI_ADAPTER_DESC1 dd = {}; ad->GetDesc1(&dd);
+        if (dd.VendorId == 0x8086) {
+            if (SUCCEEDED(D3D12CreateDevice(ad, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_d3d)))) { ad->Release(); break; }
+        }
+        ad->Release();
+    }
+    if (!g_d3d && FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_d3d))))
+        FAILMSG("D3D12CreateDevice (fence open)");
+    fac->Release();
+    return 0;
+}
+int xmx_sem_import_fence(unsigned long long handle);   // forward: xmx_sem_import delegates to it
+int xmx_sem_import(unsigned long long handle, int timeline) { (void)timeline; return xmx_sem_import_fence(handle); }
+int xmx_sem_import_fence(unsigned long long handle) {
+    if (!handle) FAILMSG("no semaphore handle given");
+    if (ensure_ze_world() != 0) return -1;
+    if (ensure_d3d() != 0) return -1;
+    int id = xsem_slot();
+    if (id < 0) FAILMSG("out of external semaphore slots");
+    ID3D12Fence* fence = nullptr;
+    if (FAILED(g_d3d->OpenSharedHandle((HANDLE)(uintptr_t)handle, IID_PPV_ARGS(&fence))))
+        FAILMSG("OpenSharedHandle (d3d12 fence)");
+    ze_external_semaphore_win32_ext_desc_t win = { ZE_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_WIN32_EXT_DESC };
+    win.handle = (void*)(uintptr_t)handle;
+    ze_external_semaphore_ext_desc_t ed = { ZE_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_EXT_DESC };
+    ed.flags = ZE_EXTERNAL_SEMAPHORE_EXT_FLAG_D3D12_FENCE;
+    ed.pNext = &win;
+    ze_external_semaphore_ext_handle_t xsem = nullptr;
+    ze_result_t r = zeDeviceImportExternalSemaphoreExt(g_zdev, &ed, &xsem);
+    if (r != ZE_RESULT_SUCCESS || !xsem) {
+        fence->Release();
+        FAILMSG("zeDeviceImportExternalSemaphoreExt: 0x%x", (unsigned)r);
+    }
+    g_xsems[id].d3d = fence; g_xsems[id].l0 = xsem;
+    return id;
+}
+unsigned long long xmx_sem_value(int id) {
+    if (id < 0 || id >= 64 || !g_xsems[id].d3d) return 0;
+    return (unsigned long long)g_xsems[id].d3d->GetCompletedValue();   // the REAL counter (option a)
+}
+// the wait: nr_net_wait records (id,value); graph_run issues the L0 external-semaphore
+// wait on an immediate command list BEFORE the kernels that read the imported buffers
+// (section 18: external-semaphore wait/signal only live on an immediate list).
+static int g_wait_id = -1; static unsigned long long g_wait_value = 0;
+int xmx_extmem_wait(int id, unsigned long long value) {
+    if (id < 0 || id >= 64 || !g_xsems[id].l0) FAILMSG("external semaphore is not live");
+    g_wait_id = id; g_wait_value = value;
+    return 0;
+}
+int xmx_extmem_wait_clear(void) { g_wait_id = -1; g_wait_value = 0; return 0; }
+int xmx_extmem_wait_pending(void) { return g_wait_id >= 0 ? 1 : 0; }
+#else
 static int g_xsem = 0;
 int xmx_sem_import(unsigned long long handle, int timeline) { (void)handle; (void)timeline; return ++g_xsem; }
 int xmx_sem_import_fence(unsigned long long handle) { (void)handle; return ++g_xsem; }
@@ -322,6 +403,7 @@ unsigned long long xmx_sem_value(int id) { (void)id; return 0; }
 int xmx_extmem_wait(int id, unsigned long long value) { (void)id; (void)value; return 0; }
 int xmx_extmem_wait_clear(void) { return 0; }
 int xmx_extmem_wait_pending(void) { return 0; }
+#endif
 
 /* prepare()-required recorder names the CURRENT plan does NOT walk (section 68's split:
    15 swap-in targets the plan DOES walk, vs these fused-path names nr_replay GRABs only
