@@ -350,7 +350,135 @@ static int g_skipped[256];
 int xmx_rec_pre(int c,int m,int h,int f,int pl,unsigned px,unsigned ht,unsigned wd,unsigned pt,unsigned sh,unsigned sw,unsigned fl,int tb) { (void)c;(void)m;(void)h;(void)f;(void)pl;(void)px;(void)ht;(void)wd;(void)pt;(void)sh;(void)sw;(void)fl;(void)tb; NOT_YET("xmx_rec_pre"); }
 int xmx_rec_post(int c,int hd,int h,int rs,int tb,int nl,unsigned px,unsigned ht,unsigned wd,unsigned pt,unsigned sh,unsigned sw) { (void)c;(void)hd;(void)h;(void)rs;(void)tb;(void)nl;(void)px;(void)ht;(void)wd;(void)pt;(void)sh;(void)sw; NOT_YET("xmx_rec_post"); }
 int xmx_rec_gemm_qkv(int a,int w,int q,int k,int v,int sc,unsigned M,unsigned ch,unsigned hd,unsigned tk,unsigned vt) { (void)a;(void)w;(void)q;(void)k;(void)v;(void)sc;(void)M;(void)ch;(void)hd;(void)tk;(void)vt; NOT_YET("xmx_rec_gemm_qkv"); }
-int xmx_rec_gemm_qkv_window(int im,int w,int q,int k,int v,int sc,unsigned M,unsigned ch,unsigned hd,unsigned tk,unsigned wd,unsigned ht,unsigned ac,unsigned pd,unsigned im2) { (void)im;(void)w;(void)q;(void)k;(void)v;(void)sc;(void)M;(void)ch;(void)hd;(void)tk;(void)wd;(void)ht;(void)ac;(void)pd;(void)im2; NOT_YET("xmx_rec_gemm_qkv_window"); }
+// int xmx_rec_gemm_qkv_window(int image, int weight, int q, int k, int v, int scale,
+//                             unsigned M, unsigned channels, unsigned heads, unsigned tokens,
+//                             unsigned width, unsigned height, unsigned across, unsigned pad,
+//                             unsigned image_mode)
+// f16 gemm_qkv_window FOUNDATION (section 88 route; window_block's first leg). The f16
+// twin of the green int8_qkv swap-in #4 (section 75) with the window gather + publish_image
+// of gemm_staged.comp:222-243 (record_gemm_qkv + window_a, libxmx.c:2424/2437). Pinned
+// before writing (section 73):
+//   gather (host, the window_int8_residual pattern): row r -> window=r/tokens, token=r%tokens;
+//     y=(window/across)*8+token/8 - (pad>>16), x=(window%across)*8+token%8 - (pad&0xffff);
+//     OUT OF RANGE (y<0||x<0||y>=height||x>=width) -> the row's 32 channels are 0.0;
+//     else at=(y*width+x)*channels + c, read image (half iff image_mode&1), and if
+//     image_mode&2 (publish_image) e4m3 each value; the gathered A is HALF (the loader
+//     stores float16_t(lo/hi) into buf_a).
+//   gemm: A(M x channels) @ B(channels x 3*channels) -> f32 acc (M x 3C). B is (K,N)
+//     row-major (record_gemm_qkv default, NOT transposed) -> f16v1::pack_b.
+//   qkv_epilogue (qkv_epilogue.glsl:40-77, the f16 path QKV_READ(i)=float(stage[i)) --
+//     NO dequantise scale multiply (that was the int8 path): per row, per head, the 32
+//     columns of Q (part 0), K (part 1), V (part 2):
+//       Q/K: h[i]=half_round(acc); recip=cosine_reciprocal(h) (vit: vit_reciprocal);
+//            value=hmul(h,recip); Q also hmul(vit?hmul(value,VIT_ROOT):value, half_round(scale[head]));
+//       V:   value = acc (no norm);
+//       publish = e4m3(value) -> half, scatter at=((window*heads+head)*tokens+token)*32 + c%32.
+// captured window_block uses heads==1, channels==32, tokens==64.
+int xmx_rec_gemm_qkv_window(int image, int weight, int q, int k, int v, int scale,
+                            unsigned M, unsigned channels, unsigned heads, unsigned tokens,
+                            unsigned width, unsigned height, unsigned across, unsigned pad,
+                            unsigned image_mode) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!width || !height || !across || tokens != 64u || image_mode > 3u)
+        FAILMSG("invalid window-gathered QKV projection (libxmx.c:2437)");
+    if (!M || !channels || !heads || channels != heads * 32u || (M % tokens))
+        FAILMSG("QKV needs channels==heads*32, tokens|M (libxmx.c record_gemm_qkv)");
+    auto im = g_bufs.find(image), iw = g_bufs.find(weight);
+    auto iq = g_bufs.find(q), ik = g_bufs.find(k), iv = g_bufs.find(v), is = g_bufs.find(scale);
+    if (im == g_bufs.end() || iw == g_bufs.end() || iq == g_bufs.end() || ik == g_bufs.end() ||
+        iv == g_bufs.end() || is == g_bufs.end()) FAILMSG("bad gemm_qkv_window operand");
+    if (iq == ik || ik == iv || iq == iv) FAILMSG("QKV targets must be distinct");
+    const sycl::half* Img = (const sycl::half*)im->second.p;   // image (half iff mode&1)
+    const float* ImgF = (const float*)im->second.p;
+    const sycl::half* Wraw = (const sycl::half*)iw->second.p;  // (channels x 3*channels) row-major
+    sycl::half *Q = (sycl::half*)iq->second.p, *Kk = (sycl::half*)ik->second.p,
+               *V = (sycl::half*)iv->second.p;
+    const float* qs = (const float*)is->second.p;              // heads entries
+    const bool image_half = (image_mode & 1u) != 0u;
+    const bool image_publish = (image_mode & 2u) != 0u;
+    const bool vit = false;                                    // window blocks are never vit
+    const unsigned C = channels, NH = 3u * channels;
+    const int Mp = (int)(((M + 15u) / 16u) * 16u);
+    const unsigned top = pad >> 16, left = pad & 0xffffu;
+    g_cmds.push_back([=]() {
+        // gather the image into a dense (M x C) half A (host; the window_int8_residual
+        // pattern). The image is DEVICE memory: download it whole before the host gather
+        // (the section-73 trap -- dereferencing a device pointer in host code crashes).
+        const size_t img_elems = (size_t)height * width * C;
+        std::vector<sycl::half> hImgH; std::vector<float> hImgF;
+        if (image_half) { hImgH.resize(img_elems); GQ->memcpy(hImgH.data(), Img, img_elems * 2).wait(); }
+        else            { hImgF.resize(img_elems); GQ->memcpy(hImgF.data(), ImgF, img_elems * 4).wait(); }
+        std::vector<sycl::half> hA((size_t)M * C);
+        for (unsigned r = 0; r < M; ++r) {
+            unsigned window = r / tokens, token = r % tokens;
+            int y = (int)((window / across) * 8u + token / 8u) - (int)top;
+            int x = (int)((window % across) * 8u + token % 8u) - (int)left;
+            if (y < 0 || x < 0 || y >= (int)height || x >= (int)width) {
+                for (unsigned c = 0; c < C; ++c) hA[(size_t)r * C + c] = sycl::half(0.f);
+                continue;
+            }
+            size_t at = ((size_t)y * width + x) * C;
+            for (unsigned c = 0; c < C; ++c) {
+                float val = image_half ? (float)hImgH[at + c] : hImgF[at + c];
+                if (image_publish) val = qr_e4m3(val);
+                hA[(size_t)r * C + c] = sycl::half(val);
+            }
+        }
+        std::vector<sycl::half> hApad((size_t)Mp * C, sycl::half(0.f));
+        std::memcpy(hApad.data(), hA.data(), (size_t)M * C * 2);
+        std::vector<sycl::half> hB((size_t)C * NH), hAp((size_t)Mp * C), hBp((size_t)C * NH);
+        GQ->memcpy(hB.data(), Wraw, (size_t)C * NH * 2).wait();
+        f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)C);
+        f16v1::pack_b(hB.data(), hBp.data(), (int)C, (int)NH);
+        sycl::half* dAp = (sycl::half*)sycl::malloc_device((size_t)Mp * C * 2, *GQ);
+        sycl::half* dBp = (sycl::half*)sycl::malloc_device((size_t)C * NH * 2, *GQ);
+        float* dC = (float*)sycl::malloc_device((size_t)Mp * NH * 4, *GQ);
+        GQ->memcpy(dAp, hAp.data(), (size_t)Mp * C * 2).wait();
+        GQ->memcpy(dBp, hBp.data(), (size_t)C * NH * 2).wait();
+        f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)NH, (int)C).wait();
+        // qkv_epilogue: in-place Q/K head norm on the f32 acc (QKV_READ = float(stage)),
+        // then publish e4m3 -> half scatter. One device pass per (row, head) for the norm,
+        // then the publish/scatter pass.
+        GQ->parallel_for(sycl::range((size_t)M * heads), [=](sycl::item<1> it) {
+            size_t i = it.get_id(0);
+            unsigned r = (unsigned)(i / heads), head = (unsigned)(i % heads);
+            float row32[32];
+            for (int c2 = 0; c2 < 32; ++c2) {
+                unsigned n = head * 32u + (unsigned)c2;
+                row32[c2] = qr_half_round(dC[(size_t)r * NH + n]);
+            }
+            float recip = ctree::cosine_reciprocal(row32);
+            float sc = qr_half_round(qs[head]);
+            for (int c2 = 0; c2 < 32; ++c2) {
+                unsigned n = head * 32u + (unsigned)c2;
+                float val = qr_half_round(cr_mul(row32[c2], recip));
+                val = qr_half_round(cr_mul(val, sc));                 // Q: * scale (no VIT_ROOT, not vit)
+                dC[(size_t)r * NH + n] = val;
+            }
+            for (int c2 = 0; c2 < 32; ++c2) {
+                unsigned n = C + head * 32u + (unsigned)c2;
+                row32[c2] = qr_half_round(dC[(size_t)r * NH + n]);
+            }
+            float krec = ctree::cosine_reciprocal(row32);
+            for (int c2 = 0; c2 < 32; ++c2) {
+                unsigned n = C + head * 32u + (unsigned)c2;
+                dC[(size_t)r * NH + n] = qr_half_round(cr_mul(row32[c2], krec));
+            }
+            // V: no norm, the raw acc value stays (QKV_READ returns it).
+        }).wait();
+        GQ->parallel_for(sycl::range((size_t)M * NH), [=](sycl::item<1> it) {
+            size_t i = it.get_id(0);
+            unsigned r = (unsigned)(i / NH), n = (unsigned)(i % NH);
+            unsigned part = n / C, col = n % C, head = col / 32u;
+            sycl::half out = sycl::half(qr_e4m3(dC[i]));              // publish = e4m3 only
+            unsigned w = r / tokens, t = r % tokens;
+            size_t at = (((size_t)w * heads + head) * tokens + t) * 32u + (col % 32u);
+            if (part == 0u) Q[at] = out; else if (part == 1u) Kk[at] = out; else V[at] = out;
+        }).wait();
+        sycl::free(dAp, *GQ); sycl::free(dBp, *GQ); sycl::free(dC, *GQ);
+    });
+    return 0;
+}
 // int xmx_rec_gemm_residual(int a, int b, int c, int skip, int cosine,
 //                           unsigned M, unsigned N, unsigned K, unsigned flags)
 // f16 gemm_residual FOUNDATION (section 88, the f16 twin of the green int8 residual
@@ -415,7 +543,92 @@ int xmx_rec_gemm_residual(int a, int b, int c, int skip, int cosine,
     });
     return 0;
 }
-int xmx_rec_gemm_window_residual(int a,int b,int c,int sk,int co,unsigned M,unsigned N,unsigned K,unsigned fl,unsigned ht,unsigned wd,unsigned ac,unsigned pd) { (void)a;(void)b;(void)c;(void)sk;(void)co;(void)M;(void)N;(void)K;(void)fl;(void)ht;(void)wd;(void)ac;(void)pd; NOT_YET("xmx_rec_gemm_window_residual"); }
+// int xmx_rec_gemm_window_residual(int a, int b, int c, int skip, int cosine,
+//                                  unsigned M, unsigned N, unsigned K, unsigned flags,
+//                                  unsigned height, unsigned width, unsigned across,
+//                                  unsigned pad)
+// f16 gemm_window_residual FOUNDATION (section 88 route; window_block's third leg). The
+// f16 twin of the green int8 window_int8_residual swap-in #5 (section 76): the SAME
+// unpadded-image index map of residual_epilogue.glsl:4-15, but the acc is already the true
+// value (no cr_mul(row)*cr_mul(col) dequantise step). libxmx.c:2377 pins the ABI:
+// record_gemm(a,b,c,M,N,K, batch=1, dense, flags|0xa0000, skip, cosine, window) -- B is
+// (K,N) row-major (record_gemm default, NOT transposed) -> f16v1::pack_b.
+//   block position: r = window*64 + token (window-major over the 8x8 token grid);
+//   map: y=(window/across)*8+token/8, x=(window%across)*8+token%8, top=pad>>16,
+//     left=pad&0xffff; OUT OF RANGE (cropped padding) -> the element is skipped ENTIRELY
+//     (.comp:258 continue before any read or write);
+//   at = ((y-top)*width + x-left)*N + col reads the skip (IMAGE layout, height*width*N)
+//     and writes C; cosine read at at%N = col (the map preserves %N).
+//   total = fma( skipped, cosine[col], acc )  ONE fused rounding (residual_epilogue.glsl:22);
+//   out = publish(epi, total) -> f16 iff 0x1000 else f32. skip half iff 0x40000.
+// SIZE validation AT RUN TIME (the step-2588 lesson, section 76): the scratch recording's
+// placeholder buffers are tiny and destroyed before the captured graph runs.
+int xmx_rec_gemm_window_residual(int a, int b, int c, int skip, int cosine,
+                                 unsigned M, unsigned N, unsigned K, unsigned flags,
+                                 unsigned height, unsigned width, unsigned across,
+                                 unsigned pad) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!height || !width || !across) FAILMSG("invalid window residual");
+    if (!M || !N || !K || (N % 16u) || (K % 16u) || (M % 64u))
+        FAILMSG("gemm_window_residual f16 needs N%%16,K%%16,M%%64 (our tile)");
+    auto ia = g_bufs.find(a), ib = g_bufs.find(b), ic = g_bufs.find(c);
+    auto isk = g_bufs.find(skip), ico = g_bufs.find(cosine);
+    if (ia == g_bufs.end() || ib == g_bufs.end() || ic == g_bufs.end() ||
+        isk == g_bufs.end() || ico == g_bufs.end()) FAILMSG("bad gemm_window_residual operand");
+    const unsigned epi = (flags >> 8) & 0xFu;
+    const bool narrow = (flags & 0x1000u) != 0u;
+    const bool half_skip = (flags & 0x40000u) != 0u;
+    const size_t wsz = narrow ? 2u : 4u;
+    const size_t img_elems = (size_t)height * width * N;
+    const size_t blk_elems = (size_t)M * N;
+    const size_t c_need = img_elems * wsz, k_need = img_elems * (half_skip ? 2u : 4u);
+    const int Mp = (int)(((M + 15u) / 16u) * 16u);
+    const size_t na = (size_t)Mp * K, nb = (size_t)K * N;
+    const unsigned top = pad >> 16, left = pad & 0xffffu;
+    g_cmds.push_back([=]() {
+        auto sized = [&](int id, size_t bytes, const char* what) -> void* {
+            auto it = g_bufs.find(id);
+            if (it == g_bufs.end())
+                throw std::runtime_error(std::string("window residual: ") + what + " not live at run");
+            if (it->second.bytes < bytes)
+                throw std::runtime_error(std::string("window residual: ") + what + " smaller than the image at run");
+            return it->second.p;
+        };
+        sycl::half* Araw = (sycl::half*)sized(a, (size_t)M * K * 2, "A");
+        sycl::half* Braw = (sycl::half*)sized(b, nb * 2, "B");
+        void* Cout = sized(c, c_need, "C");
+        const void* skp = sized(skip, k_need, "skip");
+        const float* cp = (const float*)sized(cosine, (size_t)N * 4u, "cosine");
+        std::vector<sycl::half> hA((size_t)M * K), hApad(na, sycl::half(0.f)), hB(nb), hAp(na), hBp(nb);
+        GQ->memcpy(hA.data(), Araw, (size_t)M * K * 2).wait();
+        std::memcpy(hApad.data(), hA.data(), (size_t)M * K * 2);
+        GQ->memcpy(hB.data(), Braw, nb * 2).wait();
+        f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
+        f16v1::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
+        sycl::half* dAp = (sycl::half*)sycl::malloc_device(na * 2, *GQ);
+        sycl::half* dBp = (sycl::half*)sycl::malloc_device(nb * 2, *GQ);
+        float* dC = (float*)sycl::malloc_device((size_t)Mp * N * 4, *GQ);
+        GQ->memcpy(dAp, hAp.data(), na * 2).wait();
+        GQ->memcpy(dBp, hBp.data(), nb * 2).wait();
+        f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K).wait();
+        GQ->parallel_for(sycl::range(blk_elems),
+                         [=](sycl::item<1> it) {
+            size_t i = it.get_id(0);
+            unsigned r = (unsigned)(i / N), col = (unsigned)(i % N);
+            unsigned window = r / 64u, token = r % 64u;
+            unsigned y = (window / across) * 8u + token / 8u;
+            unsigned x = (window % across) * 8u + token % 8u;
+            if (y < top || x < left || y - top >= height || x - left >= width) return;
+            size_t out = ((size_t)(y - top) * width + (x - left)) * N + col;
+            float sk = half_skip ? (float)((const sycl::half*)skp)[out] : ((const float*)skp)[out];
+            float total = sycl::fma(sk, cp[col], dC[i]);
+            if (narrow) ((sycl::half*)Cout)[out] = sycl::half(qr_publish(epi, total));
+            else        ((float*)Cout)[out] = qr_publish(epi, total);
+        }).wait();
+        sycl::free(dAp, *GQ); sycl::free(dBp, *GQ); sycl::free(dC, *GQ);
+    });
+    return 0;
+}
 int xmx_rec_gemm_int8_fused(int a,int b,int c,int as,int bs,unsigned M,unsigned N,unsigned K,unsigned fl) { (void)a;(void)b;(void)c;(void)as;(void)bs;(void)M;(void)N;(void)K;(void)fl; NOT_YET("xmx_rec_gemm_int8_fused"); }
 
 /* swap-in TARGETS (section 68 A-list): names exist so prepare() GRABs them; every one
@@ -1710,7 +1923,197 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
     });
     return 0;
 }
-int xmx_rec_window_block(int image, int qkv, int projection, int target, int bias, int cosine, int scale, int pooled, int windows, int height, int width, int across, int pad, int flags) { (void)image; (void)qkv; (void)projection; (void)target; (void)bias; (void)cosine; (void)scale; (void)pooled; (void)windows; (void)height; (void)width; (void)across; (void)pad; (void)flags; NOT_YET("xmx_rec_window_block"); }
+// int xmx_rec_window_block(int image, int qkv, int projection, int target, int bias,
+//                          int cosine, int scale, int pooled, unsigned windows,
+//                          unsigned height, unsigned width, unsigned across, unsigned pad,
+//                          unsigned flags)
+// swap-in #15 (section 88 route): a 32-channel window block's attention half, composed
+// from the three legs window_block.comp replaces. window_block.comp's header is explicit:
+// "Three passes did this: the QKV projection, gathering the window's rows from the image
+// and normalising Q and K in its epilogue; window attention; and the output projection
+// with the residual ... the output is the three passes', bit for bit" (test_window_block.py
+// is the shipping witness, :208-216 the decomposition). Pinned before writing (section 73):
+//   leg1 = gemm_qkv_window(image, qkv -> q,k,v, rows=windows*64, C=32, heads=1, tokens=64,
+//          width,height,across,pad, image_mode = (image_half?1:0)|2)   [publish_image ALWAYS:
+//          the image is the projection's input and is rounded to e4m3 on the way in]
+//   leg2 = window_attention(q,k,v, bias, attended, batches=windows, heads=1, merged=1)
+//   leg3 = gemm_window_residual(attended, projection, image, cosine -> target,
+//          rows, 32, 32, flags, height,width,across,pad)   [skip = the image itself]
+// captured window_block (section 88's plan dump): 10 calls, ALL heads==1 C==32 tokens==64;
+// plain flags in {0x1100 epi1+narrow, 0x0 f32-out}, image_half = flags&0x8000. The pool
+// (0x800000, block 0) and head (0x1000000, block 70) forms need their own extra legs
+// (gemm_window_residual_pool / the compact head GEMM) -- rejected fail-loud until built.
+// Composition = ONE g_cmds push (one plan step -> +1 pass); the three legs run back to
+// back on device scratch (q/k/v/attended never leave as plan buffers -- the fused kernel
+// keeps them in shared, section 9's megakernel job).
+int xmx_rec_window_block(int image, int qkv, int projection, int target, int bias,
+                         int cosine, int scale, int pooled, unsigned windows,
+                         unsigned height, unsigned width, unsigned across, unsigned pad,
+                         unsigned flags) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!windows || !height || !width || !across || windows % across)
+        FAILMSG("invalid window block geometry (libxmx.c:2637)");
+    if (flags & 0x800000u) NOT_YET("xmx_rec_window_block pooled form (needs gemm_window_residual_pool)");
+    if (flags & 0x1000000u) NOT_YET("xmx_rec_window_block head form (needs the compact head GEMM)");
+    auto im = g_bufs.find(image), iq = g_bufs.find(qkv), ipr = g_bufs.find(projection),
+         itg = g_bufs.find(target), ib = g_bufs.find(bias), ico = g_bufs.find(cosine),
+         isc = g_bufs.find(scale);
+    if (im == g_bufs.end() || iq == g_bufs.end() || ipr == g_bufs.end() || itg == g_bufs.end() ||
+        ib == g_bufs.end() || ico == g_bufs.end() || isc == g_bufs.end())
+        FAILMSG("bad window_block operand");
+    const bool image_half = (flags & 0x8000u) != 0u;
+    const unsigned epi = (flags >> 8) & 0xFu;
+    const bool narrow = (flags & 0x1000u) != 0u;
+    const unsigned C = 32u, heads = 1u, tokens = 64u, NH = 3u * C;
+    const unsigned rows = windows * tokens;
+    const int Mp = (int)(((rows + 15u) / 16u) * 16u);
+    const unsigned top = pad >> 16, left = pad & 0xffffu;
+    const size_t wsz = narrow ? 2u : 4u;
+    const size_t img_elems = (size_t)height * width * C;
+    const size_t blk_elems = (size_t)rows * C;
+    const size_t c_need = img_elems * wsz, k_need = img_elems * (image_half ? 2u : 4u);
+    const int image_id = image, target_id = target;
+    g_cmds.push_back([=]() {
+        auto sized = [&](int id, size_t bytes, const char* what) -> void* {
+            auto it = g_bufs.find(id);
+            if (it == g_bufs.end()) throw std::runtime_error(std::string("window block: ") + what + " not live at run");
+            if (it->second.bytes < bytes) throw std::runtime_error(std::string("window block: ") + what + " smaller than needed at run");
+            return it->second.p;
+        };
+        const sycl::half* ImgH = (const sycl::half*)sized(image, img_elems * (image_half ? 2u : 4u), "image");
+        const float* ImgF = (const float*)ImgH;
+        const sycl::half* Wraw = (const sycl::half*)sized(qkv, (size_t)C * NH * 2, "qkv");
+        const sycl::half* Praw = (const sycl::half*)sized(projection, (size_t)C * C * 2, "projection");
+        void* Tgt = sized(target, c_need, "target");
+        const float* Bp = (const float*)sized(bias, (size_t)64u * 64u * 4, "bias");
+        const float* cp = (const float*)sized(cosine, (size_t)C * 4, "cosine");
+        const float* qs = (const float*)sized(scale, 4, "scale");
+        // ---- LEG 1: gather + gemm + qkv_epilogue -> dQ,dK,dV (device scratch) ----
+        // the image is DEVICE memory: download it whole to host before the gather (the
+        // section-73 trap -- reading a device pointer from host code = access violation).
+        std::vector<float> hImgF; std::vector<sycl::half> hImgH;
+        if (image_half) { hImgH.resize(img_elems); GQ->memcpy(hImgH.data(), ImgH, img_elems * 2).wait(); }
+        else            { hImgF.resize(img_elems); GQ->memcpy(hImgF.data(), ImgF, img_elems * 4).wait(); }
+        std::vector<sycl::half> hA((size_t)rows * C);
+        for (unsigned r = 0; r < rows; ++r) {
+            unsigned window = r / tokens, token = r % tokens;
+            int y = (int)((window / across) * 8u + token / 8u) - (int)top;
+            int x = (int)((window % across) * 8u + token % 8u) - (int)left;
+            if (y < 0 || x < 0 || y >= (int)height || x >= (int)width) {
+                for (unsigned c = 0; c < C; ++c) hA[(size_t)r * C + c] = sycl::half(0.f);
+                continue;
+            }
+            size_t at = ((size_t)y * width + x) * C;
+            for (unsigned c = 0; c < C; ++c) {
+                float val = image_half ? (float)hImgH[at + c] : hImgF[at + c];
+                val = qr_e4m3(val);                                   // publish_image always
+                hA[(size_t)r * C + c] = sycl::half(val);
+            }
+        }
+        std::vector<sycl::half> hApad((size_t)Mp * C, sycl::half(0.f));
+        std::memcpy(hApad.data(), hA.data(), (size_t)rows * C * 2);
+        std::vector<sycl::half> hB((size_t)C * NH), hAp((size_t)Mp * C), hBp((size_t)C * NH);
+        GQ->memcpy(hB.data(), Wraw, (size_t)C * NH * 2).wait();
+        f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)C);
+        f16v1::pack_b(hB.data(), hBp.data(), (int)C, (int)NH);
+        sycl::half* dAp = (sycl::half*)sycl::malloc_device((size_t)Mp * C * 2, *GQ);
+        sycl::half* dBp = (sycl::half*)sycl::malloc_device((size_t)C * NH * 2, *GQ);
+        float* dCq = (float*)sycl::malloc_device((size_t)Mp * NH * 4, *GQ);
+        GQ->memcpy(dAp, hAp.data(), (size_t)Mp * C * 2).wait();
+        GQ->memcpy(dBp, hBp.data(), (size_t)C * NH * 2).wait();
+        f16v1::gemm(*GQ, dAp, dBp, dCq, Mp, (int)NH, (int)C).wait();
+        sycl::free(dAp, *GQ); sycl::free(dBp, *GQ);
+        sycl::half* dQ = (sycl::half*)sycl::malloc_device((size_t)rows * C * 2, *GQ);
+        sycl::half* dK = (sycl::half*)sycl::malloc_device((size_t)rows * C * 2, *GQ);
+        sycl::half* dV = (sycl::half*)sycl::malloc_device((size_t)rows * C * 2, *GQ);
+        GQ->parallel_for(sycl::range((size_t)rows), [=](sycl::item<1> it) {   // heads==1
+            unsigned r = (unsigned)it.get_id(0);
+            float row32[32];
+            for (int c2 = 0; c2 < 32; ++c2) row32[c2] = qr_half_round(dCq[(size_t)r * NH + c2]);
+            float recip = ctree::cosine_reciprocal(row32);
+            float sc = qr_half_round(qs[0]);
+            for (int c2 = 0; c2 < 32; ++c2) {
+                float val = qr_half_round(cr_mul(row32[c2], recip));
+                val = qr_half_round(cr_mul(val, sc));
+                dQ[(size_t)r * 32u + c2] = sycl::half(qr_e4m3(val));
+            }
+            for (int c2 = 0; c2 < 32; ++c2) row32[c2] = qr_half_round(dCq[(size_t)r * NH + C + c2]);
+            float krec = ctree::cosine_reciprocal(row32);
+            for (int c2 = 0; c2 < 32; ++c2)
+                dK[(size_t)r * 32u + c2] = sycl::half(qr_e4m3(qr_half_round(cr_mul(row32[c2], krec))));
+            for (int c2 = 0; c2 < 32; ++c2)
+                dV[(size_t)r * 32u + c2] = sycl::half(qr_e4m3(dCq[(size_t)r * NH + 2u * C + c2]));
+        }).wait();
+        sycl::free(dCq, *GQ);
+        // ---- LEG 2: window attention (heads==1) -> dAttended (windows,64,32) half ----
+        float* dScores = (float*)sycl::malloc_device((size_t)windows * 64u * 64u * 4, *GQ);
+        sycl::half* dProbs = (sycl::half*)sycl::malloc_device((size_t)windows * 64u * 64u * 2, *GQ);
+        float* dCtx = (float*)sycl::malloc_device((size_t)windows * 64u * 32u * 4, *GQ);
+        std::vector<sycl::half> hq(64u*32u), hk(64u*32u), hp(64u*64u), hv(64u*32u);
+        std::vector<sycl::half> Aq(64u*32u), Bk(64u*32u), Ap(64u*64u), Bv(64u*32u);
+        for (unsigned w = 0; w < windows; ++w) {
+            GQ->memcpy(hq.data(), dQ + (size_t)w*64u*32u, 64u*32u*2).wait();
+            GQ->memcpy(hk.data(), dK + (size_t)w*64u*32u, 64u*32u*2).wait();
+            f16v1::pack_a(hq.data(), Aq.data(), 64, 32);
+            f16v1::pack_b_t(hk.data(), Bk.data(), 32, 64);
+            sycl::half* dA=(sycl::half*)sycl::malloc_device(64u*32u*2,*GQ);
+            sycl::half* dB=(sycl::half*)sycl::malloc_device(64u*32u*2,*GQ);
+            GQ->memcpy(dA,Aq.data(),64u*32u*2).wait(); GQ->memcpy(dB,Bk.data(),64u*32u*2).wait();
+            f16v1::gemm(*GQ, dA, dB, dScores + (size_t)w*64u*64u, 64, 64, 32).wait();
+            sycl::free(dA,*GQ); sycl::free(dB,*GQ);
+        }
+        GQ->parallel_for(sycl::range((size_t)windows*64u),
+                         smax::softmax_kernel()(dScores, dProbs, windows*64u, 64u, Bp, 1u)).wait();
+        for (unsigned w = 0; w < windows; ++w) {
+            GQ->memcpy(hp.data(), dProbs + (size_t)w*64u*64u, 64u*64u*2).wait();
+            GQ->memcpy(hv.data(), dV + (size_t)w*64u*32u, 64u*32u*2).wait();
+            f16v1::pack_a(hp.data(), Ap.data(), 64, 64);
+            f16v1::pack_b(hv.data(), Bv.data(), 64, 32);
+            sycl::half* dA=(sycl::half*)sycl::malloc_device(64u*64u*2,*GQ);
+            sycl::half* dB=(sycl::half*)sycl::malloc_device(64u*32u*2,*GQ);
+            GQ->memcpy(dA,Ap.data(),64u*64u*2).wait(); GQ->memcpy(dB,Bv.data(),64u*32u*2).wait();
+            f16v1::gemm(*GQ, dA, dB, dCtx + (size_t)w*64u*32u, 64, 32, 64).wait();
+            sycl::free(dA,*GQ); sycl::free(dB,*GQ);
+        }
+        sycl::free(dScores,*GQ); sycl::free(dProbs,*GQ);
+        sycl::half* dAttended = (sycl::half*)sycl::malloc_device((size_t)rows * C * 2, *GQ);
+        GQ->parallel_for(sycl::range((size_t)rows * C), [=](sycl::item<1> it) {   // merge, heads==1
+            unsigned index = (unsigned)it.get_id(0);
+            unsigned c = index % C, token = index / C;
+            dAttended[index] = sycl::half(qr_e4m3(dCtx[(size_t)token * 32u + c]));
+        }).wait();
+        sycl::free(dCtx,*GQ); sycl::free(dQ,*GQ); sycl::free(dK,*GQ); sycl::free(dV,*GQ);
+        // ---- LEG 3: window residual (attended, projection, image, cosine -> target) ----
+        std::vector<sycl::half> hAr((size_t)rows * C), hArpad((size_t)Mp * C, sycl::half(0.f)),
+            hPr((size_t)C * C), hApp((size_t)Mp * C), hPpr((size_t)C * C);
+        GQ->memcpy(hAr.data(), dAttended, (size_t)rows * C * 2).wait();
+        std::memcpy(hArpad.data(), hAr.data(), (size_t)rows * C * 2);
+        GQ->memcpy(hPr.data(), Praw, (size_t)C * C * 2).wait();
+        f16v1::pack_a(hArpad.data(), hApp.data(), Mp, (int)C);
+        f16v1::pack_b(hPr.data(), hPpr.data(), (int)C, (int)C);
+        sycl::half* dAp3 = (sycl::half*)sycl::malloc_device((size_t)Mp * C * 2, *GQ);
+        sycl::half* dBp3 = (sycl::half*)sycl::malloc_device((size_t)C * C * 2, *GQ);
+        float* dC3 = (float*)sycl::malloc_device((size_t)Mp * C * 4, *GQ);
+        GQ->memcpy(dAp3, hApp.data(), (size_t)Mp * C * 2).wait();
+        GQ->memcpy(dBp3, hPpr.data(), (size_t)C * C * 2).wait();
+        f16v1::gemm(*GQ, dAp3, dBp3, dC3, Mp, (int)C, (int)C).wait();
+        GQ->parallel_for(sycl::range(blk_elems), [=](sycl::item<1> it) {
+            size_t i = it.get_id(0);
+            unsigned r = (unsigned)(i / C), col = (unsigned)(i % C);
+            unsigned window = r / 64u, token = r % 64u;
+            unsigned y = (window / across) * 8u + token / 8u;
+            unsigned x = (window % across) * 8u + token % 8u;
+            if (y < top || x < left || y - top >= height || x - left >= width) return;
+            size_t out = ((size_t)(y - top) * width + (x - left)) * C + col;
+            float sk = image_half ? (float)ImgH[out] : ImgF[out];
+            float total = sycl::fma(sk, cp[col], dC3[i]);
+            if (narrow) ((sycl::half*)Tgt)[out] = sycl::half(qr_publish(epi, total));
+            else        ((float*)Tgt)[out] = qr_publish(epi, total);
+        }).wait();
+        sycl::free(dAp3,*GQ); sycl::free(dBp3,*GQ); sycl::free(dC3,*GQ); sycl::free(dAttended,*GQ);
+    });
+    return 0;
+}
 
 // int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K)
 // libxmx.c:2471 shape ([c_int]*3 + [c_uint]*2). Appends the proven SYCL kernel.
