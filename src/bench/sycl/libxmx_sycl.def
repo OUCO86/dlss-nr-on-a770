@@ -63,6 +63,7 @@ EXPORTS
     xmx_rec_merge_heads_scale
     xmx_rec_unary2
     xmx_rec_window_attention
+    xmx_rec_gemm_window_residual_pool
     xmx_rec_window_block
     xmx_rec_quant
     xmx_rec_gemm_s8
