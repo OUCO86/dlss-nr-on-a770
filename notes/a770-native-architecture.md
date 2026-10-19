@@ -2238,3 +2238,24 @@ device 一直对——flags 位义要逐位核(§74 守卫层教训的 flags 版
 passes 链: 224→...→670→**671**。build **31 门全绿**。captured 691 已换 **671=97%**。
 剩 **20 全 ffn/window_block**(ffn_stem 1 + ffn 8 + ffn_merge 1 + window_block 10)=前辈否证
 "不进 int8 GEMM"的 **f16 coopmat 融合大核**。§80 裁定=过渡执行器最后做。
+
+## 88. 决策前提变了: ffn/window_block 不是"赌 int8", 而是能用 f16 腿组合复现(须重新知情)
+
+§80 我按"ffn/window_block=前辈否证'不进 int8 GEMM'的 coopmat 融合 pass, 要么赌 int8 契约
+要么 host 过渡执行器"请你定了 b。现在到"最后"了, 侦察发现**前提错了**:
+
+前辈否证的是把它们塞进 **int8** GEMM。但它们的出货形态是 **f16** coopmat 融合核, 而
+test_ffn_fused.py:65-70 与 test_window_block.py:70-79 已证 **fused == 多趟 f16 GEMM 序列**
+(和 window_attention 的 test_window_attention.py 完全同构):
+- ffn = rt.gemm(a,expand,hidden16) → rt.gemm_residual(hidden16,projection,source,cosine,want)
+- window_block = rt.gemm_qkv(image,qkv,q,k,v,scale) → rt.window_attention → rt.gemm_residual
+  (+ 可选 pool/head 腿)
+
+我已绿地基: f16 gemm 非转置(§82) + 转置(§83) + window_attention(§85) + merge_heads(§84)。
+**只缺两个 f16 地基**: f16 gemm_residual(=我已绿 int8 residual 的 f16 版, 加 skip*cosine
+到 f16 acc) + f16 gemm_qkv(=我已绿 int8_qkv 的 f16 版, 三输出)。都是已绿腿的同构变体,
+不是新数学, 且能 bit-exact/within-one 门控——**比 host 过渡执行器干净得多**(可验证、
+不引入 CPU 慢路径、和已做的 11 族一致)。
+
+结论: 最后 20 步的正确路线是**补 2 个 f16 地基 + 组合 ffn/window_block recorder**, 不是
+§80 设想的 host 过渡。这是决策前提的实质变化, 必须让用户重新知情再定, 不擅自推翻 b。
