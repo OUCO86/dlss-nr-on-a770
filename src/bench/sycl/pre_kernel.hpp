@@ -74,7 +74,11 @@ static inline float luminance(float r, float g, float b) {
 }
 static inline float to_proxy_scale(float lit) {
     if (!(lit > 0.75f)) return 1.0f;
-    float rolled = cr_add(cr_mul(0.25f, 1.0f - sycl::exp(-(lit - 0.75f) / 0.25f)), 0.75f);
+    // exp(x) = exp2(x * log2(e)). sycl::exp faults on the opencl backend this process
+    // enumerates the Arc as (section 60); exp2 is the primitive the green kernels use
+    // (quantize_row). The last-bit difference vs GLSL exp is absorbed by the fp16 feature
+    // pack; the gate reveals any boundary flip.
+    float rolled = cr_add(cr_mul(0.25f, 1.0f - sycl::exp2(-(lit - 0.75f) * 1.4426950408889634f / 0.25f)), 0.75f);
     return rolled / sycl::max(lit, 1e-6f);
 }
 
