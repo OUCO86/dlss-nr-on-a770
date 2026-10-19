@@ -58,7 +58,9 @@ EXPORTS
     xmx_rec_global_attention
     xmx_rec_quant_window
     xmx_rec_unary
+    xmx_rec_vit_softmax
     xmx_rec_merge_heads
+    xmx_rec_merge_heads_scale
     xmx_rec_unary2
     xmx_rec_window_attention
     xmx_rec_window_block

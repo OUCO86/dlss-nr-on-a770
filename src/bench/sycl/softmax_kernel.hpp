@@ -21,7 +21,8 @@
 // correctness one (this is a bit-exact numeric gate).
 #pragma once
 #include <sycl/sycl.hpp>
-#include "publish_kernel.hpp"   // qr_half_round, cr_mul, cr_add, qr_e4m3, qr_e4m3_scalar
+#include "publish_kernel.hpp"
+#include "cosine_tree_kernel.hpp"   // cr_hadd, cr_hmul (the half-domain add/mul)   // qr_half_round, cr_mul, cr_add, qr_e4m3, qr_e4m3_scalar
 
 namespace smax {
 
@@ -146,4 +147,59 @@ inline auto softmax_i8_kernel() {
     };
 }
 
+// vit_weight (attention.comp:297-302 / global_attention.comp:82-87): the ViT's
+// exponential, its OWN affine (0.08953857421875 / 1.708984375, clamp [1.439453125,
+// 1.9775390625]) and a 4-bit shift where the window blocks' is 5. Transcribed verbatim.
+static inline float vit_weight(float logit) {
+    float affine = cr_add(cr_mul(qr_half_round(logit), 0.08953857421875f), 1.708984375f);
+    affine = qr_half_round(affine);
+    affine = sycl::min(sycl::max(affine, 1.439453125f), 1.9775390625f);
+    uint16_t bits = sycl::bit_cast<uint16_t>(sycl::half(affine));
+    uint16_t shifted = (uint16_t)((((uint32_t)bits << 4) + 0x4000u) & 0xFFFFu);
+    return (float)sycl::bit_cast<sycl::half>(shifted);
+}
+
+// vit_softmax_kernel (attention.comp:221-241 `vit_softmax`, one work-item per row):
+//   blocks = ceil(tokens/64); zero = vit_weight(0);
+//   per block: column[c] (c 0..7) = hadd-tree over pair[j] (j 0..3), pair[j] =
+//     hadd(w0,w1) with k0=b*64+c+16j, k1=k0+8, w = k<tokens ? vit_weight(a[base+k]) : zero;
+//   total = hadd(total, hadd(even,odd)) with even=hadd(hadd(hadd(c0,c2),c4),c6),
+//     odd=hadd(hadd(hadd(c1,c3),c5),c7);
+//   padding = blocks*64 - tokens; if padding>0 total = hadd(total, -hmul(zero,padding));
+//   reciprocal[row] = half_round(1.0/total);
+//   store(base+k) = k<tokens ? e4m3(vit_weight(a[base+k])) : 0.0   (narrow: half out).
+inline auto vit_softmax_kernel() {
+    return [](const float* src, sycl::half* dst, float* recip, unsigned rows,
+              unsigned tokens, unsigned stride) {
+        return [=](sycl::item<1> it) {
+            unsigned r = (unsigned)it.get_id(0);
+            if (r >= rows) return;
+            const float* row = src + (size_t)r * stride;
+            unsigned blocks = (tokens + 63u) / 64u;
+            float zero = vit_weight(0.0f), total = 0.0f;
+            for (unsigned b = 0; b < blocks; ++b) {
+                float column[8];
+                for (unsigned c = 0; c < 8u; ++c) {
+                    float pair[4];
+                    for (unsigned j = 0; j < 4u; ++j) {
+                        unsigned k0 = b * 64u + c + 16u * j, k1 = k0 + 8u;
+                        float w0 = k0 < tokens ? vit_weight(row[k0]) : zero;
+                        float w1 = k1 < tokens ? vit_weight(row[k1]) : zero;
+                        pair[j] = ctree::cr_hadd(w0, w1);
+                    }
+                    column[c] = ctree::cr_hadd(ctree::cr_hadd(ctree::cr_hadd(pair[0], pair[1]), pair[2]), pair[3]);
+                }
+                float even = ctree::cr_hadd(ctree::cr_hadd(ctree::cr_hadd(column[0], column[2]), column[4]), column[6]);
+                float odd  = ctree::cr_hadd(ctree::cr_hadd(ctree::cr_hadd(column[1], column[3]), column[5]), column[7]);
+                total = ctree::cr_hadd(total, ctree::cr_hadd(even, odd));
+            }
+            unsigned padding = blocks * 64u - tokens;
+            if (padding > 0u) total = ctree::cr_hadd(total, -ctree::cr_hmul(zero, (float)padding));
+            recip[r] = qr_half_round(sycl::ext::intel::math::fdiv_rn(1.0f, total));
+            sycl::half* outr = dst + (size_t)r * stride;
+            for (unsigned k = 0; k < stride; ++k)
+                outr[k] = sycl::half(k < tokens ? qr_e4m3(vit_weight(row[k])) : 0.0f);
+        };
+    };
+}
 } // namespace smax

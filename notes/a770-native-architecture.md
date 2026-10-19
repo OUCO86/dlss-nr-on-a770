@@ -2207,3 +2207,21 @@ captured 691 已换 **662=96%**。剩 29 全待决族: global_attention 8 + wind
 ffn 10 + unary2 1。global_attention 用 **ViT softmax**(attention.comp vit_weight +
 归一化后移到 merge_heads 0x20000 scale 腿)——新腿, f16 gemm 复用。window_block/ffn/unary2
 =过渡执行器(§80 最后)。
+
+## 86. swap-in #10 global_attention GREEN（5 变体端到端 WITHIN-ONE）+ passes 670 (97%)
+
+ViT softmax 腿(§86 新地基): attention.comp:221-241 `vit_softmax` 逐字转录——vit_weight
+(ViT 自己的 affine 0.0895/1.709 + clamp[1.439,1.978] + 4-bit shift, 非 window 的 bit-affine)、
+half-add 求和树(column[8]→even/odd→total, 每步 cr_hadd=half_round(f32 add))、padding 修正
+(total=hadd(total,-hmul(zero,padding)))、reciprocal=half_round(1/total) 写 d、probs=e4m3(vit_weight)
+写 dst(归一化后移到 merge)。门 5 变体 probs 0-differ + reciprocals bits-equal(含 640×640 十块树)。
+merge_heads_scale 腿(0x20000, resident.comp:635-639): value=half_round(half_round(load_a)*scale[at])。
+
+global_attention recorder=四腿组合(scores=f16gemm_t→vit_softmax→attnV=f16gemm→
+merge_heads_scale), 端到端对 test_global_attention.py:62-68 四趟 golden, WITHIN-ONE 5 变体
+0 bad(含 640×640×4 瓶颈真形状)。namespace 边界坑: 插入把 `} // namespace smax` 的 } 吃掉,
+vit_* 落 namespace 外→编译错, 修=删提前的 } 补末尾 }。
+
+passes 链: 224→248→320→388→448→500→552→568→610→662→**670**。build **31 门全绿**。
+captured 691 已换 **670=97%**。剩 **21 全过渡执行器族**: window_block 10 + ffn 10 + unary2 1
+(§80 裁定=最后做, 不赌 int8 契约)。终点线(游戏出帧)现在只差这 21 步。

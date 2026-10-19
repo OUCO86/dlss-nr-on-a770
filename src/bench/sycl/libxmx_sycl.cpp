@@ -906,7 +906,84 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
     });
     return 0;
 }
-int xmx_rec_global_attention(int q, int k, int v, int merged, int rows, int tokens, int heads) { (void)q; (void)k; (void)v; (void)merged; (void)rows; (void)tokens; (void)heads; NOT_YET("xmx_rec_global_attention"); }
+// int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
+//                              unsigned tokens, unsigned heads)
+// swap-in #10 (section 86): the bottleneck block's attention, COMPOSED from the four
+// gated legs -- the shipping global_attention.comp does it in one coopmat kernel, and
+// test_global_attention.py:62-68 proves it is bit-identical (up to the GEMMs' own
+// rounding) to: gemm(q,k,scores,transpose_b,batch=heads) -> vit_softmax(scores,probs,
+// reciprocal,heads*rows,tokens,stride=rows) -> gemm(probs,v,ctx,batch=heads) ->
+// merge_heads(ctx,merged,1,rows,heads*32,heads,EPI_E4M3,narrow,scale=reciprocal).
+// We reproduce THAT four-pass contract. Q/K/V are (heads,rows,32) half (the QKV
+// epilogue's output); merged is (rows, heads*32) half. rows is a multiple of 16 and
+// within the tokens' 64-block (the shipped guard); the tile pads rows to 16.
+int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
+                             unsigned tokens, unsigned heads) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!rows || (rows % 16u) || !tokens || tokens > rows || !heads ||
+        ((rows + 63u) / 64u) != ((tokens + 63u) / 64u))
+        FAILMSG("global attention needs rows%%16==0 within the tokens' 64-block");
+    auto iq = g_bufs.find(q), ik = g_bufs.find(k), iv = g_bufs.find(v), im = g_bufs.find(merged);
+    if (iq == g_bufs.end() || ik == g_bufs.end() || iv == g_bufs.end() || im == g_bufs.end())
+        FAILMSG("bad global attention operand");
+    const sycl::half* Q = (const sycl::half*)iq->second.p;
+    const sycl::half* Kk = (const sycl::half*)ik->second.p;
+    const sycl::half* V = (const sycl::half*)iv->second.p;
+    void* M = im->second.p;
+    const unsigned CH = heads * 32u;
+    const size_t sc = (size_t)heads * rows * rows;   // scores & probs
+    const size_t cx = (size_t)heads * rows * 32u;    // ctx
+    g_cmds.push_back([=]() {
+        float* dScores = (float*)sycl::malloc_device(sc * 4, *GQ);
+        sycl::half* dProbs = (sycl::half*)sycl::malloc_device(sc * 2, *GQ);
+        float* dRecip = (float*)sycl::malloc_device((size_t)heads * rows * 4, *GQ);
+        float* dCtx = (float*)sycl::malloc_device(cx * 4, *GQ);
+        const int Mp = (int)(((rows + 15u) / 16u) * 16u);
+        std::vector<sycl::half> hq((size_t)rows * 32u), hk((size_t)rows * 32u), hv((size_t)rows * 32u);
+        std::vector<sycl::half> Aq((size_t)Mp * 32u), Bk((size_t)Mp * 32u), Ap((size_t)Mp * rows), Bv((size_t)rows * 32u);
+        std::vector<sycl::half> hp((size_t)Mp * rows);
+        for (unsigned h = 0; h < heads; ++h) {
+            GQ->memcpy(hq.data(), Q + (size_t)h * rows * 32u, (size_t)rows * 32u * 2).wait();
+            GQ->memcpy(hk.data(), Kk + (size_t)h * rows * 32u, (size_t)rows * 32u * 2).wait();
+            std::vector<sycl::half> hqp((size_t)Mp * 32u, sycl::half(0.f)), hkp((size_t)Mp * 32u, sycl::half(0.f));
+            std::memcpy(hqp.data(), hq.data(), (size_t)rows * 32u * 2);
+            std::memcpy(hkp.data(), hk.data(), (size_t)rows * 32u * 2);
+            f16v1::pack_a(hqp.data(), Aq.data(), Mp, 32);
+            f16v1::pack_b_t(hkp.data(), Bk.data(), 32, (int)rows);   // K stored (rows,32)
+            sycl::half* dA=(sycl::half*)sycl::malloc_device((size_t)Mp*32u*2,*GQ);
+            sycl::half* dB=(sycl::half*)sycl::malloc_device((size_t)Mp*32u*2,*GQ);
+            GQ->memcpy(dA,Aq.data(),(size_t)Mp*32u*2).wait(); GQ->memcpy(dB,Bk.data(),(size_t)Mp*32u*2).wait();
+            f16v1::gemm(*GQ, dA, dB, dScores + (size_t)h*rows*rows, Mp, (int)rows, 32).wait();
+            sycl::free(dA,*GQ); sycl::free(dB,*GQ);
+        }
+        // vit_softmax over heads*rows rows, tokens cols, stride=rows
+        GQ->parallel_for(sycl::range((size_t)heads * rows),
+                         smax::vit_softmax_kernel()(dScores, dProbs, dRecip, heads * rows, tokens, rows)).wait();
+        for (unsigned h = 0; h < heads; ++h) {
+            GQ->memcpy(hp.data(), dProbs + (size_t)h * rows * rows, (size_t)rows * rows * 2).wait();
+            GQ->memcpy(hv.data(), V + (size_t)h * rows * 32u, (size_t)rows * 32u * 2).wait();
+            std::vector<sycl::half> hpp((size_t)Mp * rows, sycl::half(0.f));
+            std::memcpy(hpp.data(), hp.data(), (size_t)rows * rows * 2);
+            f16v1::pack_a(hpp.data(), Ap.data(), Mp, (int)rows);
+            f16v1::pack_b(hv.data(), Bv.data(), (int)rows, 32);     // V stored (rows,32) = (K,N)
+            sycl::half* dA=(sycl::half*)sycl::malloc_device((size_t)Mp*rows*2,*GQ);
+            sycl::half* dB=(sycl::half*)sycl::malloc_device((size_t)rows*32u*2,*GQ);
+            GQ->memcpy(dA,Ap.data(),(size_t)Mp*rows*2).wait(); GQ->memcpy(dB,Bv.data(),(size_t)rows*32u*2).wait();
+            f16v1::gemm(*GQ, dA, dB, dCtx + (size_t)h*rows*32u, Mp, 32, (int)rows).wait();
+            sycl::free(dA,*GQ); sycl::free(dB,*GQ);
+        }
+        // merge_heads_scale: (1,rows,heads*32) with scale=reciprocal (heads*rows), e4m3, half
+        GQ->parallel_for(sycl::range((size_t)rows * CH), [=](sycl::item<1> it) {
+            unsigned index = (unsigned)it.get_id(0);
+            unsigned c = index % CH, token = index / CH;
+            size_t at = (size_t)(c / 32u) * rows + token;   // window=0: at=(0*heads + c/32)*rows + token
+            float value = qr_half_round(cr_mul(qr_half_round(dCtx[at * 32u + (c % 32u)]), dRecip[at]));
+            ((sycl::half*)M)[index] = sycl::half(qr_e4m3(value));
+        }).wait();
+        sycl::free(dScores,*GQ); sycl::free(dProbs,*GQ); sycl::free(dRecip,*GQ); sycl::free(dCtx,*GQ);
+    });
+    return 0;
+}
 // int xmx_rec_quant_window(int source, int packed, int scale, unsigned M, unsigned K,
 //                          unsigned height, unsigned width, unsigned across, unsigned pad)
 // swap-in #6 (section 77): the SAME proven qr_kernel the plain xmx_rec_quant runs, with
@@ -1029,6 +1106,30 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
 // window=rest/tokens, at=(window*heads + c/32)*tokens + token, value=load_a(at*32 + c%32),
 // then store (publish(epi) + narrow iff bit12). No 0x20000 scale leg (window_attention
 // uses the plain merge; the ViT's vit_softmax normalisation is global_attention's path).
+// int xmx_rec_vit_softmax(int source, int dst, int reciprocal, unsigned rows,
+//                         unsigned tokens, unsigned stride)
+// the ViT softmax leg (section 86): attention.comp:221-241 `vit_softmax` verbatim --
+// weights published UNNORMALISED (e4m3(vit_weight)) into dst, and the row's reciprocal
+// (half_round(1/total), total = the vendor's half-add tree) into `reciprocal` for
+// merge_heads(scale=...) to apply. stride defaults to tokens. The global_attention
+// recorder composes it; gated standalone against the .comp transcription (the .comp IS
+// the authority, section 34/76 discipline -- nr_model.vit_attend is within-one only).
+int xmx_rec_vit_softmax(int source, int dst, int reciprocal, unsigned rows,
+                        unsigned tokens, unsigned stride) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!rows || !tokens || (stride && stride < tokens)) FAILMSG("bad vit_softmax dims");
+    if (stride == 0u) stride = tokens;
+    auto s = g_bufs.find(source), d = g_bufs.find(dst), rc = g_bufs.find(reciprocal);
+    if (s == g_bufs.end() || d == g_bufs.end() || rc == g_bufs.end()) FAILMSG("bad vit_softmax operand");
+    const float* sp = (const float*)s->second.p;
+    sycl::half* dp = (sycl::half*)d->second.p;
+    float* rp = (float*)rc->second.p;
+    g_cmds.push_back([=]() {
+        GQ->parallel_for(sycl::range((size_t)rows),
+                         smax::vit_softmax_kernel()(sp, dp, rp, rows, tokens, stride)).wait();
+    });
+    return 0;
+}
 int xmx_rec_merge_heads(int source, int dst, unsigned windows, unsigned tokens,
                         unsigned channels, unsigned heads, unsigned epilogue,
                         unsigned narrow) {
@@ -1046,6 +1147,37 @@ int xmx_rec_merge_heads(int source, int dst, unsigned windows, unsigned tokens,
             unsigned token = rest % tokens, window = rest / tokens;
             size_t at = ((size_t)window * heads + c / 32u) * tokens + token;
             float value = qr_publish(epilogue, sp[at * 32u + (c % 32u)]);
+            if (narrow) ((sycl::half*)dp)[index] = sycl::half(value);
+            else        ((float*)dp)[index] = value;
+        }).wait();
+    });
+    return 0;
+}
+// int xmx_rec_merge_heads_scale(int source, int dst, int scale, unsigned windows,
+//                                unsigned tokens, unsigned channels, unsigned heads,
+//                                unsigned epilogue, unsigned narrow)
+// the 0x20000 leg (resident.comp:635-639): value = half_round(half_round(load_a) *
+// scale[at]) -- the ViT's normalisation deferred to the merge (vit_softmax wrote the
+// per-row reciprocal). scale is float[windows*heads*tokens] indexed by `at`.
+int xmx_rec_merge_heads_scale(int source, int dst, int scale, unsigned windows,
+                              unsigned tokens, unsigned channels, unsigned heads,
+                              unsigned epilogue, unsigned narrow) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!windows || !tokens || !channels || !heads || (channels % 32u)) FAILMSG("bad merge_heads_scale dims");
+    auto s = g_bufs.find(source), d = g_bufs.find(dst), sc = g_bufs.find(scale);
+    if (s == g_bufs.end() || d == g_bufs.end() || sc == g_bufs.end()) FAILMSG("bad merge_heads_scale operand");
+    const float* sp = (const float*)s->second.p;
+    void* dp = d->second.p;
+    const float* scp = (const float*)sc->second.p;
+    const unsigned n = windows * tokens * channels;
+    g_cmds.push_back([=]() {
+        GQ->parallel_for(sycl::range((size_t)n), [=](sycl::item<1> it) {
+            unsigned index = (unsigned)it.get_id(0);
+            unsigned c = index % channels, rest = index / channels;
+            unsigned token = rest % tokens, window = rest / tokens;
+            size_t at = ((size_t)window * heads + c / 32u) * tokens + token;
+            float value = qr_half_round(cr_mul(qr_half_round(sp[at * 32u + (c % 32u)]), scp[at]));
+            value = qr_publish(epilogue, value);
             if (narrow) ((sycl::half*)dp)[index] = sycl::half(value);
             else        ((float*)dp)[index] = value;
         }).wait();
