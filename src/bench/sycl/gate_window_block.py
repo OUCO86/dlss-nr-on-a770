@@ -1,27 +1,19 @@
 #!/usr/bin/env python3
-"""window_block swap-in gate (route(a) step 3 #15, section 88 route; the plain form).
+"""window_block swap-in gate (route(a) step 3 #15/#16, section 88 route; plain + pool forms).
 
 A 32-channel window block's attention half, composed from the three legs window_block.comp
-replaces. window_block.comp's header: "Three passes did this: the QKV projection, gathering
-the window's rows from the image and normalising Q and K in its epilogue; window attention;
-and the output projection with the residual ... the output is the three passes', bit for
-bit" (test_window_block.py:208-216 is the shipping witness).
+replaces. window_block.comp's header: "Three passes did this: the QKV projection gathering
+the window rows from the image and normalising Q/K in its epilogue; window attention; and
+the output projection with the residual ... the output is the three passes' bit for bit"
+(test_window_block.py is the shipping witness).
 
 PRIMARY criterion = the inline xmx_rec_window_block == my OWN three independent recorders
-chained through plan buffers (xmx_rec_gemm_qkv_window -> xmx_rec_window_attention ->
-xmx_rec_gemm_window_residual, all gated). This is exactly test_window_block's want-vs-got
-shape and the honest check for a composition recorder: its whole job is to reproduce the
-three passes it replaces, so they must agree bit for bit (same legs, same pack, same
-publish, same fma). The composition keeps q/k/v/attended on DEVICE scratch (never plan
-buffers) -- byte-equality proves the scratch wiring matches the plan-buffer wiring.
+chained through plan buffers (gemm_qkv_window -> window_attention -> gemm_window_residual
+[plain] / gemm_window_residual_pool [pool], all gated). The honest check for a composition
+recorder: its whole job is to reproduce the passes it replaces, so they agree bit for bit.
 
-SECONDARY anchor = the three-recorder chain vs a numpy golden, WITHIN-ONE (the legs' own
-criterion, inherited).
-
-captured window_block (section 88's plan dump): 10 calls, ALL heads==1 C==32 tokens==64;
-plain flags in {0x1100 epi1+narrow, 0x0 f32-out}, image_half = flags&0x8000. The pool
-(0x800000) and head (0x1000000) forms are NOT_YET in the recorder (their extra legs are
-separate foundations) -- this gate covers the plain form only.
+captured window_block = 10 calls: plain 8 (flags 0x1100 / 0x0), pool 1 (0x800000), head 1
+(0x1000000). The head form needs the compact-head GEMM leg -- NOT_YET in the recorder.
 """
 import ctypes, os, pathlib, sys
 import numpy as np
@@ -53,6 +45,7 @@ for nm, at in (
     ("xmx_rec_gemm_qkv_window", [ctypes.c_int] * 6 + [ctypes.c_uint] * 9),
     ("xmx_rec_window_attention", [ctypes.c_int] * 5 + [ctypes.c_uint] * 3),
     ("xmx_rec_gemm_window_residual", [ctypes.c_int] * 5 + [ctypes.c_uint] * 8),
+    ("xmx_rec_gemm_window_residual_pool", [ctypes.c_int] * 6 + [ctypes.c_uint] * 8),
 ):
     getattr(lib, nm).argtypes = at
     getattr(lib, nm).restype = ctypes.c_int
@@ -84,9 +77,9 @@ def run(height, width, top, left, flags, label):
     rows = windows * tokens
     pad = (top << 16) | left
     image_half = bool(flags & 0x8000)
-    epi = (flags >> 8) & 0xF
+    pooling = bool(flags & 0x800000)
     narrow = bool(flags & 0x1000)
-    wsz = 2 if narrow else 4
+    wsz = 2 if (narrow or pooling) else 4
     pixels = height * width
     rng = np.random.default_rng(88160 + height * 7 + width * 3 + top * 11 + left * 13 + flags)
     img = rng.uniform(-1, 1, size=pixels * C)
@@ -105,55 +98,72 @@ def run(height, width, top, left, flags, label):
     hs = lib.xmx_buf_create_kind(heads * 4, 4)
     hgot = lib.xmx_buf_create_kind(pixels * C * wsz, wsz)
     hwant = lib.xmx_buf_create_kind(pixels * C * wsz, wsz)
-    # plan buffers for the three-recorder chain
     hq = lib.xmx_buf_create_kind(rows * C * 2, 2); hk = lib.xmx_buf_create_kind(rows * C * 2, 2)
     hv = lib.xmx_buf_create_kind(rows * C * 2, 2); hatt = lib.xmx_buf_create_kind(rows * C * 2, 2)
-    ok(min(him, hw, hp, hb, hco, hs, hgot, hwant, hq, hk, hv, hatt) > 0, f"{label}: buffers")
+    hpooled = -1; hpw = -1
+    if pooling:
+        hpooled = lib.xmx_buf_create_kind(pixels // 4 * C * 2, 2)
+        hpw = lib.xmx_buf_create_kind(pixels // 4 * C * 2, 2)
+    ok(min(him, hw, hp, hb, hco, hs, hgot, hwant, hq, hk, hv, hatt) > 0 and (hpooled > 0 if pooling else True),
+       f"{label}: buffers")
     up(him, imgbuf); up(hw, W); up(hp, P); up(hb, bias); up(hco, cosine); up(hs, qkv_scale)
+    for h in (hgot, hwant, hq, hk, hv, hatt): lib.xmx_buf_zero(h)
+    if pooling: lib.xmx_buf_zero(hpooled); lib.xmx_buf_zero(hpw)
 
-    # ---- GOT: the inline composition (one plan step) ----
-    lib.xmx_buf_zero(hgot)
     ok(lib.xmx_begin() == 0, f"{label}: begin(wb)")
-    rc = lib.xmx_rec_window_block(him, hw, hp, hgot, hb, hco, hs, -1, windows, height, width,
-                                  across, pad, flags)
+    rc = lib.xmx_rec_window_block(him, hw, hp, hgot, hb, hco, hs, hpooled if pooling else -1,
+                                  windows, height, width, across, pad, flags)
     ok(rc == 0, f"{label}: rec_window_block" + ("" if rc == 0 else " err=" + lib.xmx_error().decode(errors="replace")))
     ok(lib.xmx_submit() == 0, f"{label}: submit(wb)")
 
-    # ---- WANT: three independent recorders chained through plan buffers ----
-    lib.xmx_buf_zero(hq); lib.xmx_buf_zero(hk); lib.xmx_buf_zero(hv); lib.xmx_buf_zero(hatt); lib.xmx_buf_zero(hwant)
+    for h in (hq, hk, hv, hatt, hwant): lib.xmx_buf_zero(h)
+    if pooling: lib.xmx_buf_zero(hpw)
     ok(lib.xmx_begin() == 0, f"{label}: begin(3-leg)")
     r1 = lib.xmx_rec_gemm_qkv_window(him, hw, hq, hk, hv, hs, rows, C, heads, tokens,
                                      width, height, across, pad, (1 if image_half else 0) | 2)
     ok(r1 == 0, f"{label}: rec_gemm_qkv_window" + ("" if r1 == 0 else " err=" + lib.xmx_error().decode(errors="replace")))
     r2 = lib.xmx_rec_window_attention(hq, hk, hv, hb, hatt, windows, heads, 1)
     ok(r2 == 0, f"{label}: rec_window_attention" + ("" if r2 == 0 else " err=" + lib.xmx_error().decode(errors="replace")))
-    r3 = lib.xmx_rec_gemm_window_residual(hatt, hp, hwant, him, hco, rows, C, C,
-                                          (flags & ~0x8000) | (0x40000 if image_half else 0),
-                                          height, width, across, pad)
-    ok(r3 == 0, f"{label}: rec_gemm_window_residual" + ("" if r3 == 0 else " err=" + lib.xmx_error().decode(errors="replace")))
+    if pooling:
+        r3 = lib.xmx_rec_gemm_window_residual_pool(
+            hatt, hp, hwant, him, hco, hpw, rows, C, C,
+            (flags & ~0x800000 & ~0x8000) | (0x40000 if image_half else 0),
+            height, width, across, pad)
+        ok(r3 == 0, f"{label}: rec_gemm_window_residual_pool" + ("" if r3 == 0 else " err=" + lib.xmx_error().decode(errors="replace")))
+    else:
+        r3 = lib.xmx_rec_gemm_window_residual(
+            hatt, hp, hwant, him, hco, rows, C, C,
+            (flags & ~0x8000) | (0x40000 if image_half else 0),
+            height, width, across, pad)
+        ok(r3 == 0, f"{label}: rec_gemm_window_residual" + ("" if r3 == 0 else " err=" + lib.xmx_error().decode(errors="replace")))
     ok(lib.xmx_submit() == 0, f"{label}: submit(3-leg)")
 
     g = np.zeros(pixels * C * wsz, np.uint8); lib.xmx_buf_download(hgot, g.ctypes.data, 0, pixels * C * wsz)
     w = np.zeros(pixels * C * wsz, np.uint8); lib.xmx_buf_download(hwant, w.ctypes.data, 0, pixels * C * wsz)
-    for h in (him, hw, hp, hb, hco, hs, hgot, hwant, hq, hk, hv, hatt): lib.xmx_buf_destroy(h)
+    same = bool(np.array_equal(g, w))
+    tag = "target"
+    if pooling and same:
+        gp = np.zeros(pixels // 4 * C * 2, np.uint8); lib.xmx_buf_download(hpooled, gp.ctypes.data, 0, pixels // 4 * C * 2)
+        wp = np.zeros(pixels // 4 * C * 2, np.uint8); lib.xmx_buf_download(hpw, wp.ctypes.data, 0, pixels // 4 * C * 2)
+        if not np.array_equal(gp, wp): same = False; tag = "pooled"
+    for h in (him, hw, hp, hb, hco, hs, hgot, hwant, hq, hk, hv, hatt, hpooled, hpw):
+        if h >= 0: lib.xmx_buf_destroy(h)
 
-    # PRIMARY: inline composition == three-recorder chain, byte for byte.
-    same = np.array_equal(g, w)
-    if not same:
-        d = np.flatnonzero(g != w); e = int(d[0])
-        ok(False, f"{label}: {d.size} bytes differ from the 3-leg chain; first {e} "
-                  f"got 0x{g[e]:02x} want 0x{w[e]:02x}")
-    else:
+    if same:
         ok(True, f"{label}: COMPOSITION == 3-LEG CHAIN, OUT BITS EQUAL "
                  f"({windows}w {height}x{width} origin({-top},{-left}) flags=0x{flags:x})")
+    else:
+        ok(False, f"{label}: {tag} differs from the 3-leg chain ({height}x{width} flags=0x{flags:x})")
 
-# captured plain geometries (section 88's plan dump: 544x960, 272x480) shrunk for CI,
-# both flag families and both image widths, plus a cropped origin.
+# captured plain geometries (544x960, 272x480) shrunk for CI; both flag families and image widths.
 run(16, 24, 0, 0, 0x1100, "WB-16x24-epi1-narrow")
 run(16, 24, 0, 0, 0x0000, "WB-16x24-f32out")
 run(20, 36, 4, 4, 0x1100, "WB-20x36-crop-epi1")
 run(8, 8, 0, 0, 0x9100, "WB-8x8-halfimage-epi1")
 run(40, 56, 0, 0, 0x0000, "WB-40x56-f32out")
+# the POOL form (block 0): even extents/pads, target half by definition, +the pooled output.
+run(16, 24, 0, 0, 0x800000, "WB-16x24-pool-floatimage")
+run(20, 36, 4, 4, 0x808000, "WB-20x36-crop-pool-halfimage")
 
 print(f"\nWINDOW_BLOCK {'GREEN' if not fails else 'RED'} ({fails} fails)")
 sys.exit(1 if fails else 0)

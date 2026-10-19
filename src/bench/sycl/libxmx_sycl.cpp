@@ -1923,6 +1923,97 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
     });
     return 0;
 }
+// int xmx_rec_gemm_window_residual_pool(int a, int b, int skip_out, int skip, int cosine,
+//        int pooled, unsigned M, unsigned N, unsigned K, unsigned flags,
+//        unsigned height, unsigned width, unsigned across, unsigned pad)
+// f16 gemm_window_residual_pool FOUNDATION (section 88 route; window_block's POOL form's
+// third leg). libxmx.c:2393: record_gemm(a,b,skip_out,M,N,K,1,...,flags|0x8a0000,skip,
+// cosine,window,...,pooled). = the window_residual map + TWO published outputs made in the
+// epilogue (gemm_staged.comp:346-390, pinned before writing -- section 73):
+//   skip_out (the c target) = e4m3(total) as half;  total = fma(skip, cosine[col], acc);
+//   pooled = e4m3(0.25 * the four taps summed in order (token, token+8, token+1, token+9))
+//            at the half-resolution image index (the window's 16 pooled pixels).
+// pool needs even extents and pads (xmxres gemm_residual_pool guard).
+int xmx_rec_gemm_window_residual_pool(int a, int b, int skip_out, int skip, int cosine,
+                                      int pooled, unsigned M, unsigned N, unsigned K,
+                                      unsigned flags, unsigned height, unsigned width,
+                                      unsigned across, unsigned pad) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!height || !width || !across) FAILMSG("invalid pooled window residual");
+    if (!M || !N || !K || (N % 16u) || (K % 16u) || (M % 64u))
+        FAILMSG("gemm_window_residual_pool f16 needs N%%16,K%%16,M%%64");
+    if ((height % 2u) || (width % 2u) || ((pad >> 16) % 2u) || ((pad & 0xffffu) % 2u))
+        FAILMSG("a pooled window residual needs even extents and pads");
+    auto ia = g_bufs.find(a), ib = g_bufs.find(b), iso = g_bufs.find(skip_out);
+    auto isk = g_bufs.find(skip), ico = g_bufs.find(cosine), ipd = g_bufs.find(pooled);
+    if (ia == g_bufs.end() || ib == g_bufs.end() || iso == g_bufs.end() ||
+        isk == g_bufs.end() || ico == g_bufs.end() || ipd == g_bufs.end())
+        FAILMSG("bad gemm_window_residual_pool operand");
+    const bool half_skip = (flags & 0x40000u) != 0u;
+    const size_t img_elems = (size_t)height * width * N;
+    const size_t blk_elems = (size_t)M * N;
+    const int Mp = (int)(((M + 15u) / 16u) * 16u);
+    const size_t na = (size_t)Mp * K, nb = (size_t)K * N;
+    const unsigned top = pad >> 16, left = pad & 0xffffu;
+    g_cmds.push_back([=]() {
+        auto sized = [&](int id, size_t bytes, const char* what) -> void* {
+            auto it = g_bufs.find(id);
+            if (it == g_bufs.end()) throw std::runtime_error(std::string("pooled residual: ") + what + " not live at run");
+            if (it->second.bytes < bytes) throw std::runtime_error(std::string("pooled residual: ") + what + " smaller at run");
+            return it->second.p;
+        };
+        sycl::half* Araw = (sycl::half*)sized(a, (size_t)M * K * 2, "A");
+        sycl::half* Braw = (sycl::half*)sized(b, nb * 2, "B");
+        sycl::half* SkipOut = (sycl::half*)sized(skip_out, img_elems * 2, "skip_out");
+        const void* skp = sized(skip, img_elems * (half_skip ? 2u : 4u), "skip");
+        const float* cp = (const float*)sized(cosine, (size_t)N * 4u, "cosine");
+        sycl::half* Pl = (sycl::half*)sized(pooled, (img_elems / 4u) * 2, "pooled");
+        std::vector<sycl::half> hA((size_t)M * K), hApad(na, sycl::half(0.f)), hB(nb), hAp(na), hBp(nb);
+        GQ->memcpy(hA.data(), Araw, (size_t)M * K * 2).wait();
+        std::memcpy(hApad.data(), hA.data(), (size_t)M * K * 2);
+        GQ->memcpy(hB.data(), Braw, nb * 2).wait();
+        f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
+        f16v1::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
+        sycl::half* dAp = (sycl::half*)sycl::malloc_device(na * 2, *GQ);
+        sycl::half* dBp = (sycl::half*)sycl::malloc_device(nb * 2, *GQ);
+        float* dC = (float*)sycl::malloc_device((size_t)Mp * N * 4, *GQ);
+        float* dStage = (float*)sycl::malloc_device((size_t)M * N * 4, *GQ);
+        GQ->memcpy(dAp, hAp.data(), na * 2).wait();
+        GQ->memcpy(dBp, hBp.data(), nb * 2).wait();
+        f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K).wait();
+        GQ->parallel_for(sycl::range(blk_elems), [=](sycl::item<1> it) {
+            size_t i = it.get_id(0);
+            unsigned r = (unsigned)(i / N), col = (unsigned)(i % N);
+            unsigned window = r / 64u, token = r % 64u;
+            unsigned y = (window / across) * 8u + token / 8u;
+            unsigned x = (window % across) * 8u + token % 8u;
+            if (y < top || x < left || y - top >= height || x - left >= width) return;
+            size_t out = ((size_t)(y - top) * width + (x - left)) * N + col;
+            float sk = half_skip ? (float)((const sycl::half*)skp)[out] : ((const float*)skp)[out];
+            float total = sycl::fma(sk, cp[col], dC[i]);
+            SkipOut[out] = sycl::half(qr_e4m3(total));
+            dStage[i] = total;
+        }).wait();
+        GQ->parallel_for(sycl::range((size_t)(M / 64u) * 16u * N), [=](sycl::item<1> it) {
+            size_t e = it.get_id(0);
+            unsigned pixel = (unsigned)((e / N) % 16u), c = (unsigned)(e % N);   // pixel WITHIN the window (the flat range spans windows -- the .comp's e is per-workgroup <16*BN)
+            unsigned window = (unsigned)(e / (16u * N));
+            unsigned token = (pixel / 4u) * 16u + (pixel % 4u) * 2u;
+            unsigned y = (window / across) * 8u + token / 8u;
+            unsigned x = (window % across) * 8u + token % 8u;
+            if (y < top || x < left || y - top >= height || x - left >= width) return;
+            size_t base = (size_t)window * 64u * N;
+            float total = cr_add(cr_add(cr_add(dStage[base + (size_t)token * N + c],
+                                               dStage[base + (size_t)(token + 8u) * N + c]),
+                                        dStage[base + (size_t)(token + 1u) * N + c]),
+                                 dStage[base + (size_t)(token + 9u) * N + c]);
+            size_t out = ((size_t)((y - top) / 2u) * (width / 2u) + ((x - left) / 2u)) * N + c;
+            Pl[out] = sycl::half(qr_e4m3(cr_mul(total, 0.25f)));
+        }).wait();
+        sycl::free(dAp, *GQ); sycl::free(dBp, *GQ); sycl::free(dC, *GQ); sycl::free(dStage, *GQ);
+    });
+    return 0;
+}
 // int xmx_rec_window_block(int image, int qkv, int projection, int target, int bias,
 //                          int cosine, int scale, int pooled, unsigned windows,
 //                          unsigned height, unsigned width, unsigned across, unsigned pad,
@@ -1953,14 +2044,22 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
     if (!g_recording) FAILMSG("not recording");
     if (!windows || !height || !width || !across || windows % across)
         FAILMSG("invalid window block geometry (libxmx.c:2637)");
-    if (flags & 0x800000u) NOT_YET("xmx_rec_window_block pooled form (needs gemm_window_residual_pool)");
     if (flags & 0x1000000u) NOT_YET("xmx_rec_window_block head form (needs the compact head GEMM)");
+    const bool pooling = (flags & 0x800000u) != 0u;
     auto im = g_bufs.find(image), iq = g_bufs.find(qkv), ipr = g_bufs.find(projection),
          itg = g_bufs.find(target), ib = g_bufs.find(bias), ico = g_bufs.find(cosine),
          isc = g_bufs.find(scale);
     if (im == g_bufs.end() || iq == g_bufs.end() || ipr == g_bufs.end() || itg == g_bufs.end() ||
         ib == g_bufs.end() || ico == g_bufs.end() || isc == g_bufs.end())
         FAILMSG("bad window_block operand");
+    sycl::half* Pl = nullptr;
+    if (pooling) {
+        if ((height % 2u) || (width % 2u) || ((pad >> 16) % 2u) || ((pad & 0xffffu) % 2u))
+            FAILMSG("a pooled window block needs even extents and pads (libxmx.c:2648)");
+        auto it = g_bufs.find(pooled);
+        if (it == g_bufs.end()) FAILMSG("bad window_block pooled operand");
+        Pl = (sycl::half*)it->second.p;
+    }
     const bool image_half = (flags & 0x8000u) != 0u;
     const unsigned epi = (flags >> 8) & 0xFu;
     const bool narrow = (flags & 0x1000u) != 0u;
@@ -1968,7 +2067,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
     const unsigned rows = windows * tokens;
     const int Mp = (int)(((rows + 15u) / 16u) * 16u);
     const unsigned top = pad >> 16, left = pad & 0xffffu;
-    const size_t wsz = narrow ? 2u : 4u;
+    const size_t wsz = (narrow || pooling) ? 2u : 4u;   // the pool's target is half by definition
     const size_t img_elems = (size_t)height * width * C;
     const size_t blk_elems = (size_t)rows * C;
     const size_t c_need = img_elems * wsz, k_need = img_elems * (image_half ? 2u : 4u);
@@ -2097,6 +2196,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         GQ->memcpy(dAp3, hApp.data(), (size_t)Mp * C * 2).wait();
         GQ->memcpy(dBp3, hPpr.data(), (size_t)C * C * 2).wait();
         f16v1::gemm(*GQ, dAp3, dBp3, dC3, Mp, (int)C, (int)C).wait();
+        float* dStage = pooling ? (float*)sycl::malloc_device((size_t)rows * C * 4, *GQ) : nullptr;
         GQ->parallel_for(sycl::range(blk_elems), [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             unsigned r = (unsigned)(i / C), col = (unsigned)(i % C);
@@ -2107,9 +2207,37 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             size_t out = ((size_t)(y - top) * width + (x - left)) * C + col;
             float sk = image_half ? (float)ImgH[out] : ImgF[out];
             float total = sycl::fma(sk, cp[col], dC3[i]);
-            if (narrow) ((sycl::half*)Tgt)[out] = sycl::half(qr_publish(epi, total));
-            else        ((float*)Tgt)[out] = qr_publish(epi, total);
+            if (pooling) {
+                // skip_out (target) = e4m3(total) as half; the raw total goes to the stage
+                // for the pool (gemm_staged.comp:346-353).
+                ((sycl::half*)Tgt)[out] = sycl::half(qr_e4m3(total));
+                dStage[i] = total;
+            } else if (narrow) ((sycl::half*)Tgt)[out] = sycl::half(qr_publish(epi, total));
+            else               ((float*)Tgt)[out] = qr_publish(epi, total);
         }).wait();
+        if (pooling) {
+            // the 2x2 pool (gemm_staged.comp:371-390): taps (token,token+8,token+1,token+9)
+            // summed in that order (precise), *0.25, e4m3 -> half, into pooled at the
+            // half-resolution image index. token = (pixel/4)*16 + (pixel%4)*2 over the
+            // window's 16 pooled pixels.
+            GQ->parallel_for(sycl::range((size_t)windows * 16u * C), [=](sycl::item<1> it) {
+                size_t e = it.get_id(0);
+                unsigned pixel = (unsigned)((e / C) % 16u), c = (unsigned)(e % C);   // pixel WITHIN the window (flat range spans windows)
+                unsigned window = (unsigned)(e / (16u * C));
+                unsigned token = (pixel / 4u) * 16u + (pixel % 4u) * 2u;
+                unsigned y = (window / across) * 8u + token / 8u;
+                unsigned x = (window % across) * 8u + token % 8u;
+                if (y < top || x < left || y - top >= height || x - left >= width) return;
+                size_t base = (size_t)window * 64u * C;
+                float total = cr_add(cr_add(cr_add(dStage[base + (size_t)token * C + c],
+                                                   dStage[base + (size_t)(token + 8u) * C + c]),
+                                            dStage[base + (size_t)(token + 1u) * C + c]),
+                                     dStage[base + (size_t)(token + 9u) * C + c]);
+                size_t out = ((size_t)((y - top) / 2u) * (width / 2u) + ((x - left) / 2u)) * C + c;
+                Pl[out] = sycl::half(qr_e4m3(cr_mul(total, 0.25f)));
+            }).wait();
+            sycl::free(dStage, *GQ);
+        }
         sycl::free(dAp3,*GQ); sycl::free(dBp3,*GQ); sycl::free(dC3,*GQ); sycl::free(dAttended,*GQ);
     });
     return 0;
