@@ -248,6 +248,9 @@ int xmx_abort(void) { g_recording = false; g_cmds.clear(); return 0; }
 // of today's recorders; the pack moves device-side when the chains themselves
 // fuse -- step 1 only has to prove freeze/replay identity and the ordering.
 static std::vector<std::vector<std::function<void()>>> g_graphs;
+#ifdef _WIN32
+static int fence_host_wait(void);   // defined in the fence block; graph_run calls it
+#endif
 int xmx_graph_capture(void) {
     if (!g_recording) FAILMSG("not recording");
     g_graphs.push_back(std::move(g_cmds));
@@ -260,6 +263,18 @@ int xmx_graph_run(int id) {
     if (id < 0 || id >= (int)g_graphs.size() || g_graphs[id].empty())
         FAILMSG("graph is not live");
     int passes = (int)g_graphs[id].size();
+    // The fence wait (section 90): the game calls nr_net_wait (which records the
+    // pending fence via xmx_extmem_wait) then nr_net_run, same thread, in order
+    // (NrPipeline.cpp:648/654). The shipped engine does a DEVICE-side wait (vkQueueSubmit
+    // pWaitSemaphores); for our L0 engine an immediate-list wait lives on a DIFFERENT
+    // queue than the SYCL kernels, so it would not order them. The correct, no-loss form
+    // is a HOST-side wait here (fence_host_wait): block until the D3D12 fence reaches the
+    // value BEFORE the kernels launch. The game's queue has already signalled it before
+    // netWait is called (nr_replay.c:408), so this returns immediately in practice -- but
+    // it is a real wait, so a late fence cannot let the kernels read half-written buffers.
+#ifdef _WIN32
+    if (fence_host_wait() != 0) return -1;
+#endif
     try {
         for (auto& fn : g_graphs[id]) fn();     // same order, wait-per-kernel like submit
     } catch (const std::exception& e) { FAILMSG("graph_run: %s", e.what()); }
@@ -390,6 +405,23 @@ unsigned long long xmx_sem_value(int id) {
 // wait on an immediate command list BEFORE the kernels that read the imported buffers
 // (section 18: external-semaphore wait/signal only live on an immediate list).
 static int g_wait_id = -1; static unsigned long long g_wait_value = 0;
+// the host-side fence wait graph_run calls before launching kernels (section 90): block
+// until the imported D3D12 fence reaches the recorded value. The game's queue has already
+// signalled it before netWait (nr_replay.c:408), so this returns immediately in practice.
+static int fence_host_wait(void) {
+    if (g_wait_id < 0 || g_wait_id >= 64 || !g_xsems[g_wait_id].d3d) return 0;
+    ID3D12Fence* f = g_xsems[g_wait_id].d3d;
+    if (f->GetCompletedValue() < g_wait_value) {
+        static HANDLE ev = nullptr;
+        if (!ev) ev = CreateEventEx(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
+        if (FAILED(f->SetEventOnCompletion(g_wait_value, ev)))
+            FAILMSG("SetEventOnCompletion failed");
+        if (WaitForSingleObject(ev, 5000) != WAIT_OBJECT_0)
+            FAILMSG("the game's fence did not reach the frame value within 5s");
+    }
+    g_wait_id = -1; g_wait_value = 0;   // consumed for this run
+    return 0;
+}
 int xmx_extmem_wait(int id, unsigned long long value) {
     if (id < 0 || id >= 64 || !g_xsems[id].l0) FAILMSG("external semaphore is not live");
     g_wait_id = id; g_wait_value = value;
