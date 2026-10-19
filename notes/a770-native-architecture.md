@@ -2186,3 +2186,24 @@ gemm_f16 门现 7 变体(含 scores 形状 64x64x32 batch1/8 transposed)全 ACC 
 attnV=f16gemm(P,V)→merge_heads), 门=对四趟 golden 端到端(test_window_attention.py:52-55 的
 rt.gemm/softmax/gemm/merge_heads 序列), 判据 within-one(f16 gemm 腿) + 各腿自洽。
 build 现 28 门。
+
+## 85. swap-in #9 window_attention GREEN（5 变体端到端 WITHIN-ONE）+ passes 662 (96%)
+
+最大待决族(52 次)成立=**四腿组合**(§84 地基): scores=f16gemm_t(Q,K)→softmax_bias→
+attnV=f16gemm(P,V)→merge_heads(e4m3,narrow)。一个 g_cmds push=整块 attention(passes 每
+captured 调用 +1)。出货 window_attention.comp 是单 coopmat 融合核(shared memory), 但
+test_window_attention.py 已证它**bit-identical 于四趟序列**——我复现那四趟的字节契约。
+merged=1(出口 (windows,64,heads*32) half)是 captured 全用模式; merged=0(f32 ctx)也接。
+
+门=端到端对四趟 golden(numpy 复现 test_window_attention.py:52-55), 判据 **WITHIN-ONE**
+(两条 f16 gemm 腿带硬件 K 累加序 slack, softmax/merge 腿 bit-exact 各自门控)——正是整条
+换芯链的 §51 网。输入用 e4m3-grid halves(QKV epilogue 真实出口形态)。5 变体全 0 bad。
+
+⚠ walk run 35.6s = per-batch 循环 + 每 batch 单独 gemm + 多次 malloc/memcpy 的脚手架开销
+(§58/69 禁引性能), 唯一合法读数=passes 计数。批处理 tile 是 megakernel 阶段的事。
+
+passes 链: 224→248→320→388→448→500→552→568→610→**662**。build **29 门全绿**。
+captured 691 已换 **662=96%**。剩 29 全待决族: global_attention 8 + window_block 10 +
+ffn 10 + unary2 1。global_attention 用 **ViT softmax**(attention.comp vit_weight +
+归一化后移到 merge_heads 0x20000 scale 腿)——新腿, f16 gemm 复用。window_block/ffn/unary2
+=过渡执行器(§80 最后)。

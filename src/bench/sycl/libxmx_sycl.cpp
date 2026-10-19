@@ -1053,7 +1053,89 @@ int xmx_rec_merge_heads(int source, int dst, unsigned windows, unsigned tokens,
     return 0;
 }
 int xmx_rec_unary2(int kind, int a, int b, int c, int d, int second, int n, int channels, int p0, int batch, int sa, int sb, int sc, int k) { (void)kind; (void)a; (void)b; (void)c; (void)d; (void)second; (void)n; (void)channels; (void)p0; (void)batch; (void)sa; (void)sb; (void)sc; (void)k; NOT_YET("xmx_rec_unary2"); }
-int xmx_rec_window_attention(int q, int k, int v, int bias, int out, int batches, int heads, int merged) { (void)q; (void)k; (void)v; (void)bias; (void)out; (void)batches; (void)heads; (void)merged; NOT_YET("xmx_rec_window_attention"); }
+// int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
+//                              unsigned batches, unsigned heads, unsigned merged)
+// swap-in #9 (section 85): the fused window attention, COMPOSED from the four gated
+// foundations (sections 82/83/84) -- the shipping window_attention.comp does all four in
+// one coopmat kernel with shared memory, and test_window_attention.py proves that fused
+// kernel is bit-identical to the four-pass sequence rt.gemm(q,k,scores,transpose_b) ->
+// rt.softmax(scores,probs,narrow,bias,heads) -> rt.gemm(probs,v,ctx) ->
+// rt.merge_heads(ctx,out,EPI_E4M3,narrow). We reproduce THAT four-pass contract (the
+// byte contract the fused kernel is defined by), one g_cmds push = the whole attention
+// (passes +1 per captured call).
+//   q,k,v: (batches, 64, 32) half, batches = windows*heads (the QKV epilogue's output).
+//   bias: (heads, 64, 64) f32, or -1 (no bias).
+//   out: merged=1 -> (windows, 64, heads*32) half (merge_heads); merged=0 -> the f32
+//        attnV context (batches, 64, 32).
+//   scores (batches,64,64) f32, probs (batches,64,64) half, ctx (batches,64,32) f32 are
+//   device scratch allocated in the closure.
+int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
+                             unsigned batches, unsigned heads, unsigned merged) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!batches || !heads || (batches % heads)) FAILMSG("window attention needs heads | batches");
+    if (merged > 1) FAILMSG("invalid window attention output mode");
+    auto iq = g_bufs.find(q), ik = g_bufs.find(k), iv = g_bufs.find(v), io = g_bufs.find(out);
+    if (iq == g_bufs.end() || ik == g_bufs.end() || iv == g_bufs.end() || io == g_bufs.end())
+        FAILMSG("bad window attention operand");
+    const sycl::half* Q = (const sycl::half*)iq->second.p;
+    const sycl::half* Kk = (const sycl::half*)ik->second.p;
+    const sycl::half* V = (const sycl::half*)iv->second.p;
+    void* Out = io->second.p;
+    const float* Bp = nullptr;
+    if (bias >= 0) { auto it = g_bufs.find(bias); if (it == g_bufs.end()) FAILMSG("bad bias"); Bp = (const float*)it->second.p; }
+    const unsigned windows = batches / heads;
+    const size_t sc_elems = (size_t)batches * 64u * 64u;   // scores & probs
+    const size_t ctx_elems = (size_t)batches * 64u * 32u;  // attnV context
+    g_cmds.push_back([=]() {
+        float* dScores = (float*)sycl::malloc_device(sc_elems * 4, *GQ);
+        sycl::half* dProbs = (sycl::half*)sycl::malloc_device(sc_elems * 2, *GQ);
+        float* dCtx = (float*)sycl::malloc_device(ctx_elems * 4, *GQ);
+        // per-batch f16 gemms (correctness-first: the tile is not batched; the fused
+        // kernel's shared-memory reuse is the megakernel-era job, section 9).
+        std::vector<sycl::half> hq(64u*32u), hk(64u*32u), hp(64u*64u), hv(64u*32u);
+        std::vector<sycl::half> Aq(64u*32u), Bk(64u*32u), Ap(64u*64u), Bv(64u*32u);
+        for (unsigned b = 0; b < batches; ++b) {
+            GQ->memcpy(hq.data(), Q + (size_t)b*64u*32u, 64u*32u*2).wait();
+            GQ->memcpy(hk.data(), Kk + (size_t)b*64u*32u, 64u*32u*2).wait();
+            f16v1::pack_a(hq.data(), Aq.data(), 64, 32);
+            f16v1::pack_b_t(hk.data(), Bk.data(), 32, 64);   // K stored (64 tokens,32 ch)
+            sycl::half* dA=(sycl::half*)sycl::malloc_device(64u*32u*2,*GQ);
+            sycl::half* dB=(sycl::half*)sycl::malloc_device(64u*32u*2,*GQ);
+            GQ->memcpy(dA,Aq.data(),64u*32u*2).wait(); GQ->memcpy(dB,Bk.data(),64u*32u*2).wait();
+            f16v1::gemm(*GQ, dA, dB, dScores + (size_t)b*64u*64u, 64, 64, 32).wait();
+            sycl::free(dA,*GQ); sycl::free(dB,*GQ);
+        }
+        // softmax over (batches*64) rows of 64, with bias (heads,64,64)
+        GQ->parallel_for(sycl::range((size_t)batches*64u),
+                         smax::softmax_kernel()(dScores, dProbs, batches*64u, 64u, Bp, heads)).wait();
+        for (unsigned b = 0; b < batches; ++b) {
+            GQ->memcpy(hp.data(), dProbs + (size_t)b*64u*64u, 64u*64u*2).wait();
+            GQ->memcpy(hv.data(), V + (size_t)b*64u*32u, 64u*32u*2).wait();
+            f16v1::pack_a(hp.data(), Ap.data(), 64, 64);
+            f16v1::pack_b(hv.data(), Bv.data(), 64, 32);     // V stored (64 tokens,32 ch) = (K,N)
+            sycl::half* dA=(sycl::half*)sycl::malloc_device(64u*64u*2,*GQ);
+            sycl::half* dB=(sycl::half*)sycl::malloc_device(64u*32u*2,*GQ);
+            GQ->memcpy(dA,Ap.data(),64u*64u*2).wait(); GQ->memcpy(dB,Bv.data(),64u*32u*2).wait();
+            f16v1::gemm(*GQ, dA, dB, dCtx + (size_t)b*64u*32u, 64, 32, 64).wait();
+            sycl::free(dA,*GQ); sycl::free(dB,*GQ);
+        }
+        if (merged) {
+            // merge_heads: (windows,heads,64,32) -> (windows,64,heads*32), publish e4m3, half
+            const unsigned CH = heads * 32u;
+            GQ->parallel_for(sycl::range((size_t)windows*64u*CH), [=](sycl::item<1> it) {
+                unsigned index = (unsigned)it.get_id(0);
+                unsigned c = index % CH, rest = index / CH;
+                unsigned token = rest % 64u, window = rest / 64u;
+                size_t at = ((size_t)window * heads + c / 32u) * 64u + token;
+                ((sycl::half*)Out)[index] = sycl::half(qr_e4m3(dCtx[at * 32u + (c % 32u)]));
+            }).wait();
+        } else {
+            GQ->memcpy(Out, dCtx, ctx_elems * 4).wait();
+        }
+        sycl::free(dScores,*GQ); sycl::free(dProbs,*GQ); sycl::free(dCtx,*GQ);
+    });
+    return 0;
+}
 int xmx_rec_window_block(int image, int qkv, int projection, int target, int bias, int cosine, int scale, int pooled, int windows, int height, int width, int across, int pad, int flags) { (void)image; (void)qkv; (void)projection; (void)target; (void)bias; (void)cosine; (void)scale; (void)pooled; (void)windows; (void)height; (void)width; (void)across; (void)pad; (void)flags; NOT_YET("xmx_rec_window_block"); }
 
 // int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K)
