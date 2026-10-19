@@ -2120,3 +2120,10 @@ dpas 参数序 (acc, B, A) 同前辈 esimd_dpas_peak.cpp:45。探针入仓可复
 不是 numpy——f16×f16→f32 的 K 累加顺序是硬件定义。我的 ESIMD f16 核门用 numpy f32 golden +
 **within-one 判据**(§51, 非 bit-equal): 输入是精确 half, f32 累加 16 项误差极小, within-one
 轻松满足; 若将来要 bit-exact 对 coopmat 走 §51 双后端配对。
+
+## 81.5 f16 GEMM tile standalone GREEN (esimd_f16_tile.cpp, 32x32x32 0 bad maxrel 1.6e-5)
+
+§81 布局的 tiled 版: 一 work-item=一 16x16 tile, 2 A 行带 x 2 B 列带=每 16-K 步 4 dpas,
+逐行 store(simd<float,64>=8x8 行主序, v1 的 store 形态)。pack 照 §81: A 行主序,
+B 交错 (k/2)*16+jl*2+(k%2)。host 对 f32 点积 within-one(累加序硬件定义, maxrel 1.6e-5
+远小于容差)。这是 window_attention(scores/attnV 都是 f16 gemm)与 fp16 gemm 族(42)共用地基。
