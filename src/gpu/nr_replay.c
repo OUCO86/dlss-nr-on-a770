@@ -1463,6 +1463,26 @@ int main(int argc, char **argv)
 			continue;
 		if (r.ids[i] < 0 || nr_plan_buffers[i].bytes < 16)
 			continue;
+		const char *dump = getenv("NR_DUMP_OUT");
+		if (dump) {           /* the whole-frame gate (section 64 step 4): write every
+		                       * host-readable buffer in full so two engines' frames can
+		                       * be compared element-by-element, not just a head sample. */
+			unsigned long long nb = nr_plan_buffers[i].bytes;
+			unsigned char *full = malloc((size_t)nb);
+			if (full && f_buf_download(r.ids[i], full, 0, nb) == 0) {
+				char path[600];
+				snprintf(path, sizeof path, "%s.%u.bin", dump, i);
+				FILE *fp = fopen(path, "wb");
+				if (fp) {
+					fwrite(full, 1, (size_t)nb, fp);
+					fclose(fp);
+					printf("dumped buffer %u: %llu bytes -> %s\n", i, nb, path);
+				}
+			} else
+				printf("dump buffer %u FAILED\n", i);
+			free(full);
+			continue;
+		}
 		float head[4];
 		unsigned long long take = sizeof head < nr_plan_buffers[i].bytes
 			? sizeof head : nr_plan_buffers[i].bytes;
