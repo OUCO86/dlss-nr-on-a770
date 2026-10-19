@@ -2225,3 +2225,16 @@ vit_* 落 namespace 外→编译错, 修=删提前的 } 补末尾 }。
 passes 链: 224→248→320→388→448→500→552→568→610→662→**670**。build **31 门全绿**。
 captured 691 已换 **670=97%**。剩 **21 全过渡执行器族**: window_block 10 + ffn 10 + unary2 1
 (§80 裁定=最后做, 不赌 int8 契约)。终点线(游戏出帧)现在只差这 21 步。
+
+## 87. swap-in #11 unary2 GREEN（UPSAMPLE_ADD+second）+ passes 671 (97%)
+
+unary2 唯一 captured 调用 kind=0x10015: sub=21 UPSAMPLE_ADD, epi=(>>8)&0xF=**0**(无 publish
+变换), narrow bit(0x1000)=**0**(C 是 f32!), b-half(0x10000)=1。second 输出=resident.comp:600
+`HalfBuf(second).v[index]=float16_t(e4m3(merged))`(永远 half, e4m3 only 无 gate)。
+门=resident.comp:598-600 逐字: merged=A[nearest2x]+B*sine[c](两非融合步), C=publish(0,merged)
+→f32, second=e4m3(merged)→half。两次 golden 算错(先 epi=1 后 narrow=1)都是**我读 flags 错**,
+device 一直对——flags 位义要逐位核(§74 守卫层教训的 flags 版)。
+
+passes 链: 224→...→670→**671**。build **31 门全绿**。captured 691 已换 **671=97%**。
+剩 **20 全 ffn/window_block**(ffn_stem 1 + ffn 8 + ffn_merge 1 + window_block 10)=前辈否证
+"不进 int8 GEMM"的 **f16 coopmat 融合大核**。§80 裁定=过渡执行器最后做。

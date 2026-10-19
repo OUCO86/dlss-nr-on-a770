@@ -43,6 +43,8 @@ for nm, at in (
     ("xmx_begin", []), ("xmx_abort", []), ("xmx_submit", []),
     ("xmx_rec_unary", [ctypes.c_uint] + [ctypes.c_int] * 4 + [ctypes.c_uint] * 2
                        + [ctypes.c_float] + [ctypes.c_uint] * 5),
+    ("xmx_rec_unary2", [ctypes.c_uint] + [ctypes.c_int] * 5 + [ctypes.c_uint] * 2
+                        + [ctypes.c_float] + [ctypes.c_uint] * 5),
 ):
     getattr(lib, nm).argtypes = at
     getattr(lib, nm).restype = ctypes.c_int
@@ -158,6 +160,51 @@ test_e4m3_half()
 test_pool2()
 test_upsample_add()
 test_pad_end()
+
+def test_unary2_upsample_add():
+    # kind 0x10015 = UPSAMPLE_ADD(21) + epi1 + narrow + b-half (the captured unary2).
+    # second output = e4m3(merged) half (resident.comp:600).
+    global fails
+    kind = 0x10015
+    h, w, ch = 8, 12, 32          # target 8x12, source 4x6
+    n = h * w * ch
+    rng = np.random.default_rng(8790)
+    A = rng.uniform(-2, 2, size=(h // 2) * (w // 2) * ch).astype(np.float32)   # a f32 (bit15 off)
+    B = rng.uniform(-1, 1, size=n).astype(np.float16)                          # b half (bit16)
+    d = rng.uniform(-1, 1, size=ch).astype(np.float32)                         # sine
+    ha = lib.xmx_buf_create_kind(A.nbytes, 4)
+    hb = lib.xmx_buf_create_kind(B.nbytes, 2)
+    hc = lib.xmx_buf_create_kind(n * 4, 4)   # narrow bit OFF (0x10015 & 0x1000 == 0): f32 out
+    hd = lib.xmx_buf_create_kind(d.nbytes, 4)
+    h2 = lib.xmx_buf_create_kind(n * 2, 2)   # the second is always half (resident.comp:600)
+    ok(min(ha, hb, hc, hd, h2) > 0, "unary2: buffers")
+    up(ha, A); up(hb, B); up(hd, d)
+    lib.xmx_buf_zero(hc); lib.xmx_buf_zero(h2)
+    ok(lib.xmx_begin() == 0, "unary2: begin")
+    rc = lib.xmx_rec_unary2(kind, ha, hb, hc, hd, h2, n, ch, float(1.0), 0, w, w // 2, 0, 0)
+    ok(rc == 0, "unary2: rec" + ("" if rc == 0 else " err=" + lib.xmx_error().decode(errors="replace")))
+    ok(lib.xmx_submit() == 0, "unary2: submit")
+    gc = np.zeros(n * 4, np.uint8); lib.xmx_buf_download(hc, gc.ctypes.data, 0, n * 4)
+    g2 = np.zeros(n * 2, np.uint8); lib.xmx_buf_download(h2, g2.ctypes.data, 0, n * 2)
+    for hh in (ha, hb, hc, hd, h2): lib.xmx_buf_destroy(hh)
+    # golden: merged = A[nearest2x] + B*sine[c] (two non-fused f32 steps), publish e4m3,
+    # narrow half to C; second = e4m3(merged) half.
+    out = np.zeros(n, np.float32)
+    for i in range(n):
+        cc = i % ch; rest = i // ch
+        x = rest % w; y = rest // w
+        aval = A[((y // 2) * (w // 2) + (x // 2)) * ch + cc]
+        merged = np.float32(aval + np.float32(np.float32(B[i]) * d[cc]))
+        out[i] = merged
+    # kind 0x10015: epi = (0x10015>>8)&0xF = 0 (NO publish transform), narrow=1, b-half=1.
+    # So C = half(merged) (publish(0,x)=x), and the SECOND = e4m3(merged) (resident.comp:600).
+    c_f32 = np.asarray(out, np.float32).view(np.uint8)   # publish(0,x)=x, narrow off -> f32
+    pub = np.asarray(NM.e4m3(out), np.float16).view(np.uint8)
+    samec = np.array_equal(gc, c_f32)
+    same2 = np.array_equal(g2, pub)
+    ok(samec and same2, f"unary2 UPSAMPLE_ADD: C(f32 merged) 0-differ={samec} second(e4m3 half) 0-differ={same2}")
+
+test_unary2_upsample_add()
 
 print(f"\nUNARY_KINDS {'GREEN' if not fails else 'RED'} ({fails} fails)")
 sys.exit(1 if fails else 0)

@@ -1184,7 +1184,52 @@ int xmx_rec_merge_heads_scale(int source, int dst, int scale, unsigned windows,
     });
     return 0;
 }
-int xmx_rec_unary2(int kind, int a, int b, int c, int d, int second, int n, int channels, int p0, int batch, int sa, int sb, int sc, int k) { (void)kind; (void)a; (void)b; (void)c; (void)d; (void)second; (void)n; (void)channels; (void)p0; (void)batch; (void)sa; (void)sb; (void)sc; (void)k; NOT_YET("xmx_rec_unary2"); }
+// int xmx_rec_unary2(unsigned kind, int a, int b, int c, int d, int second, unsigned n,
+//                    unsigned channels, float p0, unsigned batch, unsigned sa,
+//                    unsigned sb, unsigned sc, unsigned k)
+// swap-in #11 (section 87): the captured graph's single unary2 call is kind 0x10015 =
+// UPSAMPLE_ADD(21) + epi1 + narrow + b-half, WITH a second output. resident.comp:598-600:
+//   merged = load_a(nearest2x) + load_b(index)*sine[c]   (two non-fused precise steps)
+//   store(index, merged)                                 (publish(epi) + narrow)
+//   if (second) HalfBuf(second).v[index] = float16_t(e4m3(merged))   -- the RAW published
+//     skip the block 70 head reads, e4m3 only (no gate), always half.
+// Same gather/publish as the unary UPSAMPLE_ADD branch, plus the second store.
+int xmx_rec_unary2(unsigned kind, int a, int b, int c, int d, int second, unsigned n,
+                   unsigned channels, float p0, unsigned batch, unsigned sa,
+                   unsigned sb, unsigned sc, unsigned k) {
+    if (!g_recording) FAILMSG("not recording");
+    const unsigned flags = kind;
+    const unsigned sub = flags & 0xFFu;
+    if (sub != 21u) FAILMSG("unary2: only UPSAMPLE_ADD(21) is in the captured graph (section 87)");
+    if (second < 0) FAILMSG("a two-output pass needs its second output");
+    auto ia = g_bufs.find(a), ic = g_bufs.find(c), i2 = g_bufs.find(second);
+    if (ia == g_bufs.end() || ic == g_bufs.end() || i2 == g_bufs.end()) FAILMSG("bad unary2 operand");
+    const sycl::half* A = (const sycl::half*)ia->second.p;
+    void* C = ic->second.p;
+    sycl::half* S = (sycl::half*)i2->second.p;
+    const sycl::half* B = nullptr; if (b >= 0) { auto it = g_bufs.find(b); if (it != g_bufs.end()) B = (const sycl::half*)it->second.p; }
+    const float* D = nullptr; if (d >= 0) { auto it = g_bufs.find(d); if (it != g_bufs.end()) D = (const float*)it->second.p; }
+    const bool a_half = (flags & 0x8000u) != 0u, b_half = (flags & 0x10000u) != 0u;
+    const bool narrow = (flags & 0x1000u) != 0u;
+    const unsigned epi = (flags >> 8) & 0xFu;
+    const unsigned N = n, CH = channels, SA = sa, SB = sb;
+    g_cmds.push_back([=]() {
+        GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
+            unsigned index = (unsigned)it.get_id(0);
+            unsigned cc = index % CH, rest = index / CH;
+            unsigned x = rest % SA, y = rest / SA;
+            float bval = b_half ? (float)((const sycl::half*)B)[index] : ((const float*)B)[index];
+            size_t asrc = ((size_t)(y / 2u) * SB + (x / 2u)) * CH + cc;
+            float aval = a_half ? (float)((const sycl::half*)A)[asrc] : ((const float*)A)[asrc];
+            float merged = cr_add(aval, cr_mul(bval, D[cc]));
+            float value = qr_publish(epi, merged);
+            if (narrow) ((sycl::half*)C)[index] = sycl::half(value);
+            else        ((float*)C)[index] = value;
+            S[index] = sycl::half(qr_e4m3(merged));   // the second: e4m3 only, always half
+        }).wait();
+    });
+    return 0;
+}
 // int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
 //                              unsigned batches, unsigned heads, unsigned merged)
 // swap-in #9 (section 85): the fused window attention, COMPOSED from the four gated
