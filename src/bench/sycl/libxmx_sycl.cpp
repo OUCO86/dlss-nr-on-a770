@@ -27,6 +27,7 @@
 #include "gemm_s8_v7_kernel.hpp"
 #include "gemm_s8_v8_kernel.hpp"
 #include "gemm_f16_v1_kernel.hpp"
+#include "pre_kernel.hpp"
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
@@ -429,7 +430,40 @@ static int l0_permissive() {
         g_skipped[name[4]] = (g_skipped[name[4]] + 1) % 100000; return 0; } \
     FAILMSG("%s not implemented on the Level-Zero engine (walk must not call it; fused-path leg, section 64 step 3)", name); return -1; } while(0)
 static int g_skipped[256];
-int xmx_rec_pre(int c,int m,int h,int f,int pl,unsigned px,unsigned ht,unsigned wd,unsigned pt,unsigned sh,unsigned sw,unsigned fl,int tb) { (void)c;(void)m;(void)h;(void)f;(void)pl;(void)px;(void)ht;(void)wd;(void)pt;(void)sh;(void)sw;(void)fl;(void)tb; NOT_YET("xmx_rec_pre"); }
+// int xmx_rec_pre(int colour, int motion, int history, int features, int plan,
+//                 unsigned pixels, unsigned height, unsigned width,
+//                 unsigned pitch, unsigned source_h, unsigned source_w, unsigned flags, int table)
+// route(a) step 5 (section 90): the fused image INPUT, SYCL port of nr_pre.comp. The
+// game runs the fused path (section 90's log evidence), so this must produce the sixteen
+// feature channels from the game's own colour/motion/history exactly as nr_pre.comp does.
+// All operands are buffer IDs (nr_replay.c:686 passes r->colour/r->motion/r->history/
+// r->plan/r->table -- the imported game buffers + the host-built plan/table). The kernel
+// (pre_kernel.hpp) is elementwise/geometry; the shadow gate (old dll's nr_pre.spv vs this,
+// identical inputs, compare feature BYTES) is the authority (section 62) -- exp() in
+// to_proxy is the one bit-exact risk.
+int xmx_rec_pre(int colour, int motion, int history, int features, int plan,
+                unsigned pixels, unsigned height, unsigned width,
+                unsigned pitch, unsigned source_h, unsigned source_w, unsigned flags, int table) {
+    if (!g_recording) FAILMSG("not recording");
+    if (!pixels || !height || !width) FAILMSG("invalid fused input extent");
+    auto ic = g_bufs.find(colour), im = g_bufs.find(motion), ih = g_bufs.find(history);
+    auto ift = g_bufs.find(features), ip = g_bufs.find(plan), itb = g_bufs.find(table);
+    if (ic == g_bufs.end() || im == g_bufs.end() || ih == g_bufs.end() ||
+        ift == g_bufs.end() || ip == g_bufs.end() || itb == g_bufs.end())
+        FAILMSG("bad fused input operand");
+    const unsigned* Col = (const unsigned*)ic->second.p;
+    const float* Mot = (const float*)im->second.p;
+    const float* His = (const float*)ih->second.p;
+    sycl::half* Feat = (sycl::half*)ift->second.p;
+    const float* Pl = (const float*)ip->second.p;
+    const float* Tb = (const float*)itb->second.p;
+    prepass::PreArgs A{ Col, Mot, His, Feat, Pl, Tb, pixels, height, width,
+                        pitch, source_h, source_w, flags };
+    g_cmds.push_back([=]() {
+        GQ->parallel_for(sycl::range((size_t)pixels), prepass::pre_kernel(A)).wait();
+    });
+    return 0;
+}
 int xmx_rec_post(int c,int hd,int h,int rs,int tb,int nl,unsigned px,unsigned ht,unsigned wd,unsigned pt,unsigned sh,unsigned sw) { (void)c;(void)hd;(void)h;(void)rs;(void)tb;(void)nl;(void)px;(void)ht;(void)wd;(void)pt;(void)sh;(void)sw; NOT_YET("xmx_rec_post"); }
 int xmx_rec_gemm_qkv(int a,int w,int q,int k,int v,int sc,unsigned M,unsigned ch,unsigned hd,unsigned tk,unsigned vt) { (void)a;(void)w;(void)q;(void)k;(void)v;(void)sc;(void)M;(void)ch;(void)hd;(void)tk;(void)vt; NOT_YET("xmx_rec_gemm_qkv"); }
 // int xmx_rec_gemm_qkv_window(int image, int weight, int q, int k, int v, int scale,
