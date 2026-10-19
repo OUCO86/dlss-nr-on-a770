@@ -41,6 +41,20 @@ static inline void pack_b(const half* B, half* Bp, int K, int N) {
                             B[(size_t)(kc * TS + k) * N + tc * TS + js * 8 + jl];
 }
 
+// B TRANSPOSED: the scores leg's K is stored (N, K) row-major (tokens x head_dim), and
+// gemm_staged.comp:16 `transposed = flags bit 0` makes ldb default to K -- logical
+// B[k][j] = Bmem[j*K + k]. Same dpas operand layout, only the source index flips.
+static inline void pack_b_t(const half* B, half* Bp, int K, int N) {
+    int kb_n = K / TS, tc_n = N / TS;
+    for (int kc = 0; kc < kb_n; ++kc)
+        for (int tc = 0; tc < tc_n; ++tc)
+            for (int js = 0; js < 2; ++js)
+                for (int k = 0; k < 16; ++k)
+                    for (int jl = 0; jl < 8; ++jl)
+                        Bp[(((size_t)(kc * tc_n + tc) * 2 + js) * 128) + (k / 2) * 16 + jl * 2 + (k % 2)] =
+                            B[(size_t)(tc * TS + js * 8 + jl) * K + kc * TS + k];
+}
+
 // C = A @ B, f32 accumulate, Mp x N. Ap/Bp packed. Returns the event.
 static inline sycl::event gemm(sycl::queue& q, const half* Ap, const half* Bp,
                                float* C, int Mp, int N, int K) {

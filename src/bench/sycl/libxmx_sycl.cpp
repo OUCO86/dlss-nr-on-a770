@@ -385,7 +385,7 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
     if (!g_recording) FAILMSG("not recording");
     if (!M || !N || !K || (N % 16u) || (K % 16u))
         FAILMSG("gemm f16 needs N%%16==0, K%%16==0 (our tile)");
-    if (bt & 1u) FAILMSG("transposed B not used by the captured graph (section 82)");
+    const bool transposed = (bt & 1u) != 0u;   // scores leg: B stored (N,K), ldb->K
     if (bt & 0x800000u) FAILMSG("pooled window residual belongs to the window_block family");
     auto ia = g_bufs.find(a), ib = g_bufs.find(b), ic = g_bufs.find(c);
     if (ia == g_bufs.end() || ib == g_bufs.end() || ic == g_bufs.end()) FAILMSG("bad gemm operand");
@@ -394,12 +394,17 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
     void* Cout = ic->second.p;
     const unsigned epi = (bt >> 8) & 0xFu;
     const bool narrow = (bt & 0x1000u) != 0u;
-    const unsigned lda_e = lda ? lda : K, ldb_e = ldb ? ldb : N, ldc_e = ldc ? ldc : N;
+    const unsigned lda_e = lda ? lda : K, ldb_e = ldb ? ldb : (transposed ? K : N), ldc_e = ldc ? ldc : N;
     const int Mp = (int)(((M + 15u) / 16u) * 16u);
     g_cmds.push_back([=]() {
         const size_t a_slice = (size_t)M * K, b_slice = (size_t)K * N;
         const size_t aw_b = (size_t)(M - 1) * lda_e + (size_t)(batch - 1) * sa + K + oa;
-        const size_t bw_b = (size_t)(K - 1) * ldb_e + (size_t)(batch - 1) * sb + N + ob;
+        // transposed B is stored (N, K): max-touched = (N-1)*ldb + K, NOT (K-1)*ldb + N
+        // (the section-73 stride lesson again -- the first cut sized it for the row-major
+        // layout and the gather read past the vector: G6's ~half-bad was that).
+        const size_t bw_b = transposed
+            ? (size_t)(N - 1) * ldb_e + (size_t)(batch - 1) * sb + K + ob
+            : (size_t)(K - 1) * ldb_e + (size_t)(batch - 1) * sb + N + ob;
         std::vector<sycl::half> hAw(aw_b), hBw(bw_b);
         GQ->memcpy(hAw.data(), Araw, aw_b * 2).wait();
         GQ->memcpy(hBw.data(), Braw, bw_b * 2).wait();
@@ -407,12 +412,18 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
             std::vector<sycl::half> hA(a_slice), hB(b_slice), hAp((size_t)Mp * K), hBp(b_slice);
             for (unsigned r = 0; r < M; ++r)
                 std::memcpy(hA.data() + (size_t)r * K, hAw.data() + oa + (size_t)g * sa + (size_t)r * lda_e, K * 2);
-            for (unsigned k = 0; k < K; ++k)
-                std::memcpy(hB.data() + (size_t)k * N, hBw.data() + ob + (size_t)g * sb + (size_t)k * ldb_e, N * 2);
+            if (transposed) {   // Bmem is (N,K): gather logical B[k][j] = Bmem[j*K+k]
+                for (unsigned j = 0; j < N; ++j)
+                    std::memcpy(hB.data() + (size_t)j * K, hBw.data() + ob + (size_t)g * sb + (size_t)j * ldb_e, K * 2);
+            } else {
+                for (unsigned k = 0; k < K; ++k)
+                    std::memcpy(hB.data() + (size_t)k * N, hBw.data() + ob + (size_t)g * sb + (size_t)k * ldb_e, N * 2);
+            }
             std::vector<sycl::half> hApad((size_t)Mp * K, sycl::half(0.f));
             std::memcpy(hApad.data(), hA.data(), a_slice * 2);
             f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
-            f16v1::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
+            if (transposed) f16v1::pack_b_t(hB.data(), hBp.data(), (int)K, (int)N);
+            else            f16v1::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
             sycl::half* dAp = (sycl::half*)sycl::malloc_device((size_t)Mp * K * 2, *GQ);
             sycl::half* dBp = (sycl::half*)sycl::malloc_device(b_slice * 2, *GQ);
             float* dC = (float*)sycl::malloc_device((size_t)Mp * N * 4, *GQ);

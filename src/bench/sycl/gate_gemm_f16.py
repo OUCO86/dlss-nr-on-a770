@@ -65,14 +65,14 @@ def up(h, arr):
     assert a.dtype in (np.float32, np.float16, np.int8), f"upload dtype {a.dtype}"
     assert lib.xmx_buf_upload(h, a.ctypes.data, 0, a.nbytes) == 0, lib.xmx_error().decode()
 
-def run(M, N, K, batch, sa, sb, sc, bt, lda, ldb, ldc, oa, ob, oc, label):
+def run(M, N, K, batch, sa, sb, sc, bt, lda, ldb, ldc, oa, ob, oc, label, transposed=False):
     global fails
     epi = (bt >> 8) & 0xF
     narrow = bool(bt & 0x1000)
-    lda_e = lda or K; ldb_e = ldb or N; ldc_e = ldc or N
+    lda_e = lda or K; ldb_e = ldb or (K if transposed else N); ldc_e = ldc or N
     rng = np.random.default_rng(8280 + M + N * 3 + K * 5 + batch * 7 + bt + lda + ldc)
     A_n = oa + (batch - 1) * sa + (M - 1) * lda_e + K
-    B_n = ob + (batch - 1) * sb + (K - 1) * ldb_e + N
+    B_n = ob + (batch - 1) * sb + ((N - 1) * ldb_e + K if transposed else (K - 1) * ldb_e + N)
     C_n = oc + (batch - 1) * sc + (M - 1) * ldc_e + N
     A = rng.uniform(-1, 1, size=A_n).astype(np.float16)
     B = rng.uniform(-1, 1, size=B_n).astype(np.float16)
@@ -94,7 +94,10 @@ def run(M, N, K, batch, sa, sb, sc, bt, lda, ldb, ldc, oa, ob, oc, label):
     for g in range(batch):
         Ag = np.array([[float(A[oa + g * sa + r * lda_e + k]) for k in range(K)] for r in range(M)])
         # B is (K,N) row-major: B[k][j] = B[k*ldb_e + j]. Outer loop k (K rows), inner j.
-        Bg = np.array([[float(B[ob + g * sb + k * ldb_e + j]) for j in range(N)] for k in range(K)])
+        if transposed:
+            Bg = np.array([[float(B[ob + g * sb + j * ldb_e + k]) for j in range(N)] for k in range(K)])
+        else:
+            Bg = np.array([[float(B[ob + g * sb + k * ldb_e + j]) for j in range(N)] for k in range(K)])
         acc = (Ag.astype(np.float32) @ Bg.astype(np.float32)).astype(np.float32)
         if epi == 1: v = NM.e4m3(acc)
         elif epi == 3: v = NM.e4m3(NM.quadratic_gate_activation(acc))
@@ -125,7 +128,7 @@ def run(M, N, K, batch, sa, sb, sc, bt, lda, ldb, ldc, oa, ob, oc, label):
     hc2 = lib.xmx_buf_create_kind(C_n * 4, 4)
     up(ha2, A); up(hb2, B); lib.xmx_buf_zero(hc2)
     lib.xmx_begin()
-    assert lib.xmx_rec_gemm(ha2, hb2, hc2, M, N, K, batch, sa, sb, sc, 0, lda, ldb, ldc, oa, ob, oc) == 0
+    assert lib.xmx_rec_gemm(ha2, hb2, hc2, M, N, K, batch, sa, sb, sc, (1 if transposed else 0), lda, ldb, ldc, oa, ob, oc) == 0
     assert lib.xmx_submit() == 0
     accf = np.zeros(C_n * 4, np.uint8); lib.xmx_buf_download(hc2, accf.ctypes.data, 0, C_n * 4)
     for h in (ha2, hb2, hc2): lib.xmx_buf_destroy(h)
@@ -169,6 +172,9 @@ run(640, 256, 64, 1, 0, 0, 0, 4608, 0, 0, 0, 0, 0, 0, "G3-640x256x64-epi2")
 # batched families: lda = batch*K column-slice, ldc = batch*N side-by-side (plan structure)
 run(256, 32, 128, 8, 128, 4096, 32, 4352, 1024, 0, 256, 0, 0, 0, "G4-batched8-lda1024")
 run(256, 256, 64, 8, 64, 16384, 256, 4608, 0, 0, 2048, 0, 0, 0, "G5-batched8-epi2")
+# scores leg: B stored (N,K) transposed, f32-out (the softmax reads raw f32 scores)
+run(64, 64, 32, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, "G6-scores-transposed-f32", transposed=True)
+run(64, 64, 32, 8, 2048, 2048, 4096, 1, 0, 0, 0, 0, 0, 0, "G7-scores-batched8-transposed", transposed=True)
 
 print(f"\nGEMM_F16 {'GREEN' if not fails else 'RED'} ({fails} fails)")
 sys.exit(1 if fails else 0)

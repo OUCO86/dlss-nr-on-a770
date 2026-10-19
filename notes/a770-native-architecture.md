@@ -2153,3 +2153,19 @@ captured 691 已换 **610=88%**。剩 81 全待决族: window_attention 52 + glo
 + window_block 10 + ffn 10 + unary2 1 → §80 裁定=过渡执行器放最后。
 下一步按 §80 顺序: window_attention 用三段组合(地基 f16 gemm 已就位: scores=gemm(Q,K^T),
 softmax=已绿 softmax_kernel, attnV=gemm(P,V))——先读它的 bias/merged 语义再写 recorder。
+
+## 83. f16 gemm transposed 腿 GREEN（scores 腿地基）+ pack_b_t 探针 + 又一次 stride 尺寸坑
+
+window_attention 四趟 golden(test_window_attention.py:52-55)钉死: gemm(q,k,scores,
+transpose_b=True) → softmax(scores,probs,narrow,bias,heads) → gemm(probs,v) →
+merge_heads(EPI_E4M3,narrow)。依赖链拆成地基件逐个门控(§55):
+- f16 gemm 非转置(attnV) ✓ §82
+- f16 gemm **转置**(scores): pack_b_t(B 存 (N,K), 逻辑 B[k][j]=Bmem[j*K+k], ldb→K)。
+  隔离探针 esimd_f16_tprobe.cpp(A=identity, B=(N,K) 已知值, C[i][j]应=Bmem[j][i])=
+  **TRANSPOSED PACK TRUE 0/256**。recorder 接 bt bit0。
+- 又踩 §73 stride 尺寸坑: bw_b 用 non-transposed 的 (K-1)*ldb+N, transposed 应是
+  (N-1)*ldb+K → hBw 过小 gather 越界读垃圾(G6 的 ~一半 bad 正是越界区)。修后 G6/G7 绿。
+- 待做地基: softmax 扩展(bias/heads/narrow, 我现有 xmx_rec_softmax 是 island-1 无这些;
+  出货走 xmx_rec_row resident.comp row-family), merge_heads(EPI_E4M3,narrow)。
+
+gemm_f16 门现 7 变体(含 scores 形状 64x64x32 batch1/8 transposed)全 ACC WITHIN-ONE。
