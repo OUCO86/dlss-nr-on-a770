@@ -466,6 +466,10 @@ int xmx_graph_run(int id) {
             for (auto& fn : g_graphs[id]) {
                 auto t0 = std::chrono::steady_clock::now();
                 fn();
+                GQ->wait();   // section 92: without this the closures submit async and the
+                              // per-closure wall time is meaningless (GPU overlaps between
+                              // closures -- the sum exceeded the whole run). Waiting makes
+                              // each number the family's REAL GPU time. Diagnostic path only.
                 ms.push_back(std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t0).count());
             }
