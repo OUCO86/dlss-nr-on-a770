@@ -2410,39 +2410,35 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         const float* qs = (const float*)sized(scale, 4, "scale");
         const sycl::half* HeadW = head ? (const sycl::half*)sized(pooled, (size_t)C * 16u * 2, "head weights") : nullptr;
         // ---- LEG 1: gather + gemm + qkv_epilogue -> dQ,dK,dV (device scratch) ----
-        // the image is DEVICE memory: download it whole to host before the gather (the
-        // section-73 trap -- reading a device pointer from host code = access violation).
-        std::vector<float> hImgF; std::vector<sycl::half> hImgH;
-        if (image_half) { hImgH.resize(img_elems); GQ->memcpy(hImgH.data(), ImgH, img_elems * 2).wait(); }
-        else            { hImgF.resize(img_elems); GQ->memcpy(hImgF.data(), ImgF, img_elems * 4).wait(); }
-        std::vector<sycl::half> hA((size_t)rows * C);
-        for (unsigned r = 0; r < rows; ++r) {
+        // device gather (section 92): the image is DEVICE memory, so the window gather
+        // and the e4m3 publish run on the GPU -- the old path downloaded the whole image
+        // to host, gathered there, then packed and uploaded (the section-73 trap forced
+        // the download; the download itself was the cost). Same index math as the host
+        // loop, one work-item per row.
+        sycl::half* dA = (sycl::half*)sycl::malloc_device((size_t)rows * C * 2, *GQ);
+        GQ->parallel_for(sycl::range((size_t)rows), [=](sycl::item<1> it) {
+            unsigned r = (unsigned)it.get_id(0);
             unsigned window = r / tokens, token = r % tokens;
             int y = (int)((window / across) * 8u + token / 8u) - (int)top;
             int x = (int)((window % across) * 8u + token % 8u) - (int)left;
             if (y < 0 || x < 0 || y >= (int)height || x >= (int)width) {
-                for (unsigned c = 0; c < C; ++c) hA[(size_t)r * C + c] = sycl::half(0.f);
-                continue;
+                for (unsigned c = 0; c < C; ++c) dA[(size_t)r * C + c] = sycl::half(0.f);
+                return;
             }
             size_t at = ((size_t)y * width + x) * C;
             for (unsigned c = 0; c < C; ++c) {
-                float val = image_half ? (float)hImgH[at + c] : hImgF[at + c];
+                float val = image_half ? (float)ImgH[at + c] : ImgF[at + c];
                 val = qr_e4m3(val);                                   // publish_image always
-                hA[(size_t)r * C + c] = sycl::half(val);
+                dA[(size_t)r * C + c] = sycl::half(val);
             }
-        }
-        std::vector<sycl::half> hApad((size_t)Mp * C, sycl::half(0.f));
-        std::memcpy(hApad.data(), hA.data(), (size_t)rows * C * 2);
-        std::vector<sycl::half> hB((size_t)C * NH), hAp((size_t)Mp * C), hBp((size_t)C * NH);
-        GQ->memcpy(hB.data(), Wraw, (size_t)C * NH * 2).wait();
-        f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)C);
-        f16v1::pack_b(hB.data(), hBp.data(), (int)C, (int)NH);
+        }).wait();
         sycl::half* dAp = (sycl::half*)sycl::malloc_device((size_t)Mp * C * 2, *GQ);
         sycl::half* dBp = (sycl::half*)sycl::malloc_device((size_t)C * NH * 2, *GQ);
         float* dCq = (float*)sycl::malloc_device((size_t)Mp * NH * 4, *GQ);
-        GQ->memcpy(dAp, hAp.data(), (size_t)Mp * C * 2).wait();
-        GQ->memcpy(dBp, hBp.data(), (size_t)C * NH * 2).wait();
+        packdev::pack_a16(*GQ, dA, dAp, (int)rows, Mp, (int)C);
+        packdev::pack_b16(*GQ, Wraw, dBp, (int)C, (int)NH);   // Wraw is on device
         f16v1::gemm(*GQ, dAp, dBp, dCq, Mp, (int)NH, (int)C).wait();
+        sycl::free(dA, *GQ);
         sycl::free(dAp, *GQ); sycl::free(dBp, *GQ);
         sycl::half* dQ = (sycl::half*)sycl::malloc_device((size_t)rows * C * 2, *GQ);
         sycl::half* dK = (sycl::half*)sycl::malloc_device((size_t)rows * C * 2, *GQ);
@@ -2495,18 +2491,13 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         }).wait();
         sycl::free(dCtx,*GQ); sycl::free(dQ,*GQ); sycl::free(dK,*GQ); sycl::free(dV,*GQ);
         // ---- LEG 3: window residual (attended, projection, image, cosine -> target) ----
-        std::vector<sycl::half> hAr((size_t)rows * C), hArpad((size_t)Mp * C, sycl::half(0.f)),
-            hPr((size_t)C * C), hApp((size_t)Mp * C), hPpr((size_t)C * C);
-        GQ->memcpy(hAr.data(), dAttended, (size_t)rows * C * 2).wait();
-        std::memcpy(hArpad.data(), hAr.data(), (size_t)rows * C * 2);
-        GQ->memcpy(hPr.data(), Praw, (size_t)C * C * 2).wait();
-        f16v1::pack_a(hArpad.data(), hApp.data(), Mp, (int)C);
-        f16v1::pack_b(hPr.data(), hPpr.data(), (int)C, (int)C);
+        // device pack (section 92): dAttended and Praw are already on device -- pack them
+        // in place, no download/upload round-trip (the host pack was the remaining cost).
         sycl::half* dAp3 = (sycl::half*)sycl::malloc_device((size_t)Mp * C * 2, *GQ);
         sycl::half* dBp3 = (sycl::half*)sycl::malloc_device((size_t)C * C * 2, *GQ);
         float* dC3 = (float*)sycl::malloc_device((size_t)Mp * C * 4, *GQ);
-        GQ->memcpy(dAp3, hApp.data(), (size_t)Mp * C * 2).wait();
-        GQ->memcpy(dBp3, hPpr.data(), (size_t)C * C * 2).wait();
+        packdev::pack_a16(*GQ, dAttended, dAp3, (int)rows, Mp, (int)C);
+        packdev::pack_b16(*GQ, Praw, dBp3, (int)C, (int)C);
         f16v1::gemm(*GQ, dAp3, dBp3, dC3, Mp, (int)C, (int)C).wait();
         float* dStage = pooling ? (float*)sycl::malloc_device((size_t)rows * C * 4, *GQ) : nullptr;
         sycl::half* dOut16 = head ? (sycl::half*)sycl::malloc_device(img_elems * 2, *GQ) : nullptr;
