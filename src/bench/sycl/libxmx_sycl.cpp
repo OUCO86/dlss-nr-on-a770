@@ -72,12 +72,13 @@ int xmx_init(void) {
         // The game's stderr goes nowhere, so the census of what SYCL sees goes to a
         // file beside this dll (the section-60 lesson, made readable in the field).
         FILE *cen = nullptr;
+        HMODULE self = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)&xmx_init, &self);
         {
             wchar_t wpath[1100] = {0};
-            HMODULE self = nullptr;
-            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                   (LPCWSTR)&xmx_init, &self) && self) {
+            if (self) {
                 GetModuleFileNameW(self, wpath, 1000);
                 wchar_t *slash = wcsrchr(wpath, L'\\');
                 if (slash) wcscpy(slash + 1, L"libxmx_sycl_census.txt");
@@ -88,13 +89,17 @@ int xmx_init(void) {
             std::fprintf(stderr, "%s\n", s.c_str());
             if (cen) { std::fprintf(cen, "%s\n", s.c_str()); std::fflush(cen); }
         };
-        say("[xmx_init] enumerated GPUs:");
-        for (auto& d : sycl::device::get_devices(sycl::info::device_type::gpu))
-            say("   backend=" + std::to_string((int)d.get_backend()) +
-                " name=" + d.get_info<sycl::info::device::name>());
-        say(std::string("[xmx_init] SYCL_DEVICE_FILTER now = ") +
-            (getenv("SYCL_DEVICE_FILTER") ? getenv("SYCL_DEVICE_FILTER") : "(unset)"));
-        {   // which sycl9.dll is actually loaded (the game may have brought its own)
+        // DIAGNOSE + FIELD-FIX BEFORE the first enumeration: SYCL's adapter discovery is
+        // lazy (the first get_devices() triggers ur_loader to scan for adapters), so the
+        // census of what is already loaded, and the explicit load of the Level-Zero
+        // adapter if it is missing, must happen FIRST -- after the first enumeration the
+        // runtime has already cached its adapter list. ur_loader finds adapters by a
+        // search that keys off the EXE dir / CWD; in the game those are the game folder,
+        // not work/ where the adapter sits beside us -- so the adapter may never load
+        // even though it is right here. GetModuleFileName(self) gives the exact folder
+        // this dll was loaded from (work/) regardless of CWD.
+        HMODULE ad = GetModuleHandleW(L"ur_adapter_level_zero.dll");
+        {
             HMODULE s9 = GetModuleHandleW(L"sycl9.dll");
             wchar_t sp[1024] = {0};
             if (s9 && GetModuleFileNameW(s9, sp, 1000)) {
@@ -102,15 +107,59 @@ int xmx_init(void) {
                 say(std::string("[xmx_init] loaded sycl9.dll = ") + sa);
             } else
                 say("[xmx_init] no sycl9.dll module handle found");
+            wchar_t ap[1024] = {0};
+            if (ad && GetModuleFileNameW(ad, ap, 1000)) {
+                char aa[1024]; WideCharToMultiByte(CP_UTF8, 0, ap, -1, aa, sizeof aa, nullptr, nullptr);
+                say(std::string("[xmx_init] ur_adapter_level_zero ALREADY loaded = ") + aa);
+            } else
+                say("[xmx_init] ur_adapter_level_zero NOT loaded yet");
+            HMODULE ul = GetModuleHandleW(L"ur_loader.dll");
+            wchar_t up[1024] = {0};
+            if (ul && GetModuleFileNameW(ul, up, 1000)) {
+                char ua[1024]; WideCharToMultiByte(CP_UTF8, 0, up, -1, ua, sizeof ua, nullptr, nullptr);
+                say(std::string("[xmx_init] ur_loader loaded from = ") + ua);
+            }
+            wchar_t cwd[1024] = {0};
+            if (GetCurrentDirectoryW(1000, cwd)) {
+                char ca[1024]; WideCharToMultiByte(CP_UTF8, 0, cwd, -1, ca, sizeof ca, nullptr, nullptr);
+                say(std::string("[xmx_init] process CWD = ") + ca);
+            }
+            wchar_t exe[1024] = {0};
+            if (GetModuleFileNameW(nullptr, exe, 1000)) {
+                char ea[1024]; WideCharToMultiByte(CP_UTF8, 0, exe, -1, ea, sizeof ea, nullptr, nullptr);
+                say(std::string("[xmx_init] process EXE = ") + ea);
+            }
         }
+        if (!ad && self) {
+            wchar_t selfp[1100] = {0};
+            if (GetModuleFileNameW(self, selfp, 1000)) {
+                wchar_t *sl = wcsrchr(selfp, L'\\');
+                if (sl) {
+                    wcscpy(sl + 1, L"ur_adapter_level_zero.dll");
+                    HMODULE try1 = LoadLibraryW(selfp);
+                    if (sl) wcscpy(sl + 1, L"ur_adapter_level_zero_v2.dll");
+                    HMODULE try2 = LoadLibraryW(selfp);
+                    say(std::string("[xmx_init] explicit adapter load from own dir: ") +
+                        (try1 ? "v1 OK" : "v1 failed") + " / " + (try2 ? "v2 OK" : "v2 failed"));
+                }
+            }
+        }
+        say("[xmx_init] enumerated GPUs:");
+        for (auto& d : sycl::device::get_devices(sycl::info::device_type::gpu))
+            say("   backend=" + std::to_string((int)d.get_backend()) +
+                " name=" + d.get_info<sycl::info::device::name>());
+        say(std::string("[xmx_init] SYCL_DEVICE_FILTER now = ") +
+            (getenv("SYCL_DEVICE_FILTER") ? getenv("SYCL_DEVICE_FILTER") : "(unset)"));
         sycl::device dev;
-        // Pick the Arc that IS Level Zero-backed. NO opencl fallback: the game's own
-        // tbb12.dll loads before ours, which kills the Level-Zero adapter discovery in
-        // the game process (census proves it), and the name-only fallback then ran the
-        // kernels on the OpenCL-backed Arc -- where the big pre/post kernels fault with
-        // UR error 68 and take the GPU down with them (the 2026-10-20 GPUCrash: the
-        // walk reached step 5252 and the TDR killed the game). Fail loud instead: the
-        // bridge then runs the game WITHOUT NR, cleanly, and the census says why.
+        // Pick the Arc that IS Level Zero-backed. NO opencl fallback: the game process
+        // enumerated only the OpenCL-backed Arc (the 2026-10-20 GPUCrash: the walk reached
+        // step 5252 on the opencl Arc, the big pre/post kernels fault there with UR error
+        // 68, and the TDR took the whole game's GPU down). The root cause of the game
+        // losing the L0 adapter is NOT yet pinned -- offline repro has RULED OUT both
+        // "an Arc Vulkan device up before SYCL" and "the game's tbb12 loaded first" (both
+        // still see backend=2); the in-game census (this file) is the ground truth. Until
+        // it is understood, fail loud rather than run on opencl: the bridge then runs the
+        // game WITHOUT NR, cleanly, and the census says why.
         for (auto& d : sycl::device::get_devices(sycl::info::device_type::gpu))
             if (d.get_backend() == sycl::backend::ext_oneapi_level_zero &&
                 d.get_info<sycl::info::device::name>().find("Arc") != std::string::npos) { dev = d; break; }
