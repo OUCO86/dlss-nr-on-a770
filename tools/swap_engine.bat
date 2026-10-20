@@ -22,7 +22,7 @@ if not exist "%W%\libxmx_sycl.dll" ( echo ERROR: work/libxmx_sycl.dll missing & 
 if not exist "%W%\libxmx.dll.bak-1020-coopmat" ( echo ERROR: backup missing, refusing & exit /b 1 )
 copy /Y "%W%\libxmx_sycl.dll" "%W%\libxmx.dll" >nul
 if errorlevel 1 ( echo ERROR: swap copy failed & exit /b 1 )
-echo SWAPPED: work/libxmx.dll is now the Level-Zero engine (%~zW% bytes).
+echo SWAPPED: work/libxmx.dll is now the Level-Zero engine.
 echo Backup kept at libxmx.dll.bak-1020-coopmat. Launch the game (double-click) and
 echo toggle Neural Rendering in the OptiScaler panel (Insert) to A/B. If the picture
 echo is wrong, run: swap_engine.bat revert
