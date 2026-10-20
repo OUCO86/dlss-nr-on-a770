@@ -1511,15 +1511,18 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
         // wt=gather_b+pack_b (the WEIGHT re-pack done every frame = suspected waste),
         // gm=gemm, pub=publish. Diagnostic-only (each stage waits when stg); answers
         // "GPU busy but low fps": if wt dominates, cache the packed weights once (§9).
-        int8_t* dAdense = (int8_t*)pool_get((size_t)M * K);
         int8_t* dAp = (int8_t*)pool_get((size_t)Mp * K);
         int8_t* dBdense = (int8_t*)pool_get((size_t)64u * K);   // max block width
         int32_t* dC = (int32_t*)pool_get((size_t)Mp * 64u * 4);
         for (unsigned g = 0; g < batch; ++g) {
             const size_t ce = (size_t)g * sc;                       // C advance (elements)
             double t0 = stg ? msnow() : 0.0;
-            packdev::gather_a(*GQ, Araw, dAdense, (int)M, (int)K, (int)lda_e, sa, (int)g);
-            packdev::pack_a(*GQ, dAdense, dAp, (int)M, Mp, (int)K);
+            // fused gather+pack_a (section 92): the activation operand was gathered dense
+            // (read Araw, write dAdense) then packed (read dAdense, write dAp) = two memory
+            // passes; one fused kernel reads Araw strided and writes dAp directly. Same
+            // index map as pack_a with the source stride folded in -- bit-exact by
+            // construction, and it removes the dAdense scratch entirely.
+            packdev::gather_pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K, (int)lda_e, sa, (int)g);
             if (stg) { GQ->wait(); act += msnow() - t0; }
             float* gas = (float*)as + (size_t)g * scale_stride;   // roff (.comp:143)
             float* gbs = (sb != 0u) ? ((float*)bs + (size_t)g * N) : (float*)bs;  // soff (.comp:147)
@@ -1562,7 +1565,7 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
                 if (stg) { GQ->wait(); pb += msnow() - t3; }
             }
         }
-        pool_put(dAdense); pool_put(dAp); pool_put(dBdense); pool_put(dC);
+        pool_put(dAp); pool_put(dBdense); pool_put(dC);
         // dBp is NOT put back: it is owned by g_wcache (the packed weight, reused every
         // frame). Freeing it happens only in wcache_clear/invalidate.
         if (stg && ++ncalls % 48 == 0) { std::printf("[stage] batched n=%ld act=%.1f wt=%.1f gemm=%.1f pub=%.1f ms\n", ncalls, act, wt, gm, pb); std::fflush(stdout); }

@@ -211,4 +211,41 @@ static inline void gather_b16_t(sycl::queue& q, const sycl::half* Braw, sycl::ha
     });
 }
 
+// fused strided-gather + pack_a (section 92): the activation operand was gathered dense
+// (read Araw, write dAdense) then packed (read dAdense, write dAp) = two memory passes.
+// Fuse to one: dAp[d] = Araw[oa + g*sa + srow*lda + kc*TS+k] (0 for padded rows). Same
+// index map as pack_a above with A[srow*K+...] replaced by the strided source -- so it is
+// bit-exact by construction against the gather+pack pair it replaces.
+static inline void gather_pack_a(sycl::queue& q, const int8_t* Araw, int8_t* Ap,
+                                 int M, int Mp, int K, int lda, size_t sa, int g) {
+    const int BM = 128, BK = 32;
+    int wgr = Mp / BM, kb_n = K / BK;
+    size_t n = (size_t)wgr * kb_n * 8 * 512;   // = Mp*K
+    q.parallel_for(sycl::range(n), [=](sycl::item<1> it) {
+        size_t d = it.get_id(0);
+        size_t blk = d / 512; int off = (int)(d % 512);
+        int wi = (int)(blk % 8); size_t wk = blk / 8;
+        int kb = (int)(wk % (size_t)kb_n); int w = (int)(wk / (size_t)kb_n);
+        int row = off / 32, k = off % 32;
+        int srow = w * BM + wi * 16 + row;
+        Ap[d] = srow < M ? Araw[(size_t)g * sa + (size_t)srow * lda + kb * BK + k] : (int8_t)0;
+    });
+}
+static inline void gather_pack_a16(sycl::queue& q, const sycl::half* Araw, sycl::half* Ap,
+                                   int M, int Mp, int K, int lda, size_t sa, size_t oa, int g) {
+    const int TS = 16;
+    int tr_n = Mp / TS, kb_n = K / TS;
+    size_t n = (size_t)tr_n * kb_n * 2 * 128;
+    q.parallel_for(sycl::range(n), [=](sycl::item<1> it) {
+        size_t d = it.get_id(0);
+        int k = (int)(d % 16); size_t rest = d / 16;
+        int il = (int)(rest % 8); rest /= 8;
+        int strip = (int)(rest % 2); size_t blk = rest / 2;
+        int kc = (int)(blk % (size_t)kb_n); int tr = (int)(blk / (size_t)kb_n);
+        int srow = tr * TS + strip * 8 + il;
+        Ap[d] = srow < M ? Araw[oa + (size_t)g * sa + (size_t)srow * lda + kc * TS + k]
+                         : sycl::half(0.0f);
+    });
+}
+
 } // namespace packdev
