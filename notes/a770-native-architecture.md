@@ -2324,3 +2324,30 @@ bit-identical（旧 pre/post 与我要移植的是同一 GLSL ⇒ 应 bit-identi
 4) fused 离线 walk 端到端（旧 vs 我，比 result 帧）；5) 备份 work/libxmx.dll + 换 dll 进游戏面板 A/B（画面差退回）。
 ⚠ pre/post 是纯 elementwise/几何（无 GEMM/coopmat），同我已绿 unary 核族，但 `precise` 收缩政策是 bit-exact 命门
 （§21 FMA/§74 fdiv_rn 教训同源）——写前把 .comp 逐 op 抄进注释钉死，golden 与设备两侧照它写。
+
+## 91. fused 端到端 walk = 接线验证 GREEN（§90 step 4 完成）；result 的 7% 是合成输入假象非画质
+
+**工具**：nr_replay standalone 加 NR_FUSED_SYNTH——走游戏**完全相同的 fused 代码路径**
+（prepare_fused→record_fused(pre/post)→graph_run），colour/motion/result 用合成 host buffer
+（D3D12 import 本身 §18 已单独证，这里只证接线）。C11 语法（#define LCG 非 lambda，frexpf）。
+单 run（fresh=1）隔离跨帧 history 反馈环（4 run 会把网络末位差经 history 逐 run 累积放大=测试假象）。
+colour 用真实游戏量级（encode [0,1500) 进 R11G11B10，nr_pre 注释这游戏像素到 ~1500），
+不用均匀随机 uint32（decode 出 max 131072 极端 HDR，to_proxy knee+resolve ratio 爆炸）。
+
+**结果（两引擎各跑一次 fused walk）**：
+- **693 passes = 691 网络 + pre + post**（精确自洽，零 fail-loud）——两引擎都走通完整 fused 路。
+- **features（pre 输出=网络输入）99.9993% bit-exact**：16.7M 字节里仅 118 个 half 不同，
+  全 ±1-2 fp16 ULP（码距直方图 1-2 为主，最大相对差 0.0021）= exp() 在完整帧 fp16 边界的末位翻，
+  **不是接线错**（接线错会大面积错位）。⇒ **pre 接线 PROVEN**：我的 SYCL pre 在整帧上产出
+  与出货 nr_pre.spv 字节相同的 features。
+- head 差 2.1%（网络本身，与 step4 0.94% 先验同量级；合成极端输入放大）。
+- result 差随 colour 量级单调放大（ratio 60→302 跨 bin）= post 是网络差的**确定性放大器**
+  （resolve out=shown*(predicted/proxy)），**不是 post 接线 bug**。
+- **result 的 7% 是合成极端 HDR 输入（shown 达 2496、随机 noise features、随机 gate table）
+  把网络 2% 放大的测试假象，MUST NOT 当画质数字**（铁律：不在合成/不健康链路测画质；
+  真画质=用户 LOP 实测）。Pearson 低（0.003）是 shown 逐像素方差淹没相关，非 post 错。
+
+**结论**：§90 序 1-4 全完成（pre/post 移植+验证、fence 集成、fused walk 接线）。
+**进游戏只剩 step 5**：备份 work/libxmx.dll → 换我的 dll → 用户双击 LOP 面板 A/B（画面差退回）。
+换 dll 是文件操作（可逆有备份），游戏启动只许用户双击（铁律①）。
+提交链本轮: 8614b64(fused walk)。
