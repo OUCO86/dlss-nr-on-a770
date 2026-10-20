@@ -1132,56 +1132,39 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
             float merged = sycl::fma((float)Skp[i], SC[32u + c], scaled); // fused residual add
             dMerged[i] = merged;
             dM16[i] = sycl::half(qr_e4m3(merged));                        // published = GEMM input
-        }).wait();
-        std::vector<sycl::half> hM16((size_t)M * 32);
-        GQ->memcpy(hM16.data(), dM16, (size_t)M * 32 * 2).wait();
-        pool_put(dM16);
+        });
+        // fully device-resident (section 92): dM16 stays on device for pass B's pack_a16 --
+        // the old path downloaded it and re-uploaded a packed operand (the 256ms).
         // ---- pass B: expand gemm(merged16, expand -> f32), publish(3) -> half hidden ----
-        std::vector<sycl::half> hE((size_t)32 * 128), hHp((size_t)Mp * 32), hEp((size_t)32 * 128),
-            hHid((size_t)M * 128);
-        GQ->memcpy(hE.data(), Eraw, (size_t)32 * 128 * 2).wait();
-        {
-            std::vector<sycl::half> hHpad((size_t)Mp * 32, sycl::half(0.f));
-            std::memcpy(hHpad.data(), hM16.data(), (size_t)M * 32 * 2);
-            f16v1::pack_a(hHpad.data(), hHp.data(), Mp, 32);
-            f16v1::pack_b(hE.data(), hEp.data(), 32, 128);
-            sycl::half* dA2 = (sycl::half*)pool_get((size_t)Mp * 32 * 2);
-            sycl::half* dB2 = (sycl::half*)pool_get((size_t)32 * 128 * 2);
-            float* dC1 = (float*)pool_get((size_t)Mp * 128 * 4);
-            GQ->memcpy(dA2, hHp.data(), (size_t)Mp * 32 * 2).wait();
-            GQ->memcpy(dB2, hEp.data(), (size_t)32 * 128 * 2).wait();
-            f16v1::gemm(*GQ, dA2, dB2, dC1, Mp, 128, 32);
-            sycl::half* dHid = (sycl::half*)pool_get((size_t)M * 128 * 2);
-            GQ->parallel_for(sycl::range((size_t)M * 128), [=](sycl::item<1> it) {
-                size_t i = it.get_id(0);
-                dHid[i] = sycl::half(qr_publish(3u, dC1[i]));             // gate -> e4m3
-            }).wait();
-            GQ->memcpy(hHid.data(), dHid, (size_t)M * 128 * 2).wait();
-            pool_put(dA2); pool_put(dB2); pool_put(dC1); pool_put(dHid);
-        }
+        sycl::half* dA2 = (sycl::half*)pool_get((size_t)Mp * 32 * 2);
+        sycl::half* dB2 = (sycl::half*)pool_get((size_t)32 * 128 * 2);
+        float* dC1 = (float*)pool_get((size_t)Mp * 128 * 4);
+        sycl::half* dHid = (sycl::half*)pool_get((size_t)M * 128 * 2);
+        packdev::pack_a16(*GQ, dM16, dA2, (int)M, Mp, 32);   // dM16 on device
+        packdev::pack_b16(*GQ, Eraw, dB2, 32, 128);
+        f16v1::gemm(*GQ, dA2, dB2, dC1, Mp, 128, 32);
+        pool_put(dM16);
+        GQ->parallel_for(sycl::range((size_t)M * 128), [=](sycl::item<1> it) {
+            size_t i = it.get_id(0);
+            dHid[i] = sycl::half(qr_publish(3u, dC1[i]));             // gate -> e4m3
+        });
+        pool_put(dA2); pool_put(dB2); pool_put(dC1);
         // ---- pass C: projection gemm(hidden, projection -> f32) + raw-merged residual ----
-        std::vector<sycl::half> hP((size_t)128 * 32), hXp((size_t)Mp * 128), hPp((size_t)128 * 32);
-        GQ->memcpy(hP.data(), Praw, (size_t)128 * 32 * 2).wait();
-        {
-            std::vector<sycl::half> hXpad((size_t)Mp * 128, sycl::half(0.f));
-            std::memcpy(hXpad.data(), hHid.data(), (size_t)M * 128 * 2);
-            f16v1::pack_a(hXpad.data(), hXp.data(), Mp, 128);
-            f16v1::pack_b(hP.data(), hPp.data(), 128, 32);
-            sycl::half* dA3 = (sycl::half*)pool_get((size_t)Mp * 128 * 2);
-            sycl::half* dB3 = (sycl::half*)pool_get((size_t)128 * 32 * 2);
-            float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
-            GQ->memcpy(dA3, hXp.data(), (size_t)Mp * 128 * 2).wait();
-            GQ->memcpy(dB3, hPp.data(), (size_t)128 * 32 * 2).wait();
-            f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128);
-            GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
-                size_t i = it.get_id(0);
-                unsigned col = (unsigned)(i % 32u);
-                float total = sycl::fma(dMerged[i], cp[col], dC2[i]);     // skip = raw merged f32
-                if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
-                else        ((float*)Cout)[i] = qr_publish(epi, total);
-            }).wait();
-            pool_put(dA3); pool_put(dB3); pool_put(dC2);
-        }
+        sycl::half* dA3 = (sycl::half*)pool_get((size_t)Mp * 128 * 2);
+        sycl::half* dB3 = (sycl::half*)pool_get((size_t)128 * 32 * 2);
+        float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
+        packdev::pack_a16(*GQ, dHid, dA3, (int)M, Mp, 128);   // dHid on device
+        packdev::pack_b16(*GQ, Praw, dB3, 128, 32);
+        f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128);
+        pool_put(dHid);
+        GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
+            size_t i = it.get_id(0);
+            unsigned col = (unsigned)(i % 32u);
+            float total = sycl::fma(dMerged[i], cp[col], dC2[i]);     // skip = raw merged f32
+            if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
+            else        ((float*)Cout)[i] = qr_publish(epi, total);
+        });
+        pool_put(dA3); pool_put(dB3); pool_put(dC2);
         pool_put(dMerged);
     });
     return 0;
