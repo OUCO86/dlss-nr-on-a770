@@ -813,7 +813,7 @@ int xmx_rec_gemm_qkv_window(int image, int weight, int q, int k, int v, int scal
                 dC[(size_t)r * NH + n] = qr_half_round(cr_mul(row32[c2], krec));
             }
             // V: no norm, the raw acc value stays (QKV_READ returns it).
-        }).wait();
+        });
         GQ->parallel_for(sycl::range((size_t)M * NH), [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             unsigned r = (unsigned)(i / NH), n = (unsigned)(i % NH);
@@ -822,7 +822,7 @@ int xmx_rec_gemm_qkv_window(int image, int weight, int q, int k, int v, int scal
             unsigned w = r / tokens, t = r % tokens;
             size_t at = (((size_t)w * heads + head) * tokens + t) * 32u + (col % 32u);
             if (part == 0u) Q[at] = out; else if (part == 1u) Kk[at] = out; else V[at] = out;
-        }).wait();
+        });
         pool_put(dAp); pool_put(dBp); pool_put(dC);
     });
     return 0;
@@ -887,7 +887,7 @@ int xmx_rec_gemm_residual(int a, int b, int c, int skip, int cosine,
             float total = sycl::fma(sk, cp[col], dC[i]);
             if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
             else        ((float*)Cout)[i] = qr_publish(epi, total);
-        }).wait();
+        });
         pool_put(dAp); pool_put(dBp); pool_put(dC);
     });
     return 0;
@@ -974,7 +974,7 @@ int xmx_rec_gemm_window_residual(int a, int b, int c, int skip, int cosine,
             float total = sycl::fma(sk, cp[col], dC[i]);
             if (narrow) ((sycl::half*)Cout)[out] = sycl::half(qr_publish(epi, total));
             else        ((float*)Cout)[out] = qr_publish(epi, total);
-        }).wait();
+        });
         pool_put(dAp); pool_put(dBp); pool_put(dC);
     });
     return 0;
@@ -1343,7 +1343,7 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
                 size_t out = oc + (size_t)g * sc + (size_t)r * ldc_e + col;
                 if (narrow) ((sycl::half*)Cout)[out] = sycl::half(value);
                 else        ((float*)Cout)[out] = value;
-            }).wait();
+            });
             pool_put(dAp); pool_put(dBp); pool_put(dC);
         }
     });
@@ -1398,7 +1398,7 @@ int xmx_rec_gemm_int8(int a, int b, int c, int a_scale, int b_scale,
             float v = cr_mul(cr_mul((float)dC[(size_t)r * N + col], as[r]), bs[col]);
             if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, v));
             else        ((float*)Cout)[i] = qr_publish(epi, v);
-        }).wait();
+        });
         pool_put(dAp); pool_put(dBp); pool_put(dC);
     });
     return 0;
@@ -1496,7 +1496,7 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
                     size_t out = ce + (size_t)r * ldc_ + (c0 + col);
                     if (narrow) ((sycl::half*)Cout)[out] = sycl::half(qr_publish(epi, v));
                     else        ((float*)Cout)[out] = qr_publish(epi, v);
-                }).wait();
+                });
                 pool_put(dAp); pool_put(dBp); pool_put(dC);
             }
         }
@@ -1599,7 +1599,7 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
                 float val = cr_mul(cr_mul((float)dC[(size_t)r * NH + n], as[r]), bs[n]);
                 dC[(size_t)r * NH + n] = sycl::bit_cast<int32_t>(val);
             }
-        }).wait();
+        });
         // stage 3: publish e4m3 -> half, scatter (w,h,t,32). The half value held in Q/K/V
         // slots (float bits) is what QKV_READ returns now.
         GQ->parallel_for(sycl::range((size_t)M * NH),
@@ -1612,7 +1612,7 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
             unsigned w = r / tokens, t = r % tokens;
             size_t at = (((size_t)w * heads + head) * tokens + t) * 32u + (col % 32u);
             if (part == 0u) Q[at] = out; else if (part == 1u) Kk[at] = out; else V[at] = out;
-        }).wait();
+        });
         pool_put(dAp); pool_put(dBp); pool_put(dC);
     });
     return 0;
@@ -1683,7 +1683,7 @@ int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale,
             float total = sycl::fma(sk, cp[col], stage);
             if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
             else        ((float*)Cout)[i] = qr_publish(epi, total);
-        }).wait();
+        });
         pool_put(dAp); pool_put(dBp); pool_put(dC);
     });
     return 0;
@@ -1794,7 +1794,7 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
             float total = sycl::fma(sk, cp[col], stage);
             if (narrow) ((sycl::half*)Cout)[out] = sycl::half(qr_publish(epi, total));
             else        ((float*)Cout)[out] = qr_publish(epi, total);
-        }).wait();
+        });
         pool_put(dAp); pool_put(dBp); pool_put(dC);
     });
     return 0;
@@ -1860,7 +1860,7 @@ int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
             size_t at = (size_t)(c / 32u) * rows + token;   // window=0: at=(0*heads + c/32)*rows + token
             float value = qr_half_round(cr_mul(qr_half_round(dCtx[at * 32u + (c % 32u)]), dRecip[at]));
             ((sycl::half*)M)[index] = sycl::half(qr_e4m3(value));
-        }).wait();
+        });
         pool_put(dScores); pool_put(dProbs); pool_put(dRecip); pool_put(dCtx);
     });
     return 0;
@@ -1928,7 +1928,7 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
             GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
                 size_t i = it.get_id(0);
                 ((sycl::half*)C)[i] = sycl::half(qr_e4m3(((const float*)A)[i]));
-            }).wait();
+            });
         });
     } else if (sub == 12u) {   // POOL2: 2x2 average NHWC, column-first order (.comp:529-531)
         g_cmd_names.push_back(__func__);
@@ -1944,7 +1944,7 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
                                             ld(base + ch)), ld(base + (size_t)(width + 1u) * ch));
                 float value = qr_publish(epi, cr_mul(total, 0.25f));
                 if (narrow) ((sycl::half*)C)[index] = sycl::half(value); else ((float*)C)[index] = value;
-            }).wait();
+            });
         });
     } else if (sub == 21u) {   // UPSAMPLE_ADD: a[nearest2x] + (b*sine[c]), publish
         g_cmd_names.push_back(__func__);
@@ -1960,7 +1960,7 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
                 float merged = cr_add(aval, cr_mul(bval, D[cc]));
                 float value = qr_publish(epi, merged);
                 if (narrow) ((sycl::half*)C)[index] = sycl::half(value); else ((float*)C)[index] = value;
-            }).wait();
+            });
         });
     } else if (sub == 16u) {   // PAD_END: extend with zeros
         g_cmd_names.push_back(__func__);
@@ -1976,7 +1976,7 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
                     : 0.0f;
                 value = qr_publish(epi, value);
                 if (narrow) ((sycl::half*)C)[index] = sycl::half(value); else ((float*)C)[index] = value;
-            }).wait();
+            });
         });
     } else {
         FAILMSG("unary kind not implemented on Level-Zero (section 79 covers 12/16/18/21)");
@@ -2037,7 +2037,7 @@ int xmx_rec_merge_heads(int source, int dst, unsigned windows, unsigned tokens,
             float value = qr_publish(epilogue, sp[at * 32u + (c % 32u)]);
             if (narrow) ((sycl::half*)dp)[index] = sycl::half(value);
             else        ((float*)dp)[index] = value;
-        }).wait();
+        });
     });
     return 0;
 }
@@ -2069,7 +2069,7 @@ int xmx_rec_merge_heads_scale(int source, int dst, int scale, unsigned windows,
             value = qr_publish(epilogue, value);
             if (narrow) ((sycl::half*)dp)[index] = sycl::half(value);
             else        ((float*)dp)[index] = value;
-        }).wait();
+        });
     });
     return 0;
 }
@@ -2116,7 +2116,7 @@ int xmx_rec_unary2(unsigned kind, int a, int b, int c, int d, int second, unsign
             if (narrow) ((sycl::half*)C)[index] = sycl::half(value);
             else        ((float*)C)[index] = value;
             S[index] = sycl::half(qr_e4m3(merged));   // the second: e4m3 only, always half
-        }).wait();
+        });
     });
     return 0;
 }
@@ -2187,7 +2187,7 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
                 unsigned token = rest % 64u, window = rest / 64u;
                 size_t at = ((size_t)window * heads + c / 32u) * 64u + token;
                 ((sycl::half*)Out)[index] = sycl::half(qr_e4m3(dCtx[at * 32u + (c % 32u)]));
-            }).wait();
+            });
         } else {
             GQ->memcpy(Out, dCtx, ctx_elems * 4).wait();
         }
@@ -2267,7 +2267,7 @@ int xmx_rec_gemm_window_residual_pool(int a, int b, int skip_out, int skip, int 
             float total = sycl::fma(sk, cp[col], dC[i]);
             SkipOut[out] = sycl::half(qr_e4m3(total));
             dStage[i] = total;
-        }).wait();
+        });
         GQ->parallel_for(sycl::range((size_t)(M / 64u) * 16u * N), [=](sycl::item<1> it) {
             size_t e = it.get_id(0);
             unsigned pixel = (unsigned)((e / N) % 16u), c = (unsigned)(e % N);   // pixel WITHIN the window (the flat range spans windows -- the .comp's e is per-workgroup <16*BN)
@@ -2283,7 +2283,7 @@ int xmx_rec_gemm_window_residual_pool(int a, int b, int skip_out, int skip, int 
                                  dStage[base + (size_t)(token + 9u) * N + c]);
             size_t out = ((size_t)((y - top) / 2u) * (width / 2u) + ((x - left) / 2u)) * N + c;
             Pl[out] = sycl::half(qr_e4m3(cr_mul(total, 0.25f)));
-        }).wait();
+        });
         pool_put(dAp); pool_put(dBp); pool_put(dC); pool_put(dStage);
     });
     return 0;
@@ -2386,7 +2386,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                 val = qr_e4m3(val);                                   // publish_image always
                 dA[(size_t)r * C + c] = sycl::half(val);
             }
-        }).wait();
+        });
         sycl::half* dAp = (sycl::half*)pool_get((size_t)Mp * C * 2);
         sycl::half* dBp = (sycl::half*)pool_get((size_t)C * NH * 2);
         float* dCq = (float*)pool_get((size_t)Mp * NH * 4);
@@ -2415,7 +2415,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                 dK[(size_t)r * 32u + c2] = sycl::half(qr_e4m3(qr_half_round(cr_mul(row32[c2], krec))));
             for (int c2 = 0; c2 < 32; ++c2)
                 dV[(size_t)r * 32u + c2] = sycl::half(qr_e4m3(dCq[(size_t)r * NH + 2u * C + c2]));
-        }).wait();
+        });
         pool_put(dCq);
         // ---- LEG 2: window attention (heads==1) -> dAttended (windows,64,32) half ----
         float* dScores = (float*)pool_get((size_t)windows * 64u * 64u * 4);
@@ -2443,7 +2443,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             unsigned index = (unsigned)it.get_id(0);
             unsigned c = index % C, token = index / C;
             dAttended[index] = sycl::half(qr_e4m3(dCtx[(size_t)token * 32u + c]));
-        }).wait();
+        });
         pool_put(dCtx); pool_put(dQ); pool_put(dK); pool_put(dV);
         // ---- LEG 3: window residual (attended, projection, image, cosine -> target) ----
         // device pack (section 92): dAttended and Praw are already on device -- pack them
@@ -2477,7 +2477,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                 dStage[i] = total;
             } else if (narrow) ((sycl::half*)Tgt)[out] = sycl::half(qr_publish(epi, total));
             else               ((float*)Tgt)[out] = qr_publish(epi, total);
-        }).wait();
+        });
         if (pooling) {
             // the 2x2 pool (gemm_staged.comp:371-390): taps (token,token+8,token+1,token+9)
             // summed in that order (precise), *0.25, e4m3 -> half, into pooled at the
@@ -2498,7 +2498,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                                      dStage[base + (size_t)(token + 9u) * C + c]);
                 size_t out = ((size_t)((y - top) / 2u) * (width / 2u) + ((x - left) / 2u)) * C + c;
                 Pl[out] = sycl::half(qr_e4m3(cr_mul(total, 0.25f)));
-            }).wait();
+            });
             pool_put(dStage);
         }
         if (head) {
@@ -2524,7 +2524,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                 size_t i = it.get_id(0);
                 unsigned pixel = (unsigned)(i / 4u), c = (unsigned)(i % 4u);
                 ((float*)Tgt)[i] = dH4[(size_t)pixel * 16u + c];   // compact: first four columns
-            }).wait();
+            });
             pool_put(dA4); pool_put(dB4); pool_put(dH4);
             pool_put(dOut16);
         }
