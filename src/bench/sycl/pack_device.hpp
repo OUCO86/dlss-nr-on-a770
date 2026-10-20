@@ -32,7 +32,7 @@ static inline void pack_a(sycl::queue& q, const int8_t* A, int8_t* Ap, int M, in
         int row = off / 32, k = off % 32;
         int srow = w * BM + wi * 16 + row;
         Ap[d] = srow < M ? A[(size_t)srow * K + kb * BK + k] : (int8_t)0;
-    }).wait();
+    });
 }
 // pack_b (B stored TRANSPOSED, N x K row-major): dest = ((kk32*(N/8)+ntile)*64+kq*8+nl)*4+j
 //         src = (ntile*8+nl)*K + (kk32*32 + kq*4 + j)
@@ -47,7 +47,7 @@ static inline void pack_b(sycl::queue& q, const int8_t* B, int8_t* Bp, int N, in
         size_t blk = rest;                     // kk32*(N/8) + ntile
         int ntile = (int)(blk % (size_t)nt_n); int kk32 = (int)(blk / (size_t)nt_n);
         Bp[d] = B[(size_t)(ntile * 8 + nl) * K + (kk32 * 32 + kq * 4 + j)];
-    }).wait();
+    });
 }
 
 // ---- f16 family (gemm_f16_v1_kernel.hpp's maps, TS=16) ----
@@ -66,7 +66,7 @@ static inline void pack_a16(sycl::queue& q, const sycl::half* A, sycl::half* Ap,
         int kc = (int)(blk % (size_t)kb_n); int tr = (int)(blk / (size_t)kb_n);
         int srow = tr * TS + strip * 8 + il;
         Ap[d] = srow < M ? A[(size_t)srow * K + kc * TS + k] : sycl::half(0.0f);
-    }).wait();
+    });
 }
 // pack_b: B (K x N row-major) -> Bp, dest = ((kc*tc_n+tc)*2+js)*128 + (k/2)*16 + jl*2 + (k%2)
 //         src = (kc*TS + k)*N + tc*TS + js*8 + jl
@@ -83,7 +83,7 @@ static inline void pack_b16(sycl::queue& q, const sycl::half* B, sycl::half* Bp,
         int jl = rem / 2, kpar = rem % 2;
         int k = kq * 2 + kpar;
         Bp[d] = B[(size_t)(kc * TS + k) * N + tc * TS + js * 8 + jl];
-    }).wait();
+    });
 }
 // pack_b_t (scores leg: B stored (N,K) row-major, logical B[k][j]=Bmem[j*K+k]):
 //   same dest, src = (tc*TS + js*8 + jl)*K + kc*TS + k
@@ -100,7 +100,7 @@ static inline void pack_b16_t(sycl::queue& q, const sycl::half* B, sycl::half* B
         int jl = rem / 2, kpar = rem % 2;
         int k = kq * 2 + kpar;
         Bp[d] = B[(size_t)(tc * TS + js * 8 + jl) * K + kc * TS + k];
-    }).wait();
+    });
 }
 
 // ---- batched variants (section 92): window_attention's legs run the SAME tile over
@@ -124,7 +124,7 @@ static inline void pack_a16_b(sycl::queue& q, const sycl::half* A, sycl::half* A
         int kc = (int)(blk % (size_t)kb_n); int tr = (int)(blk / (size_t)kb_n);
         int srow = tr * TS + strip * 8 + il;
         Apb[d] = srow < M ? Ab[(size_t)srow * K + kc * TS + k] : sycl::half(0.0f);
-    }).wait();
+    });
 }
 static inline void pack_b16_b(sycl::queue& q, const sycl::half* B, sycl::half* Bp,
                               int K, int N, int batches) {
@@ -142,7 +142,7 @@ static inline void pack_b16_b(sycl::queue& q, const sycl::half* B, sycl::half* B
         int jl = rem / 2, kpar = rem % 2;
         int k = kq * 2 + kpar;
         Bpb[d] = Bb[(size_t)(kc * TS + k) * N + tc * TS + js * 8 + jl];
-    }).wait();
+    });
 }
 static inline void pack_b16_t_b(sycl::queue& q, const sycl::half* B, sycl::half* Bp,
                                 int K, int N, int batches) {
@@ -160,7 +160,7 @@ static inline void pack_b16_t_b(sycl::queue& q, const sycl::half* B, sycl::half*
         int jl = rem / 2, kpar = rem % 2;
         int k = kq * 2 + kpar;
         Bpb[d] = Bb[(size_t)(tc * TS + js * 8 + jl) * K + kc * TS + k];
-    }).wait();
+    });
 }
 
 // strided slice gather (section 92): the batched families read a STRIDED slice of a wide
@@ -174,14 +174,14 @@ static inline void gather_a(sycl::queue& q, const int8_t* Araw, int8_t* dA,
     q.parallel_for(sycl::range((size_t)M * K), [=](sycl::item<1> it) {
         size_t i = it.get_id(0); int r = (int)(i / K), k = (int)(i % K);
         dA[i] = Araw[(size_t)g * sa + (size_t)r * lda + k];
-    }).wait();
+    });
 }
 static inline void gather_b(sycl::queue& q, const int8_t* Braw, int8_t* dB,
                             int n0, int ncount, int K, int ldb, size_t sb, int g) {
     q.parallel_for(sycl::range((size_t)ncount * K), [=](sycl::item<1> it) {
         size_t i = it.get_id(0); int r = (int)(i / K), k = (int)(i % K);
         dB[i] = Braw[(size_t)g * sb + (size_t)(n0 + r) * ldb + k];
-    }).wait();
+    });
 }
 
 // f16 strided slice gather (section 92): the f16 gemm family reads a strided slice of a
@@ -194,21 +194,21 @@ static inline void gather_a16(sycl::queue& q, const sycl::half* Araw, sycl::half
     q.parallel_for(sycl::range((size_t)M * K), [=](sycl::item<1> it) {
         size_t i = it.get_id(0); int r = (int)(i / K), k = (int)(i % K);
         dA[i] = Araw[oa + (size_t)g * sa + (size_t)r * lda + k];
-    }).wait();
+    });
 }
 static inline void gather_b16(sycl::queue& q, const sycl::half* Braw, sycl::half* dB,
                               int K, int N, int ldb, size_t sb, size_t ob, int g) {
     q.parallel_for(sycl::range((size_t)K * N), [=](sycl::item<1> it) {
         size_t i = it.get_id(0); int k = (int)(i / N), j = (int)(i % N);
         dB[i] = Braw[ob + (size_t)g * sb + (size_t)k * ldb + j];
-    }).wait();
+    });
 }
 static inline void gather_b16_t(sycl::queue& q, const sycl::half* Braw, sycl::half* dB,
                                 int N, int K, int ldb, size_t sb, size_t ob, int g) {
     q.parallel_for(sycl::range((size_t)N * K), [=](sycl::item<1> it) {
         size_t i = it.get_id(0); int j = (int)(i / K), k = (int)(i % K);
         dB[i] = Braw[ob + (size_t)g * sb + (size_t)j * ldb + k];
-    }).wait();
+    });
 }
 
 } // namespace packdev
