@@ -2470,32 +2470,22 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         float* dScores = (float*)sycl::malloc_device((size_t)windows * 64u * 64u * 4, *GQ);
         sycl::half* dProbs = (sycl::half*)sycl::malloc_device((size_t)windows * 64u * 64u * 2, *GQ);
         float* dCtx = (float*)sycl::malloc_device((size_t)windows * 64u * 32u * 4, *GQ);
-        std::vector<sycl::half> hq(64u*32u), hk(64u*32u), hp(64u*64u), hv(64u*32u);
-        std::vector<sycl::half> Aq(64u*32u), Bk(64u*32u), Ap(64u*64u), Bv(64u*32u);
-        for (unsigned w = 0; w < windows; ++w) {
-            GQ->memcpy(hq.data(), dQ + (size_t)w*64u*32u, 64u*32u*2).wait();
-            GQ->memcpy(hk.data(), dK + (size_t)w*64u*32u, 64u*32u*2).wait();
-            f16v1::pack_a(hq.data(), Aq.data(), 64, 32);
-            f16v1::pack_b_t(hk.data(), Bk.data(), 32, 64);
-            sycl::half* dA=(sycl::half*)sycl::malloc_device(64u*32u*2,*GQ);
-            sycl::half* dB=(sycl::half*)sycl::malloc_device(64u*32u*2,*GQ);
-            GQ->memcpy(dA,Aq.data(),64u*32u*2).wait(); GQ->memcpy(dB,Bk.data(),64u*32u*2).wait();
-            f16v1::gemm(*GQ, dA, dB, dScores + (size_t)w*64u*64u, 64, 64, 32).wait();
-            sycl::free(dA,*GQ); sycl::free(dB,*GQ);
-        }
+        // batched device pack + batched gemm (section 92): the per-window host loop was
+        // the same pathology window_attention had (4 sync memcpys + 4 malloc/free + 2
+        // launches per window). dQ/dK/dV are already contiguous per window on device.
+        sycl::half* dAq = (sycl::half*)sycl::malloc_device((size_t)windows * 64u * 32u * 2, *GQ);
+        sycl::half* dBk = (sycl::half*)sycl::malloc_device((size_t)windows * 32u * 64u * 2, *GQ);
+        sycl::half* dAp2 = (sycl::half*)sycl::malloc_device((size_t)windows * 64u * 64u * 2, *GQ);
+        sycl::half* dBv = (sycl::half*)sycl::malloc_device((size_t)windows * 64u * 32u * 2, *GQ);
+        packdev::pack_a16_b(*GQ, dQ, dAq, 64, 64, 32, (int)windows);
+        packdev::pack_b16_t_b(*GQ, dK, dBk, 32, 64, (int)windows);
+        f16v1::gemm_b(*GQ, dAq, dBk, dScores, 64, 64, 32, (int)windows).wait();
         GQ->parallel_for(sycl::range((size_t)windows*64u),
                          smax::softmax_kernel()(dScores, dProbs, windows*64u, 64u, Bp, 1u)).wait();
-        for (unsigned w = 0; w < windows; ++w) {
-            GQ->memcpy(hp.data(), dProbs + (size_t)w*64u*64u, 64u*64u*2).wait();
-            GQ->memcpy(hv.data(), dV + (size_t)w*64u*32u, 64u*32u*2).wait();
-            f16v1::pack_a(hp.data(), Ap.data(), 64, 64);
-            f16v1::pack_b(hv.data(), Bv.data(), 64, 32);
-            sycl::half* dA=(sycl::half*)sycl::malloc_device(64u*64u*2,*GQ);
-            sycl::half* dB=(sycl::half*)sycl::malloc_device(64u*32u*2,*GQ);
-            GQ->memcpy(dA,Ap.data(),64u*64u*2).wait(); GQ->memcpy(dB,Bv.data(),64u*32u*2).wait();
-            f16v1::gemm(*GQ, dA, dB, dCtx + (size_t)w*64u*32u, 64, 32, 64).wait();
-            sycl::free(dA,*GQ); sycl::free(dB,*GQ);
-        }
+        packdev::pack_a16_b(*GQ, dProbs, dAp2, 64, 64, 64, (int)windows);
+        packdev::pack_b16_b(*GQ, dV, dBv, 64, 32, (int)windows);
+        f16v1::gemm_b(*GQ, dAp2, dBv, dCtx, 64, 32, 64, (int)windows).wait();
+        sycl::free(dAq,*GQ); sycl::free(dBk,*GQ); sycl::free(dAp2,*GQ); sycl::free(dBv,*GQ);
         sycl::free(dScores,*GQ); sycl::free(dProbs,*GQ);
         sycl::half* dAttended = (sycl::half*)sycl::malloc_device((size_t)rows * C * 2, *GQ);
         GQ->parallel_for(sycl::range((size_t)rows * C), [=](sycl::item<1> it) {   // merge, heads==1
