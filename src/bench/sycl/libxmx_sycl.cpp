@@ -96,7 +96,12 @@ static void* pool_get(size_t n) {
 static void pool_put(void* p) {
     if (!p) return;
     auto it = g_pool_sz.find(p);
-    if (it == g_pool_sz.end()) { sycl::free(p, *GQ); return; }   // not ours: free for real
+    // Only recycle pool-tracked blocks. Anything else (a g_wcache weight block, a real
+    // buffer) is owned elsewhere -- buf_destroy frees buffers, wcache frees cache blocks.
+    // Silently ignoring a non-pool pointer is what makes the cache conversion safe: a
+    // call site that still passes a cache-owned dBp does not free it out from under the
+    // next frame. (The old "free for real" fallback was a use-after-free for cache blocks.)
+    if (it == g_pool_sz.end()) return;
     g_pool[it->second].push_back(p);
     g_pool_sz.erase(it);
 }
@@ -129,6 +134,36 @@ static void wcache_invalidate(int id) {
 static void wcache_clear() {
     for (auto& kv : g_wcache) if (GQ) sycl::free(kv.second, *GQ);
     g_wcache.clear();
+}
+// cached weight pack: pack_b of a weight buffer is identical every frame, so pack once
+// and reuse. Key = (buffer id, N, K, variant). The block is owned by g_wcache (gemm only
+// reads it; call sites must NOT pool_put it). buf_upload/destroy invalidate.
+static int8_t* cached_pack_b_i8(int bufid, const int8_t* B, int N, int K) {
+    WKey wk{bufid, N, K, 0};
+    auto it = g_wcache.find(wk);
+    if (it != g_wcache.end()) return (int8_t*)it->second;
+    int8_t* p = (int8_t*)sycl::malloc_device((size_t)N * K, *GQ);
+    packdev::pack_b(*GQ, B, p, N, K);
+    g_wcache[wk] = p;
+    return p;
+}
+static sycl::half* cached_pack_b_f16(int bufid, const sycl::half* B, int K, int N) {
+    WKey wk{bufid, K, N, 0};
+    auto it = g_wcache.find(wk);
+    if (it != g_wcache.end()) return (sycl::half*)it->second;
+    sycl::half* p = (sycl::half*)sycl::malloc_device((size_t)K * N * 2, *GQ);
+    packdev::pack_b16(*GQ, B, p, K, N);
+    g_wcache[wk] = p;
+    return p;
+}
+static sycl::half* cached_pack_b_f16_t(int bufid, const sycl::half* B, int K, int N) {
+    WKey wk{bufid, K, N, 1};   // variant 1 = transposed layout
+    auto it = g_wcache.find(wk);
+    if (it != g_wcache.end()) return (sycl::half*)it->second;
+    sycl::half* p = (sycl::half*)sycl::malloc_device((size_t)K * N * 2, *GQ);
+    packdev::pack_b16_t(*GQ, B, p, K, N);
+    g_wcache[wk] = p;
+    return p;
 }
 
 extern "C" {
@@ -1068,24 +1103,22 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
         // queue: every read kernel is enqueued before the pool_put that recycles its
         // buffer, so cross-pass scratch reuse is safe; one wait at the end of the pass.
         sycl::half* dAp = (sycl::half*)pool_get((size_t)Mp * cin * 2);
-        sycl::half* dEp = (sycl::half*)pool_get((size_t)cin * hidden * 2);
         float* dC1 = (float*)pool_get((size_t)Mp * hidden * 4);
         sycl::half* dH = (sycl::half*)pool_get((size_t)M * hidden * 2);
         packdev::pack_a16(*GQ, Araw, dAp, (int)M, Mp, (int)cin);
-        packdev::pack_b16(*GQ, Eraw, dEp, (int)cin, (int)hidden);
+        sycl::half* dEp = cached_pack_b_f16(expand, Eraw, (int)cin, (int)hidden);   // weight
         f16v1::gemm(*GQ, dAp, dEp, dC1, Mp, (int)hidden, (int)cin);
         // publish(3) on device, store as f16 hidden16 -- stays on device for pass 2.
         GQ->parallel_for(sycl::range((size_t)M * hidden), [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             dH[i] = sycl::half(qr_publish(3u, dC1[i]));
         });
-        pool_put(dAp); pool_put(dEp); pool_put(dC1);
+        pool_put(dAp); pool_put(dC1);   // dEp is cache-owned (weight)
         // ---- pass 2: projection gemm_residual(hidden16, projection -> out) ----
         sycl::half* dHp = (sycl::half*)pool_get((size_t)Mp * hidden * 2);
-        sycl::half* dPp = (sycl::half*)pool_get((size_t)hidden * cin * 2);
         float* dC2 = (float*)pool_get((size_t)Mp * cin * 4);
         packdev::pack_a16(*GQ, dH, dHp, (int)M, Mp, (int)hidden);   // dH on device
-        packdev::pack_b16(*GQ, Praw, dPp, (int)hidden, (int)cin);
+        sycl::half* dPp = cached_pack_b_f16(projection, Praw, (int)hidden, (int)cin);   // weight
         f16v1::gemm(*GQ, dHp, dPp, dC2, Mp, (int)cin, (int)hidden);
         GQ->parallel_for(sycl::range((size_t)M * cin), [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
@@ -1098,7 +1131,7 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
             if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
             else        ((float*)Cout)[i] = qr_publish(epi, total);
         });
-        pool_put(dHp); pool_put(dPp); pool_put(dC2); pool_put(dH);
+        pool_put(dHp); pool_put(dC2); pool_put(dH);   // dPp is cache-owned (weight)
     });
     return 0;
 }
@@ -1165,24 +1198,22 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
         // the old path downloaded it and re-uploaded a packed operand (the 256ms).
         // ---- pass B: expand gemm(merged16, expand -> f32), publish(3) -> half hidden ----
         sycl::half* dA2 = (sycl::half*)pool_get((size_t)Mp * 32 * 2);
-        sycl::half* dB2 = (sycl::half*)pool_get((size_t)32 * 128 * 2);
         float* dC1 = (float*)pool_get((size_t)Mp * 128 * 4);
         sycl::half* dHid = (sycl::half*)pool_get((size_t)M * 128 * 2);
         packdev::pack_a16(*GQ, dM16, dA2, (int)M, Mp, 32);   // dM16 on device
-        packdev::pack_b16(*GQ, Eraw, dB2, 32, 128);
+        sycl::half* dB2 = cached_pack_b_f16(expand, Eraw, 32, 128);   // weight
         f16v1::gemm(*GQ, dA2, dB2, dC1, Mp, 128, 32);
         pool_put(dM16);
         GQ->parallel_for(sycl::range((size_t)M * 128), [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             dHid[i] = sycl::half(qr_publish(3u, dC1[i]));             // gate -> e4m3
         });
-        pool_put(dA2); pool_put(dB2); pool_put(dC1);
+        pool_put(dA2); pool_put(dC1);   // dB2 is cache-owned (weight)
         // ---- pass C: projection gemm(hidden, projection -> f32) + raw-merged residual ----
         sycl::half* dA3 = (sycl::half*)pool_get((size_t)Mp * 128 * 2);
-        sycl::half* dB3 = (sycl::half*)pool_get((size_t)128 * 32 * 2);
         float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
         packdev::pack_a16(*GQ, dHid, dA3, (int)M, Mp, 128);   // dHid on device
-        packdev::pack_b16(*GQ, Praw, dB3, 128, 32);
+        sycl::half* dB3 = cached_pack_b_f16(projection, Praw, 128, 32);   // weight
         f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128);
         pool_put(dHid);
         GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
@@ -1192,7 +1223,7 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
             if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
             else        ((float*)Cout)[i] = qr_publish(epi, total);
         });
-        pool_put(dA3); pool_put(dB3); pool_put(dC2);
+        pool_put(dA3); pool_put(dC2);   // dB3 is cache-owned (weight)
         pool_put(dMerged);
     });
     return 0;
@@ -1248,13 +1279,12 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
         // downloaded Fraw/Arw/Eraw/Praw AND both intermediates to host and re-uploaded
         // packed operands (the 324ms). dS stays the raw f32 stem (pass C's residual).
         sycl::half* dA = (sycl::half*)pool_get((size_t)Mp * 16 * 2);
-        sycl::half* dB = (sycl::half*)pool_get((size_t)16 * 32 * 2);
         float* dS = (float*)pool_get((size_t)Mp * 32 * 4);
         sycl::half* dH16 = (sycl::half*)pool_get((size_t)M * 32 * 2);
         packdev::pack_a16(*GQ, Fraw, dA, (int)M, Mp, 16);
-        packdev::pack_b16(*GQ, Arw, dB, 16, 32);
+        sycl::half* dB = cached_pack_b_f16(adapter, Arw, 16, 32);   // weight
         f16v1::gemm(*GQ, dA, dB, dS, Mp, 32, 16);
-        pool_put(dA); pool_put(dB);
+        pool_put(dA);   // dB is cache-owned (weight)
         // publish = E4M3 only, on device; dH16 stays for pass B's pack_a.
         GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
@@ -1262,24 +1292,22 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
         });
         // ---- pass B: expand gemm(hidden16, expand -> f32), publish(3) -> half hidden ----
         sycl::half* dA2 = (sycl::half*)pool_get((size_t)Mp * 32 * 2);
-        sycl::half* dB2 = (sycl::half*)pool_get((size_t)32 * 128 * 2);
         float* dC1 = (float*)pool_get((size_t)Mp * 128 * 4);
         sycl::half* dHid = (sycl::half*)pool_get((size_t)M * 128 * 2);
         packdev::pack_a16(*GQ, dH16, dA2, (int)M, Mp, 32);   // dH16 on device
-        packdev::pack_b16(*GQ, Eraw, dB2, 32, 128);
+        sycl::half* dB2 = cached_pack_b_f16(expand, Eraw, 32, 128);   // weight
         f16v1::gemm(*GQ, dA2, dB2, dC1, Mp, 128, 32);
         pool_put(dH16);
         GQ->parallel_for(sycl::range((size_t)M * 128), [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             dHid[i] = sycl::half(qr_publish(3u, dC1[i]));    // gate -> e4m3
         });
-        pool_put(dA2); pool_put(dB2); pool_put(dC1);
+        pool_put(dA2); pool_put(dC1);   // dB2 is cache-owned (weight)
         // ---- pass C: projection gemm(hidden, projection -> f32) + raw-stem residual ----
         sycl::half* dA3 = (sycl::half*)pool_get((size_t)Mp * 128 * 2);
-        sycl::half* dB3 = (sycl::half*)pool_get((size_t)128 * 32 * 2);
         float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
         packdev::pack_a16(*GQ, dHid, dA3, (int)M, Mp, 128);   // dHid on device
-        packdev::pack_b16(*GQ, Praw, dB3, 128, 32);
+        sycl::half* dB3 = cached_pack_b_f16(projection, Praw, 128, 32);   // weight
         f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128);
         pool_put(dHid);
         GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
@@ -1289,7 +1317,7 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
             if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
             else        ((float*)Cout)[i] = qr_publish(epi, total);
         });
-        pool_put(dA3); pool_put(dB3); pool_put(dC2);
+        pool_put(dA3); pool_put(dC2);   // dB3 is cache-owned (weight)
         pool_put(dS);
     });
     return 0;
@@ -1414,10 +1442,9 @@ int xmx_rec_gemm_int8(int a, int b, int c, int a_scale, int b_scale,
         // round-trip (download -> CPU pack -> upload) was the whole 89s/frame, and the
         // gather is bit-exact vs the host pack (PACK_DEVICE gate).
         int8_t* dAp = (int8_t*)pool_get(na);
-        int8_t* dBp = (int8_t*)pool_get(nb);
         int32_t* dC = (int32_t*)pool_get((size_t)Mp * N * 4);
         packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K);
-        packdev::pack_b(*GQ, Braw, dBp, (int)N, (int)K);   // B arrives TRANSPOSED
+        int8_t* dBp = cached_pack_b_i8(b, Braw, (int)N, (int)K);   // weight: pack once, reuse
         s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K);
         GQ->parallel_for(sycl::range((size_t)M * N),
                          [=](sycl::item<1> it) {
@@ -1427,7 +1454,7 @@ int xmx_rec_gemm_int8(int a, int b, int c, int a_scale, int b_scale,
             if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, v));
             else        ((float*)Cout)[i] = qr_publish(epi, v);
         });
-        pool_put(dAp); pool_put(dBp); pool_put(dC);
+        pool_put(dAp); pool_put(dC);   // dBp is cache-owned (cached_pack_b_i8), not pooled
     });
     return 0;
 }
@@ -1594,10 +1621,9 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
     g_cmds.push_back([=]() {
         // device pack (section 92): Araw/Braw already on device -- pack in place.
         int8_t* dAp = (int8_t*)pool_get(na);
-        int8_t* dBp = (int8_t*)pool_get(nb);
         int32_t* dC = (int32_t*)pool_get((size_t)Mp * NH * 4);
         packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)C);
-        packdev::pack_b(*GQ, Braw, dBp, (int)NH, (int)C);   // N x K row-major == transposed
+        int8_t* dBp = cached_pack_b_i8(b, Braw, (int)NH, (int)C);   // weight: pack once
         s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)NH, (int)C);
         // stage 2: deq + in-place Q/K head norm (the epilogue's order; V deqt only).
         GQ->parallel_for(sycl::range((size_t)M * heads),
@@ -1708,10 +1734,9 @@ int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale,
         // device pack (section 92): Araw/Braw are already on device -- pack in place,
         // no download/upload round-trip (same conversion as gemm_int8, packdev gate).
         int8_t* dAp = (int8_t*)pool_get(na);
-        int8_t* dBp = (int8_t*)pool_get(nb);
         int32_t* dC = (int32_t*)pool_get((size_t)Mp * N * 4);
         packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K);
-        packdev::pack_b(*GQ, Braw, dBp, (int)N, (int)K);
+        int8_t* dBp = cached_pack_b_i8(b, Braw, (int)N, (int)K);   // weight: pack once
         s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K);
         GQ->parallel_for(sycl::range((size_t)M * N),
                          [=](sycl::item<1> it) {
@@ -1814,10 +1839,9 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
         const float* cp  = (const float*)sized(cosine, (size_t)N * 4u, "cosine");
         // device pack (section 92): Araw/Braw already on device -- pack in place.
         int8_t* dAp = (int8_t*)pool_get(na);
-        int8_t* dBp = (int8_t*)pool_get(nb);
         int32_t* dC = (int32_t*)pool_get((size_t)Mp * N * 4);
         packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K);
-        packdev::pack_b(*GQ, Braw, dBp, (int)N, (int)K);
+        int8_t* dBp = cached_pack_b_i8(b, Braw, (int)N, (int)K);   // weight: pack once
         s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K);
         GQ->parallel_for(sycl::range(blk_elems),
                          [=](sycl::item<1> it) {
@@ -2427,13 +2451,12 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             }
         });
         sycl::half* dAp = (sycl::half*)pool_get((size_t)Mp * C * 2);
-        sycl::half* dBp = (sycl::half*)pool_get((size_t)C * NH * 2);
         float* dCq = (float*)pool_get((size_t)Mp * NH * 4);
         packdev::pack_a16(*GQ, dA, dAp, (int)rows, Mp, (int)C);
-        packdev::pack_b16(*GQ, Wraw, dBp, (int)C, (int)NH);   // Wraw is on device
+        sycl::half* dBp = cached_pack_b_f16(qkv, Wraw, (int)C, (int)NH);   // weight: pack once
         f16v1::gemm(*GQ, dAp, dBp, dCq, Mp, (int)NH, (int)C);
         pool_put(dA);
-        pool_put(dAp); pool_put(dBp);
+        pool_put(dAp);
         sycl::half* dQ = (sycl::half*)pool_get((size_t)rows * C * 2);
         sycl::half* dK = (sycl::half*)pool_get((size_t)rows * C * 2);
         sycl::half* dV = (sycl::half*)pool_get((size_t)rows * C * 2);
@@ -2488,10 +2511,9 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         // device pack (section 92): dAttended and Praw are already on device -- pack them
         // in place, no download/upload round-trip (the host pack was the remaining cost).
         sycl::half* dAp3 = (sycl::half*)pool_get((size_t)Mp * C * 2);
-        sycl::half* dBp3 = (sycl::half*)pool_get((size_t)C * C * 2);
         float* dC3 = (float*)pool_get((size_t)Mp * C * 4);
         packdev::pack_a16(*GQ, dAttended, dAp3, (int)rows, Mp, (int)C);
-        packdev::pack_b16(*GQ, Praw, dBp3, (int)C, (int)C);
+        sycl::half* dBp3 = cached_pack_b_f16(projection, Praw, (int)C, (int)C);   // weight: pack once
         f16v1::gemm(*GQ, dAp3, dBp3, dC3, Mp, (int)C, (int)C);
         float* dStage = pooling ? (float*)pool_get((size_t)rows * C * 4) : nullptr;
         sycl::half* dOut16 = head ? (sycl::half*)pool_get(img_elems * 2) : nullptr;
