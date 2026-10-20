@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <functional>
 #include "publish_kernel.hpp"   // cr_mul/cr_add (pre/post_kernel depend on these, as the dll does)
+#include "gemm_s8_v8_kernel.hpp" // s8v8 pack/gemm for the closure decomposition
 #include "pre_kernel.hpp"
 #include "post_kernel.hpp"
 
@@ -116,5 +117,57 @@ int main() {
     timeit("full post_kernel", [&]{ Q->parallel_for(sycl::range(pixels), postpass::post_kernel(AA)).wait(); });
     timeit("full pre again", [&]{ Q->parallel_for(sycl::range(pixels), prepass::pre_kernel(PA)).wait(); });
     std::printf("(post's head input is the feats buffer here -- shape only, timing is what matters)\n");
+
+    // ---- decompose the 13s/pass: a real gemm_int8 closure at the plan's biggest shape
+    // (M=130560 N=512 K=512, the l4 QKV family). Time each stage separately, and the
+    // per-pass malloc/free churn, to find where 13 seconds actually goes (PCIe transfer
+    // of 66MB should be ~ms, so 13s means a second pathology: alloc storm or CPU pack).
+    {
+        const int M = 130560, N = 512, K = 512, Mp = ((M + 127) / 128) * 128;
+        const size_t na = (size_t)Mp * K, nb = (size_t)N * K;
+        std::vector<int8_t> hA((size_t)M * K, 3), hB(nb, 3), hAp(na), hBp(nb);
+        int8_t *Araw = sycl::malloc_device<int8_t>((size_t)M * K, *Q);
+        int8_t *Braw = sycl::malloc_device<int8_t>(nb, *Q);
+        Q->memcpy(Araw, hA.data(), (size_t)M * K).wait();
+        Q->memcpy(Braw, hB.data(), nb).wait();
+        std::vector<float> as(M, 1.0f), bs(N, 1.0f);
+        float *das = sycl::malloc_device<float>(M * 4, *Q), *dbs = sycl::malloc_device<float>(N * 4, *Q);
+        Q->memcpy(das, as.data(), M * 4).wait(); Q->memcpy(dbs, bs.data(), N * 4).wait();
+        sycl::half* Cout = sycl::malloc_device<sycl::half>((size_t)M * N * 2, *Q);
+
+        timeit("  download A+B (host)", [&]{
+            std::vector<int8_t> a((size_t)M * K), b(nb);
+            Q->memcpy(a.data(), Araw, (size_t)M * K).wait();
+            Q->memcpy(b.data(), Braw, nb).wait(); });
+        timeit("  pack_a+pack_b (CPU)", [&]{
+            s8v8::pack_a(hA.data(), hAp.data(), Mp, K);
+            s8v8::pack_b(hB.data(), hBp.data(), N, K); });
+        timeit("  malloc 3 dev bufs", [&]{
+            void* x = sycl::malloc_device(na, *Q); void* y = sycl::malloc_device(nb, *Q);
+            void* z = sycl::malloc_device((size_t)Mp * N * 4, *Q);
+            sycl::free(x, *Q); sycl::free(y, *Q); sycl::free(z, *Q); });
+        int8_t *dAp = sycl::malloc_device<int8_t>(na, *Q), *dBp = sycl::malloc_device<int8_t>(nb, *Q);
+        int32_t *dC = sycl::malloc_device<int32_t>((size_t)Mp * N * 4, *Q);
+        timeit("  upload packed", [&]{
+            Q->memcpy(dAp, hAp.data(), na).wait(); Q->memcpy(dBp, hBp.data(), nb).wait(); });
+        timeit("  gemm (device)", [&]{ s8v8::gemm(*Q, dAp, dBp, dC, Mp, N, K).wait(); });
+        timeit("  publish (device)", [&]{
+            Q->parallel_for(sycl::range((size_t)M * N), [=](sycl::item<1> it){
+                size_t i = it.get_id(0); unsigned r = (unsigned)(i / N), col = (unsigned)(i % N);
+                float v = cr_mul(cr_mul((float)dC[(size_t)r * N + col], das[r]), dbs[col]);
+                ((sycl::half*)Cout)[i] = sycl::half(qr_publish(1u, v)); }).wait(); });
+        // the whole closure, as the recorder runs it every frame:
+        timeit("  FULL closure (as-is)", [&]{
+            std::vector<int8_t> ha((size_t)M * K), hb(nb), hap(na, 0), hbp(nb);
+            Q->memcpy(ha.data(), Araw, (size_t)M * K).wait();
+            std::memcpy(hap.data(), ha.data(), (size_t)M * K);
+            Q->memcpy(hb.data(), Braw, nb).wait();
+            s8v8::pack_a(hap.data(), hAp.data(), Mp, K); s8v8::pack_b(hb.data(), hbp.data(), N, K);
+            void* x = sycl::malloc_device(na, *Q); void* y = sycl::malloc_device(nb, *Q);
+            void* z = sycl::malloc_device((size_t)Mp * N * 4, *Q);
+            Q->memcpy(x, hAp.data(), na).wait(); Q->memcpy(y, hbp.data(), nb).wait();
+            s8v8::gemm(*Q, (int8_t*)x, (int8_t*)y, (int32_t*)z, Mp, N, K).wait();
+            sycl::free(x, *Q); sycl::free(y, *Q); sycl::free(z, *Q); });
+    }
     return 0;
 }
