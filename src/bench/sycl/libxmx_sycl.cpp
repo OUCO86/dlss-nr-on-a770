@@ -1359,50 +1359,39 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
     const int Mp = (int)(((M + 15u) / 16u) * 16u);
     g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
-        const size_t a_slice = (size_t)M * K, b_slice = (size_t)K * N;
-        // device-resident (section 92): gather the strided slice dense ON device, pack in
-        // place, gemm, publish -- the old path downloaded the whole wide buffers to host,
-        // gathered there, packed, re-uploaded (the 261ms). B is a weight: its packed slice
-        // for (g, transposed) is identical every frame, so cache it keyed by (b,N,K,
-        // g*2+transposed). A is an activation: gather+pack fresh each frame.
-        sycl::half* dAdense = (sycl::half*)pool_get(a_slice * 2);
-        sycl::half* dAp = (sycl::half*)pool_get((size_t)Mp * K * 2);
-        float* dC = (float*)pool_get((size_t)Mp * N * 4);
-        for (unsigned g = 0; g < (batch ? batch : 1u); ++g) {
-            packdev::gather_a16(*GQ, Araw, dAdense, (int)M, (int)K, (int)lda_e, sa, oa, (int)g);
-            packdev::pack_a16(*GQ, dAdense, dAp, (int)M, Mp, (int)K);
-            WKey wk{ b, (int)N, (int)K, (int)g * 2 + (transposed ? 1 : 0) };
-            auto wc = g_wcache.find(wk);
-            sycl::half* dBp;
-            if (wc != g_wcache.end()) {
-                dBp = (sycl::half*)wc->second;
-            } else {
-                sycl::half* dBdense = (sycl::half*)sycl::malloc_device(b_slice * 2, *GQ);
-                sycl::half* cp = (sycl::half*)sycl::malloc_device(b_slice * 2, *GQ);
-                if (transposed) {   // Bmem is (N,K): gather logical B[k][j] = Bmem[j*K+k]
-                    packdev::gather_b16_t(*GQ, Braw, dBdense, (int)N, (int)K, (int)ldb_e, sb, ob, (int)g);
-                    packdev::pack_b16_t(*GQ, dBdense, cp, (int)K, (int)N);
-                } else {
-                    packdev::gather_b16(*GQ, Braw, dBdense, (int)K, (int)N, (int)ldb_e, sb, ob, (int)g);
-                    packdev::pack_b16(*GQ, dBdense, cp, (int)K, (int)N);
-                }
-                sycl::free(dBdense, *GQ);
-                g_wcache[wk] = cp;
-                dBp = cp;
-            }
-            f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K);
-            GQ->parallel_for(sycl::range((size_t)M * N),
-                             [=](sycl::item<1> it) {
-                size_t i = it.get_id(0);
-                unsigned r = (unsigned)(i / N), col = (unsigned)(i % N);
-                float value = qr_publish(epi, dC[i]);
-                size_t out = oc + (size_t)g * sc + (size_t)r * ldc_e + col;
-                if (narrow) ((sycl::half*)Cout)[out] = sycl::half(value);
-                else        ((float*)Cout)[out] = value;
-            });
-            // dBp is cache-owned (weight); dAp/dC are loop-invariant scratch, put once below.
+        const size_t nb = (batch ? batch : 1u);
+        // R8a shape-merge (section 92): batch is the grid's z dimension in ONE dispatch
+        // (the shipped engine: vkCmdDispatch(..., batch); gl_WorkGroupID.z). The old
+        // recorder's host loop turned one big op into `batch` small under-filled gemms.
+        // pack-A once (all groups), pack-B once (whole weight, cached), gemm_b once,
+        // publish once. Bounds identical to the gate's aw_b/bw_b (section-73 lesson).
+        sycl::half* dAp = (sycl::half*)pool_get(nb * (size_t)Mp * K * 2);
+        float* dC = (float*)pool_get(nb * (size_t)Mp * N * 4);
+        packdev::gather_pack_a16_b(*GQ, Araw, dAp, (int)M, Mp, (int)K, (int)lda_e, sa, oa, (int)nb);
+        WKey wk{ b, (int)N, (int)K, (int)(nb * 2 + (transposed ? 1 : 0)) };
+        auto wc = g_wcache.find(wk);
+        sycl::half* dBp;
+        if (wc != g_wcache.end()) {
+            dBp = (sycl::half*)wc->second;
+        } else {
+            dBp = (sycl::half*)sycl::malloc_device(nb * (size_t)K * N * 2, *GQ);
+            if (transposed) packdev::gather_pack_b16_t_b(*GQ, Braw, dBp, (int)K, (int)N, (int)ldb_e, sb, ob, (int)nb);
+            else            packdev::gather_pack_b16_b(*GQ, Braw, dBp, (int)K, (int)N, (int)ldb_e, sb, ob, (int)nb);
+            g_wcache[wk] = dBp;
         }
-        pool_put(dAdense); pool_put(dAp); pool_put(dC);
+        f16v1::gemm_b(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K, (int)nb);
+        GQ->parallel_for(sycl::range(nb * (size_t)M * N),
+                         [=](sycl::item<1> it) {
+            size_t i = it.get_id(0);
+            size_t mn = (size_t)M * N;
+            unsigned g = (unsigned)(i / mn); size_t rem = i % mn;
+            unsigned r = (unsigned)(rem / N), col = (unsigned)(rem % N);
+            float value = qr_publish(epi, dC[g * (size_t)Mp * N + (size_t)r * N + col]);
+            size_t out = oc + g * sc + (size_t)r * ldc_e + col;
+            if (narrow) ((sycl::half*)Cout)[out] = sycl::half(value);
+            else        ((float*)Cout)[out] = value;
+        });
+        pool_put(dAp); pool_put(dC);   // dBp is cache-owned (the whole batched weight)
     });
     return 0;
 }

@@ -283,4 +283,57 @@ static inline void gather_pack_b_b(sycl::queue& q, const int8_t* Braw, int8_t* B
     });
 }
 
+// batched fused gather+pack for the f16 gemm family (section 92, R8a): all groups in one
+// launch, each group's packed operand contiguous (Ap at g*Mp*K, Bp at g*K*N). Same index
+// maps as the single-group versions with the group stride folded in -- byte-identical to
+// looping them, consumed by f16v1::gemm_b as one dispatch.
+static inline void gather_pack_a16_b(sycl::queue& q, const sycl::half* Araw, sycl::half* Ap,
+                                     int M, int Mp, int K, int lda, size_t sa, size_t oa, int batch) {
+    const int TS = 16;
+    int tr_n = Mp / TS, kb_n = K / TS;
+    size_t per = (size_t)tr_n * kb_n * 2 * 128;      // = Mp*K
+    q.parallel_for(sycl::range((size_t)batch * per), [=](sycl::item<1> it) {
+        size_t gg = it.get_id(0) / per; size_t d = it.get_id(0) % per;
+        int k = (int)(d % 16); size_t rest = d / 16;
+        int il = (int)(rest % 8); rest /= 8;
+        int strip = (int)(rest % 2); size_t blk = rest / 2;
+        int kc = (int)(blk % (size_t)kb_n); int tr = (int)(blk / (size_t)kb_n);
+        int srow = tr * TS + strip * 8 + il;
+        Ap[gg * per + d] = srow < M ? Araw[oa + gg * sa + (size_t)srow * lda + kc * TS + k]
+                                    : sycl::half(0.0f);
+    });
+}
+static inline void gather_pack_b16_b(sycl::queue& q, const sycl::half* Braw, sycl::half* Bp,
+                                     int K, int N, int ldb, size_t sb, size_t ob, int batch) {
+    const int TS = 16;
+    int kb_n = K / TS, tc_n = N / TS;
+    size_t per = (size_t)kb_n * tc_n * 2 * 128;      // = K*N
+    q.parallel_for(sycl::range((size_t)batch * per), [=](sycl::item<1> it) {
+        size_t gg = it.get_id(0) / per; size_t d = it.get_id(0) % per;
+        int inner = (int)(d % 128); size_t blk = d / 128;
+        int js = (int)(blk % 2); size_t blk2 = blk / 2;
+        int tc = (int)(blk2 % (size_t)tc_n); int kc = (int)(blk2 / (size_t)tc_n);
+        int kq = inner / 16; int rem = inner % 16;
+        int jl = rem / 2, kpar = rem % 2;
+        int k = kq * 2 + kpar;
+        Bp[gg * per + d] = Braw[ob + gg * sb + (size_t)(kc * TS + k) * ldb + tc * TS + js * 8 + jl];
+    });
+}
+static inline void gather_pack_b16_t_b(sycl::queue& q, const sycl::half* Braw, sycl::half* Bp,
+                                       int K, int N, int ldb, size_t sb, size_t ob, int batch) {
+    const int TS = 16;
+    int kb_n = K / TS, tc_n = N / TS;
+    size_t per = (size_t)kb_n * tc_n * 2 * 128;
+    q.parallel_for(sycl::range((size_t)batch * per), [=](sycl::item<1> it) {
+        size_t gg = it.get_id(0) / per; size_t d = it.get_id(0) % per;
+        int inner = (int)(d % 128); size_t blk = d / 128;
+        int js = (int)(blk % 2); size_t blk2 = blk / 2;
+        int tc = (int)(blk2 % (size_t)tc_n); int kc = (int)(blk2 / (size_t)tc_n);
+        int kq = inner / 16; int rem = inner % 16;
+        int jl = rem / 2, kpar = rem % 2;
+        int k = kq * 2 + kpar;
+        Bp[gg * per + d] = Braw[ob + gg * sb + (size_t)(tc * TS + js * 8 + jl) * ldb + kc * TS + k];
+    });
+}
+
 } // namespace packdev
