@@ -71,6 +71,40 @@ static bool g_l0 = false;   // the chosen device is Level-Zero-backed (section 9
                             // fused pre/post kernels fault on the OpenCL Arc, so they
                             // refuse unless this is set (the small gates run fine on it).
 
+// scratch pool (section 92): the per-pass sycl::malloc_device/sycl::free storm is the
+// remaining steady-state cost -- 693 passes x ~4 allocs, each zeMalloc/zeFree ~1ms,
+// ~2.7s of the 3.8s run. A size-bucketed pool hands the same device block back to the
+// next pass that needs it; blocks are freed only when the pool is cleared (close).
+// Pointer-keyed put: a free site does not know its size, so pool_get records the bucket
+// it handed out and pool_put looks it up. Sequential graph execution (wait-per-kernel)
+// means no two live scratch blocks collide; buffers stay out of circulation until
+// destroy, which returns them to the pool.
+static std::map<size_t, std::vector<void*>> g_pool;
+static std::map<void*, size_t> g_pool_sz;
+static void* pool_get(size_t n) {
+    size_t bucket = (n + 255) / 256 * 256;
+    auto it = g_pool.lower_bound(bucket);
+    if (it == g_pool.end() || it->second.empty()) {
+        void* p = sycl::malloc_device(bucket, *GQ);
+        if (p) g_pool_sz[p] = bucket;
+        return p;
+    }
+    void* p = it->second.back(); it->second.pop_back();
+    g_pool_sz[p] = bucket;
+    return p;
+}
+static void pool_put(void* p) {
+    if (!p) return;
+    auto it = g_pool_sz.find(p);
+    if (it == g_pool_sz.end()) { sycl::free(p, *GQ); return; }   // not ours: free for real
+    g_pool[it->second].push_back(p);
+    g_pool_sz.erase(it);
+}
+static void pool_clear() {
+    for (auto& kv : g_pool) for (void* p : kv.second) { sycl::free(p, *GQ); g_pool_sz.erase(p); }
+    g_pool.clear(); g_pool_sz.clear();
+}
+
 extern "C" {
 
 const char* xmx_error(void) { return GERR; }
@@ -737,9 +771,9 @@ int xmx_rec_gemm_qkv_window(int image, int weight, int q, int k, int v, int scal
         GQ->memcpy(hB.data(), Wraw, (size_t)C * NH * 2).wait();
         f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)C);
         f16v1::pack_b(hB.data(), hBp.data(), (int)C, (int)NH);
-        sycl::half* dAp = (sycl::half*)sycl::malloc_device((size_t)Mp * C * 2, *GQ);
-        sycl::half* dBp = (sycl::half*)sycl::malloc_device((size_t)C * NH * 2, *GQ);
-        float* dC = (float*)sycl::malloc_device((size_t)Mp * NH * 4, *GQ);
+        sycl::half* dAp = (sycl::half*)pool_get((size_t)Mp * C * 2);
+        sycl::half* dBp = (sycl::half*)pool_get((size_t)C * NH * 2);
+        float* dC = (float*)pool_get((size_t)Mp * NH * 4);
         GQ->memcpy(dAp, hAp.data(), (size_t)Mp * C * 2).wait();
         GQ->memcpy(dBp, hBp.data(), (size_t)C * NH * 2).wait();
         f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)NH, (int)C).wait();
@@ -782,7 +816,7 @@ int xmx_rec_gemm_qkv_window(int image, int weight, int q, int k, int v, int scal
             size_t at = (((size_t)w * heads + head) * tokens + t) * 32u + (col % 32u);
             if (part == 0u) Q[at] = out; else if (part == 1u) Kk[at] = out; else V[at] = out;
         }).wait();
-        sycl::free(dAp, *GQ); sycl::free(dBp, *GQ); sycl::free(dC, *GQ);
+        pool_put(dAp); pool_put(dBp); pool_put(dC);
     });
     return 0;
 }
@@ -832,9 +866,9 @@ int xmx_rec_gemm_residual(int a, int b, int c, int skip, int cosine,
         GQ->memcpy(hB.data(), Braw, nb * 2).wait();
         f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
         f16v1::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
-        sycl::half* dAp = (sycl::half*)sycl::malloc_device(na * 2, *GQ);
-        sycl::half* dBp = (sycl::half*)sycl::malloc_device(nb * 2, *GQ);
-        float* dC = (float*)sycl::malloc_device((size_t)Mp * N * 4, *GQ);
+        sycl::half* dAp = (sycl::half*)pool_get(na * 2);
+        sycl::half* dBp = (sycl::half*)pool_get(nb * 2);
+        float* dC = (float*)pool_get((size_t)Mp * N * 4);
         GQ->memcpy(dAp, hAp.data(), na * 2).wait();
         GQ->memcpy(dBp, hBp.data(), nb * 2).wait();
         f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K).wait();
@@ -847,7 +881,7 @@ int xmx_rec_gemm_residual(int a, int b, int c, int skip, int cosine,
             if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
             else        ((float*)Cout)[i] = qr_publish(epi, total);
         }).wait();
-        sycl::free(dAp, *GQ); sycl::free(dBp, *GQ); sycl::free(dC, *GQ);
+        pool_put(dAp); pool_put(dBp); pool_put(dC);
     });
     return 0;
 }
@@ -914,9 +948,9 @@ int xmx_rec_gemm_window_residual(int a, int b, int c, int skip, int cosine,
         GQ->memcpy(hB.data(), Braw, nb * 2).wait();
         f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
         f16v1::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
-        sycl::half* dAp = (sycl::half*)sycl::malloc_device(na * 2, *GQ);
-        sycl::half* dBp = (sycl::half*)sycl::malloc_device(nb * 2, *GQ);
-        float* dC = (float*)sycl::malloc_device((size_t)Mp * N * 4, *GQ);
+        sycl::half* dAp = (sycl::half*)pool_get(na * 2);
+        sycl::half* dBp = (sycl::half*)pool_get(nb * 2);
+        float* dC = (float*)pool_get((size_t)Mp * N * 4);
         GQ->memcpy(dAp, hAp.data(), na * 2).wait();
         GQ->memcpy(dBp, hBp.data(), nb * 2).wait();
         f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K).wait();
@@ -934,7 +968,7 @@ int xmx_rec_gemm_window_residual(int a, int b, int c, int skip, int cosine,
             if (narrow) ((sycl::half*)Cout)[out] = sycl::half(qr_publish(epi, total));
             else        ((float*)Cout)[out] = qr_publish(epi, total);
         }).wait();
-        sycl::free(dAp, *GQ); sycl::free(dBp, *GQ); sycl::free(dC, *GQ);
+        pool_put(dAp); pool_put(dBp); pool_put(dC);
     });
     return 0;
 }
@@ -1003,20 +1037,20 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
             GQ->memcpy(hE.data(), Eraw, (size_t)cin * hidden * 2).wait();
             f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)cin);
             f16v1::pack_b(hE.data(), hEp.data(), (int)cin, (int)hidden);
-            sycl::half* dAp = (sycl::half*)sycl::malloc_device((size_t)Mp * cin * 2, *GQ);
-            sycl::half* dEp = (sycl::half*)sycl::malloc_device((size_t)cin * hidden * 2, *GQ);
-            float* dC1 = (float*)sycl::malloc_device((size_t)Mp * hidden * 4, *GQ);
+            sycl::half* dAp = (sycl::half*)pool_get((size_t)Mp * cin * 2);
+            sycl::half* dEp = (sycl::half*)pool_get((size_t)cin * hidden * 2);
+            float* dC1 = (float*)pool_get((size_t)Mp * hidden * 4);
             GQ->memcpy(dAp, hAp.data(), (size_t)Mp * cin * 2).wait();
             GQ->memcpy(dEp, hEp.data(), (size_t)cin * hidden * 2).wait();
             f16v1::gemm(*GQ, dAp, dEp, dC1, Mp, (int)hidden, (int)cin).wait();
             // publish(3) on device, store as f16 hidden16, then download for the host pack.
-            sycl::half* dH = (sycl::half*)sycl::malloc_device((size_t)M * hidden * 2, *GQ);
+            sycl::half* dH = (sycl::half*)pool_get((size_t)M * hidden * 2);
             GQ->parallel_for(sycl::range((size_t)M * hidden), [=](sycl::item<1> it) {
                 size_t i = it.get_id(0);
                 dH[i] = sycl::half(qr_publish(3u, dC1[i]));
             }).wait();
             GQ->memcpy(hH.data(), dH, (size_t)M * hidden * 2).wait();   // host hidden16
-            sycl::free(dAp, *GQ); sycl::free(dEp, *GQ); sycl::free(dC1, *GQ); sycl::free(dH, *GQ);
+            pool_put(dAp); pool_put(dEp); pool_put(dC1); pool_put(dH);
             // ---- pass 2: projection gemm_residual(hidden16, projection -> out) ----
             std::vector<sycl::half> hP((size_t)hidden * cin), hHp((size_t)Mp * hidden),
                 hPp((size_t)hidden * cin);
@@ -1025,9 +1059,9 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
             GQ->memcpy(hP.data(), Praw, (size_t)hidden * cin * 2).wait();
             f16v1::pack_a(hHpad.data(), hHp.data(), Mp, (int)hidden);
             f16v1::pack_b(hP.data(), hPp.data(), (int)hidden, (int)cin);
-            sycl::half* dHp = (sycl::half*)sycl::malloc_device((size_t)Mp * hidden * 2, *GQ);
-            sycl::half* dPp = (sycl::half*)sycl::malloc_device((size_t)hidden * cin * 2, *GQ);
-            float* dC2 = (float*)sycl::malloc_device((size_t)Mp * cin * 4, *GQ);
+            sycl::half* dHp = (sycl::half*)pool_get((size_t)Mp * hidden * 2);
+            sycl::half* dPp = (sycl::half*)pool_get((size_t)hidden * cin * 2);
+            float* dC2 = (float*)pool_get((size_t)Mp * cin * 4);
             GQ->memcpy(dHp, hHp.data(), (size_t)Mp * hidden * 2).wait();
             GQ->memcpy(dPp, hPp.data(), (size_t)hidden * cin * 2).wait();
             f16v1::gemm(*GQ, dHp, dPp, dC2, Mp, (int)cin, (int)hidden).wait();
@@ -1042,7 +1076,7 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
                 if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
                 else        ((float*)Cout)[i] = qr_publish(epi, total);
             }).wait();
-            sycl::free(dHp, *GQ); sycl::free(dPp, *GQ); sycl::free(dC2, *GQ);
+            pool_put(dHp); pool_put(dPp); pool_put(dC2);
         }
     });
     return 0;
@@ -1094,8 +1128,8 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
     g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         // ---- pass A: merged4 on device -> dMerged f32 (the skip) + e4m3-half -> host ----
-        float* dMerged = (float*)sycl::malloc_device((size_t)M * 32 * 4, *GQ);   // raw, kept for pass C
-        sycl::half* dM16 = (sycl::half*)sycl::malloc_device((size_t)M * 32 * 2, *GQ);
+        float* dMerged = (float*)pool_get((size_t)M * 32 * 4);   // raw, kept for pass C
+        sycl::half* dM16 = (sycl::half*)pool_get((size_t)M * 32 * 2);
         GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             unsigned c = (unsigned)(i % 32u), pixel = (unsigned)(i / 32u);
@@ -1108,7 +1142,7 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
         }).wait();
         std::vector<sycl::half> hM16((size_t)M * 32);
         GQ->memcpy(hM16.data(), dM16, (size_t)M * 32 * 2).wait();
-        sycl::free(dM16, *GQ);
+        pool_put(dM16);
         // ---- pass B: expand gemm(merged16, expand -> f32), publish(3) -> half hidden ----
         std::vector<sycl::half> hE((size_t)32 * 128), hHp((size_t)Mp * 32), hEp((size_t)32 * 128),
             hHid((size_t)M * 128);
@@ -1118,19 +1152,19 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
             std::memcpy(hHpad.data(), hM16.data(), (size_t)M * 32 * 2);
             f16v1::pack_a(hHpad.data(), hHp.data(), Mp, 32);
             f16v1::pack_b(hE.data(), hEp.data(), 32, 128);
-            sycl::half* dA2 = (sycl::half*)sycl::malloc_device((size_t)Mp * 32 * 2, *GQ);
-            sycl::half* dB2 = (sycl::half*)sycl::malloc_device((size_t)32 * 128 * 2, *GQ);
-            float* dC1 = (float*)sycl::malloc_device((size_t)Mp * 128 * 4, *GQ);
+            sycl::half* dA2 = (sycl::half*)pool_get((size_t)Mp * 32 * 2);
+            sycl::half* dB2 = (sycl::half*)pool_get((size_t)32 * 128 * 2);
+            float* dC1 = (float*)pool_get((size_t)Mp * 128 * 4);
             GQ->memcpy(dA2, hHp.data(), (size_t)Mp * 32 * 2).wait();
             GQ->memcpy(dB2, hEp.data(), (size_t)32 * 128 * 2).wait();
             f16v1::gemm(*GQ, dA2, dB2, dC1, Mp, 128, 32).wait();
-            sycl::half* dHid = (sycl::half*)sycl::malloc_device((size_t)M * 128 * 2, *GQ);
+            sycl::half* dHid = (sycl::half*)pool_get((size_t)M * 128 * 2);
             GQ->parallel_for(sycl::range((size_t)M * 128), [=](sycl::item<1> it) {
                 size_t i = it.get_id(0);
                 dHid[i] = sycl::half(qr_publish(3u, dC1[i]));             // gate -> e4m3
             }).wait();
             GQ->memcpy(hHid.data(), dHid, (size_t)M * 128 * 2).wait();
-            sycl::free(dA2, *GQ); sycl::free(dB2, *GQ); sycl::free(dC1, *GQ); sycl::free(dHid, *GQ);
+            pool_put(dA2); pool_put(dB2); pool_put(dC1); pool_put(dHid);
         }
         // ---- pass C: projection gemm(hidden, projection -> f32) + raw-merged residual ----
         std::vector<sycl::half> hP((size_t)128 * 32), hXp((size_t)Mp * 128), hPp((size_t)128 * 32);
@@ -1140,9 +1174,9 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
             std::memcpy(hXpad.data(), hHid.data(), (size_t)M * 128 * 2);
             f16v1::pack_a(hXpad.data(), hXp.data(), Mp, 128);
             f16v1::pack_b(hP.data(), hPp.data(), 128, 32);
-            sycl::half* dA3 = (sycl::half*)sycl::malloc_device((size_t)Mp * 128 * 2, *GQ);
-            sycl::half* dB3 = (sycl::half*)sycl::malloc_device((size_t)128 * 32 * 2, *GQ);
-            float* dC2 = (float*)sycl::malloc_device((size_t)Mp * 32 * 4, *GQ);
+            sycl::half* dA3 = (sycl::half*)pool_get((size_t)Mp * 128 * 2);
+            sycl::half* dB3 = (sycl::half*)pool_get((size_t)128 * 32 * 2);
+            float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
             GQ->memcpy(dA3, hXp.data(), (size_t)Mp * 128 * 2).wait();
             GQ->memcpy(dB3, hPp.data(), (size_t)128 * 32 * 2).wait();
             f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128).wait();
@@ -1153,9 +1187,9 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
                 if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
                 else        ((float*)Cout)[i] = qr_publish(epi, total);
             }).wait();
-            sycl::free(dA3, *GQ); sycl::free(dB3, *GQ); sycl::free(dC2, *GQ);
+            pool_put(dA3); pool_put(dB3); pool_put(dC2);
         }
-        sycl::free(dMerged, *GQ);
+        pool_put(dMerged);
     });
     return 0;
 }
@@ -1215,24 +1249,24 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
         std::memcpy(hFpad.data(), hF.data(), (size_t)M * 16 * 2);
         f16v1::pack_a(hFpad.data(), hFp.data(), Mp, 16);
         f16v1::pack_b(hAd.data(), hAdp.data(), 16, 32);
-        sycl::half* dA = (sycl::half*)sycl::malloc_device((size_t)Mp * 16 * 2, *GQ);
-        sycl::half* dB = (sycl::half*)sycl::malloc_device((size_t)16 * 32 * 2, *GQ);
-        float* dS = (float*)sycl::malloc_device((size_t)Mp * 32 * 4, *GQ);
+        sycl::half* dA = (sycl::half*)pool_get((size_t)Mp * 16 * 2);
+        sycl::half* dB = (sycl::half*)pool_get((size_t)16 * 32 * 2);
+        float* dS = (float*)pool_get((size_t)Mp * 32 * 4);
         GQ->memcpy(dA, hFp.data(), (size_t)Mp * 16 * 2).wait();
         GQ->memcpy(dB, hAdp.data(), (size_t)16 * 32 * 2).wait();
         f16v1::gemm(*GQ, dA, dB, dS, Mp, 32, 16).wait();
-        sycl::free(dA, *GQ); sycl::free(dB, *GQ);
+        pool_put(dA); pool_put(dB);
         // the publish happens on DEVICE (a device kernel cannot write a host std::vector --
         // the section-79 lesson). dS stays the RAW f32 stem and is NOT freed: pass C reads
         // it as the residual's skip straight off the device (no host round-trip needed).
         {
-            sycl::half* dH16 = (sycl::half*)sycl::malloc_device((size_t)M * 32 * 2, *GQ);
+            sycl::half* dH16 = (sycl::half*)pool_get((size_t)M * 32 * 2);
             GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
                 size_t i = it.get_id(0);
                 dH16[i] = sycl::half(qr_e4m3(dS[i]));            // publish = E4M3 only
             }).wait();
             GQ->memcpy(hH16.data(), dH16, (size_t)M * 32 * 2).wait();   // host copy for pack_a
-            sycl::free(dH16, *GQ);
+            pool_put(dH16);
         }
         // ---- pass B: expand gemm(hidden16, expand -> f32), publish(3) -> half hidden ----
         std::vector<sycl::half> hE((size_t)32 * 128), hHp((size_t)Mp * 32), hEp((size_t)32 * 128),
@@ -1243,19 +1277,19 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
             std::memcpy(hHpad.data(), hH16.data(), (size_t)M * 32 * 2);
             f16v1::pack_a(hHpad.data(), hHp.data(), Mp, 32);
             f16v1::pack_b(hE.data(), hEp.data(), 32, 128);
-            sycl::half* dA2 = (sycl::half*)sycl::malloc_device((size_t)Mp * 32 * 2, *GQ);
-            sycl::half* dB2 = (sycl::half*)sycl::malloc_device((size_t)32 * 128 * 2, *GQ);
-            float* dC1 = (float*)sycl::malloc_device((size_t)Mp * 128 * 4, *GQ);
+            sycl::half* dA2 = (sycl::half*)pool_get((size_t)Mp * 32 * 2);
+            sycl::half* dB2 = (sycl::half*)pool_get((size_t)32 * 128 * 2);
+            float* dC1 = (float*)pool_get((size_t)Mp * 128 * 4);
             GQ->memcpy(dA2, hHp.data(), (size_t)Mp * 32 * 2).wait();
             GQ->memcpy(dB2, hEp.data(), (size_t)32 * 128 * 2).wait();
             f16v1::gemm(*GQ, dA2, dB2, dC1, Mp, 128, 32).wait();
-            sycl::half* dHid = (sycl::half*)sycl::malloc_device((size_t)M * 128 * 2, *GQ);
+            sycl::half* dHid = (sycl::half*)pool_get((size_t)M * 128 * 2);
             GQ->parallel_for(sycl::range((size_t)M * 128), [=](sycl::item<1> it) {
                 size_t i = it.get_id(0);
                 dHid[i] = sycl::half(qr_publish(3u, dC1[i]));    // gate -> e4m3
             }).wait();
             GQ->memcpy(hHid.data(), dHid, (size_t)M * 128 * 2).wait();   // host copy for pack_a
-            sycl::free(dA2, *GQ); sycl::free(dB2, *GQ); sycl::free(dC1, *GQ); sycl::free(dHid, *GQ);
+            pool_put(dA2); pool_put(dB2); pool_put(dC1); pool_put(dHid);
         }
         // ---- pass C: projection gemm(hidden, projection -> f32) + raw-stem residual ----
         std::vector<sycl::half> hP((size_t)128 * 32), hXp((size_t)Mp * 128), hPp((size_t)128 * 32);
@@ -1265,9 +1299,9 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
             std::memcpy(hXpad.data(), hHid.data(), (size_t)M * 128 * 2);
             f16v1::pack_a(hXpad.data(), hXp.data(), Mp, 128);
             f16v1::pack_b(hP.data(), hPp.data(), 128, 32);
-            sycl::half* dA3 = (sycl::half*)sycl::malloc_device((size_t)Mp * 128 * 2, *GQ);
-            sycl::half* dB3 = (sycl::half*)sycl::malloc_device((size_t)128 * 32 * 2, *GQ);
-            float* dC2 = (float*)sycl::malloc_device((size_t)Mp * 32 * 4, *GQ);
+            sycl::half* dA3 = (sycl::half*)pool_get((size_t)Mp * 128 * 2);
+            sycl::half* dB3 = (sycl::half*)pool_get((size_t)128 * 32 * 2);
+            float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
             GQ->memcpy(dA3, hXp.data(), (size_t)Mp * 128 * 2).wait();
             GQ->memcpy(dB3, hPp.data(), (size_t)128 * 32 * 2).wait();
             f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128).wait();
@@ -1278,9 +1312,9 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
                 if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
                 else        ((float*)Cout)[i] = qr_publish(epi, total);
             }).wait();
-            sycl::free(dA3, *GQ); sycl::free(dB3, *GQ); sycl::free(dC2, *GQ);
+            pool_put(dA3); pool_put(dB3); pool_put(dC2);
         }
-        sycl::free(dS, *GQ);
+        pool_put(dS);
     });
     return 0;
 }
@@ -1347,9 +1381,9 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
             f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
             if (transposed) f16v1::pack_b_t(hB.data(), hBp.data(), (int)K, (int)N);
             else            f16v1::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
-            sycl::half* dAp = (sycl::half*)sycl::malloc_device((size_t)Mp * K * 2, *GQ);
-            sycl::half* dBp = (sycl::half*)sycl::malloc_device(b_slice * 2, *GQ);
-            float* dC = (float*)sycl::malloc_device((size_t)Mp * N * 4, *GQ);
+            sycl::half* dAp = (sycl::half*)pool_get((size_t)Mp * K * 2);
+            sycl::half* dBp = (sycl::half*)pool_get(b_slice * 2);
+            float* dC = (float*)pool_get((size_t)Mp * N * 4);
             GQ->memcpy(dAp, hAp.data(), (size_t)Mp * K * 2).wait();
             GQ->memcpy(dBp, hBp.data(), b_slice * 2).wait();
             f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K).wait();
@@ -1362,7 +1396,7 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
                 if (narrow) ((sycl::half*)Cout)[out] = sycl::half(value);
                 else        ((float*)Cout)[out] = value;
             }).wait();
-            sycl::free(dAp, *GQ); sycl::free(dBp, *GQ); sycl::free(dC, *GQ);
+            pool_put(dAp); pool_put(dBp); pool_put(dC);
         }
     });
     return 0;
@@ -1403,9 +1437,9 @@ int xmx_rec_gemm_int8(int a, int b, int c, int a_scale, int b_scale,
         // device pack (section 92 phase-2): the operands stay on device -- the host
         // round-trip (download -> CPU pack -> upload) was the whole 89s/frame, and the
         // gather is bit-exact vs the host pack (PACK_DEVICE gate).
-        int8_t* dAp = (int8_t*)sycl::malloc_device(na, *GQ);
-        int8_t* dBp = (int8_t*)sycl::malloc_device(nb, *GQ);
-        int32_t* dC = (int32_t*)sycl::malloc_device((size_t)Mp * N * 4, *GQ);
+        int8_t* dAp = (int8_t*)pool_get(na);
+        int8_t* dBp = (int8_t*)pool_get(nb);
+        int32_t* dC = (int32_t*)pool_get((size_t)Mp * N * 4);
         packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K);
         packdev::pack_b(*GQ, Braw, dBp, (int)N, (int)K);   // B arrives TRANSPOSED
         s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K).wait();
@@ -1417,7 +1451,7 @@ int xmx_rec_gemm_int8(int a, int b, int c, int a_scale, int b_scale,
             if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, v));
             else        ((float*)Cout)[i] = qr_publish(epi, v);
         }).wait();
-        sycl::free(dAp, *GQ); sycl::free(dBp, *GQ); sycl::free(dC, *GQ);
+        pool_put(dAp); pool_put(dBp); pool_put(dC);
     });
     return 0;
 }
@@ -1498,9 +1532,9 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
                     std::memcpy(Bt.data() + (size_t)r * K, hB.data() + (size_t)(c0 + r) * K, K);
                 if (n64 == 64u) s8v8::pack_b(Bt.data(), Bp.data(), (int)n64, (int)K);
                 else            s8v8::pack_b32(Bt.data(), Bp.data(), (int)n64, (int)K);
-                int8_t* dAp = (int8_t*)sycl::malloc_device((size_t)Mp * K, *GQ);
-                int8_t* dBp = (int8_t*)sycl::malloc_device((size_t)n64 * K, *GQ);
-                int32_t* dC = (int32_t*)sycl::malloc_device((size_t)Mp * n64 * 4, *GQ);
+                int8_t* dAp = (int8_t*)pool_get((size_t)Mp * K);
+                int8_t* dBp = (int8_t*)pool_get((size_t)n64 * K);
+                int32_t* dC = (int32_t*)pool_get((size_t)Mp * n64 * 4);
                 GQ->memcpy(dAp, hAp.data(), (size_t)Mp * K).wait();
                 GQ->memcpy(dBp, Bp.data(), (size_t)n64 * K).wait();
                 if (n64 == 64u) s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)n64, (int)K).wait();
@@ -1515,7 +1549,7 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
                     if (narrow) ((sycl::half*)Cout)[out] = sycl::half(qr_publish(epi, v));
                     else        ((float*)Cout)[out] = qr_publish(epi, v);
                 }).wait();
-                sycl::free(dAp, *GQ); sycl::free(dBp, *GQ); sycl::free(dC, *GQ);
+                pool_put(dAp); pool_put(dBp); pool_put(dC);
             }
         }
     });
@@ -1577,9 +1611,9 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
         GQ->memcpy(hB.data(), Braw, nb).wait();
         s8v8::pack_a(hApad.data(), hAp.data(), Mp, (int)C);
         s8v8::pack_b(hB.data(), hBp.data(), (int)NH, (int)C);   // N x K row-major == transposed
-        int8_t* dAp = (int8_t*)sycl::malloc_device(na, *GQ);
-        int8_t* dBp = (int8_t*)sycl::malloc_device(nb, *GQ);
-        int32_t* dC = (int32_t*)sycl::malloc_device((size_t)Mp * NH * 4, *GQ);
+        int8_t* dAp = (int8_t*)pool_get(na);
+        int8_t* dBp = (int8_t*)pool_get(nb);
+        int32_t* dC = (int32_t*)pool_get((size_t)Mp * NH * 4);
         GQ->memcpy(dAp, hAp.data(), na).wait();
         GQ->memcpy(dBp, hBp.data(), nb).wait();
         s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)NH, (int)C).wait();
@@ -1636,7 +1670,7 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
             size_t at = (((size_t)w * heads + head) * tokens + t) * 32u + (col % 32u);
             if (part == 0u) Q[at] = out; else if (part == 1u) Kk[at] = out; else V[at] = out;
         }).wait();
-        sycl::free(dAp, *GQ); sycl::free(dBp, *GQ); sycl::free(dC, *GQ);
+        pool_put(dAp); pool_put(dBp); pool_put(dC);
     });
     return 0;
 }
@@ -1695,9 +1729,9 @@ int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale,
         GQ->memcpy(hB.data(), Braw, nb).wait();
         s8v8::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
         s8v8::pack_b(hB.data(), hBp.data(), (int)N, (int)K);
-        int8_t* dAp = (int8_t*)sycl::malloc_device(na, *GQ);
-        int8_t* dBp = (int8_t*)sycl::malloc_device(nb, *GQ);
-        int32_t* dC = (int32_t*)sycl::malloc_device((size_t)Mp * N * 4, *GQ);
+        int8_t* dAp = (int8_t*)pool_get(na);
+        int8_t* dBp = (int8_t*)pool_get(nb);
+        int32_t* dC = (int32_t*)pool_get((size_t)Mp * N * 4);
         GQ->memcpy(dAp, hAp.data(), na).wait();
         GQ->memcpy(dBp, hBp.data(), nb).wait();
         s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K).wait();
@@ -1711,7 +1745,7 @@ int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale,
             if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
             else        ((float*)Cout)[i] = qr_publish(epi, total);
         }).wait();
-        sycl::free(dAp, *GQ); sycl::free(dBp, *GQ); sycl::free(dC, *GQ);
+        pool_put(dAp); pool_put(dBp); pool_put(dC);
     });
     return 0;
 }
@@ -1806,9 +1840,9 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
         GQ->memcpy(hB.data(), Braw, nb).wait();
         s8v8::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
         s8v8::pack_b(hB.data(), hBp.data(), (int)N, (int)K);
-        int8_t* dAp = (int8_t*)sycl::malloc_device(na, *GQ);
-        int8_t* dBp = (int8_t*)sycl::malloc_device(nb, *GQ);
-        int32_t* dC = (int32_t*)sycl::malloc_device((size_t)Mp * N * 4, *GQ);
+        int8_t* dAp = (int8_t*)pool_get(na);
+        int8_t* dBp = (int8_t*)pool_get(nb);
+        int32_t* dC = (int32_t*)pool_get((size_t)Mp * N * 4);
         GQ->memcpy(dAp, hAp.data(), na).wait();
         GQ->memcpy(dBp, hBp.data(), nb).wait();
         s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K).wait();
@@ -1827,7 +1861,7 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
             if (narrow) ((sycl::half*)Cout)[out] = sycl::half(qr_publish(epi, total));
             else        ((float*)Cout)[out] = qr_publish(epi, total);
         }).wait();
-        sycl::free(dAp, *GQ); sycl::free(dBp, *GQ); sycl::free(dC, *GQ);
+        pool_put(dAp); pool_put(dBp); pool_put(dC);
     });
     return 0;
 }
@@ -1860,10 +1894,10 @@ int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
     const size_t cx = (size_t)heads * rows * 32u;    // ctx
     g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
-        float* dScores = (float*)sycl::malloc_device(sc * 4, *GQ);
-        sycl::half* dProbs = (sycl::half*)sycl::malloc_device(sc * 2, *GQ);
-        float* dRecip = (float*)sycl::malloc_device((size_t)heads * rows * 4, *GQ);
-        float* dCtx = (float*)sycl::malloc_device(cx * 4, *GQ);
+        float* dScores = (float*)pool_get(sc * 4);
+        sycl::half* dProbs = (sycl::half*)pool_get(sc * 2);
+        float* dRecip = (float*)pool_get((size_t)heads * rows * 4);
+        float* dCtx = (float*)pool_get(cx * 4);
         const int Mp = (int)(((rows + 15u) / 16u) * 16u);
         std::vector<sycl::half> hq((size_t)rows * 32u), hk((size_t)rows * 32u), hv((size_t)rows * 32u);
         std::vector<sycl::half> Aq((size_t)Mp * 32u), Bk((size_t)Mp * 32u), Ap((size_t)Mp * rows), Bv((size_t)rows * 32u);
@@ -1876,11 +1910,11 @@ int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
             std::memcpy(hkp.data(), hk.data(), (size_t)rows * 32u * 2);
             f16v1::pack_a(hqp.data(), Aq.data(), Mp, 32);
             f16v1::pack_b_t(hkp.data(), Bk.data(), 32, (int)rows);   // K stored (rows,32)
-            sycl::half* dA=(sycl::half*)sycl::malloc_device((size_t)Mp*32u*2,*GQ);
-            sycl::half* dB=(sycl::half*)sycl::malloc_device((size_t)Mp*32u*2,*GQ);
+            sycl::half* dA=(sycl::half*)pool_get((size_t)Mp*32u*2);
+            sycl::half* dB=(sycl::half*)pool_get((size_t)Mp*32u*2);
             GQ->memcpy(dA,Aq.data(),(size_t)Mp*32u*2).wait(); GQ->memcpy(dB,Bk.data(),(size_t)Mp*32u*2).wait();
             f16v1::gemm(*GQ, dA, dB, dScores + (size_t)h*rows*rows, Mp, (int)rows, 32).wait();
-            sycl::free(dA,*GQ); sycl::free(dB,*GQ);
+            pool_put(dA); pool_put(dB);
         }
         // vit_softmax over heads*rows rows, tokens cols, stride=rows
         GQ->parallel_for(sycl::range((size_t)heads * rows),
@@ -1892,11 +1926,11 @@ int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
             std::memcpy(hpp.data(), hp.data(), (size_t)rows * rows * 2);
             f16v1::pack_a(hpp.data(), Ap.data(), Mp, (int)rows);
             f16v1::pack_b(hv.data(), Bv.data(), (int)rows, 32);     // V stored (rows,32) = (K,N)
-            sycl::half* dA=(sycl::half*)sycl::malloc_device((size_t)Mp*rows*2,*GQ);
-            sycl::half* dB=(sycl::half*)sycl::malloc_device((size_t)rows*32u*2,*GQ);
+            sycl::half* dA=(sycl::half*)pool_get((size_t)Mp*rows*2);
+            sycl::half* dB=(sycl::half*)pool_get((size_t)rows*32u*2);
             GQ->memcpy(dA,Ap.data(),(size_t)Mp*rows*2).wait(); GQ->memcpy(dB,Bv.data(),(size_t)rows*32u*2).wait();
             f16v1::gemm(*GQ, dA, dB, dCtx + (size_t)h*rows*32u, Mp, 32, (int)rows).wait();
-            sycl::free(dA,*GQ); sycl::free(dB,*GQ);
+            pool_put(dA); pool_put(dB);
         }
         // merge_heads_scale: (1,rows,heads*32) with scale=reciprocal (heads*rows), e4m3, half
         GQ->parallel_for(sycl::range((size_t)rows * CH), [=](sycl::item<1> it) {
@@ -1906,7 +1940,7 @@ int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
             float value = qr_half_round(cr_mul(qr_half_round(dCtx[at * 32u + (c % 32u)]), dRecip[at]));
             ((sycl::half*)M)[index] = sycl::half(qr_e4m3(value));
         }).wait();
-        sycl::free(dScores,*GQ); sycl::free(dProbs,*GQ); sycl::free(dRecip,*GQ); sycl::free(dCtx,*GQ);
+        pool_put(dScores); pool_put(dProbs); pool_put(dRecip); pool_put(dCtx);
     });
     return 0;
 }
@@ -2205,13 +2239,13 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
         // 34s pathology. Q/K/V are already contiguous per batch on device, so one
         // batched pack + one batched gemm covers every window; the dpas sequence per
         // tile is identical to the loop's, so it is bit-exact by construction.
-        float* dScores = (float*)sycl::malloc_device(sc_elems * 4, *GQ);
-        sycl::half* dProbs = (sycl::half*)sycl::malloc_device(sc_elems * 2, *GQ);
-        float* dCtx = (float*)sycl::malloc_device(ctx_elems * 4, *GQ);
-        sycl::half* dAq = (sycl::half*)sycl::malloc_device((size_t)batches * 64u * 32u * 2, *GQ);
-        sycl::half* dBk = (sycl::half*)sycl::malloc_device((size_t)batches * 32u * 64u * 2, *GQ);
-        sycl::half* dAp = (sycl::half*)sycl::malloc_device((size_t)batches * 64u * 64u * 2, *GQ);
-        sycl::half* dBv = (sycl::half*)sycl::malloc_device((size_t)batches * 64u * 32u * 2, *GQ);
+        float* dScores = (float*)pool_get(sc_elems * 4);
+        sycl::half* dProbs = (sycl::half*)pool_get(sc_elems * 2);
+        float* dCtx = (float*)pool_get(ctx_elems * 4);
+        sycl::half* dAq = (sycl::half*)pool_get((size_t)batches * 64u * 32u * 2);
+        sycl::half* dBk = (sycl::half*)pool_get((size_t)batches * 32u * 64u * 2);
+        sycl::half* dAp = (sycl::half*)pool_get((size_t)batches * 64u * 64u * 2);
+        sycl::half* dBv = (sycl::half*)pool_get((size_t)batches * 64u * 32u * 2);
         // scores leg: Q(64x32) @ K^T(32x64) -> 64x64. K stored (64 tokens,32 ch) = (N,K).
         packdev::pack_a16_b(*GQ, Q, dAq, 64, 64, 32, (int)batches);
         packdev::pack_b16_t_b(*GQ, Kk, dBk, 32, 64, (int)batches);
@@ -2236,8 +2270,8 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
         } else {
             GQ->memcpy(Out, dCtx, ctx_elems * 4).wait();
         }
-        sycl::free(dScores,*GQ); sycl::free(dProbs,*GQ); sycl::free(dCtx,*GQ);
-        sycl::free(dAq,*GQ); sycl::free(dBk,*GQ); sycl::free(dAp,*GQ); sycl::free(dBv,*GQ);
+        pool_put(dScores); pool_put(dProbs); pool_put(dCtx);
+        pool_put(dAq); pool_put(dBk); pool_put(dAp); pool_put(dBv);
     });
     return 0;
 }
@@ -2293,10 +2327,10 @@ int xmx_rec_gemm_window_residual_pool(int a, int b, int skip_out, int skip, int 
         GQ->memcpy(hB.data(), Braw, nb * 2).wait();
         f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
         f16v1::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
-        sycl::half* dAp = (sycl::half*)sycl::malloc_device(na * 2, *GQ);
-        sycl::half* dBp = (sycl::half*)sycl::malloc_device(nb * 2, *GQ);
-        float* dC = (float*)sycl::malloc_device((size_t)Mp * N * 4, *GQ);
-        float* dStage = (float*)sycl::malloc_device((size_t)M * N * 4, *GQ);
+        sycl::half* dAp = (sycl::half*)pool_get(na * 2);
+        sycl::half* dBp = (sycl::half*)pool_get(nb * 2);
+        float* dC = (float*)pool_get((size_t)Mp * N * 4);
+        float* dStage = (float*)pool_get((size_t)M * N * 4);
         GQ->memcpy(dAp, hAp.data(), na * 2).wait();
         GQ->memcpy(dBp, hBp.data(), nb * 2).wait();
         f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K).wait();
@@ -2329,7 +2363,7 @@ int xmx_rec_gemm_window_residual_pool(int a, int b, int skip_out, int skip, int 
             size_t out = ((size_t)((y - top) / 2u) * (width / 2u) + ((x - left) / 2u)) * N + c;
             Pl[out] = sycl::half(qr_e4m3(cr_mul(total, 0.25f)));
         }).wait();
-        sycl::free(dAp, *GQ); sycl::free(dBp, *GQ); sycl::free(dC, *GQ); sycl::free(dStage, *GQ);
+        pool_put(dAp); pool_put(dBp); pool_put(dC); pool_put(dStage);
     });
     return 0;
 }
@@ -2415,7 +2449,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         // to host, gathered there, then packed and uploaded (the section-73 trap forced
         // the download; the download itself was the cost). Same index math as the host
         // loop, one work-item per row.
-        sycl::half* dA = (sycl::half*)sycl::malloc_device((size_t)rows * C * 2, *GQ);
+        sycl::half* dA = (sycl::half*)pool_get((size_t)rows * C * 2);
         GQ->parallel_for(sycl::range((size_t)rows), [=](sycl::item<1> it) {
             unsigned r = (unsigned)it.get_id(0);
             unsigned window = r / tokens, token = r % tokens;
@@ -2432,17 +2466,17 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                 dA[(size_t)r * C + c] = sycl::half(val);
             }
         }).wait();
-        sycl::half* dAp = (sycl::half*)sycl::malloc_device((size_t)Mp * C * 2, *GQ);
-        sycl::half* dBp = (sycl::half*)sycl::malloc_device((size_t)C * NH * 2, *GQ);
-        float* dCq = (float*)sycl::malloc_device((size_t)Mp * NH * 4, *GQ);
+        sycl::half* dAp = (sycl::half*)pool_get((size_t)Mp * C * 2);
+        sycl::half* dBp = (sycl::half*)pool_get((size_t)C * NH * 2);
+        float* dCq = (float*)pool_get((size_t)Mp * NH * 4);
         packdev::pack_a16(*GQ, dA, dAp, (int)rows, Mp, (int)C);
         packdev::pack_b16(*GQ, Wraw, dBp, (int)C, (int)NH);   // Wraw is on device
         f16v1::gemm(*GQ, dAp, dBp, dCq, Mp, (int)NH, (int)C).wait();
-        sycl::free(dA, *GQ);
-        sycl::free(dAp, *GQ); sycl::free(dBp, *GQ);
-        sycl::half* dQ = (sycl::half*)sycl::malloc_device((size_t)rows * C * 2, *GQ);
-        sycl::half* dK = (sycl::half*)sycl::malloc_device((size_t)rows * C * 2, *GQ);
-        sycl::half* dV = (sycl::half*)sycl::malloc_device((size_t)rows * C * 2, *GQ);
+        pool_put(dA);
+        pool_put(dAp); pool_put(dBp);
+        sycl::half* dQ = (sycl::half*)pool_get((size_t)rows * C * 2);
+        sycl::half* dK = (sycl::half*)pool_get((size_t)rows * C * 2);
+        sycl::half* dV = (sycl::half*)pool_get((size_t)rows * C * 2);
         GQ->parallel_for(sycl::range((size_t)rows), [=](sycl::item<1> it) {   // heads==1
             unsigned r = (unsigned)it.get_id(0);
             float row32[32];
@@ -2461,18 +2495,18 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             for (int c2 = 0; c2 < 32; ++c2)
                 dV[(size_t)r * 32u + c2] = sycl::half(qr_e4m3(dCq[(size_t)r * NH + 2u * C + c2]));
         }).wait();
-        sycl::free(dCq, *GQ);
+        pool_put(dCq);
         // ---- LEG 2: window attention (heads==1) -> dAttended (windows,64,32) half ----
-        float* dScores = (float*)sycl::malloc_device((size_t)windows * 64u * 64u * 4, *GQ);
-        sycl::half* dProbs = (sycl::half*)sycl::malloc_device((size_t)windows * 64u * 64u * 2, *GQ);
-        float* dCtx = (float*)sycl::malloc_device((size_t)windows * 64u * 32u * 4, *GQ);
+        float* dScores = (float*)pool_get((size_t)windows * 64u * 64u * 4);
+        sycl::half* dProbs = (sycl::half*)pool_get((size_t)windows * 64u * 64u * 2);
+        float* dCtx = (float*)pool_get((size_t)windows * 64u * 32u * 4);
         // batched device pack + batched gemm (section 92): the per-window host loop was
         // the same pathology window_attention had (4 sync memcpys + 4 malloc/free + 2
         // launches per window). dQ/dK/dV are already contiguous per window on device.
-        sycl::half* dAq = (sycl::half*)sycl::malloc_device((size_t)windows * 64u * 32u * 2, *GQ);
-        sycl::half* dBk = (sycl::half*)sycl::malloc_device((size_t)windows * 32u * 64u * 2, *GQ);
-        sycl::half* dAp2 = (sycl::half*)sycl::malloc_device((size_t)windows * 64u * 64u * 2, *GQ);
-        sycl::half* dBv = (sycl::half*)sycl::malloc_device((size_t)windows * 64u * 32u * 2, *GQ);
+        sycl::half* dAq = (sycl::half*)pool_get((size_t)windows * 64u * 32u * 2);
+        sycl::half* dBk = (sycl::half*)pool_get((size_t)windows * 32u * 64u * 2);
+        sycl::half* dAp2 = (sycl::half*)pool_get((size_t)windows * 64u * 64u * 2);
+        sycl::half* dBv = (sycl::half*)pool_get((size_t)windows * 64u * 32u * 2);
         packdev::pack_a16_b(*GQ, dQ, dAq, 64, 64, 32, (int)windows);
         packdev::pack_b16_t_b(*GQ, dK, dBk, 32, 64, (int)windows);
         f16v1::gemm_b(*GQ, dAq, dBk, dScores, 64, 64, 32, (int)windows).wait();
@@ -2481,26 +2515,26 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         packdev::pack_a16_b(*GQ, dProbs, dAp2, 64, 64, 64, (int)windows);
         packdev::pack_b16_b(*GQ, dV, dBv, 64, 32, (int)windows);
         f16v1::gemm_b(*GQ, dAp2, dBv, dCtx, 64, 32, 64, (int)windows).wait();
-        sycl::free(dAq,*GQ); sycl::free(dBk,*GQ); sycl::free(dAp2,*GQ); sycl::free(dBv,*GQ);
-        sycl::free(dScores,*GQ); sycl::free(dProbs,*GQ);
-        sycl::half* dAttended = (sycl::half*)sycl::malloc_device((size_t)rows * C * 2, *GQ);
+        pool_put(dAq); pool_put(dBk); pool_put(dAp2); pool_put(dBv);
+        pool_put(dScores); pool_put(dProbs);
+        sycl::half* dAttended = (sycl::half*)pool_get((size_t)rows * C * 2);
         GQ->parallel_for(sycl::range((size_t)rows * C), [=](sycl::item<1> it) {   // merge, heads==1
             unsigned index = (unsigned)it.get_id(0);
             unsigned c = index % C, token = index / C;
             dAttended[index] = sycl::half(qr_e4m3(dCtx[(size_t)token * 32u + c]));
         }).wait();
-        sycl::free(dCtx,*GQ); sycl::free(dQ,*GQ); sycl::free(dK,*GQ); sycl::free(dV,*GQ);
+        pool_put(dCtx); pool_put(dQ); pool_put(dK); pool_put(dV);
         // ---- LEG 3: window residual (attended, projection, image, cosine -> target) ----
         // device pack (section 92): dAttended and Praw are already on device -- pack them
         // in place, no download/upload round-trip (the host pack was the remaining cost).
-        sycl::half* dAp3 = (sycl::half*)sycl::malloc_device((size_t)Mp * C * 2, *GQ);
-        sycl::half* dBp3 = (sycl::half*)sycl::malloc_device((size_t)C * C * 2, *GQ);
-        float* dC3 = (float*)sycl::malloc_device((size_t)Mp * C * 4, *GQ);
+        sycl::half* dAp3 = (sycl::half*)pool_get((size_t)Mp * C * 2);
+        sycl::half* dBp3 = (sycl::half*)pool_get((size_t)C * C * 2);
+        float* dC3 = (float*)pool_get((size_t)Mp * C * 4);
         packdev::pack_a16(*GQ, dAttended, dAp3, (int)rows, Mp, (int)C);
         packdev::pack_b16(*GQ, Praw, dBp3, (int)C, (int)C);
         f16v1::gemm(*GQ, dAp3, dBp3, dC3, Mp, (int)C, (int)C).wait();
-        float* dStage = pooling ? (float*)sycl::malloc_device((size_t)rows * C * 4, *GQ) : nullptr;
-        sycl::half* dOut16 = head ? (sycl::half*)sycl::malloc_device(img_elems * 2, *GQ) : nullptr;
+        float* dStage = pooling ? (float*)pool_get((size_t)rows * C * 4) : nullptr;
+        sycl::half* dOut16 = head ? (sycl::half*)pool_get(img_elems * 2) : nullptr;
         GQ->parallel_for(sycl::range(blk_elems), [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             unsigned r = (unsigned)(i / C), col = (unsigned)(i % C);
@@ -2544,7 +2578,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                 size_t out = ((size_t)((y - top) / 2u) * (width / 2u) + ((x - left) / 2u)) * C + c;
                 Pl[out] = sycl::half(qr_e4m3(cr_mul(total, 0.25f)));
             }).wait();
-            sycl::free(dStage, *GQ);
+            pool_put(dStage);
         }
         if (head) {
             // LEG 4: the compact head GEMM (test_window_block.py:151-152). out16 (pixels x
@@ -2559,9 +2593,9 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             GQ->memcpy(hW.data(), HeadW, (size_t)C * 16u * 2).wait();
             f16v1::pack_a(hOpad.data(), hOp.data(), MpH, (int)C);
             f16v1::pack_b(hW.data(), hWp.data(), (int)C, 16);
-            sycl::half* dA4 = (sycl::half*)sycl::malloc_device((size_t)MpH * C * 2, *GQ);
-            sycl::half* dB4 = (sycl::half*)sycl::malloc_device((size_t)C * 16u * 2, *GQ);
-            float* dH4 = (float*)sycl::malloc_device((size_t)MpH * 16u * 4, *GQ);
+            sycl::half* dA4 = (sycl::half*)pool_get((size_t)MpH * C * 2);
+            sycl::half* dB4 = (sycl::half*)pool_get((size_t)C * 16u * 2);
+            float* dH4 = (float*)pool_get((size_t)MpH * 16u * 4);
             GQ->memcpy(dA4, hOp.data(), (size_t)MpH * C * 2).wait();
             GQ->memcpy(dB4, hWp.data(), (size_t)C * 16u * 2).wait();
             f16v1::gemm(*GQ, dA4, dB4, dH4, MpH, 16, (int)C).wait();
@@ -2570,10 +2604,10 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                 unsigned pixel = (unsigned)(i / 4u), c = (unsigned)(i % 4u);
                 ((float*)Tgt)[i] = dH4[(size_t)pixel * 16u + c];   // compact: first four columns
             }).wait();
-            sycl::free(dA4,*GQ); sycl::free(dB4,*GQ); sycl::free(dH4,*GQ);
-            sycl::free(dOut16, *GQ);
+            pool_put(dA4); pool_put(dB4); pool_put(dH4);
+            pool_put(dOut16);
         }
-        sycl::free(dAp3,*GQ); sycl::free(dBp3,*GQ); sycl::free(dC3,*GQ); sycl::free(dAttended,*GQ);
+        pool_put(dAp3); pool_put(dBp3); pool_put(dC3); pool_put(dAttended);
     });
     return 0;
 }
@@ -2620,12 +2654,12 @@ int xmx_rec_gemm_s8(int a, int b, int c, unsigned M, unsigned N, unsigned K) {
         GQ->memcpy(hB.data(), Braw, nb).wait();
         s8v1::pack_a(hA.data(), hAp.data(), (int)M, (int)K);
         s8v1::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
-        int8_t* dAp = sycl::malloc_device<int8_t>(na, *GQ);
-        int8_t* dCp = sycl::malloc_device<int8_t>(nb, *GQ);
+        int8_t* dAp = (int8_t*)pool_get(na);
+        int8_t* dCp = (int8_t*)pool_get(nb);
         GQ->memcpy(dAp, hAp.data(), na).wait();
         GQ->memcpy(dCp, hBp.data(), nb).wait();
         s8v1::gemm_s8(*GQ, dAp, dCp, C32, (int)M, (int)N, (int)K).wait();
-        sycl::free(dAp, *GQ); sycl::free(dCp, *GQ);
+        pool_put(dAp); pool_put(dCp);
     });
     return 0;
 }
@@ -2658,12 +2692,12 @@ int xmx_rec_gemm_s8rq(int a, int b, int c8, int col_scale, int new_scale,
         GQ->memcpy(hB.data(), Braw, nb).wait();
         s8v3::pack_a(hA.data(), hAp.data(), (int)M, (int)K);
         s8v3::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
-        int8_t* dAp = sycl::malloc_device<int8_t>(na, *GQ);
-        int8_t* dCp = sycl::malloc_device<int8_t>(nb, *GQ);
+        int8_t* dAp = (int8_t*)pool_get(na);
+        int8_t* dCp = (int8_t*)pool_get(nb);
         GQ->memcpy(dAp, hAp.data(), na).wait();
         GQ->memcpy(dCp, hBp.data(), nb).wait();
         s8v3::gemm_s8(*GQ, dAp, dCp, cs, C8, ns, (int)M, (int)N, (int)K).wait();
-        sycl::free(dAp, *GQ); sycl::free(dCp, *GQ);
+        pool_put(dAp); pool_put(dCp);
     });
     return 0;
 }
@@ -2701,12 +2735,12 @@ int xmx_rec_gemm_s8rq32(int a, int b, int c8, int a_scale, int col_scale, int ne
         GQ->memcpy(hB.data(), Braw, nb).wait();
         s8v7::pack_a(hA.data(), hAp.data(), (int)M, (int)K);
         s8v7::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
-        int8_t* dAp = sycl::malloc_device<int8_t>(na, *GQ);
-        int8_t* dCp = sycl::malloc_device<int8_t>(nb, *GQ);
+        int8_t* dAp = (int8_t*)pool_get(na);
+        int8_t* dCp = (int8_t*)pool_get(nb);
         GQ->memcpy(dAp, hAp.data(), na).wait();
         GQ->memcpy(dCp, hBp.data(), nb).wait();
         s8v7::gemm_s8rq32(*GQ, dAp, dCp, as, cs, C8, ns, (int)M, (int)N, (int)K).wait();
-        sycl::free(dAp, *GQ); sycl::free(dCp, *GQ);
+        pool_put(dAp); pool_put(dCp);
     });
     return 0;
 }
@@ -2896,7 +2930,7 @@ int xmx_rec_softmax_i8(int acc, int q_scale, int k_scale, int bias, int out8, in
         sycl::half* scratch = (sycl::half*)sycl::malloc_shared((size_t)rows * cols * 2, *GQ);
         GQ->parallel_for(sycl::range(rows),
                          smax::softmax_i8_kernel()(ap, qp, kp, bp, scratch, op, scp, rows, cols)).wait();
-        sycl::free(scratch, *GQ);
+        pool_put(scratch);
     });
     return 0;
 }
@@ -2959,13 +2993,13 @@ int xmx_rec_gemm_qkv_v(int a, int b, int v, int a_scale, int b_scale,
         GQ->memcpy(hB.data(), Braw, nb).wait();
         s8v5::pack_a(hA.data(), hAp.data(), (int)M, (int)channels);
         s8v5::pack_b(hB.data(), hBp.data(), (int)channels, (int)channels);
-        int8_t* dAp = sycl::malloc_device<int8_t>(na, *GQ);
-        int8_t* dBp = sycl::malloc_device<int8_t>(nb, *GQ);
+        int8_t* dAp = (int8_t*)pool_get(na);
+        int8_t* dBp = (int8_t*)pool_get(nb);
         GQ->memcpy(dAp, hAp.data(), na).wait();
         GQ->memcpy(dBp, hBp.data(), nb).wait();
         s8v5::gemm_qkv_v(*GQ, dAp, dBp, as, bs, V, (int)M, (int)channels,
                          (int)heads, (int)tokens).wait();
-        sycl::free(dAp, *GQ); sycl::free(dBp, *GQ);
+        pool_put(dAp); pool_put(dBp);
     });
     return 0;
 }
@@ -3001,13 +3035,13 @@ int xmx_rec_gemm_qkv_v_i8(int a, int b, int v8, int v_scale, int a_scale, int b_
         GQ->memcpy(hB.data(), Braw, nb).wait();
         s8v5::pack_a(hA.data(), hAp.data(), (int)M, (int)channels);
         s8v5::pack_b(hB.data(), hBp.data(), (int)channels, (int)channels);
-        int8_t* dAp = sycl::malloc_device<int8_t>(na, *GQ);
-        int8_t* dBp = sycl::malloc_device<int8_t>(nb, *GQ);
+        int8_t* dAp = (int8_t*)pool_get(na);
+        int8_t* dBp = (int8_t*)pool_get(nb);
         GQ->memcpy(dAp, hAp.data(), na).wait();
         GQ->memcpy(dBp, hBp.data(), nb).wait();
         s8v5::gemm_qkv_v_i8(*GQ, dAp, dBp, as, bs, V8, vs, (int)M, (int)channels,
                             (int)heads, (int)tokens).wait();
-        sycl::free(dAp, *GQ); sycl::free(dBp, *GQ);
+        pool_put(dAp); pool_put(dBp);
     });
     return 0;
 }
@@ -3038,12 +3072,12 @@ int xmx_rec_gemm_qkv_deq(int a, int b, int out, int a_scale, int b_scale,
         GQ->memcpy(hB.data(), Braw, nb).wait();
         s8v5::pack_a(hA.data(), hAp.data(), (int)M, (int)channels);
         s8v5::pack_b(hB.data(), hBp.data(), (int)channels, (int)channels);
-        int8_t* dAp = sycl::malloc_device<int8_t>(na, *GQ);
-        int8_t* dBp = sycl::malloc_device<int8_t>(nb, *GQ);
+        int8_t* dAp = (int8_t*)pool_get(na);
+        int8_t* dBp = (int8_t*)pool_get(nb);
         GQ->memcpy(dAp, hAp.data(), na).wait();
         GQ->memcpy(dBp, hBp.data(), nb).wait();
         s8v5::gemm_qkv_deq(*GQ, dAp, dBp, as, bs, OUT, (int)M, (int)channels).wait();
-        sycl::free(dAp, *GQ); sycl::free(dBp, *GQ);
+        pool_put(dAp); pool_put(dBp);
     });
     return 0;
 }
