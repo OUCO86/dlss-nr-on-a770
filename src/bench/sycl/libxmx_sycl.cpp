@@ -105,6 +105,32 @@ static void pool_clear() {
     g_pool.clear(); g_pool_sz.clear();
 }
 
+// weight-pack cache (section 92): a weight buffer's PACKED form is identical every frame
+// (weights never change after their one blob upload). The per-frame gather+pack of the
+// weight operand is the "GPU busy doing waste" the user measured (stage timing: wt=489ms
+// of pure re-packing). Cache the packed B keyed by (buffer id, a, b, c) -- for the direct
+// families (a,b)=(N,K),c=0; for the batched families (a,b,c)=(column block c0, width n64,
+// group g). First frame packs, later frames reuse. Ids are monotonic (g_nextbuf++) so a
+// destroyed id is never reused; buf_upload to a live id (re-upload) and buf_destroy
+// invalidate. The cached block is owned by the cache, NOT the pool -- call sites must not
+// pool_put it (gemm only reads it, so cross-pass reuse is safe).
+struct WKey { int id; int a; int b; int c;
+              bool operator<(const WKey& o) const {
+                  if (id != o.id) return id < o.id;
+                  if (a != o.a) return a < o.a;
+                  if (b != o.b) return b < o.b;
+                  return c < o.c; } };
+static std::map<WKey, void*> g_wcache;
+static void wcache_invalidate(int id) {
+    for (auto it = g_wcache.begin(); it != g_wcache.end(); )
+        if (it->first.id == id) { if (GQ) sycl::free(it->second, *GQ); it = g_wcache.erase(it); }
+        else ++it;
+}
+static void wcache_clear() {
+    for (auto& kv : g_wcache) if (GQ) sycl::free(kv.second, *GQ);
+    g_wcache.clear();
+}
+
 extern "C" {
 
 const char* xmx_error(void) { return GERR; }
@@ -327,6 +353,7 @@ int xmx_buf_upload(int id, const void* src, unsigned long long off, unsigned lon
     if (!GQ) FAILMSG("not initialised");
     auto it = g_bufs.find(id); if (it == g_bufs.end()) FAILMSG("no such buffer");
     GQ->memcpy((char*)it->second.p + off, src, n).wait();
+    wcache_invalidate(id);   // a re-upload changes the bytes: drop any packed cache for it
     return 0;
 }
 int xmx_buf_download(int id, void* dst, unsigned long long off, unsigned long long n) {
@@ -343,6 +370,7 @@ int xmx_buf_zero(int id) {
 }
 int xmx_buf_destroy(int id) {
     auto it = g_bufs.find(id); if (it == g_bufs.end()) return 0;
+    wcache_invalidate(id);   // drop any packed cache keyed on this buffer
     if (it->second.imported)
         zeMemFree(g_zctx, it->second.p);       // drop OUR reference; producer owns the memory
     else if (GQ)
@@ -1441,6 +1469,9 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
     const int Mp = l0_ceil_bm(M);
     g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
+        static bool stg = getenv("NR_STAGE_TIMING") != nullptr;
+        static double act=0,wt=0,gm=0,pb=0; static long ncalls=0;
+        auto msnow=[](){ return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
         const unsigned lda_e = lda ? lda : K, ldb_e = ldb ? ldb : K;
         const int nb64 = (int)(N / 64u);
         const unsigned nrem = N % 64u;
@@ -1449,25 +1480,49 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
         // place, gemm, publish -- the old path downloaded the whole wide buffers to host,
         // gathered there, packed, and re-uploaded (the 839ms). The gather indices stay
         // within the gate's aw_b/bw_b bounds (the section-73 over-read lesson).
+        // NR_STAGE_TIMING=1: per-stage wall time -- act=gather_a+pack_a (activation),
+        // wt=gather_b+pack_b (the WEIGHT re-pack done every frame = suspected waste),
+        // gm=gemm, pub=publish. Diagnostic-only (each stage waits when stg); answers
+        // "GPU busy but low fps": if wt dominates, cache the packed weights once (§9).
         int8_t* dAdense = (int8_t*)pool_get((size_t)M * K);
         int8_t* dAp = (int8_t*)pool_get((size_t)Mp * K);
         int8_t* dBdense = (int8_t*)pool_get((size_t)64u * K);   // max block width
-        int8_t* dBp = (int8_t*)pool_get((size_t)64u * K);
         int32_t* dC = (int32_t*)pool_get((size_t)Mp * 64u * 4);
         for (unsigned g = 0; g < batch; ++g) {
             const size_t ce = (size_t)g * sc;                       // C advance (elements)
+            double t0 = stg ? msnow() : 0.0;
             packdev::gather_a(*GQ, Araw, dAdense, (int)M, (int)K, (int)lda_e, sa, (int)g);
             packdev::pack_a(*GQ, dAdense, dAp, (int)M, Mp, (int)K);
+            if (stg) { GQ->wait(); act += msnow() - t0; }
             float* gas = (float*)as + (size_t)g * scale_stride;   // roff (.comp:143)
             float* gbs = (sb != 0u) ? ((float*)bs + (size_t)g * N) : (float*)bs;  // soff (.comp:147)
             for (int blk = 0; blk <= nblocks; ++blk) {
                 unsigned c0 = (unsigned)blk * 64u;
                 unsigned n64 = (nrem && blk == nb64) ? nrem : 64u;
-                packdev::gather_b(*GQ, Braw, dBdense, (int)c0, (int)n64, (int)K, (int)ldb_e, sb, (int)g);
-                packdev::pack_b(*GQ, dBdense, dBp, (int)n64, (int)K);   // pack_b is N-parameterised
+                double t1 = stg ? msnow() : 0.0;
+                // weight-pack cache (section 92): B is a weight (unchanged after blob
+                // upload), so its packed slice for (c0,n64,g) is identical every frame --
+                // pack once, reuse. Key = (B buffer id, c0, n64, g). The block lives in
+                // the cache, NOT the pool: gemm only reads it and call sites never put it.
+                WKey wk{ b, (int)c0, (int)n64, (int)g };
+                auto wc = g_wcache.find(wk);
+                int8_t* dBp;
+                if (wc != g_wcache.end()) {
+                    dBp = (int8_t*)wc->second;
+                } else {
+                    packdev::gather_b(*GQ, Braw, dBdense, (int)c0, (int)n64, (int)K, (int)ldb_e, sb, (int)g);
+                    int8_t* cp = (int8_t*)sycl::malloc_device((size_t)n64 * K, *GQ);
+                    packdev::pack_b(*GQ, dBdense, cp, (int)n64, (int)K);   // pack_b is N-parameterised
+                    g_wcache[wk] = cp;
+                    dBp = cp;
+                }
+                if (stg) { GQ->wait(); wt += msnow() - t1; }
+                double t2 = stg ? msnow() : 0.0;
                 if (n64 == 64u) s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)n64, (int)K);
                 else            s8v8::gemm32(*GQ, dAp, dBp, dC, Mp, (int)n64, (int)K);
+                if (stg) { GQ->wait(); gm += msnow() - t2; }
                 // publish this block into the ldc-strided output (only real M rows)
+                double t3 = stg ? msnow() : 0.0;
                 GQ->parallel_for(sycl::range((size_t)M * n64),
                                  [=](sycl::item<1> it) {
                     size_t i = it.get_id(0);
@@ -1477,9 +1532,13 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
                     if (narrow) ((sycl::half*)Cout)[out] = sycl::half(qr_publish(epi, v));
                     else        ((float*)Cout)[out] = qr_publish(epi, v);
                 });
+                if (stg) { GQ->wait(); pb += msnow() - t3; }
             }
         }
-        pool_put(dAdense); pool_put(dAp); pool_put(dBdense); pool_put(dBp); pool_put(dC);
+        pool_put(dAdense); pool_put(dAp); pool_put(dBdense); pool_put(dC);
+        // dBp is NOT put back: it is owned by g_wcache (the packed weight, reused every
+        // frame). Freeing it happens only in wcache_clear/invalidate.
+        if (stg && ++ncalls % 48 == 0) { std::printf("[stage] batched n=%ld act=%.1f wt=%.1f gemm=%.1f pub=%.1f ms\n", ncalls, act, wt, gm, pb); std::fflush(stdout); }
     });
     return 0;
 }
