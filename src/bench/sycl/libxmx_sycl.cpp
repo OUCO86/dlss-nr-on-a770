@@ -1869,7 +1869,7 @@ int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
         f16v1::gemm_b(*GQ, dAq, dBk, dScores, Mp, (int)rows, 32, (int)heads);
         // vit_softmax over heads*rows rows, tokens cols, stride=rows -- one launch.
         GQ->parallel_for(sycl::range((size_t)heads * rows),
-                         smax::vit_softmax_kernel()(dScores, dProbs, dRecip, heads * rows, tokens, rows)).wait();
+                         smax::vit_softmax_kernel()(dScores, dProbs, dRecip, heads * rows, tokens, rows));
         // attnV leg: P(rows x rows) @ V(rows x 32) -> rows x 32. V stored (rows,32)=(K,N).
         packdev::pack_a16_b(*GQ, dProbs, dAp, (int)rows, Mp, (int)rows, (int)heads);
         packdev::pack_b16_b(*GQ, V, dBv, (int)rows, 32, (int)heads);
@@ -2035,7 +2035,7 @@ int xmx_rec_vit_softmax(int source, int dst, int reciprocal, unsigned rows,
     g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         GQ->parallel_for(sycl::range((size_t)rows),
-                         smax::vit_softmax_kernel()(sp, dp, rp, rows, tokens, stride)).wait();
+                         smax::vit_softmax_kernel()(sp, dp, rp, rows, tokens, stride));
     });
     return 0;
 }
@@ -2195,7 +2195,7 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
         f16v1::gemm_b(*GQ, dAq, dBk, dScores, 64, 64, 32, (int)batches);
         // softmax over (batches*64) rows of 64, with bias (heads,64,64) -- one launch.
         GQ->parallel_for(sycl::range((size_t)batches*64u),
-                         smax::softmax_kernel()(dScores, dProbs, batches*64u, 64u, Bp, heads)).wait();
+                         smax::softmax_kernel()(dScores, dProbs, batches*64u, 64u, Bp, heads));
         // attnV leg: P(64x64) @ V(64x32) -> 64x32. V stored (64 tokens,32 ch) = (K,N).
         packdev::pack_a16_b(*GQ, dProbs, dAp, 64, 64, 64, (int)batches);
         packdev::pack_b16_b(*GQ, V, dBv, 64, 32, (int)batches);
@@ -2453,7 +2453,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         packdev::pack_b16_t_b(*GQ, dK, dBk, 32, 64, (int)windows);
         f16v1::gemm_b(*GQ, dAq, dBk, dScores, 64, 64, 32, (int)windows);
         GQ->parallel_for(sycl::range((size_t)windows*64u),
-                         smax::softmax_kernel()(dScores, dProbs, windows*64u, 64u, Bp, 1u)).wait();
+                         smax::softmax_kernel()(dScores, dProbs, windows*64u, 64u, Bp, 1u));
         packdev::pack_a16_b(*GQ, dProbs, dAp2, 64, 64, 64, (int)windows);
         packdev::pack_b16_b(*GQ, dV, dBv, 64, 32, (int)windows);
         f16v1::gemm_b(*GQ, dAp2, dBv, dCtx, 64, 32, 64, (int)windows);
@@ -2821,7 +2821,7 @@ int xmx_rec_softmax(int source, int dst, unsigned rows, unsigned cols) {
     sycl::half* dp = (sycl::half*)d->second.p;
     g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
-        GQ->parallel_for(sycl::range(rows), smax::softmax_kernel()(sp, dp, rows, cols, nullptr, 0)).wait();
+        GQ->parallel_for(sycl::range(rows), smax::softmax_kernel()(sp, dp, rows, cols, nullptr, 0));
     });
     return 0;
 }
@@ -2836,7 +2836,7 @@ int xmx_rec_softmax_bias(int source, int dst, int bias, unsigned rows, unsigned 
     const float* bp = (const float*)b->second.p;
     g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
-        GQ->parallel_for(sycl::range(rows), smax::softmax_kernel()(sp, dp, rows, cols, bp, heads)).wait();
+        GQ->parallel_for(sycl::range(rows), smax::softmax_kernel()(sp, dp, rows, cols, bp, heads));
     });
     return 0;
 }

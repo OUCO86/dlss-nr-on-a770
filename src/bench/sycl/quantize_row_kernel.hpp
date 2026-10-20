@@ -168,5 +168,5 @@ inline void qr_launch(sycl::queue& q, sycl::device& dev, K kern,
         sycl::local_accessor<float, 1> la(sycl::range<1>(256u), h);
         h.parallel_for(sycl::nd_range<2>(sycl::range(256u * gxx, gyy), sycl::range(256u, 1u)),
             kern(dsrc, dpack, dscale, m, k, flags, image_h, image_w, window_cols, window_pad, dprod, drecip, la));
-    }).wait();
+    });   // no .wait(): the in-order queue orders quant->consumer, graph_run drains once (section 92)
 }
