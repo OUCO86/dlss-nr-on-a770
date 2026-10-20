@@ -201,7 +201,12 @@ int xmx_init(void) {
             (g_l0 ? " (Level-Zero: fused allowed)" : " (OpenCL: fused pre/post will refuse)"));
         if (cen) fclose(cen);
         GD = new sycl::device(dev);
-        GQ = new sycl::queue(dev);
+        // in-order queue (section 92): the pass closures chain pack->gemm->publish on
+        // device; with an in-order queue the enqueue order IS the execution order, so the
+        // GPU pipelines across passes and the scratch pool is safe to reuse without a
+        // per-pass host .wait() (the ~2000 sync points were the low GPU utilisation the
+        // user saw in-game). graph_run/submit wait once at the end.
+        GQ = new sycl::queue(dev, sycl::property::queue::in_order{});
         GERR[0] = 0;
         return 0;
     } catch (const std::exception& e) { FAILMSG("xmx_init: %s", e.what()); }
@@ -429,9 +434,11 @@ int xmx_graph_run(int id) {
                 if (f) std::fprintf(f, "op %s %.1f\n", kv.first.c_str(), kv.second);
             }
             if (f) std::fclose(f);
+            GQ->wait();   // the closures may enqueue without per-pass waits; drain before returning
             return passes;
         }
-        for (auto& fn : g_graphs[id]) fn();     // same order, wait-per-kernel like submit
+        for (auto& fn : g_graphs[id]) fn();     // in-order queue: enqueue order = execution order
+        GQ->wait();                             // one host sync for the whole graph (was ~2000)
     } catch (const std::exception& e) { FAILMSG("graph_run: %s", e.what()); }
     return passes;
 }
@@ -2721,7 +2728,8 @@ int xmx_rec_gemm_s8rq32(int a, int b, int c8, int a_scale, int col_scale, int ne
 int xmx_submit(void) {
     if (!g_recording) FAILMSG("not recording");
     try {
-        for (auto& fn : g_cmds) fn();   // each qr_launch already .wait()s; ordered like the plan
+        for (auto& fn : g_cmds) fn();   // in-order queue: enqueue order = execution order
+        GQ->wait();                     // one host sync for the whole recording
     } catch (const std::exception& e) { g_cmds.clear(); g_cmd_names.clear(); g_recording = false; FAILMSG("submit: %s", e.what()); }
     g_cmds.clear(); g_cmd_names.clear(); g_recording = false;
     return 0;
