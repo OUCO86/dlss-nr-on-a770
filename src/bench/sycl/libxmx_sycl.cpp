@@ -33,6 +33,7 @@
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
+#include <set>
 #include <chrono>
 #include <algorithm>
 #include <map>
@@ -1496,79 +1497,45 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
     const int Mp = l0_ceil_bm(M);
     g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
-        static bool stg = getenv("NR_STAGE_TIMING") != nullptr;
-        static double act=0,wt=0,gm=0,pb=0; static long ncalls=0;
-        auto msnow=[](){ return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
         const unsigned lda_e = lda ? lda : K, ldb_e = ldb ? ldb : K;
-        const int nb64 = (int)(N / 64u);
-        const unsigned nrem = N % 64u;
-        const int nblocks = (nrem && nb64 >= 0) ? nb64 : nb64 - 1;   // blk loop upper (inclusive)
-        // device-resident (section 92): gather the strided slice dense ON device, pack in
-        // place, gemm, publish -- the old path downloaded the whole wide buffers to host,
-        // gathered there, packed, and re-uploaded (the 839ms). The gather indices stay
-        // within the gate's aw_b/bw_b bounds (the section-73 over-read lesson).
-        // NR_STAGE_TIMING=1: per-stage wall time -- act=gather_a+pack_a (activation),
-        // wt=gather_b+pack_b (the WEIGHT re-pack done every frame = suspected waste),
-        // gm=gemm, pub=publish. Diagnostic-only (each stage waits when stg); answers
-        // "GPU busy but low fps": if wt dominates, cache the packed weights once (§9).
-        int8_t* dAp = (int8_t*)pool_get((size_t)Mp * K);
-        int8_t* dBdense = (int8_t*)pool_get((size_t)64u * K);   // max block width
-        int32_t* dC = (int32_t*)pool_get((size_t)Mp * 64u * 4);
-        for (unsigned g = 0; g < batch; ++g) {
-            const size_t ce = (size_t)g * sc;                       // C advance (elements)
-            double t0 = stg ? msnow() : 0.0;
-            // fused gather+pack_a (section 92): the activation operand was gathered dense
-            // (read Araw, write dAdense) then packed (read dAdense, write dAp) = two memory
-            // passes; one fused kernel reads Araw strided and writes dAp directly. Same
-            // index map as pack_a with the source stride folded in -- bit-exact by
-            // construction, and it removes the dAdense scratch entirely.
-            packdev::gather_pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K, (int)lda_e, sa, (int)g);
-            if (stg) { GQ->wait(); act += msnow() - t0; }
-            float* gas = (float*)as + (size_t)g * scale_stride;   // roff (.comp:143)
-            float* gbs = (sb != 0u) ? ((float*)bs + (size_t)g * N) : (float*)bs;  // soff (.comp:147)
-            for (int blk = 0; blk <= nblocks; ++blk) {
-                unsigned c0 = (unsigned)blk * 64u;
-                unsigned n64 = (nrem && blk == nb64) ? nrem : 64u;
-                double t1 = stg ? msnow() : 0.0;
-                // weight-pack cache (section 92): B is a weight (unchanged after blob
-                // upload), so its packed slice for (c0,n64,g) is identical every frame --
-                // pack once, reuse. Key = (B buffer id, c0, n64, g). The block lives in
-                // the cache, NOT the pool: gemm only reads it and call sites never put it.
-                WKey wk{ b, (int)c0, (int)n64, (int)g };
-                auto wc = g_wcache.find(wk);
-                int8_t* dBp;
-                if (wc != g_wcache.end()) {
-                    dBp = (int8_t*)wc->second;
-                } else {
-                    packdev::gather_b(*GQ, Braw, dBdense, (int)c0, (int)n64, (int)K, (int)ldb_e, sb, (int)g);
-                    int8_t* cp = (int8_t*)sycl::malloc_device((size_t)n64 * K, *GQ);
-                    packdev::pack_b(*GQ, dBdense, cp, (int)n64, (int)K);   // pack_b is N-parameterised
-                    g_wcache[wk] = cp;
-                    dBp = cp;
-                }
-                if (stg) { GQ->wait(); wt += msnow() - t1; }
-                double t2 = stg ? msnow() : 0.0;
-                if (n64 == 64u) s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)n64, (int)K);
-                else            s8v8::gemm32(*GQ, dAp, dBp, dC, Mp, (int)n64, (int)K);
-                if (stg) { GQ->wait(); gm += msnow() - t2; }
-                // publish this block into the ldc-strided output (only real M rows)
-                double t3 = stg ? msnow() : 0.0;
-                GQ->parallel_for(sycl::range((size_t)M * n64),
-                                 [=](sycl::item<1> it) {
-                    size_t i = it.get_id(0);
-                    unsigned r = (unsigned)(i / n64), col = (unsigned)(i % n64);
-                    float v = cr_mul(cr_mul((float)dC[(size_t)r * n64 + col], gas[r]), gbs[c0 + col]);
-                    size_t out = ce + (size_t)r * ldc_ + (c0 + col);
-                    if (narrow) ((sycl::half*)Cout)[out] = sycl::half(qr_publish(epi, v));
-                    else        ((float*)Cout)[out] = qr_publish(epi, v);
-                });
-                if (stg) { GQ->wait(); pb += msnow() - t3; }
-            }
+        // R8a shape-merge (section 92): ONE dispatch per stage for the whole op -- the
+        // batch is the grid's z dimension, exactly how the shipped engine does it
+        // (libxmx.c:2334 vkCmdDispatch(..., batch); gemm_staged.comp:115 gl_WorkGroupID.z).
+        // The old recorder translated the plan's batch PARAMETER into a HOST loop of
+        // `batch` small gemm dispatches (M=640 batch=8 = 8x160-thread launches, 4% fill)
+        // -- that was my defect, not the design's. Now: gather+pack A for all groups in
+        // one kernel, pack B (weight, cached whole) in one kernel, gemm_b/gemm32_b in ONE
+        // launch, publish in one launch. Bounds identical to the gate's aw_b/bw_b.
+        int8_t* dAp = (int8_t*)pool_get((size_t)batch * Mp * K);
+        int32_t* dC = (int32_t*)pool_get((size_t)batch * Mp * N * 4);
+        packdev::gather_pack_a_b(*GQ, Araw, dAp, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch);
+        // the whole batched B is one weight: pack once (all groups), cache, reuse.
+        WKey wk{ b, (int)N, (int)K, (int)batch };
+        auto wc = g_wcache.find(wk);
+        int8_t* dBp;
+        if (wc != g_wcache.end()) {
+            dBp = (int8_t*)wc->second;
+        } else {
+            dBp = (int8_t*)sycl::malloc_device((size_t)batch * N * K, *GQ);
+            packdev::gather_pack_b_b(*GQ, Braw, dBp, (int)N, (int)K, (int)ldb_e, sb, (int)batch);
+            g_wcache[wk] = dBp;
         }
-        pool_put(dAp); pool_put(dBdense); pool_put(dC);
-        // dBp is NOT put back: it is owned by g_wcache (the packed weight, reused every
-        // frame). Freeing it happens only in wcache_clear/invalidate.
-        if (stg && ++ncalls % 48 == 0) { std::printf("[stage] batched n=%ld act=%.1f wt=%.1f gemm=%.1f pub=%.1f ms\n", ncalls, act, wt, gm, pb); std::fflush(stdout); }
+        if ((N % 64u) == 0u) s8v8::gemm_b(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K, (int)batch);
+        else                 s8v8::gemm32_b(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K, (int)batch);
+        // publish: one launch over all groups (dequant scales indexed per group).
+        GQ->parallel_for(sycl::range((size_t)batch * M * N), [=](sycl::item<1> it) {
+            size_t i = it.get_id(0);
+            unsigned mn = M * N;
+            unsigned g = (unsigned)(i / mn); size_t rem = i % mn;
+            unsigned r = (unsigned)(rem / N), col = (unsigned)(rem % N);
+            float* gas = (float*)as + (size_t)g * scale_stride;                       // roff (.comp:143)
+            float* gbs = (sb != 0u) ? ((float*)bs + (size_t)g * N) : (float*)bs;      // soff (.comp:147)
+            float v = cr_mul(cr_mul((float)dC[(size_t)g * Mp * N + (size_t)r * N + col], gas[r]), gbs[col]);
+            size_t out = (size_t)g * sc + (size_t)r * ldc_ + col;
+            if (narrow) ((sycl::half*)Cout)[out] = sycl::half(qr_publish(epi, v));
+            else        ((float*)Cout)[out] = qr_publish(epi, v);
+        });
+        pool_put(dAp); pool_put(dC);   // dBp is cache-owned (the whole batched weight)
     });
     return 0;
 }

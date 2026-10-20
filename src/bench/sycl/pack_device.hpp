@@ -248,4 +248,39 @@ static inline void gather_pack_a16(sycl::queue& q, const sycl::half* Araw, sycl:
     });
 }
 
+// batched fused gather+pack (section 92, R8a shape-merge): all `batch` groups in ONE
+// launch, each group's packed operand contiguous (Ap at g*Mp*K / Bp at g*N*K). Same index
+// maps as the single-group versions with the group stride folded into the source -- so
+// the result is byte-identical to looping the single-group kernels, and gemm_b/gemm32_b
+// consume it as one dispatch.
+static inline void gather_pack_a_b(sycl::queue& q, const int8_t* Araw, int8_t* Ap,
+                                   int M, int Mp, int K, int lda, size_t sa, int batch) {
+    const int BM = 128, BK = 32;
+    int wgr = Mp / BM, kb_n = K / BK;
+    size_t per = (size_t)wgr * kb_n * 8 * 512;      // = Mp*K
+    q.parallel_for(sycl::range((size_t)batch * per), [=](sycl::item<1> it) {
+        size_t gg = it.get_id(0) / per; size_t d = it.get_id(0) % per;
+        size_t blk = d / 512; int off = (int)(d % 512);
+        int wi = (int)(blk % 8); size_t wk = blk / 8;
+        int kb = (int)(wk % (size_t)kb_n); int w = (int)(wk / (size_t)kb_n);
+        int row = off / 32, k = off % 32;
+        int srow = w * BM + wi * 16 + row;
+        Ap[gg * per + d] = srow < M ? Araw[gg * sa + (size_t)srow * lda + kb * BK + k] : (int8_t)0;
+    });
+}
+static inline void gather_pack_b_b(sycl::queue& q, const int8_t* Braw, int8_t* Bp,
+                                   int N, int K, int ldb, size_t sb, int batch) {
+    int nt_n = N / 8, kk_n = K / 32;
+    size_t per = (size_t)kk_n * nt_n * 64 * 4;      // = N*K
+    q.parallel_for(sycl::range((size_t)batch * per), [=](sycl::item<1> it) {
+        size_t gg = it.get_id(0) / per; size_t d = it.get_id(0) % per;
+        int j = (int)(d % 4); size_t rest = d / 4;
+        int nl = (int)(rest % 8); rest /= 8;
+        int kq = (int)(rest % 8); rest /= 8;
+        size_t blk = rest;
+        int ntile = (int)(blk % (size_t)nt_n); int kk32 = (int)(blk / (size_t)nt_n);
+        Bp[gg * per + d] = Braw[gg * sb + (size_t)(ntile * 8 + nl) * ldb + (kk32 * 32 + kq * 4 + j)];
+    });
+}
+
 } // namespace packdev

@@ -125,6 +125,151 @@ static inline void pack_b32(const int8_t* B, int8_t* Bp, int N, int K) {
     // identical map to pack_b -- it already takes N as a parameter (N/8=4 tiles at 32).
     pack_b(B, Bp, N, K);
 }
+// batched (section 92, R8a shape-merge): `batch` INDEPENDENT groups in ONE dispatch --
+// the batch is the grid's z dimension, exactly how the shipped engine does it
+// (libxmx.c:2334 vkCmdDispatch(..., batch); gemm_staged.comp:115 gl_WorkGroupID.z). The
+// per-group operands are contiguous (Ap at g*Mp*K, Bp at g*N*K, C32 at g*Mp*N), so the
+// only change vs gemm() above is the base-pointer shift by the group stride -- the dpas
+// inner loop is byte-identical, hence bit-exact by construction. This replaces the
+// recorder's for(g){gemm()} host loop, which turned one big dispatch into `batch` small
+// under-filled ones (the M=640 batch=8 = 8x160-thread pathology the user caught).
+static inline sycl::event gemm_b(sycl::queue& q, const int8_t* Ap, const int8_t* Bp,
+                                 int32_t* C32, int Mp, int N, int K, int batch) {
+    int wg = (Mp / BM) * (N / BN);
+    size_t apb = (size_t)Mp * K, bpb = (size_t)N * K, cb = (size_t)Mp * N;
+    return q.submit([&](handler& h) {
+        h.parallel_for(nd_range(range((size_t)wg * batch * NT), range(NT)), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+            esimd::slm_init<SLM_TOTAL>();
+            int gid = (int)it.get_group(0);
+            int lid = (int)it.get_local_id(0);
+            int g = gid / wg; int loc = gid % wg;
+            int NB = N / BN;
+            int wg_row = loc / NB, wg_col = loc % NB;
+            int wi_row = lid / 4, wi_col = lid % 4;
+            const int8_t* apb_g = Ap + (size_t)g * apb;
+            const int8_t* bp_g  = Bp + (size_t)g * bpb;
+            int32_t* c_g = C32 + (size_t)g * cb;
+            const int8_t* apb = apb_g + (size_t)(wg_row * (K / BK)) * 8 * 512;
+            const int8_t* bp = bp_g + (size_t)wg_col * (BN / 8) * 256;
+            auto load_block = [=](int buf, int kb) SYCL_ESIMD_FUNCTION {
+                esimd::simd<int8_t, 128> av = esimd::block_load<int8_t, 128>(
+                    apb + (size_t)kb * SLM_A + lid * 128, esimd::overaligned_tag<16>{});
+                esimd::slm_block_store(buf * SLM_A + lid * 128, av, esimd::overaligned_tag<16>{});
+                esimd::simd<int8_t, 64> bv = esimd::block_load<int8_t, 64>(
+                    bp + (size_t)kb * N * 32 + lid * 64, esimd::overaligned_tag<16>{});
+                esimd::slm_block_store(SLM_B_BASE + buf * SLM_B + lid * 64, bv, esimd::overaligned_tag<16>{});
+            };
+            auto load_grf = [=](int buf, esimd::simd<int8_t,256>& a0, esimd::simd<int8_t,256>& a1,
+                                esimd::simd<int8_t,256>& b0, esimd::simd<int8_t,256>& b1) SYCL_ESIMD_FUNCTION {
+                uint32_t offA = buf * SLM_A + wi_row * 512;
+                uint32_t offB = SLM_B_BASE + buf * SLM_B + wi_col * 512;
+                a0 = esimd::slm_block_load<int8_t, 256>(offA + 0, esimd::overaligned_tag<16>{});
+                a1 = esimd::slm_block_load<int8_t, 256>(offA + 256, esimd::overaligned_tag<16>{});
+                b0 = esimd::slm_block_load<int8_t, 256>(offB + 0, esimd::overaligned_tag<16>{});
+                b1 = esimd::slm_block_load<int8_t, 256>(offB + 256, esimd::overaligned_tag<16>{});
+            };
+            esimd::simd<int8_t, 256> a0, a1, b0, b1;
+            esimd::simd<int32_t, 64> c00(0), c01(0), c10(0), c11(0);
+            load_block(0, 0);
+            esimd::barrier();
+            int kb_n = K / BK;
+            for (int b = 0; b < kb_n; ++b) {
+                int cur = b & 1, nxt = cur ^ 1;
+                if (b + 1 < kb_n) load_block(nxt, b + 1);
+                load_grf(cur, a0, a1, b0, b1);
+                c00 = esimd::xmx::dpas<8, 8, int32_t>(c00, b0, a0);
+                c01 = esimd::xmx::dpas<8, 8, int32_t>(c01, b1, a0);
+                c10 = esimd::xmx::dpas<8, 8, int32_t>(c10, b0, a1);
+                c11 = esimd::xmx::dpas<8, 8, int32_t>(c11, b1, a1);
+                esimd::barrier();
+            }
+            int gr = wg_row * BM + wi_row * 16, gc = wg_col * BN + wi_col * 16;
+            for (int r = 0; r < 8; ++r) {
+                esimd::simd<int32_t, 16> row0;
+                row0.select<8, 1>(0) = c00.select<8, 1>(r * 8);
+                row0.select<8, 1>(8) = c01.select<8, 1>(r * 8);
+                esimd::simd<int32_t, 16> row1;
+                row1.select<8, 1>(0) = c10.select<8, 1>(r * 8);
+                row1.select<8, 1>(8) = c11.select<8, 1>(r * 8);
+                esimd::block_store<int32_t, 16>(c_g + (size_t)(gr + r) * N + gc, row0, esimd::overaligned_tag<16>{});
+                esimd::block_store<int32_t, 16>(c_g + (size_t)(gr + 8 + r) * N + gc, row1, esimd::overaligned_tag<16>{});
+            }
+        });
+    });
+}
+
+// gemm32 with the batch folded into the grid (section 92, R8a): same fork discipline as
+// gemm_b -- per-group contiguous operands, dpas loop byte-identical, bit-exact by
+// construction. For the batched family's N=32 shapes.
+static inline sycl::event gemm32_b(sycl::queue& q, const int8_t* Ap, const int8_t* Bp,
+                                   int32_t* C32, int Mp, int N, int K, int batch) {
+    const int BN32 = 32, NT32 = 16, WI_ROWS = BM / 16, WI_COLS = BN32 / 16;
+    const int SLM_A32 = BM * BK, SLM_B32 = BK * BN32;
+    const int SLM_B32_BASE = 2 * SLM_A32;
+    const int SLM_TOTAL32 = 2 * SLM_A32 + 2 * SLM_B32;
+    int wg = (Mp / BM) * (N / BN32);
+    size_t apb = (size_t)Mp * K, bpb = (size_t)N * K, cb = (size_t)Mp * N;
+    return q.submit([&](handler& h) {
+        h.parallel_for(nd_range(range((size_t)wg * batch * NT32), range(NT32)), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+            esimd::slm_init<SLM_TOTAL32>();
+            int gid = (int)it.get_group(0);
+            int lid = (int)it.get_local_id(0);
+            int g = gid / wg; int loc = gid % wg;
+            int NB = N / BN32;
+            int wg_row = loc / NB, wg_col = loc % NB;
+            int wi_row = lid / WI_COLS, wi_col = lid % WI_COLS;
+            const int8_t* apb_g = Ap + (size_t)g * apb;
+            const int8_t* bp_g  = Bp + (size_t)g * bpb;
+            int32_t* c_g = C32 + (size_t)g * cb;
+            const int8_t* apb = apb_g + (size_t)(wg_row * (K / BK)) * WI_ROWS * 512;
+            const int8_t* bp = bp_g + (size_t)wg_col * (BN32 / 8) * 256;
+            auto load_block = [=](int buf, int kb) SYCL_ESIMD_FUNCTION {
+                esimd::simd<int8_t, 256> av = esimd::block_load<int8_t, 256>(
+                    apb + (size_t)kb * SLM_A32 + lid * 256, esimd::overaligned_tag<16>{});
+                esimd::slm_block_store(buf * SLM_A32 + lid * 256, av, esimd::overaligned_tag<16>{});
+                esimd::simd<int8_t, 64> bv = esimd::block_load<int8_t, 64>(
+                    bp + (size_t)kb * N * 32 + lid * 64, esimd::overaligned_tag<16>{});
+                esimd::slm_block_store(SLM_B32_BASE + buf * SLM_B32 + lid * 64, bv, esimd::overaligned_tag<16>{});
+            };
+            auto load_grf = [=](int buf, esimd::simd<int8_t,256>& a0, esimd::simd<int8_t,256>& a1,
+                                esimd::simd<int8_t,256>& b0, esimd::simd<int8_t,256>& b1) SYCL_ESIMD_FUNCTION {
+                uint32_t offA = buf * SLM_A32 + wi_row * 512;
+                uint32_t offB = SLM_B32_BASE + buf * SLM_B32 + wi_col * 512;
+                a0 = esimd::slm_block_load<int8_t, 256>(offA + 0, esimd::overaligned_tag<16>{});
+                a1 = esimd::slm_block_load<int8_t, 256>(offA + 256, esimd::overaligned_tag<16>{});
+                b0 = esimd::slm_block_load<int8_t, 256>(offB + 0, esimd::overaligned_tag<16>{});
+                b1 = esimd::slm_block_load<int8_t, 256>(offB + 256, esimd::overaligned_tag<16>{});
+            };
+            esimd::simd<int8_t, 256> a0, a1, b0, b1;
+            esimd::simd<int32_t, 64> c00(0), c01(0), c10(0), c11(0);
+            load_block(0, 0);
+            esimd::barrier();
+            int kb_n = K / BK;
+            for (int b = 0; b < kb_n; ++b) {
+                int cur = b & 1, nxt = cur ^ 1;
+                if (b + 1 < kb_n) load_block(nxt, b + 1);
+                load_grf(cur, a0, a1, b0, b1);
+                c00 = esimd::xmx::dpas<8, 8, int32_t>(c00, b0, a0);
+                c01 = esimd::xmx::dpas<8, 8, int32_t>(c01, b1, a0);
+                c10 = esimd::xmx::dpas<8, 8, int32_t>(c10, b0, a1);
+                c11 = esimd::xmx::dpas<8, 8, int32_t>(c11, b1, a1);
+                esimd::barrier();
+            }
+            int gr = wg_row * BM + wi_row * 16, gc = wg_col * BN32 + wi_col * 16;
+            for (int r = 0; r < 8; ++r) {
+                esimd::simd<int32_t, 16> row0;
+                row0.select<8, 1>(0) = c00.select<8, 1>(r * 8);
+                row0.select<8, 1>(8) = c01.select<8, 1>(r * 8);
+                esimd::simd<int32_t, 16> row1;
+                row1.select<8, 1>(0) = c10.select<8, 1>(r * 8);
+                row1.select<8, 1>(8) = c11.select<8, 1>(r * 8);
+                esimd::block_store<int32_t, 16>(c_g + (size_t)(gr + r) * N + gc, row0, esimd::overaligned_tag<16>{});
+                esimd::block_store<int32_t, 16>(c_g + (size_t)(gr + 8 + r) * N + gc, row1, esimd::overaligned_tag<16>{});
+            }
+        });
+    });
+}
+
 static inline sycl::event gemm32(sycl::queue& q, const int8_t* Ap, const int8_t* Bp,
                                  int32_t* C32, int Mp, int N, int K) {
     const int BN32 = 32, NT32 = 16, WI_ROWS = BM / 16, WI_COLS = BN32 / 16;
