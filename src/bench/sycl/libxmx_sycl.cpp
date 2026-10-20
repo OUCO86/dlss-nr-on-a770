@@ -1232,81 +1232,53 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
     const int Mp = (int)(((M + 15u) / 16u) * 16u);
     g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
-        // ---- pass A: stem gemm(features, adapter -> f32), publish e4m3 -> hidden16 ----
-        std::vector<sycl::half> hF((size_t)M * 16), hAd((size_t)16 * 32),
-            hFp((size_t)Mp * 16), hAdp((size_t)16 * 32);
-        std::vector<sycl::half> hH16((size_t)M * 32);            // published hidden16 (host copy for pack_a)
-        GQ->memcpy(hF.data(), Fraw, (size_t)M * 16 * 2).wait();
-        GQ->memcpy(hAd.data(), Arw, (size_t)16 * 32 * 2).wait();
-        std::vector<sycl::half> hFpad((size_t)Mp * 16, sycl::half(0.f));
-        std::memcpy(hFpad.data(), hF.data(), (size_t)M * 16 * 2);
-        f16v1::pack_a(hFpad.data(), hFp.data(), Mp, 16);
-        f16v1::pack_b(hAd.data(), hAdp.data(), 16, 32);
+        // fully device-resident (section 92): all three legs pack on device and the
+        // hidden16/hidden intermediates stay on device between them -- the old path
+        // downloaded Fraw/Arw/Eraw/Praw AND both intermediates to host and re-uploaded
+        // packed operands (the 324ms). dS stays the raw f32 stem (pass C's residual).
         sycl::half* dA = (sycl::half*)pool_get((size_t)Mp * 16 * 2);
         sycl::half* dB = (sycl::half*)pool_get((size_t)16 * 32 * 2);
         float* dS = (float*)pool_get((size_t)Mp * 32 * 4);
-        GQ->memcpy(dA, hFp.data(), (size_t)Mp * 16 * 2).wait();
-        GQ->memcpy(dB, hAdp.data(), (size_t)16 * 32 * 2).wait();
+        sycl::half* dH16 = (sycl::half*)pool_get((size_t)M * 32 * 2);
+        packdev::pack_a16(*GQ, Fraw, dA, (int)M, Mp, 16);
+        packdev::pack_b16(*GQ, Arw, dB, 16, 32);
         f16v1::gemm(*GQ, dA, dB, dS, Mp, 32, 16);
         pool_put(dA); pool_put(dB);
-        // the publish happens on DEVICE (a device kernel cannot write a host std::vector --
-        // the section-79 lesson). dS stays the RAW f32 stem and is NOT freed: pass C reads
-        // it as the residual's skip straight off the device (no host round-trip needed).
-        {
-            sycl::half* dH16 = (sycl::half*)pool_get((size_t)M * 32 * 2);
-            GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
-                size_t i = it.get_id(0);
-                dH16[i] = sycl::half(qr_e4m3(dS[i]));            // publish = E4M3 only
-            }).wait();
-            GQ->memcpy(hH16.data(), dH16, (size_t)M * 32 * 2).wait();   // host copy for pack_a
-            pool_put(dH16);
-        }
+        // publish = E4M3 only, on device; dH16 stays for pass B's pack_a.
+        GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
+            size_t i = it.get_id(0);
+            dH16[i] = sycl::half(qr_e4m3(dS[i]));
+        });
         // ---- pass B: expand gemm(hidden16, expand -> f32), publish(3) -> half hidden ----
-        std::vector<sycl::half> hE((size_t)32 * 128), hHp((size_t)Mp * 32), hEp((size_t)32 * 128),
-            hHid((size_t)M * 128);
-        GQ->memcpy(hE.data(), Eraw, (size_t)32 * 128 * 2).wait();
-        {
-            std::vector<sycl::half> hHpad((size_t)Mp * 32, sycl::half(0.f));
-            std::memcpy(hHpad.data(), hH16.data(), (size_t)M * 32 * 2);
-            f16v1::pack_a(hHpad.data(), hHp.data(), Mp, 32);
-            f16v1::pack_b(hE.data(), hEp.data(), 32, 128);
-            sycl::half* dA2 = (sycl::half*)pool_get((size_t)Mp * 32 * 2);
-            sycl::half* dB2 = (sycl::half*)pool_get((size_t)32 * 128 * 2);
-            float* dC1 = (float*)pool_get((size_t)Mp * 128 * 4);
-            GQ->memcpy(dA2, hHp.data(), (size_t)Mp * 32 * 2).wait();
-            GQ->memcpy(dB2, hEp.data(), (size_t)32 * 128 * 2).wait();
-            f16v1::gemm(*GQ, dA2, dB2, dC1, Mp, 128, 32);
-            sycl::half* dHid = (sycl::half*)pool_get((size_t)M * 128 * 2);
-            GQ->parallel_for(sycl::range((size_t)M * 128), [=](sycl::item<1> it) {
-                size_t i = it.get_id(0);
-                dHid[i] = sycl::half(qr_publish(3u, dC1[i]));    // gate -> e4m3
-            }).wait();
-            GQ->memcpy(hHid.data(), dHid, (size_t)M * 128 * 2).wait();   // host copy for pack_a
-            pool_put(dA2); pool_put(dB2); pool_put(dC1); pool_put(dHid);
-        }
+        sycl::half* dA2 = (sycl::half*)pool_get((size_t)Mp * 32 * 2);
+        sycl::half* dB2 = (sycl::half*)pool_get((size_t)32 * 128 * 2);
+        float* dC1 = (float*)pool_get((size_t)Mp * 128 * 4);
+        sycl::half* dHid = (sycl::half*)pool_get((size_t)M * 128 * 2);
+        packdev::pack_a16(*GQ, dH16, dA2, (int)M, Mp, 32);   // dH16 on device
+        packdev::pack_b16(*GQ, Eraw, dB2, 32, 128);
+        f16v1::gemm(*GQ, dA2, dB2, dC1, Mp, 128, 32);
+        pool_put(dH16);
+        GQ->parallel_for(sycl::range((size_t)M * 128), [=](sycl::item<1> it) {
+            size_t i = it.get_id(0);
+            dHid[i] = sycl::half(qr_publish(3u, dC1[i]));    // gate -> e4m3
+        });
+        pool_put(dA2); pool_put(dB2); pool_put(dC1);
         // ---- pass C: projection gemm(hidden, projection -> f32) + raw-stem residual ----
-        std::vector<sycl::half> hP((size_t)128 * 32), hXp((size_t)Mp * 128), hPp((size_t)128 * 32);
-        GQ->memcpy(hP.data(), Praw, (size_t)128 * 32 * 2).wait();
-        {
-            std::vector<sycl::half> hXpad((size_t)Mp * 128, sycl::half(0.f));
-            std::memcpy(hXpad.data(), hHid.data(), (size_t)M * 128 * 2);
-            f16v1::pack_a(hXpad.data(), hXp.data(), Mp, 128);
-            f16v1::pack_b(hP.data(), hPp.data(), 128, 32);
-            sycl::half* dA3 = (sycl::half*)pool_get((size_t)Mp * 128 * 2);
-            sycl::half* dB3 = (sycl::half*)pool_get((size_t)128 * 32 * 2);
-            float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
-            GQ->memcpy(dA3, hXp.data(), (size_t)Mp * 128 * 2).wait();
-            GQ->memcpy(dB3, hPp.data(), (size_t)128 * 32 * 2).wait();
-            f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128);
-            GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
-                size_t i = it.get_id(0);
-                unsigned col = (unsigned)(i % 32u);
-                float total = sycl::fma(dS[i], cp[col], dC2[i]);   // skip = RAW f32 stem (device)
-                if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
-                else        ((float*)Cout)[i] = qr_publish(epi, total);
-            }).wait();
-            pool_put(dA3); pool_put(dB3); pool_put(dC2);
-        }
+        sycl::half* dA3 = (sycl::half*)pool_get((size_t)Mp * 128 * 2);
+        sycl::half* dB3 = (sycl::half*)pool_get((size_t)128 * 32 * 2);
+        float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
+        packdev::pack_a16(*GQ, dHid, dA3, (int)M, Mp, 128);   // dHid on device
+        packdev::pack_b16(*GQ, Praw, dB3, 128, 32);
+        f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128);
+        pool_put(dHid);
+        GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
+            size_t i = it.get_id(0);
+            unsigned col = (unsigned)(i % 32u);
+            float total = sycl::fma(dS[i], cp[col], dC2[i]);   // skip = RAW f32 stem (device)
+            if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
+            else        ((float*)Cout)[i] = qr_publish(epi, total);
+        });
+        pool_put(dA3); pool_put(dB3); pool_put(dC2);
         pool_put(dS);
     });
     return 0;
