@@ -783,7 +783,7 @@ int xmx_rec_gemm_qkv_window(int image, int weight, int q, int k, int v, int scal
         float* dC = (float*)pool_get((size_t)Mp * NH * 4);
         GQ->memcpy(dAp, hAp.data(), (size_t)Mp * C * 2).wait();
         GQ->memcpy(dBp, hBp.data(), (size_t)C * NH * 2).wait();
-        f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)NH, (int)C).wait();
+        f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)NH, (int)C);
         // qkv_epilogue: in-place Q/K head norm on the f32 acc (QKV_READ = float(stage)),
         // then publish e4m3 -> half scatter. One device pass per (row, head) for the norm,
         // then the publish/scatter pass.
@@ -878,7 +878,7 @@ int xmx_rec_gemm_residual(int a, int b, int c, int skip, int cosine,
         float* dC = (float*)pool_get((size_t)Mp * N * 4);
         GQ->memcpy(dAp, hAp.data(), na * 2).wait();
         GQ->memcpy(dBp, hBp.data(), nb * 2).wait();
-        f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K).wait();
+        f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K);
         GQ->parallel_for(sycl::range((size_t)M * N),
                          [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
@@ -960,7 +960,7 @@ int xmx_rec_gemm_window_residual(int a, int b, int c, int skip, int cosine,
         float* dC = (float*)pool_get((size_t)Mp * N * 4);
         GQ->memcpy(dAp, hAp.data(), na * 2).wait();
         GQ->memcpy(dBp, hBp.data(), nb * 2).wait();
-        f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K).wait();
+        f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K);
         GQ->parallel_for(sycl::range(blk_elems),
                          [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
@@ -1034,57 +1034,43 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
     const int Mp = (int)(((M + 15u) / 16u) * 16u);
     g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
-        // ---- pass 1: expand, publish(3)=gate->e4m3, narrow f16 -> hidden16 ----
-        {
-            std::vector<sycl::half> hA((size_t)M * cin), hApad((size_t)Mp * cin, sycl::half(0.f)),
-                hE((size_t)cin * hidden), hAp((size_t)Mp * cin), hEp((size_t)cin * hidden),
-                hH((size_t)M * hidden);   // host hidden16: its OWN buffer (M*hidden > M*cin, reusing hA overruns it -- the section-73 size lesson)
-            GQ->memcpy(hA.data(), Araw, (size_t)M * cin * 2).wait();
-            std::memcpy(hApad.data(), hA.data(), (size_t)M * cin * 2);
-            GQ->memcpy(hE.data(), Eraw, (size_t)cin * hidden * 2).wait();
-            f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)cin);
-            f16v1::pack_b(hE.data(), hEp.data(), (int)cin, (int)hidden);
-            sycl::half* dAp = (sycl::half*)pool_get((size_t)Mp * cin * 2);
-            sycl::half* dEp = (sycl::half*)pool_get((size_t)cin * hidden * 2);
-            float* dC1 = (float*)pool_get((size_t)Mp * hidden * 4);
-            GQ->memcpy(dAp, hAp.data(), (size_t)Mp * cin * 2).wait();
-            GQ->memcpy(dEp, hEp.data(), (size_t)cin * hidden * 2).wait();
-            f16v1::gemm(*GQ, dAp, dEp, dC1, Mp, (int)hidden, (int)cin).wait();
-            // publish(3) on device, store as f16 hidden16, then download for the host pack.
-            sycl::half* dH = (sycl::half*)pool_get((size_t)M * hidden * 2);
-            GQ->parallel_for(sycl::range((size_t)M * hidden), [=](sycl::item<1> it) {
-                size_t i = it.get_id(0);
-                dH[i] = sycl::half(qr_publish(3u, dC1[i]));
-            }).wait();
-            GQ->memcpy(hH.data(), dH, (size_t)M * hidden * 2).wait();   // host hidden16
-            pool_put(dAp); pool_put(dEp); pool_put(dC1); pool_put(dH);
-            // ---- pass 2: projection gemm_residual(hidden16, projection -> out) ----
-            std::vector<sycl::half> hP((size_t)hidden * cin), hHp((size_t)Mp * hidden),
-                hPp((size_t)hidden * cin);
-            std::vector<sycl::half> hHpad((size_t)Mp * hidden, sycl::half(0.f));
-            std::memcpy(hHpad.data(), hH.data(), (size_t)M * hidden * 2);
-            GQ->memcpy(hP.data(), Praw, (size_t)hidden * cin * 2).wait();
-            f16v1::pack_a(hHpad.data(), hHp.data(), Mp, (int)hidden);
-            f16v1::pack_b(hP.data(), hPp.data(), (int)hidden, (int)cin);
-            sycl::half* dHp = (sycl::half*)pool_get((size_t)Mp * hidden * 2);
-            sycl::half* dPp = (sycl::half*)pool_get((size_t)hidden * cin * 2);
-            float* dC2 = (float*)pool_get((size_t)Mp * cin * 4);
-            GQ->memcpy(dHp, hHp.data(), (size_t)Mp * hidden * 2).wait();
-            GQ->memcpy(dPp, hPp.data(), (size_t)hidden * cin * 2).wait();
-            f16v1::gemm(*GQ, dHp, dPp, dC2, Mp, (int)cin, (int)hidden).wait();
-            GQ->parallel_for(sycl::range((size_t)M * cin), [=](sycl::item<1> it) {
-                size_t i = it.get_id(0);
-                unsigned col = (unsigned)(i % cin);
-                float total = dC2[i];
-                if (residual) {
-                    float sk = half_skip ? (float)((const sycl::half*)skp)[i] : ((const float*)skp)[i];
-                    total = sycl::fma(sk, cp[col], total);
-                }
-                if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
-                else        ((float*)Cout)[i] = qr_publish(epi, total);
-            }).wait();
-            pool_put(dHp); pool_put(dPp); pool_put(dC2);
-        }
+        // fully device-resident (section 92): both legs pack on device (packdev), the
+        // hidden16 stays on device between them -- the old path downloaded Araw/Eraw and
+        // the hidden16 to host and re-uploaded packed operands (the 519ms). in-order
+        // queue: every read kernel is enqueued before the pool_put that recycles its
+        // buffer, so cross-pass scratch reuse is safe; one wait at the end of the pass.
+        sycl::half* dAp = (sycl::half*)pool_get((size_t)Mp * cin * 2);
+        sycl::half* dEp = (sycl::half*)pool_get((size_t)cin * hidden * 2);
+        float* dC1 = (float*)pool_get((size_t)Mp * hidden * 4);
+        sycl::half* dH = (sycl::half*)pool_get((size_t)M * hidden * 2);
+        packdev::pack_a16(*GQ, Araw, dAp, (int)M, Mp, (int)cin);
+        packdev::pack_b16(*GQ, Eraw, dEp, (int)cin, (int)hidden);
+        f16v1::gemm(*GQ, dAp, dEp, dC1, Mp, (int)hidden, (int)cin);
+        // publish(3) on device, store as f16 hidden16 -- stays on device for pass 2.
+        GQ->parallel_for(sycl::range((size_t)M * hidden), [=](sycl::item<1> it) {
+            size_t i = it.get_id(0);
+            dH[i] = sycl::half(qr_publish(3u, dC1[i]));
+        });
+        pool_put(dAp); pool_put(dEp); pool_put(dC1);
+        // ---- pass 2: projection gemm_residual(hidden16, projection -> out) ----
+        sycl::half* dHp = (sycl::half*)pool_get((size_t)Mp * hidden * 2);
+        sycl::half* dPp = (sycl::half*)pool_get((size_t)hidden * cin * 2);
+        float* dC2 = (float*)pool_get((size_t)Mp * cin * 4);
+        packdev::pack_a16(*GQ, dH, dHp, (int)M, Mp, (int)hidden);   // dH on device
+        packdev::pack_b16(*GQ, Praw, dPp, (int)hidden, (int)cin);
+        f16v1::gemm(*GQ, dHp, dPp, dC2, Mp, (int)cin, (int)hidden);
+        GQ->parallel_for(sycl::range((size_t)M * cin), [=](sycl::item<1> it) {
+            size_t i = it.get_id(0);
+            unsigned col = (unsigned)(i % cin);
+            float total = dC2[i];
+            if (residual) {
+                float sk = half_skip ? (float)((const sycl::half*)skp)[i] : ((const float*)skp)[i];
+                total = sycl::fma(sk, cp[col], total);
+            }
+            if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
+            else        ((float*)Cout)[i] = qr_publish(epi, total);
+        });
+        pool_put(dHp); pool_put(dPp); pool_put(dC2); pool_put(dH);
     });
     return 0;
 }
@@ -1164,7 +1150,7 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
             float* dC1 = (float*)pool_get((size_t)Mp * 128 * 4);
             GQ->memcpy(dA2, hHp.data(), (size_t)Mp * 32 * 2).wait();
             GQ->memcpy(dB2, hEp.data(), (size_t)32 * 128 * 2).wait();
-            f16v1::gemm(*GQ, dA2, dB2, dC1, Mp, 128, 32).wait();
+            f16v1::gemm(*GQ, dA2, dB2, dC1, Mp, 128, 32);
             sycl::half* dHid = (sycl::half*)pool_get((size_t)M * 128 * 2);
             GQ->parallel_for(sycl::range((size_t)M * 128), [=](sycl::item<1> it) {
                 size_t i = it.get_id(0);
@@ -1186,7 +1172,7 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
             float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
             GQ->memcpy(dA3, hXp.data(), (size_t)Mp * 128 * 2).wait();
             GQ->memcpy(dB3, hPp.data(), (size_t)128 * 32 * 2).wait();
-            f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128).wait();
+            f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128);
             GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
                 size_t i = it.get_id(0);
                 unsigned col = (unsigned)(i % 32u);
@@ -1261,7 +1247,7 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
         float* dS = (float*)pool_get((size_t)Mp * 32 * 4);
         GQ->memcpy(dA, hFp.data(), (size_t)Mp * 16 * 2).wait();
         GQ->memcpy(dB, hAdp.data(), (size_t)16 * 32 * 2).wait();
-        f16v1::gemm(*GQ, dA, dB, dS, Mp, 32, 16).wait();
+        f16v1::gemm(*GQ, dA, dB, dS, Mp, 32, 16);
         pool_put(dA); pool_put(dB);
         // the publish happens on DEVICE (a device kernel cannot write a host std::vector --
         // the section-79 lesson). dS stays the RAW f32 stem and is NOT freed: pass C reads
@@ -1289,7 +1275,7 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
             float* dC1 = (float*)pool_get((size_t)Mp * 128 * 4);
             GQ->memcpy(dA2, hHp.data(), (size_t)Mp * 32 * 2).wait();
             GQ->memcpy(dB2, hEp.data(), (size_t)32 * 128 * 2).wait();
-            f16v1::gemm(*GQ, dA2, dB2, dC1, Mp, 128, 32).wait();
+            f16v1::gemm(*GQ, dA2, dB2, dC1, Mp, 128, 32);
             sycl::half* dHid = (sycl::half*)pool_get((size_t)M * 128 * 2);
             GQ->parallel_for(sycl::range((size_t)M * 128), [=](sycl::item<1> it) {
                 size_t i = it.get_id(0);
@@ -1311,7 +1297,7 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
             float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
             GQ->memcpy(dA3, hXp.data(), (size_t)Mp * 128 * 2).wait();
             GQ->memcpy(dB3, hPp.data(), (size_t)128 * 32 * 2).wait();
-            f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128).wait();
+            f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128);
             GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
                 size_t i = it.get_id(0);
                 unsigned col = (unsigned)(i % 32u);
@@ -1393,7 +1379,7 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
             float* dC = (float*)pool_get((size_t)Mp * N * 4);
             GQ->memcpy(dAp, hAp.data(), (size_t)Mp * K * 2).wait();
             GQ->memcpy(dBp, hBp.data(), b_slice * 2).wait();
-            f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K).wait();
+            f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K);
             GQ->parallel_for(sycl::range((size_t)M * N),
                              [=](sycl::item<1> it) {
                 size_t i = it.get_id(0);
@@ -1449,7 +1435,7 @@ int xmx_rec_gemm_int8(int a, int b, int c, int a_scale, int b_scale,
         int32_t* dC = (int32_t*)pool_get((size_t)Mp * N * 4);
         packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K);
         packdev::pack_b(*GQ, Braw, dBp, (int)N, (int)K);   // B arrives TRANSPOSED
-        s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K).wait();
+        s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K);
         GQ->parallel_for(sycl::range((size_t)M * N),
                          [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
@@ -1544,8 +1530,8 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
                 int32_t* dC = (int32_t*)pool_get((size_t)Mp * n64 * 4);
                 GQ->memcpy(dAp, hAp.data(), (size_t)Mp * K).wait();
                 GQ->memcpy(dBp, Bp.data(), (size_t)n64 * K).wait();
-                if (n64 == 64u) s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)n64, (int)K).wait();
-                else            s8v8::gemm32(*GQ, dAp, dBp, dC, Mp, (int)n64, (int)K).wait();
+                if (n64 == 64u) s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)n64, (int)K);
+                else            s8v8::gemm32(*GQ, dAp, dBp, dC, Mp, (int)n64, (int)K);
                 // publish this block into the ldc-strided output (only real M rows)
                 GQ->parallel_for(sycl::range((size_t)M * n64),
                                  [=](sycl::item<1> it) {
@@ -1618,7 +1604,7 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
         int32_t* dC = (int32_t*)pool_get((size_t)Mp * NH * 4);
         packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)C);
         packdev::pack_b(*GQ, Braw, dBp, (int)NH, (int)C);   // N x K row-major == transposed
-        s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)NH, (int)C).wait();
+        s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)NH, (int)C);
         // stage 2: deq + in-place Q/K head norm (the epilogue's order; V deqt only).
         GQ->parallel_for(sycl::range((size_t)M * heads),
                          [=](sycl::item<1> it) {
@@ -1732,7 +1718,7 @@ int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale,
         int32_t* dC = (int32_t*)pool_get((size_t)Mp * N * 4);
         packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K);
         packdev::pack_b(*GQ, Braw, dBp, (int)N, (int)K);
-        s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K).wait();
+        s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K);
         GQ->parallel_for(sycl::range((size_t)M * N),
                          [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
@@ -1838,7 +1824,7 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
         int32_t* dC = (int32_t*)pool_get((size_t)Mp * N * 4);
         packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K);
         packdev::pack_b(*GQ, Braw, dBp, (int)N, (int)K);
-        s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K).wait();
+        s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K);
         GQ->parallel_for(sycl::range(blk_elems),
                          [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
@@ -1903,14 +1889,14 @@ int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
         // scores leg: Q(rows x 32) @ K^T(32 x rows) -> rows x rows. K stored (rows,32)=(N,K).
         packdev::pack_a16_b(*GQ, Q, dAq, (int)rows, Mp, 32, (int)heads);
         packdev::pack_b16_t_b(*GQ, Kk, dBk, 32, (int)rows, (int)heads);
-        f16v1::gemm_b(*GQ, dAq, dBk, dScores, Mp, (int)rows, 32, (int)heads).wait();
+        f16v1::gemm_b(*GQ, dAq, dBk, dScores, Mp, (int)rows, 32, (int)heads);
         // vit_softmax over heads*rows rows, tokens cols, stride=rows -- one launch.
         GQ->parallel_for(sycl::range((size_t)heads * rows),
                          smax::vit_softmax_kernel()(dScores, dProbs, dRecip, heads * rows, tokens, rows)).wait();
         // attnV leg: P(rows x rows) @ V(rows x 32) -> rows x 32. V stored (rows,32)=(K,N).
         packdev::pack_a16_b(*GQ, dProbs, dAp, (int)rows, Mp, (int)rows, (int)heads);
         packdev::pack_b16_b(*GQ, V, dBv, (int)rows, 32, (int)heads);
-        f16v1::gemm_b(*GQ, dAp, dBv, dCtx, Mp, 32, (int)rows, (int)heads).wait();
+        f16v1::gemm_b(*GQ, dAp, dBv, dCtx, Mp, 32, (int)rows, (int)heads);
         pool_put(dAq); pool_put(dBk); pool_put(dAp); pool_put(dBv);
         // merge_heads_scale: (1,rows,heads*32) with scale=reciprocal (heads*rows), e4m3, half
         GQ->parallel_for(sycl::range((size_t)rows * CH), [=](sycl::item<1> it) {
@@ -2229,14 +2215,14 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
         // scores leg: Q(64x32) @ K^T(32x64) -> 64x64. K stored (64 tokens,32 ch) = (N,K).
         packdev::pack_a16_b(*GQ, Q, dAq, 64, 64, 32, (int)batches);
         packdev::pack_b16_t_b(*GQ, Kk, dBk, 32, 64, (int)batches);
-        f16v1::gemm_b(*GQ, dAq, dBk, dScores, 64, 64, 32, (int)batches).wait();
+        f16v1::gemm_b(*GQ, dAq, dBk, dScores, 64, 64, 32, (int)batches);
         // softmax over (batches*64) rows of 64, with bias (heads,64,64) -- one launch.
         GQ->parallel_for(sycl::range((size_t)batches*64u),
                          smax::softmax_kernel()(dScores, dProbs, batches*64u, 64u, Bp, heads)).wait();
         // attnV leg: P(64x64) @ V(64x32) -> 64x32. V stored (64 tokens,32 ch) = (K,N).
         packdev::pack_a16_b(*GQ, dProbs, dAp, 64, 64, 64, (int)batches);
         packdev::pack_b16_b(*GQ, V, dBv, 64, 32, (int)batches);
-        f16v1::gemm_b(*GQ, dAp, dBv, dCtx, 64, 32, 64, (int)batches).wait();
+        f16v1::gemm_b(*GQ, dAp, dBv, dCtx, 64, 32, 64, (int)batches);
         if (merged) {
             // merge_heads: (windows,heads,64,32) -> (windows,64,heads*32), publish e4m3, half
             const unsigned CH = heads * 32u;
@@ -2313,7 +2299,7 @@ int xmx_rec_gemm_window_residual_pool(int a, int b, int skip_out, int skip, int 
         float* dStage = (float*)pool_get((size_t)M * N * 4);
         GQ->memcpy(dAp, hAp.data(), na * 2).wait();
         GQ->memcpy(dBp, hBp.data(), nb * 2).wait();
-        f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K).wait();
+        f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K);
         GQ->parallel_for(sycl::range(blk_elems), [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             unsigned r = (unsigned)(i / N), col = (unsigned)(i % N);
@@ -2451,7 +2437,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         float* dCq = (float*)pool_get((size_t)Mp * NH * 4);
         packdev::pack_a16(*GQ, dA, dAp, (int)rows, Mp, (int)C);
         packdev::pack_b16(*GQ, Wraw, dBp, (int)C, (int)NH);   // Wraw is on device
-        f16v1::gemm(*GQ, dAp, dBp, dCq, Mp, (int)NH, (int)C).wait();
+        f16v1::gemm(*GQ, dAp, dBp, dCq, Mp, (int)NH, (int)C);
         pool_put(dA);
         pool_put(dAp); pool_put(dBp);
         sycl::half* dQ = (sycl::half*)pool_get((size_t)rows * C * 2);
@@ -2489,12 +2475,12 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         sycl::half* dBv = (sycl::half*)pool_get((size_t)windows * 64u * 32u * 2);
         packdev::pack_a16_b(*GQ, dQ, dAq, 64, 64, 32, (int)windows);
         packdev::pack_b16_t_b(*GQ, dK, dBk, 32, 64, (int)windows);
-        f16v1::gemm_b(*GQ, dAq, dBk, dScores, 64, 64, 32, (int)windows).wait();
+        f16v1::gemm_b(*GQ, dAq, dBk, dScores, 64, 64, 32, (int)windows);
         GQ->parallel_for(sycl::range((size_t)windows*64u),
                          smax::softmax_kernel()(dScores, dProbs, windows*64u, 64u, Bp, 1u)).wait();
         packdev::pack_a16_b(*GQ, dProbs, dAp2, 64, 64, 64, (int)windows);
         packdev::pack_b16_b(*GQ, dV, dBv, 64, 32, (int)windows);
-        f16v1::gemm_b(*GQ, dAp2, dBv, dCtx, 64, 32, 64, (int)windows).wait();
+        f16v1::gemm_b(*GQ, dAp2, dBv, dCtx, 64, 32, 64, (int)windows);
         pool_put(dAq); pool_put(dBk); pool_put(dAp2); pool_put(dBv);
         pool_put(dScores); pool_put(dProbs);
         sycl::half* dAttended = (sycl::half*)pool_get((size_t)rows * C * 2);
@@ -2512,7 +2498,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         float* dC3 = (float*)pool_get((size_t)Mp * C * 4);
         packdev::pack_a16(*GQ, dAttended, dAp3, (int)rows, Mp, (int)C);
         packdev::pack_b16(*GQ, Praw, dBp3, (int)C, (int)C);
-        f16v1::gemm(*GQ, dAp3, dBp3, dC3, Mp, (int)C, (int)C).wait();
+        f16v1::gemm(*GQ, dAp3, dBp3, dC3, Mp, (int)C, (int)C);
         float* dStage = pooling ? (float*)pool_get((size_t)rows * C * 4) : nullptr;
         sycl::half* dOut16 = head ? (sycl::half*)pool_get(img_elems * 2) : nullptr;
         GQ->parallel_for(sycl::range(blk_elems), [=](sycl::item<1> it) {
@@ -2578,7 +2564,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             float* dH4 = (float*)pool_get((size_t)MpH * 16u * 4);
             GQ->memcpy(dA4, hOp.data(), (size_t)MpH * C * 2).wait();
             GQ->memcpy(dB4, hWp.data(), (size_t)C * 16u * 2).wait();
-            f16v1::gemm(*GQ, dA4, dB4, dH4, MpH, 16, (int)C).wait();
+            f16v1::gemm(*GQ, dA4, dB4, dH4, MpH, 16, (int)C);
             GQ->parallel_for(sycl::range((size_t)pixels * 4u), [=](sycl::item<1> it) {
                 size_t i = it.get_id(0);
                 unsigned pixel = (unsigned)(i / 4u), c = (unsigned)(i % 4u);
