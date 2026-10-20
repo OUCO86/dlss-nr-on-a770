@@ -1898,40 +1898,27 @@ int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
         sycl::half* dProbs = (sycl::half*)pool_get(sc * 2);
         float* dRecip = (float*)pool_get((size_t)heads * rows * 4);
         float* dCtx = (float*)pool_get(cx * 4);
-        const int Mp = (int)(((rows + 15u) / 16u) * 16u);
-        std::vector<sycl::half> hq((size_t)rows * 32u), hk((size_t)rows * 32u), hv((size_t)rows * 32u);
-        std::vector<sycl::half> Aq((size_t)Mp * 32u), Bk((size_t)Mp * 32u), Ap((size_t)Mp * rows), Bv((size_t)rows * 32u);
-        std::vector<sycl::half> hp((size_t)Mp * rows);
-        for (unsigned h = 0; h < heads; ++h) {
-            GQ->memcpy(hq.data(), Q + (size_t)h * rows * 32u, (size_t)rows * 32u * 2).wait();
-            GQ->memcpy(hk.data(), Kk + (size_t)h * rows * 32u, (size_t)rows * 32u * 2).wait();
-            std::vector<sycl::half> hqp((size_t)Mp * 32u, sycl::half(0.f)), hkp((size_t)Mp * 32u, sycl::half(0.f));
-            std::memcpy(hqp.data(), hq.data(), (size_t)rows * 32u * 2);
-            std::memcpy(hkp.data(), hk.data(), (size_t)rows * 32u * 2);
-            f16v1::pack_a(hqp.data(), Aq.data(), Mp, 32);
-            f16v1::pack_b_t(hkp.data(), Bk.data(), 32, (int)rows);   // K stored (rows,32)
-            sycl::half* dA=(sycl::half*)pool_get((size_t)Mp*32u*2);
-            sycl::half* dB=(sycl::half*)pool_get((size_t)Mp*32u*2);
-            GQ->memcpy(dA,Aq.data(),(size_t)Mp*32u*2).wait(); GQ->memcpy(dB,Bk.data(),(size_t)Mp*32u*2).wait();
-            f16v1::gemm(*GQ, dA, dB, dScores + (size_t)h*rows*rows, Mp, (int)rows, 32).wait();
-            pool_put(dA); pool_put(dB);
-        }
-        // vit_softmax over heads*rows rows, tokens cols, stride=rows
+        const int Mp = (int)(((rows + 15u) / 16u) * 16u);   // rows%16==0 (guard) => Mp==rows
+        // batched device pack + batched gemm (section 92): Q/Kk/V are contiguous per head
+        // on device (h*rows*32), dScores at h*rows*rows, dCtx at h*rows*32 -- the same
+        // shape window_attention had, so one batched pack + one batched gemm per leg
+        // replaces the per-head host loop (the 460ms pathology). Bit-exact by construction.
+        sycl::half* dAq = (sycl::half*)pool_get((size_t)heads * Mp * 32u * 2);
+        sycl::half* dBk = (sycl::half*)pool_get((size_t)heads * 32u * rows * 2);
+        sycl::half* dAp = (sycl::half*)pool_get((size_t)heads * Mp * rows * 2);
+        sycl::half* dBv = (sycl::half*)pool_get((size_t)heads * rows * 32u * 2);
+        // scores leg: Q(rows x 32) @ K^T(32 x rows) -> rows x rows. K stored (rows,32)=(N,K).
+        packdev::pack_a16_b(*GQ, Q, dAq, (int)rows, Mp, 32, (int)heads);
+        packdev::pack_b16_t_b(*GQ, Kk, dBk, 32, (int)rows, (int)heads);
+        f16v1::gemm_b(*GQ, dAq, dBk, dScores, Mp, (int)rows, 32, (int)heads).wait();
+        // vit_softmax over heads*rows rows, tokens cols, stride=rows -- one launch.
         GQ->parallel_for(sycl::range((size_t)heads * rows),
                          smax::vit_softmax_kernel()(dScores, dProbs, dRecip, heads * rows, tokens, rows)).wait();
-        for (unsigned h = 0; h < heads; ++h) {
-            GQ->memcpy(hp.data(), dProbs + (size_t)h * rows * rows, (size_t)rows * rows * 2).wait();
-            GQ->memcpy(hv.data(), V + (size_t)h * rows * 32u, (size_t)rows * 32u * 2).wait();
-            std::vector<sycl::half> hpp((size_t)Mp * rows, sycl::half(0.f));
-            std::memcpy(hpp.data(), hp.data(), (size_t)rows * rows * 2);
-            f16v1::pack_a(hpp.data(), Ap.data(), Mp, (int)rows);
-            f16v1::pack_b(hv.data(), Bv.data(), (int)rows, 32);     // V stored (rows,32) = (K,N)
-            sycl::half* dA=(sycl::half*)pool_get((size_t)Mp*rows*2);
-            sycl::half* dB=(sycl::half*)pool_get((size_t)rows*32u*2);
-            GQ->memcpy(dA,Ap.data(),(size_t)Mp*rows*2).wait(); GQ->memcpy(dB,Bv.data(),(size_t)rows*32u*2).wait();
-            f16v1::gemm(*GQ, dA, dB, dCtx + (size_t)h*rows*32u, Mp, 32, (int)rows).wait();
-            pool_put(dA); pool_put(dB);
-        }
+        // attnV leg: P(rows x rows) @ V(rows x 32) -> rows x 32. V stored (rows,32)=(K,N).
+        packdev::pack_a16_b(*GQ, dProbs, dAp, (int)rows, Mp, (int)rows, (int)heads);
+        packdev::pack_b16_b(*GQ, V, dBv, (int)rows, 32, (int)heads);
+        f16v1::gemm_b(*GQ, dAp, dBv, dCtx, Mp, 32, (int)rows, (int)heads).wait();
+        pool_put(dAq); pool_put(dBk); pool_put(dAp); pool_put(dBv);
         // merge_heads_scale: (1,rows,heads*32) with scale=reciprocal (heads*rows), e4m3, half
         GQ->parallel_for(sycl::range((size_t)rows * CH), [=](sycl::item<1> it) {
             unsigned index = (unsigned)it.get_id(0);
