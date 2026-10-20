@@ -1605,17 +1605,12 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
     const size_t na = (size_t)Mp * C, nb = (size_t)NH * C;
     g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
-        std::vector<int8_t> hA((size_t)M * C), hApad(na, 0), hB(nb), hAp(na), hBp(nb);
-        GQ->memcpy(hA.data(), Araw, (size_t)M * C).wait();
-        std::memcpy(hApad.data(), hA.data(), (size_t)M * C);
-        GQ->memcpy(hB.data(), Braw, nb).wait();
-        s8v8::pack_a(hApad.data(), hAp.data(), Mp, (int)C);
-        s8v8::pack_b(hB.data(), hBp.data(), (int)NH, (int)C);   // N x K row-major == transposed
+        // device pack (section 92): Araw/Braw already on device -- pack in place.
         int8_t* dAp = (int8_t*)pool_get(na);
         int8_t* dBp = (int8_t*)pool_get(nb);
         int32_t* dC = (int32_t*)pool_get((size_t)Mp * NH * 4);
-        GQ->memcpy(dAp, hAp.data(), na).wait();
-        GQ->memcpy(dBp, hBp.data(), nb).wait();
+        packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)C);
+        packdev::pack_b(*GQ, Braw, dBp, (int)NH, (int)C);   // N x K row-major == transposed
         s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)NH, (int)C).wait();
         // stage 2: deq + in-place Q/K head norm (the epilogue's order; V deqt only).
         GQ->parallel_for(sycl::range((size_t)M * heads),
@@ -1723,17 +1718,13 @@ int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale,
     const size_t na = (size_t)Mp * K, nb = (size_t)N * K;
     g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
-        std::vector<int8_t> hA((size_t)M * K), hApad(na, 0), hB(nb), hAp(na), hBp(nb);
-        GQ->memcpy(hA.data(), Araw, (size_t)M * K).wait();
-        std::memcpy(hApad.data(), hA.data(), (size_t)M * K);
-        GQ->memcpy(hB.data(), Braw, nb).wait();
-        s8v8::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
-        s8v8::pack_b(hB.data(), hBp.data(), (int)N, (int)K);
+        // device pack (section 92): Araw/Braw are already on device -- pack in place,
+        // no download/upload round-trip (same conversion as gemm_int8, packdev gate).
         int8_t* dAp = (int8_t*)pool_get(na);
         int8_t* dBp = (int8_t*)pool_get(nb);
         int32_t* dC = (int32_t*)pool_get((size_t)Mp * N * 4);
-        GQ->memcpy(dAp, hAp.data(), na).wait();
-        GQ->memcpy(dBp, hBp.data(), nb).wait();
+        packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K);
+        packdev::pack_b(*GQ, Braw, dBp, (int)N, (int)K);
         s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K).wait();
         GQ->parallel_for(sycl::range((size_t)M * N),
                          [=](sycl::item<1> it) {
@@ -1834,17 +1825,12 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
         const float* bs = (const float*)sized(b_scale, (size_t)N * 4u, "b_scale");
         const void*  skp = sized(skip,   k_need,     "skip");
         const float* cp  = (const float*)sized(cosine, (size_t)N * 4u, "cosine");
-        std::vector<int8_t> hA((size_t)M * K), hApad(na, 0), hB(nb), hAp(na), hBp(nb);
-        GQ->memcpy(hA.data(), Araw, (size_t)M * K).wait();
-        std::memcpy(hApad.data(), hA.data(), (size_t)M * K);
-        GQ->memcpy(hB.data(), Braw, nb).wait();
-        s8v8::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
-        s8v8::pack_b(hB.data(), hBp.data(), (int)N, (int)K);
+        // device pack (section 92): Araw/Braw already on device -- pack in place.
         int8_t* dAp = (int8_t*)pool_get(na);
         int8_t* dBp = (int8_t*)pool_get(nb);
         int32_t* dC = (int32_t*)pool_get((size_t)Mp * N * 4);
-        GQ->memcpy(dAp, hAp.data(), na).wait();
-        GQ->memcpy(dBp, hBp.data(), nb).wait();
+        packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K);
+        packdev::pack_b(*GQ, Braw, dBp, (int)N, (int)K);
         s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K).wait();
         GQ->parallel_for(sycl::range(blk_elems),
                          [=](sycl::item<1> it) {
