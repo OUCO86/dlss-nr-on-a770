@@ -69,26 +69,60 @@ const char* xmx_error(void) { return GERR; }
 
 int xmx_init(void) {
     try {
-        std::fprintf(stderr, "[xmx_init] enumerated GPUs://n");
+        // The game's stderr goes nowhere, so the census of what SYCL sees goes to a
+        // file beside this dll (the section-60 lesson, made readable in the field).
+        FILE *cen = nullptr;
+        {
+            wchar_t wpath[1100] = {0};
+            HMODULE self = nullptr;
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCWSTR)&xmx_init, &self) && self) {
+                GetModuleFileNameW(self, wpath, 1000);
+                wchar_t *slash = wcsrchr(wpath, L'\\');
+                if (slash) wcscpy(slash + 1, L"libxmx_sycl_census.txt");
+                cen = _wfopen(wpath, L"w");
+            }
+        }
+        auto say = [cen](const std::string& s) {
+            std::fprintf(stderr, "%s\n", s.c_str());
+            if (cen) { std::fprintf(cen, "%s\n", s.c_str()); std::fflush(cen); }
+        };
+        say("[xmx_init] enumerated GPUs:");
         for (auto& d : sycl::device::get_devices(sycl::info::device_type::gpu))
-            std::fprintf(stderr, "   backend=%d name=%s\n", (int)d.get_backend(),
-                         d.get_info<sycl::info::device::name>().c_str());
-        std::fprintf(stderr, "[xmx_init] SYCL_DEVICE_FILTER now = %s\n",
-                     getenv("SYCL_DEVICE_FILTER") ? getenv("SYCL_DEVICE_FILTER") : "(unset)");
+            say("   backend=" + std::to_string((int)d.get_backend()) +
+                " name=" + d.get_info<sycl::info::device::name>());
+        say(std::string("[xmx_init] SYCL_DEVICE_FILTER now = ") +
+            (getenv("SYCL_DEVICE_FILTER") ? getenv("SYCL_DEVICE_FILTER") : "(unset)"));
+        {   // which sycl9.dll is actually loaded (the game may have brought its own)
+            HMODULE s9 = GetModuleHandleW(L"sycl9.dll");
+            wchar_t sp[1024] = {0};
+            if (s9 && GetModuleFileNameW(s9, sp, 1000)) {
+                char sa[1024]; WideCharToMultiByte(CP_UTF8, 0, sp, -1, sa, sizeof sa, nullptr, nullptr);
+                say(std::string("[xmx_init] loaded sycl9.dll = ") + sa);
+            } else
+                say("[xmx_init] no sycl9.dll module handle found");
+        }
         sycl::device dev;
-        // the gate pairing (section 60) runs this dll IN THE SAME PROCESS as the shipped
-        // Vulkan runtime: SYCL then enumerates the A770 through several adapters, and an
-        // OpenCL-backed Arc would make get_native<ext_oneapi_level_zero> throw "Backends
-        // mismatch". Pick the Arc that IS Level Zero-backed; fall back to name-only for
-        // the standalone gates (their filter pins level_zero anyway, both paths agree).
+        // Pick the Arc that IS Level Zero-backed. NO opencl fallback: the game's own
+        // tbb12.dll loads before ours, which kills the Level-Zero adapter discovery in
+        // the game process (census proves it), and the name-only fallback then ran the
+        // kernels on the OpenCL-backed Arc -- where the big pre/post kernels fault with
+        // UR error 68 and take the GPU down with them (the 2026-10-20 GPUCrash: the
+        // walk reached step 5252 and the TDR killed the game). Fail loud instead: the
+        // bridge then runs the game WITHOUT NR, cleanly, and the census says why.
         for (auto& d : sycl::device::get_devices(sycl::info::device_type::gpu))
             if (d.get_backend() == sycl::backend::ext_oneapi_level_zero &&
                 d.get_info<sycl::info::device::name>().find("Arc") != std::string::npos) { dev = d; break; }
-        if (dev.get_backend() != sycl::backend::ext_oneapi_level_zero)
-            for (auto& d : sycl::device::get_devices(sycl::info::device_type::gpu))
-                if (d.get_info<sycl::info::device::name>().find("Arc") != std::string::npos) { dev = d; break; }
-        std::fprintf(stderr, "[xmx_init] chosen: backend=%d name=%s\n",
-                     (int)dev.get_backend(), dev.get_info<sycl::info::device::name>().c_str());
+        if (dev.get_backend() != sycl::backend::ext_oneapi_level_zero) {
+            say("[xmx_init] NO Level-Zero Arc visible in this process -- refusing the "
+                "OpenCL Arc (it faults the fused kernels; section 60/90). Census above.");
+            if (cen) fclose(cen);
+            FAILMSG("no Level-Zero Arc device in this process (see libxmx_sycl_census.txt)");
+        }
+        say("[xmx_init] chosen: backend=" + std::to_string((int)dev.get_backend()) +
+            " name=" + dev.get_info<sycl::info::device::name>());
+        if (cen) fclose(cen);
         GD = new sycl::device(dev);
         GQ = new sycl::queue(dev);
         GERR[0] = 0;
