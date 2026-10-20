@@ -184,4 +184,31 @@ static inline void gather_b(sycl::queue& q, const int8_t* Braw, int8_t* dB,
     }).wait();
 }
 
+// f16 strided slice gather (section 92): the f16 gemm family reads a strided slice of a
+// wide buffer per group. Same math as the host gather it replaces, on device.
+//   gather_a16: dA[r*K+k] = Araw[oa + g*sa + r*lda + k]
+//   gather_b16 (row-major B, K x N): dB[k*N+j] = Braw[ob + g*sb + k*ldb + j]
+//   gather_b16_t (transposed B, N x K): dB[j*K+k] = Braw[ob + g*sb + j*ldb + k]
+static inline void gather_a16(sycl::queue& q, const sycl::half* Araw, sycl::half* dA,
+                              int M, int K, int lda, size_t sa, size_t oa, int g) {
+    q.parallel_for(sycl::range((size_t)M * K), [=](sycl::item<1> it) {
+        size_t i = it.get_id(0); int r = (int)(i / K), k = (int)(i % K);
+        dA[i] = Araw[oa + (size_t)g * sa + (size_t)r * lda + k];
+    }).wait();
+}
+static inline void gather_b16(sycl::queue& q, const sycl::half* Braw, sycl::half* dB,
+                              int K, int N, int ldb, size_t sb, size_t ob, int g) {
+    q.parallel_for(sycl::range((size_t)K * N), [=](sycl::item<1> it) {
+        size_t i = it.get_id(0); int k = (int)(i / N), j = (int)(i % N);
+        dB[i] = Braw[ob + (size_t)g * sb + (size_t)k * ldb + j];
+    }).wait();
+}
+static inline void gather_b16_t(sycl::queue& q, const sycl::half* Braw, sycl::half* dB,
+                                int N, int K, int ldb, size_t sb, size_t ob, int g) {
+    q.parallel_for(sycl::range((size_t)N * K), [=](sycl::item<1> it) {
+        size_t i = it.get_id(0); int j = (int)(i / K), k = (int)(i % K);
+        dB[i] = Braw[ob + (size_t)g * sb + (size_t)j * ldb + k];
+    }).wait();
+}
+
 } // namespace packdev

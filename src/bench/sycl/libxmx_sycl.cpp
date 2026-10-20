@@ -1359,37 +1359,36 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
     g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         const size_t a_slice = (size_t)M * K, b_slice = (size_t)K * N;
-        const size_t aw_b = (size_t)(M - 1) * lda_e + (size_t)(batch - 1) * sa + K + oa;
-        // transposed B is stored (N, K): max-touched = (N-1)*ldb + K, NOT (K-1)*ldb + N
-        // (the section-73 stride lesson again -- the first cut sized it for the row-major
-        // layout and the gather read past the vector: G6's ~half-bad was that).
-        const size_t bw_b = transposed
-            ? (size_t)(N - 1) * ldb_e + (size_t)(batch - 1) * sb + K + ob
-            : (size_t)(K - 1) * ldb_e + (size_t)(batch - 1) * sb + N + ob;
-        std::vector<sycl::half> hAw(aw_b), hBw(bw_b);
-        GQ->memcpy(hAw.data(), Araw, aw_b * 2).wait();
-        GQ->memcpy(hBw.data(), Braw, bw_b * 2).wait();
+        // device-resident (section 92): gather the strided slice dense ON device, pack in
+        // place, gemm, publish -- the old path downloaded the whole wide buffers to host,
+        // gathered there, packed, re-uploaded (the 261ms). B is a weight: its packed slice
+        // for (g, transposed) is identical every frame, so cache it keyed by (b,N,K,
+        // g*2+transposed). A is an activation: gather+pack fresh each frame.
+        sycl::half* dAdense = (sycl::half*)pool_get(a_slice * 2);
+        sycl::half* dAp = (sycl::half*)pool_get((size_t)Mp * K * 2);
+        float* dC = (float*)pool_get((size_t)Mp * N * 4);
         for (unsigned g = 0; g < (batch ? batch : 1u); ++g) {
-            std::vector<sycl::half> hA(a_slice), hB(b_slice), hAp((size_t)Mp * K), hBp(b_slice);
-            for (unsigned r = 0; r < M; ++r)
-                std::memcpy(hA.data() + (size_t)r * K, hAw.data() + oa + (size_t)g * sa + (size_t)r * lda_e, K * 2);
-            if (transposed) {   // Bmem is (N,K): gather logical B[k][j] = Bmem[j*K+k]
-                for (unsigned j = 0; j < N; ++j)
-                    std::memcpy(hB.data() + (size_t)j * K, hBw.data() + ob + (size_t)g * sb + (size_t)j * ldb_e, K * 2);
+            packdev::gather_a16(*GQ, Araw, dAdense, (int)M, (int)K, (int)lda_e, sa, oa, (int)g);
+            packdev::pack_a16(*GQ, dAdense, dAp, (int)M, Mp, (int)K);
+            WKey wk{ b, (int)N, (int)K, (int)g * 2 + (transposed ? 1 : 0) };
+            auto wc = g_wcache.find(wk);
+            sycl::half* dBp;
+            if (wc != g_wcache.end()) {
+                dBp = (sycl::half*)wc->second;
             } else {
-                for (unsigned k = 0; k < K; ++k)
-                    std::memcpy(hB.data() + (size_t)k * N, hBw.data() + ob + (size_t)g * sb + (size_t)k * ldb_e, N * 2);
+                sycl::half* dBdense = (sycl::half*)sycl::malloc_device(b_slice * 2, *GQ);
+                sycl::half* cp = (sycl::half*)sycl::malloc_device(b_slice * 2, *GQ);
+                if (transposed) {   // Bmem is (N,K): gather logical B[k][j] = Bmem[j*K+k]
+                    packdev::gather_b16_t(*GQ, Braw, dBdense, (int)N, (int)K, (int)ldb_e, sb, ob, (int)g);
+                    packdev::pack_b16_t(*GQ, dBdense, cp, (int)K, (int)N);
+                } else {
+                    packdev::gather_b16(*GQ, Braw, dBdense, (int)K, (int)N, (int)ldb_e, sb, ob, (int)g);
+                    packdev::pack_b16(*GQ, dBdense, cp, (int)K, (int)N);
+                }
+                sycl::free(dBdense, *GQ);
+                g_wcache[wk] = cp;
+                dBp = cp;
             }
-            std::vector<sycl::half> hApad((size_t)Mp * K, sycl::half(0.f));
-            std::memcpy(hApad.data(), hA.data(), a_slice * 2);
-            f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
-            if (transposed) f16v1::pack_b_t(hB.data(), hBp.data(), (int)K, (int)N);
-            else            f16v1::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
-            sycl::half* dAp = (sycl::half*)pool_get((size_t)Mp * K * 2);
-            sycl::half* dBp = (sycl::half*)pool_get(b_slice * 2);
-            float* dC = (float*)pool_get((size_t)Mp * N * 4);
-            GQ->memcpy(dAp, hAp.data(), (size_t)Mp * K * 2).wait();
-            GQ->memcpy(dBp, hBp.data(), b_slice * 2).wait();
             f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K);
             GQ->parallel_for(sycl::range((size_t)M * N),
                              [=](sycl::item<1> it) {
@@ -1400,8 +1399,9 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
                 if (narrow) ((sycl::half*)Cout)[out] = sycl::half(value);
                 else        ((float*)Cout)[out] = value;
             });
-            pool_put(dAp); pool_put(dBp); pool_put(dC);
+            // dBp is cache-owned (weight); dAp/dC are loop-invariant scratch, put once below.
         }
+        pool_put(dAdense); pool_put(dAp); pool_put(dC);
     });
     return 0;
 }
