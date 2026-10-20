@@ -163,4 +163,25 @@ static inline void pack_b16_t_b(sycl::queue& q, const sycl::half* B, sycl::half*
     }).wait();
 }
 
+// strided slice gather (section 92): the batched families read a STRIDED slice of a wide
+// buffer (rows lda elements apart, the group advances sa elements). The old path
+// downloaded the whole wide buffer to host, gathered there, then packed and uploaded --
+// the 839ms. Gather it dense ON device so the pack reads dense: no host round-trip.
+//   gather_a: dA[r*K+k] = Araw[g*sa + r*lda + k]        (r<M, k<K)
+//   gather_b: dB[n*K+k] = Braw[g*sb + (n0+n)*ldb + k]   (n<ncount, k<K; n0 = column block)
+static inline void gather_a(sycl::queue& q, const int8_t* Araw, int8_t* dA,
+                            int M, int K, int lda, size_t sa, int g) {
+    q.parallel_for(sycl::range((size_t)M * K), [=](sycl::item<1> it) {
+        size_t i = it.get_id(0); int r = (int)(i / K), k = (int)(i % K);
+        dA[i] = Araw[(size_t)g * sa + (size_t)r * lda + k];
+    }).wait();
+}
+static inline void gather_b(sycl::queue& q, const int8_t* Braw, int8_t* dB,
+                            int n0, int ncount, int K, int ldb, size_t sb, int g) {
+    q.parallel_for(sycl::range((size_t)ncount * K), [=](sycl::item<1> it) {
+        size_t i = it.get_id(0); int r = (int)(i / K), k = (int)(i % K);
+        dB[i] = Braw[(size_t)g * sb + (size_t)(n0 + r) * ldb + k];
+    }).wait();
+}
+
 } // namespace packdev

@@ -1441,50 +1441,30 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
     const int Mp = l0_ceil_bm(M);
     g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
-        const size_t a_slice = (size_t)M * K, b_slice = (size_t)N * K;
         const unsigned lda_e = lda ? lda : K, ldb_e = ldb ? ldb : K;
-        // Copy the WIDE buffers back whole (device->host via the queue -- std::memcpy on a
-        // device pointer is the access violation the first batched gate run hit, my stride
-        // fix's own bug), then the group slice-gather is plain HOST arithmetic.
-        // EXACT max-touched sizes ((rows-1)*stride + advance + row), NOT rows*stride --
-        // with lda>K the old form over-read the buffer by lda-K bytes (caught reading my
-        // own gather back against the gate harness sizes).
-        const size_t aw_b = (size_t)(M - 1) * lda_e + (size_t)(batch - 1) * sa + K;
-        const size_t bw_b = (size_t)(N - 1) * ldb_e + (size_t)(batch - 1) * sb + K;
-        std::vector<int8_t> hAw(aw_b), hBw(bw_b);
-        GQ->memcpy(hAw.data(), Araw, aw_b).wait();
-        GQ->memcpy(hBw.data(), Braw, bw_b).wait();
+        const int nb64 = (int)(N / 64u);
+        const unsigned nrem = N % 64u;
+        const int nblocks = (nrem && nb64 >= 0) ? nb64 : nb64 - 1;   // blk loop upper (inclusive)
+        // device-resident (section 92): gather the strided slice dense ON device, pack in
+        // place, gemm, publish -- the old path downloaded the whole wide buffers to host,
+        // gathered there, packed, and re-uploaded (the 839ms). The gather indices stay
+        // within the gate's aw_b/bw_b bounds (the section-73 over-read lesson).
+        int8_t* dAdense = (int8_t*)pool_get((size_t)M * K);
+        int8_t* dAp = (int8_t*)pool_get((size_t)Mp * K);
+        int8_t* dBdense = (int8_t*)pool_get((size_t)64u * K);   // max block width
+        int8_t* dBp = (int8_t*)pool_get((size_t)64u * K);
+        int32_t* dC = (int32_t*)pool_get((size_t)Mp * 64u * 4);
         for (unsigned g = 0; g < batch; ++g) {
             const size_t ce = (size_t)g * sc;                       // C advance (elements)
-            // GATHER the group's COL-SLICED operands dense (the stride lesson of section
-            // 73's first gate run: rows are lda bytes apart, the group advances sa BYTES):
-            std::vector<int8_t> hA(a_slice), hB(b_slice);
-            for (unsigned r = 0; r < M; ++r)
-                std::memcpy(hA.data() + (size_t)r * K, hAw.data() + (size_t)r * lda_e + (size_t)g * sa, K);
-            for (unsigned n = 0; n < N; ++n)
-                std::memcpy(hB.data() + (size_t)n * K, hBw.data() + (size_t)n * ldb_e + (size_t)g * sb, K);
-            std::vector<int8_t> hApad((size_t)Mp * K, 0), hAp((size_t)Mp * K), hBp(b_slice);
-            std::memcpy(hApad.data(), hA.data(), a_slice);
-            s8v8::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
-            // column blocks: 64 each plus a 32 tail if N%64
-            int nb64 = (int)(N / 64u);
-            unsigned nrem = N % 64u;
+            packdev::gather_a(*GQ, Araw, dAdense, (int)M, (int)K, (int)lda_e, sa, (int)g);
+            packdev::pack_a(*GQ, dAdense, dAp, (int)M, Mp, (int)K);
             float* gas = (float*)as + (size_t)g * scale_stride;   // roff (.comp:143)
             float* gbs = (sb != 0u) ? ((float*)bs + (size_t)g * N) : (float*)bs;  // soff (.comp:147)
-            for (int blk = 0; blk <= ((nrem && nb64 >= 0) ? nb64 : nb64 - 1); ++blk) {
+            for (int blk = 0; blk <= nblocks; ++blk) {
                 unsigned c0 = (unsigned)blk * 64u;
                 unsigned n64 = (nrem && blk == nb64) ? nrem : 64u;
-                // dense (M,K)x(N,64-slice) at this group's slice, packed per block
-                std::vector<int8_t> Bt((size_t)n64 * K), Bp((size_t)n64 * K);
-                for (unsigned r = 0; r < n64; ++r)
-                    std::memcpy(Bt.data() + (size_t)r * K, hB.data() + (size_t)(c0 + r) * K, K);
-                if (n64 == 64u) s8v8::pack_b(Bt.data(), Bp.data(), (int)n64, (int)K);
-                else            s8v8::pack_b32(Bt.data(), Bp.data(), (int)n64, (int)K);
-                int8_t* dAp = (int8_t*)pool_get((size_t)Mp * K);
-                int8_t* dBp = (int8_t*)pool_get((size_t)n64 * K);
-                int32_t* dC = (int32_t*)pool_get((size_t)Mp * n64 * 4);
-                GQ->memcpy(dAp, hAp.data(), (size_t)Mp * K).wait();
-                GQ->memcpy(dBp, Bp.data(), (size_t)n64 * K).wait();
+                packdev::gather_b(*GQ, Braw, dBdense, (int)c0, (int)n64, (int)K, (int)ldb_e, sb, (int)g);
+                packdev::pack_b(*GQ, dBdense, dBp, (int)n64, (int)K);   // pack_b is N-parameterised
                 if (n64 == 64u) s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)n64, (int)K);
                 else            s8v8::gemm32(*GQ, dAp, dBp, dC, Mp, (int)n64, (int)K);
                 // publish this block into the ldc-strided output (only real M rows)
@@ -1497,9 +1477,9 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
                     if (narrow) ((sycl::half*)Cout)[out] = sycl::half(qr_publish(epi, v));
                     else        ((float*)Cout)[out] = qr_publish(epi, v);
                 });
-                pool_put(dAp); pool_put(dBp); pool_put(dC);
             }
         }
+        pool_put(dAdense); pool_put(dAp); pool_put(dBdense); pool_put(dBp); pool_put(dC);
     });
     return 0;
 }
