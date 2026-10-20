@@ -367,6 +367,14 @@ static struct {
 	unsigned long long plan_bytes;
 	const float *table;
 	char folder[1024];
+	/* NR_FUSED_SYNTH (offline walk only, section 90 step 4): when set, prepare_fused
+	 * makes colour/motion/result as plain host buffers uploaded from these pointers
+	 * instead of importing the game's D3D12 handles -- the D3D12 import itself is
+	 * already proven (section 18, gate_d3d_import), so what this mode exercises is the
+	 * FUSED WIRING: record_fused calling pre/post with the right buffer ids, pre's
+	 * features feeding the network's first read, post reading the head and writing
+	 * result, and the whole frame running end-to-end without a fail-loud. */
+	const void *synth_colour, *synth_motion;
 } fuse;
 
 void nr_net_fuse(unsigned long long colour, unsigned long long motion,
@@ -709,12 +717,29 @@ static int prepare_fused(replay *r)
 	char post[1024];
 	snprintf(post, sizeof post, "%s\\nr_post.spv", fuse.folder);
 
-	if ((r->colour = f_buf_import(fuse.colour, fuse.colour_bytes)) < 0)
-		return r->why = "the colour would not import", -1;
-	r->result = f_buf_import(fuse.result, fuse.result_bytes);
-	if (r->result < 0)
-		return r->why = "the answer's buffer would not import", -1;
-	if (fuse.motion) {
+	if (fuse.synth_colour) {
+		/* NR_FUSED_SYNTH (section 90 step 4): host buffers, not D3D12 imports. The
+		 * import path is already proven (section 18); this mode exercises the fused
+		 * WIRING -- record_fused's pre/post calls, pre's features feeding the network,
+		 * post reading the head and writing result, end-to-end without fail-loud. */
+		r->colour = f_buf_create_kind(fuse.colour_bytes, 0);
+		if (r->colour < 0 || f_buf_upload(r->colour, fuse.synth_colour, 0, fuse.colour_bytes) != 0)
+			return r->why = "the synth colour would not go in", -1;
+		r->result = f_buf_create_kind(fuse.result_bytes, 0);
+		if (r->result < 0 || f_buf_zero(r->result) != 0)
+			return r->why = "the synth result would not come up", -1;
+	} else {
+		if ((r->colour = f_buf_import(fuse.colour, fuse.colour_bytes)) < 0)
+			return r->why = "the colour would not import", -1;
+		r->result = f_buf_import(fuse.result, fuse.result_bytes);
+		if (r->result < 0)
+			return r->why = "the answer's buffer would not import", -1;
+	}
+	if (fuse.synth_motion) {
+		r->motion = f_buf_create_kind(fuse.motion_bytes, 0);
+		if (r->motion < 0 || f_buf_upload(r->motion, fuse.synth_motion, 0, fuse.motion_bytes) != 0)
+			return r->why = "the synth motion would not go in", -1;
+	} else if (fuse.motion) {
 		r->motion = f_buf_import(fuse.motion, fuse.motion_bytes);
 		if (r->motion < 0)
 			return r->why = "the motion would not import", -1;
@@ -1437,6 +1462,82 @@ int main(int argc, char **argv)
 	       nr_plan_extent[1], nr_plan_extent[0], nr_plan_step_count,
 	       nr_plan_buffer_count, nr_plan_blob_count);
 
+	/* NR_FUSED_SYNTH (section 90 step 4): drive the SAME fused code path the game
+	 * uses -- prepare_fused + record_fused(pre/post) + graph_run -- but with host
+	 * synthetic colour/motion/result instead of the game's D3D12 imports (the import
+	 * itself is already proven, section 18). What this measures is the WIRING: does
+	 * nr_replay call my xmx_rec_pre/xmx_rec_post with the right buffer ids, does pre's
+	 * features feed the network's first read, does post read the head and write result,
+	 * and does the whole frame run end-to-end without a fail-loud. The inputs are a
+	 * fixed-seed LCG so the old dll and my dll see byte-identical frames; the result
+	 * buffer is dumped for the A/B. */
+	int fused_synth = getenv("NR_FUSED_SYNTH") != NULL;
+	unsigned char *synth_colour = NULL, *synth_motion = NULL;
+	float *synth_plan = NULL, *synth_table = NULL;
+	if (fused_synth) {
+		const unsigned h = nr_plan_extent[0], w = nr_plan_extent[1];
+		const unsigned sh = h, sw = w;                 /* source == network: identity mirror */
+		uint32_t st = 0x5EEDF00Du;
+		#define LCG() (st = st * 1664525u + 1013904223u)
+		synth_colour = malloc((size_t)sh * sw * 4);
+		synth_motion = malloc((size_t)sh * sw * 2 * 4);
+		/* plan: noise (h*w*3 f32), controls (5), rows (h, int32 bit patterns), columns (w) */
+		size_t plan_n = (size_t)h * w * 3 + 5 + h + w;
+		synth_plan = malloc(plan_n * 4);
+		synth_table = malloc(65536 * 4);
+		for (size_t i = 0; i < (size_t)sh * sw; i++) {
+			/* a REALISTIC game-scale colour, not uniform random uint32: the game's
+			 * scene-linear HDR reaches ~1500 (nr_pre.comp's own comment), and uniform
+			 * random words decode to extreme values (max 131072) that the to_proxy knee
+			 * and post's resolve ratio amplify into huge absolute differences -- a test
+			 * artifact, not a wiring fault. Encode [0,1500) into R11G11B10 instead. */
+			uint32_t word = 0;
+			for (int ch = 0; ch < 3; ch++) {
+				float x = (float)(LCG() % 150000u) / 100.0f;
+				int e; float f = frexpf(x, &e);
+				uint32_t m; int biased = e + 14;
+				if (ch < 2) {
+					m = (uint32_t)floorf(128.0f * f - 64.0f + 0.5f);
+					if (m > 63u) m = 63u;
+					if (biased >= 31) { word |= 31u << 6u << (11u * (unsigned)ch); continue; }
+					if (biased <= 0 || !(x > 0.0f)) continue;
+					word |= (((uint32_t)biased << 6u) | m) << (11u * (unsigned)ch);
+				} else {
+					m = (uint32_t)floorf(64.0f * f - 32.0f + 0.5f);
+					if (m > 31u) m = 31u;
+					if (biased >= 31) { word |= 31u << 5u << 22u; continue; }
+					if (biased <= 0 || !(x > 0.0f)) continue;
+					word |= (((uint32_t)biased << 5u) | m) << 22u;
+				}
+			}
+			((uint32_t*)synth_colour)[i] = word;
+		}
+		for (size_t i = 0; i < (size_t)sh * sw * 2; i++)
+			((float*)synth_motion)[i] = ((float)LCG() / 2147483648.0f) - 1.0f;
+		for (size_t i = 0; i < (size_t)h * w * 3; i++)
+			synth_plan[i] = (float)LCG() / 4294967295.0f;
+		synth_plan[(size_t)h * w * 3 + 0] = 0.0f; synth_plan[(size_t)h * w * 3 + 1] = 1.0f;
+		synth_plan[(size_t)h * w * 3 + 2] = 1.0f; synth_plan[(size_t)h * w * 3 + 3] = -1.0f;
+		synth_plan[(size_t)h * w * 3 + 4] = -1.0f;
+		size_t rowsAt = (size_t)h * w * 3 + 5;
+		for (unsigned y = 0; y < h; y++) { int v = (int)y; float f; memcpy(&f, &v, 4); synth_plan[rowsAt + y] = f; }
+		size_t colsAt = rowsAt + h;
+		for (unsigned x = 0; x < w; x++) { int v = (int)x; float f; memcpy(&f, &v, 4); synth_plan[colsAt + x] = f; }
+		for (int i = 0; i < 65536; i++) synth_table[i] = (float)LCG() / 4294967295.0f;
+		#undef LCG
+		fuse.asked = 1;
+		fuse.colour = fuse.motion = fuse.result = 0;
+		fuse.colour_bytes = (unsigned long long)sh * sw * 4;
+		fuse.motion_bytes = (unsigned long long)sh * sw * 2 * 4;
+		fuse.result_bytes = (unsigned long long)sh * sw * 4;
+		fuse.pitch = sw; fuse.source_h = sh; fuse.source_w = sw;
+		fuse.exposure = 0.5f; fuse.intensity = 0.8f; fuse.confidence = 1.0f;
+		fuse.plan = synth_plan; fuse.plan_bytes = plan_n * 4;
+		fuse.table = synth_table;
+		fuse.synth_colour = synth_colour; fuse.synth_motion = synth_motion;
+		printf("fused synth: colour %ux%u, plan %zu floats, table 65536\n", sh, sw, plan_n);
+	}
+
 	/* Wall time, not CPU time: a run ends when the device says it has, and the wait is
 	 * a fence — the thread sleeps through most of it, which `clock` would not count. */
 	double began = now_ms();
@@ -1448,13 +1549,51 @@ int main(int argc, char **argv)
 	 * nothing else waiting. Whatever it is, it is the whole of the network's cost on
 	 * this card — there is no host work left to hide it behind. */
 	int passes = 0;
-	for (int i = 0; i < 4; i++) {
+	/* fused synth runs ONCE: the fused path has a cross-frame history feedback loop
+	 * (post writes neural into history, the next pre reprojects against it). With
+	 * synthetic random inputs, two engines' network last-bit differences compound
+	 * through that loop run over run -- a test artifact, not a wiring fault. One run
+	 * (fresh=1, no history behind it) isolates the wiring: pre -> network -> post. */
+	int nruns = fused_synth ? 1 : 4;
+	for (int i = 0; i < nruns; i++) {
 		double at = now_ms();
 		passes = f_graph_run(r.graph);
 		printf("run %d: %.2f ms (%d passes)\n", i, now_ms() - at, passes);
 	}
 	if (passes < 0)
 		return 1;
+
+	/* The fused answer lives in r->result (the game's buffer), not in a kind==1 plan
+	 * buffer -- dump it so the two engines' composed frames can be compared. */
+	if (fused_synth && r.result >= 0) {
+		const char *dump = getenv("NR_DUMP_OUT");
+		unsigned long long nb = fuse.result_bytes;
+		unsigned char *full = malloc((size_t)nb);
+		if (full && f_buf_download(r.result, full, 0, nb) == 0) {
+			char path[600];
+			snprintf(path, sizeof path, "%s.result.bin", dump ? dump : "fused");
+			FILE *fp = fopen(path, "wb");
+			if (fp) { fwrite(full, 1, (size_t)nb, fp); fclose(fp);
+				printf("dumped fused result: %llu bytes -> %s\n", nb, path); }
+		} else
+			printf("dump fused result FAILED\n");
+		free(full);
+		/* dump the features (pre's output, kind==2 HOST_WRITE) too: if they are
+		 * bit-exact between engines, pre's WIRING is right and any result difference
+		 * is the network's, amplified by post -- not a pre/post fault. */
+		if (dump && r.features >= 0 && r.ids[r.features] >= 0) {
+			unsigned long long fb = nr_plan_buffers[r.features].bytes;
+			unsigned char *ff = malloc((size_t)fb);
+			if (ff && f_buf_download(r.ids[r.features], ff, 0, fb) == 0) {
+				char path[600];
+				snprintf(path, sizeof path, "%s.features.bin", dump);
+				FILE *fp = fopen(path, "wb");
+				if (fp) { fwrite(ff, 1, (size_t)fb, fp); fclose(fp);
+					printf("dumped features: %llu bytes -> %s\n", fb, path); }
+			}
+			free(ff);
+		}
+	}
 
 	/* What came out. Every buffer the host was meant to read, so the answer can be
 	 * found without knowing its name. */
