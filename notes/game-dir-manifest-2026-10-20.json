@@ -1,0 +1,178 @@
+{
+ "taken": "2026-10-20 13:55:36",
+ "dir": "F:/Game/Lies of P\\LiesofP\\Binaries\\Win64",
+ "files": {
+  "LOP-Win64-Shipping.exe": {
+   "size": 119546368,
+   "sha256": "bb45f7359d1e41e6288ae86cb3f6fe3120962c633fdc873d8c24f680c1c936c1"
+  },
+  "OpenImageDenoise.dll": {
+   "size": 49771408,
+   "sha256": "11213c268e6c67262d48e7351e1f6c196acbb91a9a1cf059d4d758c34368f08a"
+  },
+  "OptiScaler.1.log": {
+   "size": 17611,
+   "sha256": "fb8d15d049b5a96f4d6a700d68a8bc503250fd9dbeca4df5ae8b9cf72088492d"
+  },
+  "OptiScaler.2.log": {
+   "size": 19007,
+   "sha256": "cb46e6c192e121324d8e89e6cd1b455750db746e7f975b23daf567d11fd9f149"
+  },
+  "OptiScaler.ini": {
+   "size": 45838,
+   "sha256": "979d55b361d833bfc82abfc2c3c12200bd1f91e5810338d82a5227eae4bc3f79"
+  },
+  "OptiScaler.ini.orig": {
+   "size": 47477,
+   "sha256": "6d7ed07e2e9df3d611b6f59047716bcbc0b67834296b8e4414816189b1233aa7"
+  },
+  "OptiScaler.log": {
+   "size": 1015757,
+   "sha256": "a78c1157949c769eaf5c551cfa06a4243c93a6e246556a3819dfa936024918d5"
+  },
+  "amd_fidelityfx_dx12.dll": {
+   "size": 26376,
+   "sha256": "e2d85aa05a9bd9ed8b38935fdf5199372cca6f74c12015143bb6f945ee1608aa"
+  },
+  "amd_fidelityfx_framegeneration_dx12.dll": {
+   "size": 40085776,
+   "sha256": "02297beedd285e822d3a64f314cf00faf378dcec0edc47ff0c4dd71b3a8c2f18"
+  },
+  "amd_fidelityfx_upscaler_dx12.dll": {
+   "size": 28761864,
+   "sha256": "d0dcccc74a43c44ba435b7a369b456e0970d8a4464e4bd683119b374f2c9fb46"
+  },
+  "amd_fidelityfx_vk.dll": {
+   "size": 9332432,
+   "sha256": "a1624cc4238fef046f30c4d80ce3f47be63fc5f5373f49e3ee9edb9960f54c78"
+  },
+  "dlssg_to_fsr3_amd_is_better.dll": {
+   "size": 3038208,
+   "sha256": "806020c0444f7841a3a9f661295c16fc482e981e0666d0b9624bf6ccd19c4b5e"
+  },
+  "dlssnr_on_amd_setup 0.3.2.exe": {
+   "size": 7082251,
+   "sha256": "ebbe7f942e5c87de4928d7e1cbcf2977ea848940b54b4a74fdf158ae63a88d39"
+  },
+  "dlssnr_on_amd_setup-0.60.exe": {
+   "size": 59841536,
+   "sha256": "20636c9587e858e2b35b29702ef36bcb0018a985592e24d6ca95b3e1b41d2e71"
+  },
+  "dlssnr_on_amd_setup0.2.11.exe": {
+   "size": 4737763,
+   "sha256": "dbf7e40ca6940924ffe0960b350f3d55cb99ed27dde84aec47cdf8a0b7303a74"
+  },
+  "dlssnr_on_amd_setup0.2.12.exe": {
+   "size": 4720355,
+   "sha256": "87dbde90f1249ceb32e06ca4d68c34fd8b5d9d1130fd4ee4560a0eb33079b876"
+  },
+  "dlssnr_on_amd_setup0.2.13.exe": {
+   "size": 4664547,
+   "sha256": "f499460237bccf3c8bc423947ebcb76ec0804f0928553fb4a36089d28c6d19c8"
+  },
+  "dlssnr_on_amd_setup0.2.15.exe": {
+   "size": 7401714,
+   "sha256": "66b910da005e000070256b55c41dd5d0e1ae1ea6a8c3a9d0b76edc1749438092"
+  },
+  "dlssnr_on_amd_setup0.2.16.exe": {
+   "size": 7535858,
+   "sha256": "6a6ad3bbe266ba265c27ec0021e12aa8f34f39f436840d7538e66a0f8ee67fd7"
+  },
+  "dlssnr_on_amd_setup0.2.17.exe": {
+   "size": 7538418,
+   "sha256": "4fcd167d07bc4964eaf9162aa8f4f11e852b91bf866b28cb48d45934022440bc"
+  },
+  "dlssnr_on_amd_setup0.2.18.exe": {
+   "size": 7570162,
+   "sha256": "dad67cc649ad91ba28e83c30049fc899900ae532daf818803bd1123e6e2315c3"
+  },
+  "dlssnr_on_amd_setup0.3.1.exe": {
+   "size": 7598347,
+   "sha256": "cf7ada1486b499700a84846b342ca2b1defdb4db622843f812151f255f2ad63c"
+  },
+  "dlssnr_on_amd_setup0.3.3.exe": {
+   "size": 10763776,
+   "sha256": "af5b9bbe8e97eea4c564341a78caf752de02a0b622a141c53c5a70e782fec994"
+  },
+  "dlssnr_on_amd_setup0.40.exe": {
+   "size": 13183488,
+   "sha256": "2d37453e918a1c5487314b3ae7c088b624ac0be1b82469427ec04b481a845ded"
+  },
+  "dlssnr_on_amd_setup0.43.exe": {
+   "size": 15910400,
+   "sha256": "186ebe51db8abc4c1884ed7a31148108b139d0c4b35323014b00f90543b5447b"
+  },
+  "dlssnr_on_amd_setup0.5.0.exe": {
+   "size": 41864192,
+   "sha256": "39df94a0c94b8194135cb2f85aedcc9225a7a62a66fb8adee600729fceab145e"
+  },
+  "dlssnr_on_amd_setup_0.5.1.exe": {
+   "size": 41730048,
+   "sha256": "b00818c7f5be906651819cc72b952458b6cc5a8e75b45f851894323abbc792be"
+  },
+  "dxgi.dll": {
+   "size": 26664448,
+   "sha256": "f4f9c45e6dcd5dd386d06e524f5f53f0d14a93e4982ba720c015ef1b8de0fe47"
+  },
+  "embree.2.14.0.dll": {
+   "size": 20321280,
+   "sha256": "4bb99ad5643f1315682c78ee0250fc3cc5c1dcdf1938c3ccf480d67dcd7e6449"
+  },
+  "fakenvapi.dll": {
+   "size": 415232,
+   "sha256": "373e73dc06e2d66e90083fde3bc99ef5c1ed0bef98d1f7eda56c8b073269c3f1"
+  },
+  "fakenvapi.ini": {
+   "size": 466,
+   "sha256": "a4bfa3ec7b4badd93ae5e1ad74a582238082d871f54f38f68e7d9fb6384ce772"
+  },
+  "libxell.dll": {
+   "size": 411504,
+   "sha256": "61aeeab7fdcfb6d1742f86c14c68c663d759607d01a6132645c857291eaebb86"
+  },
+  "libxess.dll": {
+   "size": 77795704,
+   "sha256": "251659dd84a3e84de67c886a4186e01f3eca49b00641906fe38bb6b807e5d5b7"
+  },
+  "libxess_dx11.dll": {
+   "size": 156016,
+   "sha256": "c7cfe86f0c9d94e4fb3696d3cd5035e2bbb6a8b1b0572f8b7395a4cdfd0c625e"
+  },
+  "libxess_fg.dll": {
+   "size": 22957432,
+   "sha256": "ec5e0c65e075570c6ede72618bb666d0be0c2e10b2ea9762c0fe8cb8e375ab27"
+  },
+  "lmxxf-modules.zip": {
+   "size": 19778649,
+   "sha256": "a620185d45d18f057aa617e00781b9f377e78e240be4abc4aa9219f1e1ef6534"
+  },
+  "setup_linux.sh": {
+   "size": 12328,
+   "sha256": "0571b0ae077d985616acf9f4101e8338fc225b1b22aa7b339100c7ea3f3022be"
+  },
+  "setup_windows.bat": {
+   "size": 16947,
+   "sha256": "cf731a2d308df4b48db968b911b0ea1fc490fdf79d6c2ed168363312c95d2f4e"
+  },
+  "tbb.dll": {
+   "size": 383488,
+   "sha256": "6fbb72516c91fd1085e0e9df6988c53b3e75cff5e42214920493356d8ba8745f"
+  },
+  "tbb12.dll": {
+   "size": 383856,
+   "sha256": "061f3b283b3e5b24c5ac45772ee19e2f4b24cdacb3ff8ae4f815fe62836e5a45"
+  },
+  "tbbmalloc.dll": {
+   "size": 51200,
+   "sha256": "9922d112e764f438ffae851b462282e02e3745994fea955dd2a73a61dcde1d21"
+  },
+  "uninstall_optiscaler.bat": {
+   "size": 1124,
+   "sha256": "d3cd495354f6f12386f8d10b20064a7662c67577d12c7e64c4b29a3501930e8a"
+  },
+  "\u4fdd\u7559\u53c2\u8003native-game-flags.txt": {
+   "size": 3945,
+   "sha256": "b9df1843006d4e6e1e424360e480dace70bdd4f1bd3dd8293c4b09d2f655eb91"
+  }
+ }
+}
