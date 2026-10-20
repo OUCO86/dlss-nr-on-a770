@@ -32,6 +32,8 @@
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
+#include <chrono>
+#include <algorithm>
 #include <vector>
 #include <unordered_map>
 #include <stdexcept>
@@ -359,6 +361,38 @@ int xmx_graph_run(int id) {
     if (fence_host_wait() != 0) return -1;
 #endif
     try {
+        // NR_RUN_TIMING=1: time every closure so the 89s/frame is attributed to families
+        // instead of guessed at (the game's 120s RenderThread watchdog assert, 2026-10-20).
+        static bool rtiming = getenv("NR_RUN_TIMING") != nullptr;
+        if (rtiming) {
+            std::vector<double> ms;
+            ms.reserve(g_graphs[id].size());
+            for (auto& fn : g_graphs[id]) {
+                auto t0 = std::chrono::steady_clock::now();
+                fn();
+                ms.push_back(std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count());
+            }
+            std::vector<int> ord(ms.size());
+            for (size_t i = 0; i < ord.size(); i++) ord[i] = (int)i;
+            std::sort(ord.begin(), ord.end(), [&](int a, int b){ return ms[a] > ms[b]; });
+            std::FILE *f = std::fopen("run_timing.txt", "w");
+            double tot = 0; for (double m : ms) tot += m;
+            std::printf("[run_timing] %zu passes, total %.0f ms; top 25:\n", ms.size(), tot);
+            if (f) std::fprintf(f, "passes=%zu total=%.0fms\n", ms.size(), tot);
+            for (int i = 0; i < 25 && i < (int)ord.size(); i++) {
+                std::printf("   pass %4d: %8.1f ms\n", ord[i], ms[ord[i]]);
+                if (f) std::fprintf(f, "pass %d %.1f\n", ord[i], ms[ord[i]]);
+            }
+            // family histogram by 50-pass buckets of summed time
+            for (size_t b = 0; b + 50 <= ms.size(); b += 50) {
+                double s = 0; for (size_t i = b; i < b + 50; i++) s += ms[i];
+                std::printf("   passes [%4zu..%4zu]: %8.1f ms\n", b, b + 49, s);
+                if (f) std::fprintf(f, "bucket %zu %.1f\n", b, s);
+            }
+            if (f) std::fclose(f);
+            return passes;
+        }
         for (auto& fn : g_graphs[id]) fn();     // same order, wait-per-kernel like submit
     } catch (const std::exception& e) { FAILMSG("graph_run: %s", e.what()); }
     return passes;
