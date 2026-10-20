@@ -88,4 +88,47 @@ static inline sycl::event gemm(sycl::queue& q, const half* Ap, const half* Bp,
     });
 }
 
+// batched: `batches` independent Mp x N = (Mp x K) @ (K x N) matrices, contiguous per
+// batch (Ap at b*Mp*K, Bp at b*K*N, C at b*Mp*N). One launch -- the per-batch host loop
+// (4 sync memcpys + 4 malloc/free + 2 launches each, batches up to 2040) was the
+// window_attention 34s pathology (section 92). The dpas sequence per tile is IDENTICAL
+// to gemm() above -- only the base pointers shift by the batch stride -- so it is
+// bit-exact by construction against the loop it replaces.
+static inline sycl::event gemm_b(sycl::queue& q, const half* Ap, const half* Bp,
+                                 float* C, int Mp, int N, int K, int batches) {
+    int tr_n = Mp / TS, tc_n = N / TS, kb_n = K / TS;
+    size_t apb = (size_t)Mp * K, bpb = (size_t)K * N, cb = (size_t)Mp * N;
+    return q.submit([&](handler& h) {
+        h.parallel_for(range<1>((size_t)batches * tr_n * tc_n), [=](item<1> it) SYCL_ESIMD_KERNEL {
+            size_t g = it.get_id(0);
+            int b = (int)(g / ((size_t)tr_n * tc_n)); size_t t0 = g % ((size_t)tr_n * tc_n);
+            const half* Ab = Ap + (size_t)b * apb; const half* Bb = Bp + (size_t)b * bpb;
+            float* Cb = C + (size_t)b * cb;
+            int t = (int)t0; int tr = t / tc_n, tc = t % tc_n;
+            esimd::simd<float, 64> c00(0.f), c01(0.f), c10(0.f), c11(0.f);
+            for (int kc = 0; kc < kb_n; ++kc) {
+                const half* ab = Ab + ((size_t)(tr * kb_n + kc) * 2) * 128;
+                const half* bb = Bb + ((size_t)(kc * tc_n + tc) * 2) * 128;
+                esimd::simd<half, 128> a0(ab, esimd::overaligned_tag<16>{});
+                esimd::simd<half, 128> a1(ab + 128, esimd::overaligned_tag<16>{});
+                esimd::simd<half, 128> b0(bb, esimd::overaligned_tag<16>{});
+                esimd::simd<half, 128> b1(bb + 128, esimd::overaligned_tag<16>{});
+                c00 = esimd::xmx::dpas<8, 8, float>(c00, b0, a0);
+                c01 = esimd::xmx::dpas<8, 8, float>(c01, b1, a0);
+                c10 = esimd::xmx::dpas<8, 8, float>(c10, b0, a1);
+                c11 = esimd::xmx::dpas<8, 8, float>(c11, b1, a1);
+            }
+            float* out = Cb + (size_t)(tr * TS) * N + tc * TS;
+            for (int r = 0; r < 8; ++r) {
+                esimd::simd<float, 8> r00 = c00.template select<8, 1>(r * 8);
+                esimd::simd<float, 8> r01 = c01.template select<8, 1>(r * 8);
+                esimd::simd<float, 8> r10 = c10.template select<8, 1>(r * 8);
+                esimd::simd<float, 8> r11 = c11.template select<8, 1>(r * 8);
+                r00.copy_to(out + (size_t)r * N);       r01.copy_to(out + (size_t)r * N + 8);
+                r10.copy_to(out + (size_t)(8 + r) * N); r11.copy_to(out + (size_t)(8 + r) * N + 8);
+            }
+        });
+    });
+}
+
 } // namespace f16v1

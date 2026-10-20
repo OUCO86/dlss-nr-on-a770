@@ -27,6 +27,7 @@
 #include "gemm_s8_v7_kernel.hpp"
 #include "gemm_s8_v8_kernel.hpp"
 #include "gemm_f16_v1_kernel.hpp"
+#include "pack_device.hpp"
 #include "pre_kernel.hpp"
 #include "post_kernel.hpp"
 #include <cstring>
@@ -34,6 +35,7 @@
 #include <cstdio>
 #include <chrono>
 #include <algorithm>
+#include <map>
 #include <vector>
 #include <unordered_map>
 #include <stdexcept>
@@ -64,6 +66,10 @@ static int g_nextbuf = 1;
 // recording
 static bool g_recording = false;
 static std::vector<std::function<void()>> g_cmds;
+static std::vector<const char*> g_cmd_names;
+static bool g_l0 = false;   // the chosen device is Level-Zero-backed (section 92): the
+                            // fused pre/post kernels fault on the OpenCL Arc, so they
+                            // refuse unless this is set (the small gates run fine on it).
 
 extern "C" {
 
@@ -132,20 +138,9 @@ int xmx_init(void) {
                 say(std::string("[xmx_init] process EXE = ") + ea);
             }
         }
-        if (!ad && self) {
-            wchar_t selfp[1100] = {0};
-            if (GetModuleFileNameW(self, selfp, 1000)) {
-                wchar_t *sl = wcsrchr(selfp, L'\\');
-                if (sl) {
-                    wcscpy(sl + 1, L"ur_adapter_level_zero.dll");
-                    HMODULE try1 = LoadLibraryW(selfp);
-                    if (sl) wcscpy(sl + 1, L"ur_adapter_level_zero_v2.dll");
-                    HMODULE try2 = LoadLibraryW(selfp);
-                    say(std::string("[xmx_init] explicit adapter load from own dir: ") +
-                        (try1 ? "v1 OK" : "v1 failed") + " / " + (try2 ? "v2 OK" : "v2 failed"));
-                }
-            }
-        }
+        // (No explicit adapter preload here: it broke the gates' own discovery. The game
+        //  problem is solved by deploying the adapter beside the EXE -- swap_engine.bat
+        //  does that -- and the census below proves it worked: chosen backend=2.)
         say("[xmx_init] enumerated GPUs:");
         for (auto& d : sycl::device::get_devices(sycl::info::device_type::gpu))
             say("   backend=" + std::to_string((int)d.get_backend()) +
@@ -153,26 +148,23 @@ int xmx_init(void) {
         say(std::string("[xmx_init] SYCL_DEVICE_FILTER now = ") +
             (getenv("SYCL_DEVICE_FILTER") ? getenv("SYCL_DEVICE_FILTER") : "(unset)"));
         sycl::device dev;
-        // Pick the Arc that IS Level Zero-backed. NO opencl fallback: the game process
-        // enumerated only the OpenCL-backed Arc (the 2026-10-20 GPUCrash: the walk reached
-        // step 5252 on the opencl Arc, the big pre/post kernels fault there with UR error
-        // 68, and the TDR took the whole game's GPU down). The root cause of the game
-        // losing the L0 adapter is NOT yet pinned -- offline repro has RULED OUT both
-        // "an Arc Vulkan device up before SYCL" and "the game's tbb12 loaded first" (both
-        // still see backend=2); the in-game census (this file) is the ground truth. Until
-        // it is understood, fail loud rather than run on opencl: the bridge then runs the
-        // game WITHOUT NR, cleanly, and the census says why.
+        // Prefer the Level-Zero Arc. Fall back to the OpenCL Arc ONLY for the small
+        // elementwise/GEMM gates, which run correctly on it (the section-60 reality: a
+        // Python process sees only the opencl Arc). The FUSED pre/post kernels fault on
+        // opencl (the 2026-10-20 GPUCrash), so xmx_rec_pre/xmx_rec_post refuse opencl
+        // themselves (g_l0 flag below) -- the game, which has the adapter deployed beside
+        // its exe (swap_engine.bat), gets backend=2 and runs fused; a game without it
+        // declines cleanly instead of crashing.
         for (auto& d : sycl::device::get_devices(sycl::info::device_type::gpu))
             if (d.get_backend() == sycl::backend::ext_oneapi_level_zero &&
                 d.get_info<sycl::info::device::name>().find("Arc") != std::string::npos) { dev = d; break; }
-        if (dev.get_backend() != sycl::backend::ext_oneapi_level_zero) {
-            say("[xmx_init] NO Level-Zero Arc visible in this process -- refusing the "
-                "OpenCL Arc (it faults the fused kernels; section 60/90). Census above.");
-            if (cen) fclose(cen);
-            FAILMSG("no Level-Zero Arc device in this process (see libxmx_sycl_census.txt)");
-        }
-        say("[xmx_init] chosen: backend=" + std::to_string((int)dev.get_backend()) +
-            " name=" + dev.get_info<sycl::info::device::name>());
+        if (dev.get_backend() != sycl::backend::ext_oneapi_level_zero)
+            for (auto& d : sycl::device::get_devices(sycl::info::device_type::gpu))
+                if (d.get_info<sycl::info::device::name>().find("Arc") != std::string::npos) { dev = d; break; }
+        g_l0 = (dev.get_backend() == sycl::backend::ext_oneapi_level_zero);
+        say(std::string("[xmx_init] chosen: backend=") + std::to_string((int)dev.get_backend()) +
+            " name=" + dev.get_info<sycl::info::device::name>() +
+            (g_l0 ? " (Level-Zero: fused allowed)" : " (OpenCL: fused pre/post will refuse)"));
         if (cen) fclose(cen);
         GD = new sycl::device(dev);
         GQ = new sycl::queue(dev);
@@ -333,12 +325,13 @@ int xmx_abort(void) { g_recording = false; g_cmds.clear(); return 0; }
 // of today's recorders; the pack moves device-side when the chains themselves
 // fuse -- step 1 only has to prove freeze/replay identity and the ordering.
 static std::vector<std::vector<std::function<void()>>> g_graphs;
+static std::vector<std::vector<const char*>> g_graph_names;
 #ifdef _WIN32
 static int fence_host_wait(void);   // defined in the fence block; graph_run calls it
 #endif
 int xmx_graph_capture(void) {
     if (!g_recording) FAILMSG("not recording");
-    g_graphs.push_back(std::move(g_cmds));
+    g_graphs.push_back(std::move(g_cmds)); g_graph_names.push_back(std::move(g_cmd_names));
     g_cmds.clear();
     g_recording = false;
     return (int)g_graphs.size() - 1;
@@ -381,14 +374,25 @@ int xmx_graph_run(int id) {
             std::printf("[run_timing] %zu passes, total %.0f ms; top 25:\n", ms.size(), tot);
             if (f) std::fprintf(f, "passes=%zu total=%.0fms\n", ms.size(), tot);
             for (int i = 0; i < 25 && i < (int)ord.size(); i++) {
-                std::printf("   pass %4d: %8.1f ms\n", ord[i], ms[ord[i]]);
-                if (f) std::fprintf(f, "pass %d %.1f\n", ord[i], ms[ord[i]]);
+                const char* nm = (id < (int)g_graph_names.size() && ord[i] < (int)g_graph_names[id].size())
+                                 ? g_graph_names[id][ord[i]] : "?";
+                std::printf("   pass %4d %-32s %8.1f ms\n", ord[i], nm, ms[ord[i]]);
+                if (f) std::fprintf(f, "pass %d %s %.1f\n", ord[i], nm, ms[ord[i]]);
             }
-            // family histogram by 50-pass buckets of summed time
-            for (size_t b = 0; b + 50 <= ms.size(); b += 50) {
-                double s = 0; for (size_t i = b; i < b + 50; i++) s += ms[i];
-                std::printf("   passes [%4zu..%4zu]: %8.1f ms\n", b, b + 49, s);
-                if (f) std::fprintf(f, "bucket %zu %.1f\n", b, s);
+            // per-op-name totals: which family owns the time
+            std::map<std::string, double> byname;
+            for (size_t i = 0; i < ms.size(); i++) {
+                const char* nm = (id < (int)g_graph_names.size() && i < g_graph_names[id].size())
+                                 ? g_graph_names[id][i] : "?";
+                byname[nm] += ms[i];
+            }
+            std::vector<std::pair<std::string, double>> v(byname.begin(), byname.end());
+            std::sort(v.begin(), v.end(), [](auto& a, auto& b){ return a.second > b.second; });
+            std::printf("[run_timing] per-op totals:\n");
+            if (f) std::fprintf(f, "per-op totals:\n");
+            for (auto& kv : v) {
+                std::printf("   %-32s %9.1f ms\n", kv.first.c_str(), kv.second);
+                if (f) std::fprintf(f, "op %s %.1f\n", kv.first.c_str(), kv.second);
             }
             if (f) std::fclose(f);
             return passes;
@@ -595,6 +599,7 @@ int xmx_rec_pre(int colour, int motion, int history, int features, int plan,
                 unsigned pixels, unsigned height, unsigned width,
                 unsigned pitch, unsigned source_h, unsigned source_w, unsigned flags, int table) {
     if (!g_recording) FAILMSG("not recording");
+    if (!g_l0) FAILMSG("xmx_rec_pre needs a Level-Zero device (the fused kernel faults on OpenCL; section 92)");
     if (!pixels || !height || !width) FAILMSG("invalid fused input extent");
     auto ic = g_bufs.find(colour), im = g_bufs.find(motion), ih = g_bufs.find(history);
     auto ift = g_bufs.find(features), ip = g_bufs.find(plan), itb = g_bufs.find(table);
@@ -609,6 +614,7 @@ int xmx_rec_pre(int colour, int motion, int history, int features, int plan,
     const float* Tb = (const float*)itb->second.p;
     prepass::PreArgs A{ Col, Mot, His, Feat, Pl, Tb, pixels, height, width,
                         pitch, source_h, source_w, flags };
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         GQ->parallel_for(sycl::range((size_t)pixels), prepass::pre_kernel(A)).wait();
     });
@@ -628,6 +634,7 @@ int xmx_rec_post(int colour, int head, int history, int result, int table, int n
                  unsigned pixels, unsigned height, unsigned width,
                  unsigned pitch, unsigned source_h, unsigned source_w) {
     if (!g_recording) FAILMSG("not recording");
+    if (!g_l0) FAILMSG("xmx_rec_post needs a Level-Zero device (the fused kernel faults on OpenCL; section 92)");
     if (!pixels || !height || !width) FAILMSG("invalid fused output extent");
     auto ic = g_bufs.find(colour), ihd = g_bufs.find(head), ih = g_bufs.find(history);
     auto irs = g_bufs.find(result), itb = g_bufs.find(table), inl = g_bufs.find(neural);
@@ -642,6 +649,7 @@ int xmx_rec_post(int colour, int head, int history, int result, int table, int n
     float* Neu = (float*)inl->second.p;
     postpass::PostArgs A{ Col, Hd, His, Res, Tb, Neu, pixels, height, width,
                           pitch, source_h, source_w };
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         GQ->parallel_for(sycl::range((size_t)pixels), postpass::post_kernel(A)).wait();
     });
@@ -698,6 +706,7 @@ int xmx_rec_gemm_qkv_window(int image, int weight, int q, int k, int v, int scal
     const unsigned C = channels, NH = 3u * channels;
     const int Mp = (int)(((M + 15u) / 16u) * 16u);
     const unsigned top = pad >> 16, left = pad & 0xffffu;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         // gather the image into a dense (M x C) half A (host; the window_int8_residual
         // pattern). The image is DEVICE memory: download it whole before the host gather
@@ -815,6 +824,7 @@ int xmx_rec_gemm_residual(int a, int b, int c, int skip, int cosine,
     const bool half_skip = (flags & 0x40000u) != 0u;
     const int Mp = (int)(((M + 15u) / 16u) * 16u);
     const size_t na = (size_t)Mp * K, nb = (size_t)K * N;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         std::vector<sycl::half> hA((size_t)M * K), hApad(na, sycl::half(0.f)), hB(nb), hAp(na), hBp(nb);
         GQ->memcpy(hA.data(), Araw, (size_t)M * K * 2).wait();
@@ -883,6 +893,7 @@ int xmx_rec_gemm_window_residual(int a, int b, int c, int skip, int cosine,
     const int Mp = (int)(((M + 15u) / 16u) * 16u);
     const size_t na = (size_t)Mp * K, nb = (size_t)K * N;
     const unsigned top = pad >> 16, left = pad & 0xffffu;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         auto sized = [&](int id, size_t bytes, const char* what) -> void* {
             auto it = g_bufs.find(id);
@@ -980,6 +991,7 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
     const bool narrow = (flags & 0x1000u) != 0u;
     const bool half_skip = (flags & 0x40000u) != 0u;
     const int Mp = (int)(((M + 15u) / 16u) * 16u);
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         // ---- pass 1: expand, publish(3)=gate->e4m3, narrow f16 -> hidden16 ----
         {
@@ -1079,6 +1091,7 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
     const unsigned epi = (flags >> 8) & 0xFu;
     const bool narrow = (flags & 0x1000u) != 0u;
     const int Mp = (int)(((M + 15u) / 16u) * 16u);
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         // ---- pass A: merged4 on device -> dMerged f32 (the skip) + e4m3-half -> host ----
         float* dMerged = (float*)sycl::malloc_device((size_t)M * 32 * 4, *GQ);   // raw, kept for pass C
@@ -1190,6 +1203,7 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
     const unsigned epi = (flags >> 8) & 0xFu;
     const bool narrow = (flags & 0x1000u) != 0u;
     const int Mp = (int)(((M + 15u) / 16u) * 16u);
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         // ---- pass A: stem gemm(features, adapter -> f32), publish e4m3 -> hidden16 ----
         std::vector<sycl::half> hF((size_t)M * 16), hAd((size_t)16 * 32),
@@ -1304,6 +1318,7 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
     const bool narrow = (bt & 0x1000u) != 0u;
     const unsigned lda_e = lda ? lda : K, ldb_e = ldb ? ldb : (transposed ? K : N), ldc_e = ldc ? ldc : N;
     const int Mp = (int)(((M + 15u) / 16u) * 16u);
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         const size_t a_slice = (size_t)M * K, b_slice = (size_t)K * N;
         const size_t aw_b = (size_t)(M - 1) * lda_e + (size_t)(batch - 1) * sa + K + oa;
@@ -1383,18 +1398,16 @@ int xmx_rec_gemm_int8(int a, int b, int c, int a_scale, int b_scale,
     const bool narrow = (flags & 0x1000u) != 0u;
     const int Mp = l0_ceil_bm(M);
     const size_t na = (size_t)Mp * K, nb = (size_t)N * K;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
-        std::vector<int8_t> hA((size_t)M * K), hApad(na, 0), hB(nb), hAp(na), hBp(nb);
-        GQ->memcpy(hA.data(), Araw, (size_t)M * K).wait();
-        std::memcpy(hApad.data(), hA.data(), (size_t)M * K);   // pad rows stay zero
-        GQ->memcpy(hB.data(), Braw, nb).wait();
-        s8v8::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
-        s8v8::pack_b(hB.data(), hBp.data(), (int)N, (int)K);   // B arrives TRANSPOSED
+        // device pack (section 92 phase-2): the operands stay on device -- the host
+        // round-trip (download -> CPU pack -> upload) was the whole 89s/frame, and the
+        // gather is bit-exact vs the host pack (PACK_DEVICE gate).
         int8_t* dAp = (int8_t*)sycl::malloc_device(na, *GQ);
         int8_t* dBp = (int8_t*)sycl::malloc_device(nb, *GQ);
         int32_t* dC = (int32_t*)sycl::malloc_device((size_t)Mp * N * 4, *GQ);
-        GQ->memcpy(dAp, hAp.data(), na).wait();
-        GQ->memcpy(dBp, hBp.data(), nb).wait();
+        packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K);
+        packdev::pack_b(*GQ, Braw, dBp, (int)N, (int)K);   // B arrives TRANSPOSED
         s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K).wait();
         GQ->parallel_for(sycl::range((size_t)M * N),
                          [=](sycl::item<1> it) {
@@ -1444,6 +1457,7 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
     const unsigned epi = (flags >> 8) & 0xFu;
     const bool narrow = (flags & 0x1000u) != 0u;
     const int Mp = l0_ceil_bm(M);
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         const size_t a_slice = (size_t)M * K, b_slice = (size_t)N * K;
         const unsigned lda_e = lda ? lda : K, ldb_e = ldb ? ldb : K;
@@ -1555,6 +1569,7 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
     const unsigned C = channels, NH = 3u * channels;
     const int Mp = l0_ceil_bm(M);
     const size_t na = (size_t)Mp * C, nb = (size_t)NH * C;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         std::vector<int8_t> hA((size_t)M * C), hApad(na, 0), hB(nb), hAp(na), hBp(nb);
         GQ->memcpy(hA.data(), Araw, (size_t)M * C).wait();
@@ -1672,6 +1687,7 @@ int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale,
     const bool half_skip = (flags & 0x40000u) != 0u;
     const int Mp = l0_ceil_bm(M);
     const size_t na = (size_t)Mp * K, nb = (size_t)N * K;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         std::vector<int8_t> hA((size_t)M * K), hApad(na, 0), hB(nb), hAp(na), hBp(nb);
         GQ->memcpy(hA.data(), Araw, (size_t)M * K).wait();
@@ -1760,6 +1776,7 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
     const int Mp = l0_ceil_bm(M);
     const size_t na = (size_t)Mp * K, nb = (size_t)N * K;
     const unsigned top = pad >> 16, left = pad & 0xffffu;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         // RUN-TIME fresh lookups shadowing the capture-time pointers (see the lesson
         // above): sizes are checked HERE because the scratch recording's placeholder
@@ -1841,6 +1858,7 @@ int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
     const unsigned CH = heads * 32u;
     const size_t sc = (size_t)heads * rows * rows;   // scores & probs
     const size_t cx = (size_t)heads * rows * 32u;    // ctx
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         float* dScores = (float*)sycl::malloc_device(sc * 4, *GQ);
         sycl::half* dProbs = (sycl::half*)sycl::malloc_device(sc * 2, *GQ);
@@ -1911,6 +1929,7 @@ int xmx_rec_quant_window(int source, int packed, int scale, unsigned M, unsigned
     sycl::half* a = (sycl::half*)s->second.p;
     sycl::uint2* pk = (sycl::uint2*)p2->second.p;
     float* sc = (float*)c->second.p;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         qr_launch(*GQ, *GD, qr_kernel(), a, pk, sc, M, K, 0x400000u,
                   height, width, across, pad, nullptr, nullptr);
@@ -1949,6 +1968,7 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
     // lambda captured by reference is not a legal kernel parameter -- the first cut's
     // compile error); scalars/pointers are captured by value.
     if (sub == 18u) {   // E4M3_HALF: value=a.f32; e4m3; write half (no gate, no epilogue)
+        g_cmd_names.push_back(__func__);
         g_cmds.push_back([=]() {
             GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
                 size_t i = it.get_id(0);
@@ -1956,6 +1976,7 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
             }).wait();
         });
     } else if (sub == 12u) {   // POOL2: 2x2 average NHWC, column-first order (.comp:529-531)
+        g_cmd_names.push_back(__func__);
         g_cmds.push_back([=]() {
             GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
                 size_t index = it.get_id(0);
@@ -1971,6 +1992,7 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
             }).wait();
         });
     } else if (sub == 21u) {   // UPSAMPLE_ADD: a[nearest2x] + (b*sine[c]), publish
+        g_cmd_names.push_back(__func__);
         g_cmds.push_back([=]() {
             GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
                 size_t index = it.get_id(0);
@@ -1986,6 +2008,7 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
             }).wait();
         });
     } else if (sub == 16u) {   // PAD_END: extend with zeros
+        g_cmd_names.push_back(__func__);
         g_cmds.push_back([=]() {
             GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
                 size_t index = it.get_id(0);
@@ -2032,6 +2055,7 @@ int xmx_rec_vit_softmax(int source, int dst, int reciprocal, unsigned rows,
     const float* sp = (const float*)s->second.p;
     sycl::half* dp = (sycl::half*)d->second.p;
     float* rp = (float*)rc->second.p;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         GQ->parallel_for(sycl::range((size_t)rows),
                          smax::vit_softmax_kernel()(sp, dp, rp, rows, tokens, stride)).wait();
@@ -2048,6 +2072,7 @@ int xmx_rec_merge_heads(int source, int dst, unsigned windows, unsigned tokens,
     const float* sp = (const float*)s->second.p;
     void* dp = d->second.p;
     const unsigned n = windows * tokens * channels;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         GQ->parallel_for(sycl::range((size_t)n), [=](sycl::item<1> it) {
             unsigned index = (unsigned)it.get_id(0);
@@ -2078,6 +2103,7 @@ int xmx_rec_merge_heads_scale(int source, int dst, int scale, unsigned windows,
     void* dp = d->second.p;
     const float* scp = (const float*)sc->second.p;
     const unsigned n = windows * tokens * channels;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         GQ->parallel_for(sycl::range((size_t)n), [=](sycl::item<1> it) {
             unsigned index = (unsigned)it.get_id(0);
@@ -2121,6 +2147,7 @@ int xmx_rec_unary2(unsigned kind, int a, int b, int c, int d, int second, unsign
     const bool narrow = (flags & 0x1000u) != 0u;
     const unsigned epi = (flags >> 8) & 0xFu;
     const unsigned N = n, CH = channels, SA = sa, SB = sb;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
             unsigned index = (unsigned)it.get_id(0);
@@ -2171,39 +2198,31 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
     const unsigned windows = batches / heads;
     const size_t sc_elems = (size_t)batches * 64u * 64u;   // scores & probs
     const size_t ctx_elems = (size_t)batches * 64u * 32u;  // attnV context
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
+        // device pack + batched gemm (section 92): the per-batch host loop (4 sync
+        // memcpys + 4 malloc/free + 2 launches PER batch, batches up to 2040) was the
+        // 34s pathology. Q/K/V are already contiguous per batch on device, so one
+        // batched pack + one batched gemm covers every window; the dpas sequence per
+        // tile is identical to the loop's, so it is bit-exact by construction.
         float* dScores = (float*)sycl::malloc_device(sc_elems * 4, *GQ);
         sycl::half* dProbs = (sycl::half*)sycl::malloc_device(sc_elems * 2, *GQ);
         float* dCtx = (float*)sycl::malloc_device(ctx_elems * 4, *GQ);
-        // per-batch f16 gemms (correctness-first: the tile is not batched; the fused
-        // kernel's shared-memory reuse is the megakernel-era job, section 9).
-        std::vector<sycl::half> hq(64u*32u), hk(64u*32u), hp(64u*64u), hv(64u*32u);
-        std::vector<sycl::half> Aq(64u*32u), Bk(64u*32u), Ap(64u*64u), Bv(64u*32u);
-        for (unsigned b = 0; b < batches; ++b) {
-            GQ->memcpy(hq.data(), Q + (size_t)b*64u*32u, 64u*32u*2).wait();
-            GQ->memcpy(hk.data(), Kk + (size_t)b*64u*32u, 64u*32u*2).wait();
-            f16v1::pack_a(hq.data(), Aq.data(), 64, 32);
-            f16v1::pack_b_t(hk.data(), Bk.data(), 32, 64);   // K stored (64 tokens,32 ch)
-            sycl::half* dA=(sycl::half*)sycl::malloc_device(64u*32u*2,*GQ);
-            sycl::half* dB=(sycl::half*)sycl::malloc_device(64u*32u*2,*GQ);
-            GQ->memcpy(dA,Aq.data(),64u*32u*2).wait(); GQ->memcpy(dB,Bk.data(),64u*32u*2).wait();
-            f16v1::gemm(*GQ, dA, dB, dScores + (size_t)b*64u*64u, 64, 64, 32).wait();
-            sycl::free(dA,*GQ); sycl::free(dB,*GQ);
-        }
-        // softmax over (batches*64) rows of 64, with bias (heads,64,64)
+        sycl::half* dAq = (sycl::half*)sycl::malloc_device((size_t)batches * 64u * 32u * 2, *GQ);
+        sycl::half* dBk = (sycl::half*)sycl::malloc_device((size_t)batches * 32u * 64u * 2, *GQ);
+        sycl::half* dAp = (sycl::half*)sycl::malloc_device((size_t)batches * 64u * 64u * 2, *GQ);
+        sycl::half* dBv = (sycl::half*)sycl::malloc_device((size_t)batches * 64u * 32u * 2, *GQ);
+        // scores leg: Q(64x32) @ K^T(32x64) -> 64x64. K stored (64 tokens,32 ch) = (N,K).
+        packdev::pack_a16_b(*GQ, Q, dAq, 64, 64, 32, (int)batches);
+        packdev::pack_b16_t_b(*GQ, Kk, dBk, 32, 64, (int)batches);
+        f16v1::gemm_b(*GQ, dAq, dBk, dScores, 64, 64, 32, (int)batches).wait();
+        // softmax over (batches*64) rows of 64, with bias (heads,64,64) -- one launch.
         GQ->parallel_for(sycl::range((size_t)batches*64u),
                          smax::softmax_kernel()(dScores, dProbs, batches*64u, 64u, Bp, heads)).wait();
-        for (unsigned b = 0; b < batches; ++b) {
-            GQ->memcpy(hp.data(), dProbs + (size_t)b*64u*64u, 64u*64u*2).wait();
-            GQ->memcpy(hv.data(), V + (size_t)b*64u*32u, 64u*32u*2).wait();
-            f16v1::pack_a(hp.data(), Ap.data(), 64, 64);
-            f16v1::pack_b(hv.data(), Bv.data(), 64, 32);     // V stored (64 tokens,32 ch) = (K,N)
-            sycl::half* dA=(sycl::half*)sycl::malloc_device(64u*64u*2,*GQ);
-            sycl::half* dB=(sycl::half*)sycl::malloc_device(64u*32u*2,*GQ);
-            GQ->memcpy(dA,Ap.data(),64u*64u*2).wait(); GQ->memcpy(dB,Bv.data(),64u*32u*2).wait();
-            f16v1::gemm(*GQ, dA, dB, dCtx + (size_t)b*64u*32u, 64, 32, 64).wait();
-            sycl::free(dA,*GQ); sycl::free(dB,*GQ);
-        }
+        // attnV leg: P(64x64) @ V(64x32) -> 64x32. V stored (64 tokens,32 ch) = (K,N).
+        packdev::pack_a16_b(*GQ, dProbs, dAp, 64, 64, 64, (int)batches);
+        packdev::pack_b16_b(*GQ, V, dBv, 64, 32, (int)batches);
+        f16v1::gemm_b(*GQ, dAp, dBv, dCtx, 64, 32, 64, (int)batches).wait();
         if (merged) {
             // merge_heads: (windows,heads,64,32) -> (windows,64,heads*32), publish e4m3, half
             const unsigned CH = heads * 32u;
@@ -2218,6 +2237,7 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
             GQ->memcpy(Out, dCtx, ctx_elems * 4).wait();
         }
         sycl::free(dScores,*GQ); sycl::free(dProbs,*GQ); sycl::free(dCtx,*GQ);
+        sycl::free(dAq,*GQ); sycl::free(dBk,*GQ); sycl::free(dAp,*GQ); sycl::free(dBv,*GQ);
     });
     return 0;
 }
@@ -2253,6 +2273,7 @@ int xmx_rec_gemm_window_residual_pool(int a, int b, int skip_out, int skip, int 
     const int Mp = (int)(((M + 15u) / 16u) * 16u);
     const size_t na = (size_t)Mp * K, nb = (size_t)K * N;
     const unsigned top = pad >> 16, left = pad & 0xffffu;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         auto sized = [&](int id, size_t bytes, const char* what) -> void* {
             auto it = g_bufs.find(id);
@@ -2371,6 +2392,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
     const size_t c_need = head ? (size_t)height * width * 4u * 4u : img_elems * wsz;   // head: compact float32 target (pixels x 4)
     const size_t k_need = img_elems * (image_half ? 2u : 4u);
     const int image_id = image, target_id = target;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         auto sized = [&](int id, size_t bytes, const char* what) -> void* {
             auto it = g_bufs.find(id);
@@ -2585,6 +2607,7 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
     sycl::half* a = (sycl::half*)s->second.p;
     sycl::uint2* pk = (sycl::uint2*)p->second.p;
     float* sc = (float*)c->second.p;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         qr_launch(*GQ, *GD, qr_kernel(), a, pk, sc, M, K, 0u, 0u, 0u, 0u, 0u, nullptr, nullptr);
     });
@@ -2608,6 +2631,7 @@ int xmx_rec_gemm_s8(int a, int b, int c, unsigned M, unsigned N, unsigned K) {
     int8_t* Araw = (int8_t*)ia->second.p;
     int8_t* Braw = (int8_t*)ib->second.p;
     int32_t* C32 = (int32_t*)ic->second.p;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         size_t na = (size_t)M * K, nb = (size_t)K * N;
         std::vector<int8_t> hA(na), hB(nb), hAp(na), hBp(nb);
@@ -2645,6 +2669,7 @@ int xmx_rec_gemm_s8rq(int a, int b, int c8, int col_scale, int new_scale,
     int8_t* C8 = (int8_t*)ic->second.p;
     float* cs = (float*)ics->second.p;
     float* ns = (float*)ins->second.p;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         size_t na = (size_t)M * K, nb = (size_t)K * N;
         std::vector<int8_t> hA(na), hB(nb), hAp(na), hBp(nb);
@@ -2687,6 +2712,7 @@ int xmx_rec_gemm_s8rq32(int a, int b, int c8, int a_scale, int col_scale, int ne
     float* as = (float*)ias->second.p;
     float* cs = (float*)ics->second.p;
     float* ns = (float*)ins->second.p;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         size_t na = (size_t)M * K, nb = (size_t)K * N;
         std::vector<int8_t> hA(na), hB(nb), hAp(na), hBp(nb);
@@ -2708,8 +2734,8 @@ int xmx_submit(void) {
     if (!g_recording) FAILMSG("not recording");
     try {
         for (auto& fn : g_cmds) fn();   // each qr_launch already .wait()s; ordered like the plan
-    } catch (const std::exception& e) { g_cmds.clear(); g_recording = false; FAILMSG("submit: %s", e.what()); }
-    g_cmds.clear(); g_recording = false;
+    } catch (const std::exception& e) { g_cmds.clear(); g_cmd_names.clear(); g_recording = false; FAILMSG("submit: %s", e.what()); }
+    g_cmds.clear(); g_cmd_names.clear(); g_recording = false;
     return 0;
 }
 
@@ -2724,6 +2750,7 @@ int xmx_rec_unary32(int source, int dst, unsigned count, unsigned epilogue) {
     sycl::float4* sp = (sycl::float4*)s->second.p;
     sycl::float4* dp = (sycl::float4*)d->second.p;
     unsigned n4 = count / 4u;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         GQ->parallel_for(sycl::range(n4), unary_kernel()(sp, dp, n4, epilogue)).wait();
     });
@@ -2745,6 +2772,7 @@ int xmx_rec_unary_i8(int source, int scale, int dst, unsigned count, unsigned co
     const signed char* sp = (const signed char*)s->second.p;
     const float* scp = (const float*)c->second.p;
     float* dp = (float*)d->second.p;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         GQ->parallel_for(sycl::range(count), unary_i8_kernel()(sp, scp, dp, count, cols, epilogue)).wait();
     });
@@ -2762,6 +2790,7 @@ int xmx_rec_cosine_norm(int source, int dst, unsigned rows, unsigned vit) {
     if (s == g_bufs.end() || d == g_bufs.end()) FAILMSG("bad cosine_norm operand");
     const float* sp = (const float*)s->second.p;
     float* dp = (float*)d->second.p;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         GQ->parallel_for(sycl::range(rows),
                          ctree::cosine_norm_kernel()(sp, dp, rows, vit, nullptr, 0)).wait();
@@ -2782,6 +2811,7 @@ int xmx_rec_cosine_norm_q(int source, int dst, int scale, unsigned rows, unsigne
     const float* sp = (const float*)s->second.p;
     float* dp = (float*)d->second.p;
     const float* scp = (const float*)c->second.p;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         GQ->parallel_for(sycl::range(rows),
                          ctree::cosine_norm_kernel()(sp, dp, rows, vit, scp, heads)).wait();
@@ -2807,6 +2837,7 @@ int xmx_rec_cosine_norm_i8(int source, int out8, int scale, unsigned rows, unsig
     const float* sp = (const float*)s->second.p;
     signed char* op = (signed char*)o->second.p;
     float* cp = (float*)c->second.p;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         GQ->parallel_for(sycl::range(rows),
                          ctree::cosine_norm_i8_kernel()(sp, op, cp, rows, vit, qsp, heads)).wait();
@@ -2831,6 +2862,7 @@ int xmx_rec_softmax(int source, int dst, unsigned rows, unsigned cols) {
     if (s == g_bufs.end() || d == g_bufs.end()) FAILMSG("bad softmax operand");
     const float* sp = (const float*)s->second.p;
     sycl::half* dp = (sycl::half*)d->second.p;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         GQ->parallel_for(sycl::range(rows), smax::softmax_kernel()(sp, dp, rows, cols, nullptr, 0)).wait();
     });
@@ -2845,6 +2877,7 @@ int xmx_rec_softmax_bias(int source, int dst, int bias, unsigned rows, unsigned 
     const float* sp = (const float*)s->second.p;
     sycl::half* dp = (sycl::half*)d->second.p;
     const float* bp = (const float*)b->second.p;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         GQ->parallel_for(sycl::range(rows), smax::softmax_kernel()(sp, dp, rows, cols, bp, heads)).wait();
     });
@@ -2873,6 +2906,7 @@ int xmx_rec_softmax_i8(int acc, int q_scale, int k_scale, int bias, int out8, in
     const float* bp = (const float*)ib->second.p;
     signed char* op = (signed char*)io->second.p;
     float* scp = (float*)isc->second.p;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         // scratch holds each row's pre-requantize half values between the sum pass and the
         // row-max/requantize pass; every work-item touches only its own row, so no barrier.
@@ -2905,6 +2939,7 @@ int xmx_rec_requant_i8(int acc, int a_scale, int b_scale, int out8, int scale,
     const float* bs = (const float*)ibs->second.p;
     signed char* op = (signed char*)io->second.p;
     float* scp = (float*)isc->second.p;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         GQ->parallel_for(sycl::range(rows),
                          requant::requant_i8_kernel()(ap, as, bs, op, scp, rows, cols)).wait();
@@ -2935,6 +2970,7 @@ int xmx_rec_gemm_qkv_v(int a, int b, int v, int a_scale, int b_scale,
     sycl::half* V = (sycl::half*)iv->second.p;
     float* as = (float*)ias->second.p;
     float* bs = (float*)ibs->second.p;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         size_t na = (size_t)M * channels, nb = (size_t)channels * channels;
         std::vector<int8_t> hA(na), hB(nb), hAp(na), hBp(nb);
@@ -2976,6 +3012,7 @@ int xmx_rec_gemm_qkv_v_i8(int a, int b, int v8, int v_scale, int a_scale, int b_
     float* vs = (float*)ivs->second.p;
     float* as = (float*)ias->second.p;
     float* bs = (float*)ibs->second.p;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         size_t na = (size_t)M * channels, nb = (size_t)channels * channels;
         std::vector<int8_t> hA(na), hB(nb), hAp(na), hBp(nb);
@@ -3012,6 +3049,7 @@ int xmx_rec_gemm_qkv_deq(int a, int b, int out, int a_scale, int b_scale,
     float* OUT = (float*)io->second.p;
     float* as = (float*)ias->second.p;
     float* bs = (float*)ibs->second.p;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         size_t na = (size_t)M * channels, nb = (size_t)channels * channels;
         std::vector<int8_t> hA(na), hB(nb), hAp(na), hBp(nb);
@@ -3040,6 +3078,7 @@ int xmx_rec_qkv_scatter(int src, int dst, unsigned rows, unsigned heads, unsigne
     const float* sp = (const float*)s->second.p;
     sycl::half* dp = (sycl::half*)d->second.p;
     unsigned n = rows * heads * 32u;
+    g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         GQ->parallel_for(sycl::range(n), qkv_scatter_kernel()(sp, dp, rows, heads, tokens)).wait();
     });

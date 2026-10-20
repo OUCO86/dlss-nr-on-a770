@@ -103,4 +103,64 @@ static inline void pack_b16_t(sycl::queue& q, const sycl::half* B, sycl::half* B
     }).wait();
 }
 
+// ---- batched variants (section 92): window_attention's legs run the SAME tile over
+// `batches` independent matrices. The per-batch host loop was the pathology (4 sync
+// memcpys + 4 malloc/free + 2 launches PER batch, batches up to 2040 -> tens of
+// thousands of sync points = the 34s). One launch covers all batches; source and dest
+// are contiguous per batch (A at b*M*K, Ap at b*Mp*K, B at b*K*N or b*N*K, Bp at b*K*N).
+// Same index maps as the single-matrix versions -- bit-exact by construction. ----
+static inline void pack_a16_b(sycl::queue& q, const sycl::half* A, sycl::half* Ap,
+                              int M, int Mp, int K, int batches) {
+    const int TS = 16;
+    int tr_n = Mp / TS, kb_n = K / TS;
+    size_t per = (size_t)tr_n * kb_n * 2 * 128;          // = Mp*K
+    q.parallel_for(sycl::range((size_t)batches * per), [=](sycl::item<1> it) {
+        size_t g = it.get_id(0);
+        size_t b = g / per; size_t d = g % per;
+        const sycl::half* Ab = A + b * (size_t)M * K; sycl::half* Apb = Ap + b * per;
+        int k = (int)(d % 16); size_t rest = d / 16;
+        int il = (int)(rest % 8); rest /= 8;
+        int strip = (int)(rest % 2); size_t blk = rest / 2;
+        int kc = (int)(blk % (size_t)kb_n); int tr = (int)(blk / (size_t)kb_n);
+        int srow = tr * TS + strip * 8 + il;
+        Apb[d] = srow < M ? Ab[(size_t)srow * K + kc * TS + k] : sycl::half(0.0f);
+    }).wait();
+}
+static inline void pack_b16_b(sycl::queue& q, const sycl::half* B, sycl::half* Bp,
+                              int K, int N, int batches) {
+    const int TS = 16;
+    int kb_n = K / TS, tc_n = N / TS;
+    size_t per = (size_t)kb_n * tc_n * 2 * 128;          // = K*N
+    q.parallel_for(sycl::range((size_t)batches * per), [=](sycl::item<1> it) {
+        size_t g = it.get_id(0);
+        size_t b = g / per; size_t d = g % per;
+        const sycl::half* Bb = B + b * (size_t)K * N; sycl::half* Bpb = Bp + b * per;
+        int inner = (int)(d % 128); size_t blk = d / 128;
+        int js = (int)(blk % 2); size_t blk2 = blk / 2;
+        int tc = (int)(blk2 % (size_t)tc_n); int kc = (int)(blk2 / (size_t)tc_n);
+        int kq = inner / 16; int rem = inner % 16;
+        int jl = rem / 2, kpar = rem % 2;
+        int k = kq * 2 + kpar;
+        Bpb[d] = Bb[(size_t)(kc * TS + k) * N + tc * TS + js * 8 + jl];
+    }).wait();
+}
+static inline void pack_b16_t_b(sycl::queue& q, const sycl::half* B, sycl::half* Bp,
+                                int K, int N, int batches) {
+    const int TS = 16;
+    int kb_n = K / TS, tc_n = N / TS;
+    size_t per = (size_t)kb_n * tc_n * 2 * 128;
+    q.parallel_for(sycl::range((size_t)batches * per), [=](sycl::item<1> it) {
+        size_t g = it.get_id(0);
+        size_t b = g / per; size_t d = g % per;
+        const sycl::half* Bb = B + b * (size_t)N * K; sycl::half* Bpb = Bp + b * per;
+        int inner = (int)(d % 128); size_t blk = d / 128;
+        int js = (int)(blk % 2); size_t blk2 = blk / 2;
+        int tc = (int)(blk2 % (size_t)tc_n); int kc = (int)(blk2 / (size_t)tc_n);
+        int kq = inner / 16; int rem = inner % 16;
+        int jl = rem / 2, kpar = rem % 2;
+        int k = kq * 2 + kpar;
+        Bpb[d] = Bb[(size_t)(tc * TS + js * 8 + jl) * K + kc * TS + k];
+    }).wait();
+}
+
 } // namespace packdev
