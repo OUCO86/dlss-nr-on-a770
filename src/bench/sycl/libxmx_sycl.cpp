@@ -1155,17 +1155,14 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
         // queue: every read kernel is enqueued before the pool_put that recycles its
         // buffer, so cross-pass scratch reuse is safe; one wait at the end of the pass.
         sycl::half* dAp = (sycl::half*)pool_get((size_t)Mp * cin * 2);
-        float* dC1 = (float*)pool_get((size_t)Mp * hidden * 4);
         sycl::half* dH = (sycl::half*)pool_get((size_t)M * hidden * 2);
         packdev::pack_a16(*GQ, Araw, dAp, (int)M, Mp, (int)cin);
         sycl::half* dEp = cached_pack_b_f16(expand, Eraw, (int)cin, (int)hidden);   // weight
-        f16v1::gemm(*GQ, dAp, dEp, dC1, Mp, (int)hidden, (int)cin);
-        // publish(3) on device, store as f16 hidden16 -- stays on device for pass 2.
-        GQ->parallel_for(sycl::range((size_t)M * hidden), [=](sycl::item<1> it) {
-            size_t i = it.get_id(0);
-            dH[i] = sycl::half(qr_publish(3u, dC1[i]));
-        });
-        pool_put(dAp); pool_put(dC1);   // dEp is cache-owned (weight)
+        // DERIVED (section 92): fuse publish(3) (gate_activation + e4m3) into the gemm
+        // store -- kills the dC1 float scratch + the separate publish pass. pub_esimd(3u)
+        // is the same gate+e4m3 chain proven bit-exact by the batched epi3 win.
+        f16v1::gemm_pub(*GQ, dAp, dEp, dH, (int)M, Mp, (int)hidden, (int)cin);
+        pool_put(dAp);   // dEp is cache-owned (weight)
         // ---- pass 2: projection gemm_residual(hidden16, projection -> out) ----
         sycl::half* dHp = (sycl::half*)pool_get((size_t)Mp * hidden * 2);
         float* dC2 = (float*)pool_get((size_t)Mp * cin * 4);
