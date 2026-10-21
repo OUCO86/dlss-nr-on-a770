@@ -1474,19 +1474,14 @@ int xmx_rec_gemm_int8(int a, int b, int c, int a_scale, int b_scale,
         // round-trip (download -> CPU pack -> upload) was the whole 89s/frame, and the
         // gather is bit-exact vs the host pack (PACK_DEVICE gate).
         int8_t* dAp = (int8_t*)pool_get(na);
-        int32_t* dC = (int32_t*)pool_get((size_t)Mp * N * 4);
         packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K);
         int8_t* dBp = cached_pack_b_i8(b, Braw, (int)N, (int)K);   // weight: pack once, reuse
-        s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K);
-        GQ->parallel_for(sycl::range((size_t)M * N),
-                         [=](sycl::item<1> it) {
-            size_t i = it.get_id(0);
-            unsigned r = (unsigned)(i / N), col = (unsigned)(i % N);
-            float v = cr_mul(cr_mul((float)dC[(size_t)r * N + col], as[r]), bs[col]);
-            if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, v));
-            else        ((float*)Cout)[i] = qr_publish(epi, v);
-        });
-        pool_put(dAp); pool_put(dC);   // dBp is cache-owned (cached_pack_b_i8), not pooled
+        // DERIVED (section 92): pure publish (dequant + qr_publish, no residual fma) and
+        // N%64==0 is a hard requirement -- exactly gemm_b_pub's shape (batch=1, dense ldc=N,
+        // scale_stride/col_stride 0). Kills the int32 dC scratch + the separate publish pass.
+        s8v8::gemm_b_pub(*GQ, dAp, dBp, Cout, as, bs, (int)M, Mp, (int)N, (int)K,
+                         1, (size_t)M * N, N, 0u, 0u, narrow, epi);
+        pool_put(dAp);   // dBp is cache-owned (cached_pack_b_i8), not pooled
     });
     return 0;
 }
