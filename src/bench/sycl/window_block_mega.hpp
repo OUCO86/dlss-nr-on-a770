@@ -175,4 +175,76 @@ inline sycl::event launch_leg1(
         });
     });
 }
+// normalize_esimd -- the .comp's 4-lane butterfly cosine normalize as a standalone ESIMD
+// kernel (section 92). The scalar split epilogue runs 1 work-item/row (4.04ms at the real
+// shape); the .comp uses 4 lanes/row with a butterfly reduce (subgroupShuffleXor 2 then 1)
+// so all lanes work and the reduce is log-depth. ESIMD has no shuffle (quantize_row_sycl
+// .cpp:12), so the butterfly goes through SLM (the proven workaround). One workgroup = 32
+// threads = 8 rows x 4 lanes. Reads dCq (global f32 Mp x NH), writes dQ/dK/dV (half).
+inline sycl::event normalize_esimd(sycl::queue& q, const float* dCq,
+                                   half* dQ, half* dK, half* dV,
+                                   const float* qs, unsigned rows, unsigned NH, unsigned C) {
+    return q.submit([&](handler& h) {
+        h.parallel_for(nd_range<1>(range((size_t)rows / 8u * 32u), range(32u)),
+            [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+            esimd::slm_init<8u * 16u * 4u>();   // 8 rows x (Q,K) x 4 lanes x 2 parity floats
+            uint r  = (uint)it.get_group(0) * 8u + (uint)it.get_local_id(0) / 4u;
+            uint l  = (uint)it.get_local_id(0) % 4u;
+            uint rl = (uint)it.get_local_id(0) / 4u;
+            // this lane's 8 channels: g*8 + 2l, g*8 + 2l + 1
+            float hq[8], hk[8];
+            for (int g = 0; g < 4; ++g) {
+                hq[2u*g]   = eh_round(dCq[(size_t)r * NH + g * 8u + 2u*l]);
+                hq[2u*g+1] = eh_round(dCq[(size_t)r * NH + g * 8u + 2u*l + 1u]);
+                hk[2u*g]   = eh_round(dCq[(size_t)r * NH + C + g * 8u + 2u*l]);
+                hk[2u*g+1] = eh_round(dCq[(size_t)r * NH + C + g * 8u + 2u*l + 1u]);
+            }
+            // partial[lane][parity] via SLM, then butterfly two[l]=hadd(p[l],p[l^2]),
+            // one[0]=hadd(two[0],two[1]), norm=hadd(one[0][0],one[0][1]) -- ctree order.
+            float pq[2], pk[2];
+            for (int p = 0; p < 2; ++p) {
+                pq[p] = eh_add(eh_hfma(hq[2+p], hq[2+p], eh_mul(hq[p], hq[p])),
+                               eh_hfma(hq[6+p], hq[6+p], eh_mul(hq[4+p], hq[4+p])));
+                pk[p] = eh_add(eh_hfma(hk[2+p], hk[2+p], eh_mul(hk[p], hk[p])),
+                               eh_hfma(hk[6+p], hk[6+p], eh_mul(hk[4+p], hk[4+p])));
+            }
+            esimd::simd<float,2> tq; tq[0]=pq[0]; tq[1]=pq[1];
+            esimd::slm_block_store((rl*16u + l*2u) * 4u, tq, esimd::overaligned_tag<16>{});
+            esimd::simd<float,2> tk; tk[0]=pk[0]; tk[1]=pk[1];
+            esimd::slm_block_store((rl*16u + 8u + l*2u) * 4u, tk, esimd::overaligned_tag<16>{});
+            esimd::barrier();
+            float recip[2];
+            for (int which = 0; which < 2; ++which) {
+                uint base = (rl*16u + which*8u) * 4u;     // bytes: 4 lanes x 2 parity
+                esimd::simd<float,8> pv = esimd::slm_block_load<float,8>(base, esimd::overaligned_tag<16>{});
+                // pv[l*2+p] = partial[l][p]. ctree: two[l]=hadd(p[l],p[l^2]); one[0]=hadd(two[0],two[1]);
+                float two00 = eh_add(pv[0], pv[4]);   // two[0][0]=hadd(p[0][0],p[2][0])
+                float two10 = eh_add(pv[2], pv[6]);   // two[1][0]=hadd(p[1][0],p[3][0])
+                float one00 = eh_add(two00, two10);
+                float two01 = eh_add(pv[1], pv[5]);
+                float two11 = eh_add(pv[3], pv[7]);
+                float one01 = eh_add(two01, two11);
+                float norm = eh_add(one00, one01);
+                float floorv = eh_round(ctree::COSINE_NORM_FLOOR);
+                norm = norm > floorv ? norm : floorv;
+                // 1.0f/esqrt is bit-exact here (the first ESIMD epilogue proved it); bare
+                // / in an ESIMD kernel is the hardware correctly-rounded divide, NOT the
+                // approximate reciprocal icx emits in a SYCL kernel (the §20 context).
+                recip[which] = eh_round(1.0f / esqrt(norm));
+            }
+            float sc = eh_round(qs[0]);
+            // each lane owns 8 channels (g*8+2l, g*8+2l+1); scalar stores (a 32-wide
+            // copy_to would race -- all 4 lanes target the same row).
+            for (int g = 0; g < 4; ++g) {
+                uint c0 = g*8u + 2u*l;
+                dQ[(size_t)r*32u + c0]   = half(qr_e4m3_scalar(eh_mul(eh_mul(hq[2u*g],   recip[0]), sc)));
+                dQ[(size_t)r*32u + c0+1] = half(qr_e4m3_scalar(eh_mul(eh_mul(hq[2u*g+1], recip[0]), sc)));
+                dK[(size_t)r*32u + c0]   = half(qr_e4m3_scalar(eh_mul(hk[2u*g],   recip[1])));
+                dK[(size_t)r*32u + c0+1] = half(qr_e4m3_scalar(eh_mul(hk[2u*g+1], recip[1])));
+                dV[(size_t)r*32u + c0]   = half(qr_e4m3_scalar(dCq[(size_t)r*NH + 2u*C + c0]));
+                dV[(size_t)r*32u + c0+1] = half(qr_e4m3_scalar(dCq[(size_t)r*NH + 2u*C + c0 + 1u]));
+            }
+        });
+    });
+}
 } // namespace wbmega

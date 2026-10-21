@@ -89,9 +89,16 @@ static std::map<void*, size_t> g_pool_sz;
 // 11.8-30.9 fused-store) localizes the bottleneck by arithmetic, not trial-and-error.
 static std::map<std::string, double> g_flops;
 static std::map<std::string, long> g_flops_calls;
+// section 92: also record the DISTINCT shapes per family -- the v3 fused-requantize
+// store applies only where N == BN == 64 (whole row in one workgroup, §24), so the
+// shape histogram decides which families can take the 5.6x lever and which need a
+// BN=128 variant or stay split.
+static std::map<std::string, std::map<std::string, long>> g_shapes;
 static void flop_note(const char* fam, double m, double n, double k, double batch) {
     g_flops[fam] += 2.0 * m * n * k * batch;
     g_flops_calls[fam]++;
+    char sb[96]; snprintf(sb, sizeof sb, "M=%.0f N=%.0f K=%.0f b=%.0f", m, n, k, batch);
+    g_shapes[fam][sb]++;
 }
 static long g_pool_mallocs = 0;          // section 92: pool misses = driver malloc round-trips
 static unsigned long long g_pool_malloc_bytes = 0;
@@ -530,6 +537,16 @@ int xmx_graph_run(int id) {
             std::printf("   %-16s %8.3f GFLOP  calls=%ld\n", kv.first.c_str(),
                         kv.second / 1e9, g_flops_calls[kv.first]);
         std::fflush(stdout);
+        if (getenv("NR_SHAPE_DUMP")) {
+            std::printf("[shapes] distinct GEMM shapes per family (v3 fused-requant needs N==64):\n");
+            for (auto& fam : g_shapes) {
+                std::printf("   %s://n", fam.first.c_str());
+                for (auto& sh : fam.second)
+                    std::printf("      %-34s x%ld%s\n", sh.first.c_str(), sh.second,
+                                strstr(sh.first.c_str(), "N=64") ? "  <= v3-ready" : "");
+            }
+            std::fflush(stdout);
+        }
     }
     return passes;
 }
@@ -1124,7 +1141,7 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
     const bool half_skip = (flags & 0x40000u) != 0u;
     const int Mp = (int)(((M + 15u) / 16u) * 16u);
     g_cmd_names.push_back(__func__);
-        flop_note("ffn",M,0,0,1);
+        flop_note("ffn",M,hidden,cin,1); flop_note("ffn",M,cin,hidden,1);
     g_cmds.push_back([=]() {
         // fully device-resident (section 92): both legs pack on device (packdev), the
         // hidden16 stays on device between them -- the old path downloaded Araw/Eraw and
@@ -2464,24 +2481,13 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         sycl::half* dQ = (sycl::half*)pool_get((size_t)rows * C * 2);
         sycl::half* dK = (sycl::half*)pool_get((size_t)rows * C * 2);
         sycl::half* dV = (sycl::half*)pool_get((size_t)rows * C * 2);
-        GQ->parallel_for(sycl::range((size_t)rows), [=](sycl::item<1> it) {   // heads==1
-            unsigned r = (unsigned)it.get_id(0);
-            float row32[32];
-            for (int c2 = 0; c2 < 32; ++c2) row32[c2] = qr_half_round(dCq[(size_t)r * NH + c2]);
-            float recip = ctree::cosine_reciprocal(row32);
-            float sc = qr_half_round(qs[0]);
-            for (int c2 = 0; c2 < 32; ++c2) {
-                float val = qr_half_round(cr_mul(row32[c2], recip));
-                val = qr_half_round(cr_mul(val, sc));
-                dQ[(size_t)r * 32u + c2] = sycl::half(qr_e4m3(val));
-            }
-            for (int c2 = 0; c2 < 32; ++c2) row32[c2] = qr_half_round(dCq[(size_t)r * NH + C + c2]);
-            float krec = ctree::cosine_reciprocal(row32);
-            for (int c2 = 0; c2 < 32; ++c2)
-                dK[(size_t)r * 32u + c2] = sycl::half(qr_e4m3(qr_half_round(cr_mul(row32[c2], krec))));
-            for (int c2 = 0; c2 < 32; ++c2)
-                dV[(size_t)r * 32u + c2] = sycl::half(qr_e4m3(dCq[(size_t)r * NH + 2u * C + c2]));
-        });
+        // DERIVED + MEASURED (section 92): the scalar one-work-item-per-row epilogue ran
+        // 4.03ms/call at the real shape (134400 rows x ~150-op serial chain, 0.4% of
+        // A770). wbmega::normalize_esimd is the .comp's 4-lane butterfly (all lanes
+        // active, log-depth reduce through SLM -- ESIMD has no shuffle) at 0.94ms: 4.3x
+        // faster AND bit-exact (bench_wb 4300800/4300800 vs the scalar epilogue). This is
+        // the first change the FLOPs/TOPS derivation pointed at that actually pays.
+        wbmega::normalize_esimd(*GQ, dCq, dQ, dK, dV, qs, rows, NH, C);
         pool_put(dCq);
         // ---- LEG 2: window attention (heads==1) -> dAttended (windows,64,32) half ----
         float* dScores = (float*)pool_get((size_t)windows * 64u * 64u * 4);
