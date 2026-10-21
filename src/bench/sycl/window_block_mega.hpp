@@ -659,4 +659,77 @@ inline sycl::event launch_full(
     });
 }
 
+// qkv_norm_scatter_esimd -- int8_qkv stage-2 + stage-3 MERGED (section 92, the publish-
+// fusion lever applied to the QKV scatter). qkv_norm_esimd wrote the normalised value back
+// into dC as float bits, then a separate stage-3 pass read dC, applied e4m3, and scattered
+// to Q/K/V at ((w*heads+head)*tokens+t)*32+c. This does the normalise AND the e4m3 AND the
+// scatter in one kernel -- no dC float-bits round-trip, one fewer launch. Non-vit only (the
+// 16 vit calls keep the scalar stage2+stage3). GEMM_INT8_QKV gate is the judge.
+inline sycl::event qkv_norm_scatter_esimd(sycl::queue& q, const int32_t* dC,
+                                  sycl::half* Q, sycl::half* Kk, sycl::half* V,
+                                  const float* as, const float* bs, const float* qs,
+                                  unsigned M, unsigned heads, unsigned C, unsigned NH,
+                                  unsigned tokens) {
+    unsigned rows = M * heads;
+    return q.submit([&](handler& h) {
+        h.parallel_for(nd_range<1>(range((size_t)rows / 8u * 32u), range(32u)),
+            [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+            esimd::slm_init<8u * 16u * 4u>();
+            unsigned rh = (unsigned)it.get_group(0) * 8u + (unsigned)it.get_local_id(0) / 4u;
+            unsigned l  = (unsigned)it.get_local_id(0) % 4u;
+            unsigned rl = (unsigned)it.get_local_id(0) / 4u;
+            unsigned r = rh / heads, head = rh % heads;
+            float hq[8], hk[8], hv[8];
+            for (int g = 0; g < 4; ++g) {
+                uint c2 = g*8u + 2u*l;
+                uint nq = head*32u + c2, nk = C + head*32u + c2, nv = 2u*C + head*32u + c2;
+                hq[2u*g]   = eh_round((float)((dC[(size_t)r*NH+nq] * as[r]) * bs[nq]));
+                hq[2u*g+1] = eh_round((float)((dC[(size_t)r*NH+nq+1u] * as[r]) * bs[nq+1u]));
+                hk[2u*g]   = eh_round((float)((dC[(size_t)r*NH+nk] * as[r]) * bs[nk]));
+                hk[2u*g+1] = eh_round((float)((dC[(size_t)r*NH+nk+1u] * as[r]) * bs[nk+1u]));
+                hv[2u*g]   = (float)((dC[(size_t)r*NH+nv] * as[r]) * bs[nv]);
+                hv[2u*g+1] = (float)((dC[(size_t)r*NH+nv+1u] * as[r]) * bs[nv+1u]);
+            }
+            float pq[2], pk[2];
+            for (int p = 0; p < 2; ++p) {
+                pq[p] = eh_add(eh_hfma(hq[2+p], hq[2+p], eh_mul(hq[p], hq[p])),
+                               eh_hfma(hq[6+p], hq[6+p], eh_mul(hq[4+p], hq[4+p])));
+                pk[p] = eh_add(eh_hfma(hk[2+p], hk[2+p], eh_mul(hk[p], hk[p])),
+                               eh_hfma(hk[6+p], hk[6+p], eh_mul(hk[4+p], hk[4+p])));
+            }
+            esimd::simd<float,2> tq; tq[0]=pq[0]; tq[1]=pq[1];
+            esimd::slm_block_store((rl*16u + l*2u) * 4u, tq, esimd::overaligned_tag<16>{});
+            esimd::simd<float,2> tk; tk[0]=pk[0]; tk[1]=pk[1];
+            esimd::slm_block_store((rl*16u + 8u + l*2u) * 4u, tk, esimd::overaligned_tag<16>{});
+            esimd::barrier();
+            float recip[2];
+            for (int which = 0; which < 2; ++which) {
+                uint base = (rl*16u + which*8u) * 4u;
+                esimd::simd<float,8> pv = esimd::slm_block_load<float,8>(base, esimd::overaligned_tag<16>{});
+                float two00 = eh_add(pv[0], pv[4]);
+                float two10 = eh_add(pv[2], pv[6]);
+                float one00 = eh_add(two00, two10);
+                float two01 = eh_add(pv[1], pv[5]);
+                float two11 = eh_add(pv[3], pv[7]);
+                float one01 = eh_add(two01, two11);
+                float norm = eh_add(one00, one01);
+                float floorv = eh_round(ctree::COSINE_NORM_FLOOR);
+                norm = norm > floorv ? norm : floorv;
+                recip[which] = eh_round(1.0f / esqrt(norm));
+            }
+            float sc = eh_round(qs[head]);
+            unsigned w = r / tokens, t = r % tokens;
+            for (int g = 0; g < 4; ++g) {
+                uint c2 = g*8u + 2u*l;
+                size_t at = (((size_t)w * heads + head) * tokens + t) * 32u + c2;
+                for (int e = 0; e < 2; ++e) {
+                    float vq = eh_mul(eh_mul(hq[2u*g+e], recip[0]), sc);
+                    Q[at + e] = sycl::half(qr_e4m3_scalar(vq));
+                    Kk[at + e] = sycl::half(qr_e4m3_scalar(eh_mul(hk[2u*g+e], recip[1])));
+                    V[at + e] = sycl::half(qr_e4m3_scalar(hv[2u*g+e]));
+                }
+            }
+        });
+    });
+}
 } // namespace wbmega

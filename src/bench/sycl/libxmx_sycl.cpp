@@ -1647,7 +1647,9 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
         // applies it here (deq + Q/K norm, V deq-only) for the 104/120 non-vit calls; the
         // 16 vit calls keep the scalar path (vit_reciprocal has a different reduce tree).
         if (!vit) {
-            wbmega::qkv_norm_esimd(*GQ, dC, as, bs, qs, M, heads, C, NH);
+            // DERIVED (section 92): merge stage-2 normalise + stage-3 e4m3/scatter into ONE
+            // kernel -- no dC float-bits round-trip, one fewer launch. Non-vit only.
+            wbmega::qkv_norm_scatter_esimd(*GQ, dC, Q, Kk, V, as, bs, qs, M, heads, C, NH, tokens);
         } else {
         GQ->parallel_for(sycl::range((size_t)M * heads),
                          [=](sycl::item<1> it) {
@@ -1688,9 +1690,7 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
                 dC[(size_t)r * NH + n] = sycl::bit_cast<int32_t>(val);
             }
         });
-        }   // end else (vit scalar path)
-        // stage 3: publish e4m3 -> half, scatter (w,h,t,32). The half value held in Q/K/V
-        // slots (float bits) is what QKV_READ returns now.
+        // stage 3 (vit path only): publish e4m3 -> half, scatter (w,h,t,32).
         GQ->parallel_for(sycl::range((size_t)M * NH),
                          [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
@@ -1702,6 +1702,7 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
             size_t at = (((size_t)w * heads + head) * tokens + t) * 32u + (col % 32u);
             if (part == 0u) Q[at] = out; else if (part == 1u) Kk[at] = out; else V[at] = out;
         });
+        }   // end else (vit scalar stage2 + stage3)
         pool_put(dAp); pool_put(dBp); pool_put(dC);
     });
     return 0;
