@@ -1161,7 +1161,7 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
         // DERIVED (section 92): fuse publish(3) (gate_activation + e4m3) into the gemm
         // store -- kills the dC1 float scratch + the separate publish pass. pub_esimd(3u)
         // is the same gate+e4m3 chain proven bit-exact by the batched epi3 win.
-        f16v1::gemm_pub(*GQ, dAp, dEp, dH, (int)M, Mp, (int)hidden, (int)cin);
+        f16v1::gemm_pub(*GQ, dAp, dEp, dH, (int)M, Mp, (int)hidden, (int)cin, 3u);
         pool_put(dAp);   // dEp is cache-owned (weight)
         // ---- pass 2: projection gemm_residual(hidden16, projection -> out) ----
         sycl::half* dHp = (sycl::half*)pool_get((size_t)Mp * hidden * 2);
@@ -1341,17 +1341,13 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
         });
         // ---- pass B: expand gemm(hidden16, expand -> f32), publish(3) -> half hidden ----
         sycl::half* dA2 = (sycl::half*)pool_get((size_t)Mp * 32 * 2);
-        float* dC1 = (float*)pool_get((size_t)Mp * 128 * 4);
         sycl::half* dHid = (sycl::half*)pool_get((size_t)M * 128 * 2);
         packdev::pack_a16(*GQ, dH16, dA2, (int)M, Mp, 32);   // dH16 on device
         sycl::half* dB2 = cached_pack_b_f16(expand, Eraw, 32, 128);   // weight
-        f16v1::gemm(*GQ, dA2, dB2, dC1, Mp, 128, 32);
-        pool_put(dH16);
-        GQ->parallel_for(sycl::range((size_t)M * 128), [=](sycl::item<1> it) {
-            size_t i = it.get_id(0);
-            dHid[i] = sycl::half(qr_publish(3u, dC1[i]));    // gate -> e4m3
-        });
-        pool_put(dA2); pool_put(dC1);   // dB2 is cache-owned (weight)
+        // DERIVED (section 92): fuse publish(3) into the gemm store (dC1 was dead after
+        // this pass). pass A's dS is NOT fused -- pass C re-reads it as the residual skip.
+        f16v1::gemm_pub(*GQ, dA2, dB2, dHid, (int)M, Mp, 128, 32, 3u);
+        pool_put(dH16); pool_put(dA2);   // dB2 is cache-owned (weight)
         // ---- pass C: projection gemm(hidden, projection -> f32) + raw-stem residual ----
         sycl::half* dA3 = (sycl::half*)pool_get((size_t)Mp * 128 * 2);
         float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
