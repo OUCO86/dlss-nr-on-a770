@@ -1247,17 +1247,13 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
         // the old path downloaded it and re-uploaded a packed operand (the 256ms).
         // ---- pass B: expand gemm(merged16, expand -> f32), publish(3) -> half hidden ----
         sycl::half* dA2 = (sycl::half*)pool_get((size_t)Mp * 32 * 2);
-        float* dC1 = (float*)pool_get((size_t)Mp * 128 * 4);
         sycl::half* dHid = (sycl::half*)pool_get((size_t)M * 128 * 2);
         packdev::pack_a16(*GQ, dM16, dA2, (int)M, Mp, 32);   // dM16 on device
         sycl::half* dB2 = cached_pack_b_f16(expand, Eraw, 32, 128);   // weight
-        f16v1::gemm(*GQ, dA2, dB2, dC1, Mp, 128, 32);
-        pool_put(dM16);
-        GQ->parallel_for(sycl::range((size_t)M * 128), [=](sycl::item<1> it) {
-            size_t i = it.get_id(0);
-            dHid[i] = sycl::half(qr_publish(3u, dC1[i]));             // gate -> e4m3
-        });
-        pool_put(dA2); pool_put(dC1);   // dB2 is cache-owned (weight)
+        // DERIVED (section 92): fuse publish(3) into the gemm store (dC1 was dead after
+        // this pass). pass C's residual fma stays split (the gemm_res 13-mismatch lesson).
+        f16v1::gemm_pub(*GQ, dA2, dB2, dHid, (int)M, Mp, 128, 32, 3u);
+        pool_put(dM16); pool_put(dA2);   // dB2 is cache-owned (weight)
         // ---- pass C: projection gemm(hidden, projection -> f32) + raw-merged residual ----
         sycl::half* dA3 = (sycl::half*)pool_get((size_t)Mp * 128 * 2);
         float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
