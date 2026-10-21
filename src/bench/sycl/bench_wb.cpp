@@ -12,7 +12,7 @@
 #include "cosine_tree_kernel.hpp"
 #include "softmax_kernel.hpp"
 using namespace sycl;
-static const int C=32, NH=96, windows=8160, tokens=64, height=544, width=960, across=120, rows=windows*tokens;
+static const int C=32, NH=96, windows=2100, tokens=64, height=272, width=480, across=60, rows=windows*tokens;
 int main(){
   device dev;
   for(auto&d:device::get_devices(info::device_type::gpu))
