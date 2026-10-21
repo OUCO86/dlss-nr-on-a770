@@ -83,6 +83,16 @@ static bool g_l0 = false;   // the chosen device is Level-Zero-backed (section 9
 // destroy, which returns them to the pool.
 static std::map<size_t, std::vector<void*>> g_pool;
 static std::map<void*, size_t> g_pool_sz;
+// section 92 derivation: FLOPs per GEMM family (2*M*N*K*batch), summed over the walk.
+// Divided by the trustworthy per-closure GPU time this gives each family's ACTUAL TOPS,
+// which compared against the senior's measured achievable (§8: 2.1 narrow-int32-store,
+// 11.8-30.9 fused-store) localizes the bottleneck by arithmetic, not trial-and-error.
+static std::map<std::string, double> g_flops;
+static std::map<std::string, long> g_flops_calls;
+static void flop_note(const char* fam, double m, double n, double k, double batch) {
+    g_flops[fam] += 2.0 * m * n * k * batch;
+    g_flops_calls[fam]++;
+}
 static long g_pool_mallocs = 0;          // section 92: pool misses = driver malloc round-trips
 static unsigned long long g_pool_malloc_bytes = 0;
 static void* pool_get(size_t n) {
@@ -514,6 +524,13 @@ int xmx_graph_run(int id) {
     } catch (const std::exception& e) { FAILMSG("graph_run: %s", e.what()); }
     if (getenv("NR_POOL_STATS")) { std::printf("[pool] mallocs=%ld bytes=%llu MB\n",
         g_pool_mallocs, g_pool_malloc_bytes >> 20); std::fflush(stdout); }
+    if (getenv("NR_FLOPS")) {
+        std::printf("[flops] per-family GFLOP/frame (2*M*N*K summed):\n");
+        for (auto& kv : g_flops)
+            std::printf("   %-16s %8.3f GFLOP  calls=%ld\n", kv.first.c_str(),
+                        kv.second / 1e9, g_flops_calls[kv.first]);
+        std::fflush(stdout);
+    }
     return passes;
 }
 int xmx_graph_destroy(int id) {
@@ -1107,6 +1124,7 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
     const bool half_skip = (flags & 0x40000u) != 0u;
     const int Mp = (int)(((M + 15u) / 16u) * 16u);
     g_cmd_names.push_back(__func__);
+        flop_note("ffn",M,0,0,1);
     g_cmds.push_back([=]() {
         // fully device-resident (section 92): both legs pack on device (packdev), the
         // hidden16 stays on device between them -- the old path downloaded Araw/Eraw and
@@ -1368,6 +1386,7 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
     const unsigned lda_e = lda ? lda : K, ldb_e = ldb ? ldb : (transposed ? K : N), ldc_e = ldc ? ldc : N;
     const int Mp = (int)(((M + 15u) / 16u) * 16u);
     g_cmd_names.push_back(__func__);
+        flop_note("f16_gemm",M,N,K,batch?batch:1);
     g_cmds.push_back([=]() {
         const size_t nb = (batch ? batch : 1u);
         // R8a shape-merge (section 92): batch is the grid's z dimension in ONE dispatch
@@ -1437,6 +1456,7 @@ int xmx_rec_gemm_int8(int a, int b, int c, int a_scale, int b_scale,
     const int Mp = l0_ceil_bm(M);
     const size_t na = (size_t)Mp * K, nb = (size_t)N * K;
     g_cmd_names.push_back(__func__);
+        flop_note("int8",M,N,K,1);
     g_cmds.push_back([=]() {
         // device pack (section 92 phase-2): the operands stay on device -- the host
         // round-trip (download -> CPU pack -> upload) was the whole 89s/frame, and the
@@ -1495,6 +1515,7 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
     const bool narrow = (flags & 0x1000u) != 0u;
     const int Mp = l0_ceil_bm(M);
     g_cmd_names.push_back(__func__);
+        flop_note("batched",M,N,K,batch);
     g_cmds.push_back([=]() {
         const unsigned lda_e = lda ? lda : K, ldb_e = ldb ? ldb : K;
         // R8a shape-merge (section 92): ONE dispatch per stage for the whole op -- the
@@ -1518,19 +1539,15 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
             packdev::gather_pack_b_b(*GQ, Braw, dBp, (int)N, (int)K, (int)ldb_e, sb, (int)batch);
             g_wcache[wk] = dBp;
         }
-        // epilogue fusion (section 92, the user's ordered first cut): for epi 0/1 the
-        // publish is dequant + e4m3 only, so gemm_b_pub writes the FINAL strided output
-        // straight from the accumulator registers -- no int32 dC scratch, no separate
-        // publish kernel. epi 2/3 add the gate-activation polynomial, which needs
-        // fmul_rn (libdevice, banned in an ESIMD context), so those stay on the split
-        // path. The fused store uses esimd::convert<float>(acc) * scale -- the same
-        // pattern gemm_s8_v3_kernel.hpp uses in its green fused-requantize store.
-        if ((epi == 0u || epi == 1u) && (N % 64u) == 0u) {
-            s8v8::gemm_b_pub(*GQ, dAp, dBp, Cout, as, bs, (int)M, Mp, (int)N, (int)K,
-                             (int)batch, sc, ldc_, scale_stride, (sb != 0u) ? N : 0u, narrow);
-            pool_put(dAp);   // dBp is cache-owned (the whole batched weight)
-            return;
-        }
+        // DERIVED (section 92, bench_batched.cpp): at the real batched shape gemm_b's
+        // int32 store runs 5.81 TOPS, but my fused e4m3 store (gemm_b_pub) runs only
+        // 1.89 -- 3x SLOWER, because qr_e4m3_scalar is branchy and does not vectorize in
+        // the store loop. So the GEMM core is NOT the bottleneck (5.8 TOPS is near the
+        // senior's §8 achievable); the family's 0.70 TOPS overall means ~80% of batched
+        // time is the elementwise scaffolding (gather + publish), which stays a separate
+        // vectorized pass. gemm_b_pub is kept in the header but NOT wired (it was the
+        // wrong hypothesis; the right §24 lever is int8 REQUANTIZE fused store, cheap and
+        // 4x less traffic, not e4m3 publish fused).
         int32_t* dC = (int32_t*)pool_get((size_t)batch * Mp * N * 4);
         if ((N % 64u) == 0u) s8v8::gemm_b(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K, (int)batch);
         else                 s8v8::gemm32_b(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K, (int)batch);
@@ -1600,6 +1617,7 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
     const int Mp = l0_ceil_bm(M);
     const size_t na = (size_t)Mp * C, nb = (size_t)NH * C;
     g_cmd_names.push_back(__func__);
+        flop_note("int8_qkv",M,3u*channels,channels,1);
     g_cmds.push_back([=]() {
         // device pack (section 92): Araw/Braw already on device -- pack in place.
         int8_t* dAp = (int8_t*)pool_get(na);
@@ -1712,6 +1730,7 @@ int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale,
     const int Mp = l0_ceil_bm(M);
     const size_t na = (size_t)Mp * K, nb = (size_t)N * K;
     g_cmd_names.push_back(__func__);
+        flop_note("int8_residual",M,N,K,1);
     g_cmds.push_back([=]() {
         // device pack (section 92): Araw/Braw are already on device -- pack in place,
         // no download/upload round-trip (same conversion as gemm_int8, packdev gate).
@@ -1796,6 +1815,7 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
     const size_t na = (size_t)Mp * K, nb = (size_t)N * K;
     const unsigned top = pad >> 16, left = pad & 0xffffu;
     g_cmd_names.push_back(__func__);
+        flop_note("win_int8_res",M,N,K,1);
     g_cmds.push_back([=]() {
         // RUN-TIME fresh lookups shadowing the capture-time pointers (see the lesson
         // above): sizes are checked HERE because the scratch recording's placeholder
@@ -2393,6 +2413,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
     const size_t k_need = img_elems * (image_half ? 2u : 4u);
     const int image_id = image, target_id = target;
     g_cmd_names.push_back(__func__);
+        flop_note("wb_qkv",windows*64u,96u,32u,1); flop_note("wb_scores",windows*64u,64u,32u,1); flop_note("wb_attnv",windows*64u,32u,64u,1); flop_note("wb_proj",windows*64u,32u,32u,1);
     g_cmds.push_back([=]() {
         auto sized = [&](int id, size_t bytes, const char* what) -> void* {
             auto it = g_bufs.find(id);
