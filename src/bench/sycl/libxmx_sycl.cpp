@@ -1635,6 +1635,8 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
     const size_t na = (size_t)Mp * C, nb = (size_t)NH * C;
     g_cmd_names.push_back(__func__);
         flop_note("int8_qkv",M,3u*channels,channels,1);
+        if (getenv("NR_SHAPE_DUMP")) { static long qv=0,qnv=0; if(flags&0x2000u) qv++; else qnv++;
+            std::printf("[qkv-vit] vit=%ld nonvit=%ld (running)\n", qv, qnv); }
     g_cmds.push_back([=]() {
         // device pack (section 92): Araw/Braw already on device -- pack in place.
         int8_t* dAp = (int8_t*)pool_get(na);
@@ -1643,6 +1645,13 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
         int8_t* dBp = cached_pack_b_i8(b, Braw, (int)NH, (int)C);   // weight: pack once
         s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)NH, (int)C);
         // stage 2: deq + in-place Q/K head norm (the epilogue's order; V deqt only).
+        // DERIVED (section 92): the non-vit normalize is the same scalar cosine chain that
+        // the 4-lane ESIMD butterfly just made 4.3x faster in window_block; qkv_norm_esimd
+        // applies it here (deq + Q/K norm, V deq-only) for the 104/120 non-vit calls; the
+        // 16 vit calls keep the scalar path (vit_reciprocal has a different reduce tree).
+        if (!vit) {
+            wbmega::qkv_norm_esimd(*GQ, dC, as, bs, qs, M, heads, C, NH);
+        } else {
         GQ->parallel_for(sycl::range((size_t)M * heads),
                          [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
@@ -1682,6 +1691,7 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
                 dC[(size_t)r * NH + n] = sycl::bit_cast<int32_t>(val);
             }
         });
+        }   // end else (vit scalar path)
         // stage 3: publish e4m3 -> half, scatter (w,h,t,32). The half value held in Q/K/V
         // slots (float bits) is what QKV_READ returns now.
         GQ->parallel_for(sycl::range((size_t)M * NH),
