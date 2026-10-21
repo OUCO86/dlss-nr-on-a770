@@ -1876,26 +1876,15 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
         const float* cp  = (const float*)sized(cosine, (size_t)N * 4u, "cosine");
         // device pack (section 92): Araw/Braw already on device -- pack in place.
         int8_t* dAp = (int8_t*)pool_get(na);
-        int32_t* dC = (int32_t*)pool_get((size_t)Mp * N * 4);
         packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K);
         int8_t* dBp = cached_pack_b_i8(b, Braw, (int)N, (int)K);   // weight: pack once
-        s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K);
-        GQ->parallel_for(sycl::range(blk_elems),
-                         [=](sycl::item<1> it) {
-            size_t i = it.get_id(0);
-            unsigned r = (unsigned)(i / N), col = (unsigned)(i % N);
-            unsigned window = r / 64u, token = r % 64u;
-            unsigned y = (window / across) * 8u + token / 8u;
-            unsigned x = (window % across) * 8u + token % 8u;
-            if (y < top || x < left || y - top >= height || x - left >= width) return;
-            size_t out = ((size_t)(y - top) * width + (x - left)) * N + col;
-            float stage = cr_mul(cr_mul((float)dC[i], as[r]), bs[col]);
-            float sk = half_skip ? (float)((const sycl::half*)skp)[out] : ((const float*)skp)[out];
-            float total = sycl::fma(sk, cp[col], stage);
-            if (narrow) ((sycl::half*)Cout)[out] = sycl::half(qr_publish(epi, total));
-            else        ((float*)Cout)[out] = qr_publish(epi, total);
-        });
-        pool_put(dAp); pool_put(dBp); pool_put(dC);
+        // DERIVED (section 92): same fused-publish lever as int8_residual/batched. The
+        // window variant maps the gemm row (window*64+token) to the image slot with the
+        // same bounds cull the split pass did, and reads skip at that slot. N%64==0 is a
+        // hard requirement of this op. WINDOW_INT8_RESIDUAL gate is the judge.
+        s8v8::gemm_b_res_window(*GQ, dAp, dBp, Cout, as, bs, skp, cp, (int)M, Mp, (int)N, (int)K,
+                                narrow, half_skip, epi, across, top, left, height, width);
+        pool_put(dAp);   // dBp is cache-owned (the weight)
     });
     return 0;
 }
