@@ -2227,6 +2227,7 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
     const size_t sc_elems = (size_t)batches * 64u * 64u;   // scores & probs
     const size_t ctx_elems = (size_t)batches * 64u * 32u;  // attnV context
     g_cmd_names.push_back(__func__);
+        flop_note("winattn_scores",64u,64u,32u,batches); flop_note("winattn_attnv",64u,32u,64u,batches);
     g_cmds.push_back([=]() {
         // device pack + batched gemm (section 92): the per-batch host loop (4 sync
         // memcpys + 4 malloc/free + 2 launches PER batch, batches up to 2040) was the
