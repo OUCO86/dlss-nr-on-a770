@@ -83,5 +83,19 @@ int main(){
   T2("publish 4-elem/item",[&]{ return pub4(4); }, pub_bytes);
   for(int i=0;i<3;i++) pub4(8).wait();
   T2("publish 8-elem/item",[&]{ return pub4(8); }, pub_bytes);
+  // DERIVED: is batched's 123ms scaffolding gather_pack or publish? gather_pack_a_b
+  // moves batch*Mp*K int8 (~4MB) -> should be ~0.02ms. Measure to confirm publish is the
+  // real cost (then the strided-ABI finding stands and batched has no clean win).
+  int8_t* dApG=(int8_t*)malloc_device((size_t)batch*Mp*K,q);
+  double gp_bytes=(double)batch*M*K + (double)batch*Mp*K;
+  auto gp=[&](){ return q.submit([&](handler& hh){
+    const int BM=128,BK=32; int wgr=Mp/BM,kb_n=K/BK; size_t per=(size_t)wgr*kb_n*8*512;
+    hh.parallel_for(range((size_t)batch*per),[=](item<1> it){
+      size_t gg=it.get_id(0)/per; size_t d=it.get_id(0)%per;
+      size_t blk=d/512; int off=(int)(d%512); int wi=(int)(blk%8); size_t wk=blk/8;
+      int kb=(int)(wk%(size_t)kb_n); int w=(int)(wk/(size_t)kb_n); int row=off/32,k=off%32;
+      int srow=w*BM+wi*16+row; dApG[gg*per+d]= srow<M? Araw[gg*(size_t)M*64+(size_t)srow*K+kb*BK+k]:(int8_t)0; }); }); };
+  for(int i=0;i<3;i++) gp().wait();
+  T2("gather_pack_a_b",[&]{ return gp(); }, gp_bytes);
   return 0;
 }
