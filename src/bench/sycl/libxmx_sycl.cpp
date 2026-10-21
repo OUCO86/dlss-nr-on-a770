@@ -94,6 +94,7 @@ static std::map<std::string, long> g_flops_calls;
 // shape histogram decides which families can take the 5.6x lever and which need a
 // BN=128 variant or stay split.
 static std::map<std::string, std::map<std::string, long>> g_shapes;
+static std::map<std::string, std::map<unsigned, long>> g_epi;   // epilogue-kind histogram
 static void flop_note(const char* fam, double m, double n, double k, double batch) {
     g_flops[fam] += 2.0 * m * n * k * batch;
     g_flops_calls[fam]++;
@@ -540,10 +541,15 @@ int xmx_graph_run(int id) {
         if (getenv("NR_SHAPE_DUMP")) {
             std::printf("[shapes] distinct GEMM shapes per family (v3 fused-requant needs N==64):\n");
             for (auto& fam : g_shapes) {
-                std::printf("   %s://n", fam.first.c_str());
+                std::printf("   %s:\n", fam.first.c_str());
                 for (auto& sh : fam.second)
                     std::printf("      %-34s x%ld%s\n", sh.first.c_str(), sh.second,
                                 strstr(sh.first.c_str(), "N=64") ? "  <= v3-ready" : "");
+            }
+            for (auto& fam : g_epi) {
+                std::printf("[epi] %s:", fam.first.c_str());
+                for (auto& e : fam.second) std::printf(" epi%u=x%ld", e.first, e.second);
+                std::printf("\n");
             }
             std::fflush(stdout);
         }
@@ -1533,6 +1539,7 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
     const int Mp = l0_ceil_bm(M);
     g_cmd_names.push_back(__func__);
         flop_note("batched",M,N,K,batch);
+        g_epi["batched"][(flags >> 8) & 0xFu]++;
     g_cmds.push_back([=]() {
         const unsigned lda_e = lda ? lda : K, ldb_e = ldb ? ldb : K;
         // R8a shape-merge (section 92): ONE dispatch per stage for the whole op -- the
