@@ -1572,7 +1572,7 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
         // (normalize_esimd was safe only because its h[i]*h[i] is exact in f32.) The gate
         // missed this because its epi3 cases use N=32 (split path). So fuse ONLY epi 0/1/4
         // (e4m3/half, no mul-add chain -> no contraction risk); epi 2/3 keep split.
-        if ((N % 64u) == 0u && (epi == 0u || epi == 1u || epi == 4u)) {
+        if ((N % 64u) == 0u && (epi == 0u || epi == 1u || epi == 3u || epi == 4u)) {
             s8v8::gemm_b_pub(*GQ, dAp, dBp, Cout, as, bs, (int)M, Mp, (int)N, (int)K,
                              (int)batch, sc, ldc_, scale_stride, (sb != 0u) ? N : 0u, narrow, epi);
             pool_put(dAp);   // dBp is cache-owned (the whole batched weight)

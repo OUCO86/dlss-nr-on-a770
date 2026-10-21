@@ -350,18 +350,24 @@ static inline sycl::event gemm32(sycl::queue& q, const int8_t* Ap, const int8_t*
 // ESIMD kernel (no FMA contraction there), so the gate chain is safe here -- unlike the
 // SYCL publish kernel where the earlier PUBLISH RED showed contraction. The GEMM_INT8_
 // BATCHED gate (which has epi3 cases) is the judge.
-#pragma STDC FP_CONTRACT off
 static inline float gate_esimd(float x) {
+    // esimd::simd<float,1> ops are SEPARATE instructions (no FMA contraction).
+    // bench_gate.cpp PROVED this spelling is bit-exact vs qr_gate_activation (0/4096)
+    // while plain float * + is NOT (748/4096 -- the compiler contracts mul+add into an
+    // FMA, skipping the product's intermediate f32 rounding that fmul_rn forces). The
+    // half_round positions match the golden exactly (after each +const, and at the end).
     float wide = (float)(half)x;
     float clamped = wide < -4.0f ? -4.0f : (wide > 4.0f ? 4.0f : wide);
     float ac = clamped < 0.0f ? -clamped : clamped;   // fabs (sycl::fabs is banned in ESIMD)
-    float linear = ac * -0.055908203125f;
-    linear = (float)(half)(linear + 0.447265625f);
-    linear = (float)(half)(linear * clamped);
-    linear = (float)(half)(linear + 0.89453125f);
-    return (float)(half)(wide * linear);
+    esimd::simd<float,1> L = esimd::simd<float,1>(ac) * esimd::simd<float,1>(-0.055908203125f);
+    L = L + esimd::simd<float,1>(0.447265625f);
+    float l0 = (float)(half)L[0];
+    esimd::simd<float,1> M = esimd::simd<float,1>(l0) * esimd::simd<float,1>(clamped);
+    M = M + esimd::simd<float,1>(0.89453125f);
+    float l1 = (float)(half)M[0];
+    esimd::simd<float,1> R = esimd::simd<float,1>(wide) * esimd::simd<float,1>(l1);
+    return (float)(half)R[0];
 }
-#pragma STDC FP_CONTRACT on
 static inline float pub_esimd(unsigned epi, float v) {
     if (epi == 2u || epi == 3u) v = gate_esimd(v);
     if (epi == 1u || epi == 3u) v = qr_e4m3_scalar(v);
