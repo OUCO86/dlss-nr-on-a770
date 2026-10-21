@@ -345,11 +345,34 @@ static inline sycl::event gemm32(sycl::queue& q, const int8_t* Ap, const int8_t*
 // fused requantize store (GEMM_S8RQ32 green). Scope: epi 0/1 (no gate activation); the
 // gate polynomial needs fmul_rn (libdevice, banned in ESIMD), so epi 2/3 stay on the
 // split path. The recorder picks per flags.
+// gate_esimd / pub_esimd (section 92): the epi2/3 gate-activation polynomial in ESIMD-
+// native ops. normalize_esimd proved plain l*r+acc == fadd_rn(fmul_rn) bit-exact in an
+// ESIMD kernel (no FMA contraction there), so the gate chain is safe here -- unlike the
+// SYCL publish kernel where the earlier PUBLISH RED showed contraction. The GEMM_INT8_
+// BATCHED gate (which has epi3 cases) is the judge.
+#pragma STDC FP_CONTRACT off
+static inline float gate_esimd(float x) {
+    float wide = (float)(half)x;
+    float clamped = wide < -4.0f ? -4.0f : (wide > 4.0f ? 4.0f : wide);
+    float ac = clamped < 0.0f ? -clamped : clamped;   // fabs (sycl::fabs is banned in ESIMD)
+    float linear = ac * -0.055908203125f;
+    linear = (float)(half)(linear + 0.447265625f);
+    linear = (float)(half)(linear * clamped);
+    linear = (float)(half)(linear + 0.89453125f);
+    return (float)(half)(wide * linear);
+}
+#pragma STDC FP_CONTRACT on
+static inline float pub_esimd(unsigned epi, float v) {
+    if (epi == 2u || epi == 3u) v = gate_esimd(v);
+    if (epi == 1u || epi == 3u) v = qr_e4m3_scalar(v);
+    if (epi == 4u) v = (float)(half)v;
+    return v;
+}
 static inline sycl::event gemm_b_pub(sycl::queue& q, const int8_t* Ap, const int8_t* Bp,
                                      void* Cout, const float* as, const float* bs,
                                      int M, int Mp, int N, int K, int batch,
                                      size_t sc, unsigned ldc, unsigned scale_stride,
-                                     unsigned col_stride, bool narrow) {
+                                     unsigned col_stride, bool narrow, unsigned epi) {
     int wg = (Mp / BM) * (N / BN);
     size_t apb = (size_t)Mp * K, bpb = (size_t)N * K;
     return q.submit([&](handler& h) {
@@ -414,8 +437,8 @@ static inline sycl::event gemm_b_pub(sycl::queue& q, const int8_t* Ap, const int
                     esimd::simd<float, 8> f0 = esimd::convert<float>(c00.select<8,1>(r*8).read()) * rs * csl;
                     esimd::simd<float, 8> f1 = esimd::convert<float>(c01.select<8,1>(r*8).read()) * rs * csh;
                     esimd::simd<float, 16> pub;
-                    for (int e = 0; e < 8; ++e) pub[e] = qr_e4m3_scalar(f0.read()[e]);
-                    for (int e = 0; e < 8; ++e) pub[8 + e] = qr_e4m3_scalar(f1.read()[e]);
+                    for (int e = 0; e < 8; ++e) pub[e] = pub_esimd(epi, f0.read()[e]);
+                    for (int e = 0; e < 8; ++e) pub[8 + e] = pub_esimd(epi, f1.read()[e]);
                     size_t out = (size_t)g * sc + (size_t)rr0 * ldc + gc;
                     if (narrow) esimd::convert<half>(pub).copy_to((half*)Cout + out);
                     else        pub.copy_to((float*)Cout + out);
@@ -425,8 +448,8 @@ static inline sycl::event gemm_b_pub(sycl::queue& q, const int8_t* Ap, const int
                     esimd::simd<float, 8> g0 = esimd::convert<float>(c10.select<8,1>(r*8).read()) * rs * csl;
                     esimd::simd<float, 8> g1 = esimd::convert<float>(c11.select<8,1>(r*8).read()) * rs * csh;
                     esimd::simd<float, 16> pub;
-                    for (int e = 0; e < 8; ++e) pub[e] = qr_e4m3_scalar(g0.read()[e]);
-                    for (int e = 0; e < 8; ++e) pub[8 + e] = qr_e4m3_scalar(g1.read()[e]);
+                    for (int e = 0; e < 8; ++e) pub[e] = pub_esimd(epi, g0.read()[e]);
+                    for (int e = 0; e < 8; ++e) pub[8 + e] = pub_esimd(epi, g1.read()[e]);
                     size_t out = (size_t)g * sc + (size_t)rr1 * ldc + gc;
                     if (narrow) esimd::convert<half>(pub).copy_to((half*)Cout + out);
                     else        pub.copy_to((float*)Cout + out);

@@ -1540,6 +1540,7 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
     g_cmd_names.push_back(__func__);
         flop_note("batched",M,N,K,batch);
         g_epi["batched"][(flags >> 8) & 0xFu]++;
+        if (getenv("NR_SHAPE_DUMP")) { char eb[128]; snprintf(eb,sizeof eb,"batched M=%u N=%u K=%u b=%u epi%u",M,N,K,batch,(flags>>8)&0xFu); g_shapes["epishape"][eb]++; }
     g_cmds.push_back([=]() {
         const unsigned lda_e = lda ? lda : K, ldb_e = ldb ? ldb : K;
         // R8a shape-merge (section 92): ONE dispatch per stage for the whole op -- the
@@ -1563,15 +1564,20 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
             packdev::gather_pack_b_b(*GQ, Braw, dBp, (int)N, (int)K, (int)ldb_e, sb, (int)batch);
             g_wcache[wk] = dBp;
         }
-        // DERIVED (section 92, bench_batched.cpp): at the real batched shape gemm_b's
-        // int32 store runs 5.81 TOPS, but my fused e4m3 store (gemm_b_pub) runs only
-        // 1.89 -- 3x SLOWER, because qr_e4m3_scalar is branchy and does not vectorize in
-        // the store loop. So the GEMM core is NOT the bottleneck (5.8 TOPS is near the
-        // senior's §8 achievable); the family's 0.70 TOPS overall means ~80% of batched
-        // time is the elementwise scaffolding (gather + publish), which stays a separate
-        // vectorized pass. gemm_b_pub is kept in the header but NOT wired (it was the
-        // wrong hypothesis; the right §24 lever is int8 REQUANTIZE fused store, cheap and
-        // 4x less traffic, not e4m3 publish fused).
+        // DERIVED + CORRECTED (section 92): gemm_b_pub replaces BOTH the gemm AND the
+        // publish kernel. bench_batched at the real shape: gemm_b_pub 0.568ms vs split
+        // (gemm_b 0.198 + publish 1.485 = 1.683ms) = 3x FASTER. BUT gate_esimd (epi2/3) is
+        // NOT bit-exact: the compiler contracts `ac*-0.0559 + 0.447` into an FMA, skipping
+        // the product's intermediate rounding that qr_gate_activation's fmul_rn forces.
+        // (normalize_esimd was safe only because its h[i]*h[i] is exact in f32.) The gate
+        // missed this because its epi3 cases use N=32 (split path). So fuse ONLY epi 0/1/4
+        // (e4m3/half, no mul-add chain -> no contraction risk); epi 2/3 keep split.
+        if ((N % 64u) == 0u && (epi == 0u || epi == 1u || epi == 4u)) {
+            s8v8::gemm_b_pub(*GQ, dAp, dBp, Cout, as, bs, (int)M, Mp, (int)N, (int)K,
+                             (int)batch, sc, ldc_, scale_stride, (sb != 0u) ? N : 0u, narrow, epi);
+            pool_put(dAp);   // dBp is cache-owned (the whole batched weight)
+            return;
+        }
         int32_t* dC = (int32_t*)pool_get((size_t)batch * Mp * N * 4);
         if ((N % 64u) == 0u) s8v8::gemm_b(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K, (int)batch);
         else                 s8v8::gemm32_b(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K, (int)batch);
