@@ -1148,6 +1148,7 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
     const int Mp = (int)(((M + 15u) / 16u) * 16u);
     g_cmd_names.push_back(__func__);
         flop_note("ffn",M,hidden,cin,1); flop_note("ffn",M,cin,hidden,1);
+        flop_note("ffn_stem",M,32u,128u,1);
     g_cmds.push_back([=]() {
         // fully device-resident (section 92): both legs pack on device (packdev), the
         // hidden16 stays on device between them -- the old path downloaded Araw/Eraw and
@@ -1349,6 +1350,12 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
         float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
         packdev::pack_a16(*GQ, dHid, dA3, (int)M, Mp, 128);   // dHid on device
         sycl::half* dB3 = cached_pack_b_f16(projection, Praw, 128, 32);   // weight
+        // pass C stays SPLIT (section 93): gemm_res fusion gave ZERO speed (462->464,
+        // noise) because pass C is not publish-bound (its publish was already fused in
+        // pass B), AND it cannot bit-match: sycl::fma is unsupported in an ESIMD kernel
+        // (compile error) and ESIMD's sk*cos+acc differs from the device sycl::fma by
+        // 1 ULP at e4m3 boundaries (bench_res: 3/4177920). bench_fma/bench_res kept as
+        // the isolation instruments that proved this.
         f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128);
         pool_put(dHid);
         GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
