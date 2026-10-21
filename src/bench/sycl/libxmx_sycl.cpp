@@ -1775,21 +1775,16 @@ int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale,
         // device pack (section 92): Araw/Braw are already on device -- pack in place,
         // no download/upload round-trip (same conversion as gemm_int8, packdev gate).
         int8_t* dAp = (int8_t*)pool_get(na);
-        int32_t* dC = (int32_t*)pool_get((size_t)Mp * N * 4);
         packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K);
         int8_t* dBp = cached_pack_b_i8(b, Braw, (int)N, (int)K);   // weight: pack once
-        s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K);
-        GQ->parallel_for(sycl::range((size_t)M * N),
-                         [=](sycl::item<1> it) {
-            size_t i = it.get_id(0);
-            unsigned r = (unsigned)(i / N), col = (unsigned)(i % N);
-            float stage = cr_mul(cr_mul((float)dC[i], as[r]), bs[col]);
-            float sk = half_skip ? (float)((const sycl::half*)skp)[i] : ((const float*)skp)[i];
-            float total = sycl::fma(sk, cp[col], stage);
-            if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
-            else        ((float*)Cout)[i] = qr_publish(epi, total);
-        });
-        pool_put(dAp); pool_put(dBp); pool_put(dC);
+        // DERIVED (section 92): same lever as batched -- fuse the publish into the gemm
+        // store, killing the int32 dC scratch + the separate publish pass. The residual
+        // epilogue's sycl::fma(skip,cos,stage) maps to ESIMD's auto-contracted sk*cp+stage
+        // (one fused rounding, the gate_esimd lesson used correctly). N%64==0 is already a
+        // hard requirement of this op, so every call qualifies. GEMM_INT8_RESIDUAL judges.
+        s8v8::gemm_b_res(*GQ, dAp, dBp, Cout, as, bs, skp, cp, (int)M, Mp, (int)N, (int)K,
+                         narrow, half_skip, epi);
+        pool_put(dAp);   // dBp is cache-owned (the weight)
     });
     return 0;
 }
