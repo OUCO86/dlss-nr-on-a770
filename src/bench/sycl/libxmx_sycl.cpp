@@ -20,6 +20,7 @@
 #include "publish_kernel.hpp"
 #include "cosine_tree_kernel.hpp"
 #include "softmax_kernel.hpp"
+#include "window_block_mega.hpp"
 #include "requant_kernel.hpp"
 #include "gemm_s8_v1_kernel.hpp"
 #include "gemm_s8_v3_kernel.hpp"
@@ -82,10 +83,13 @@ static bool g_l0 = false;   // the chosen device is Level-Zero-backed (section 9
 // destroy, which returns them to the pool.
 static std::map<size_t, std::vector<void*>> g_pool;
 static std::map<void*, size_t> g_pool_sz;
+static long g_pool_mallocs = 0;          // section 92: pool misses = driver malloc round-trips
+static unsigned long long g_pool_malloc_bytes = 0;
 static void* pool_get(size_t n) {
     size_t bucket = (n + 255) / 256 * 256;
     auto it = g_pool.lower_bound(bucket);
     if (it == g_pool.end() || it->second.empty()) {
+        g_pool_mallocs++; g_pool_malloc_bytes += bucket;   // section 92: driver round-trip count
         void* p = sycl::malloc_device(bucket, *GQ);
         if (p) g_pool_sz[p] = bucket;
         return p;
@@ -508,6 +512,8 @@ int xmx_graph_run(int id) {
         for (auto& fn : g_graphs[id]) fn();     // in-order queue: enqueue order = execution order
         GQ->wait();                             // one host sync for the whole graph (was ~2000)
     } catch (const std::exception& e) { FAILMSG("graph_run: %s", e.what()); }
+    if (getenv("NR_POOL_STATS")) { std::printf("[pool] mallocs=%ld bytes=%llu MB\n",
+        g_pool_mallocs, g_pool_malloc_bytes >> 20); std::fflush(stdout); }
     return passes;
 }
 int xmx_graph_destroy(int id) {
@@ -1500,7 +1506,6 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
         // one kernel, pack B (weight, cached whole) in one kernel, gemm_b/gemm32_b in ONE
         // launch, publish in one launch. Bounds identical to the gate's aw_b/bw_b.
         int8_t* dAp = (int8_t*)pool_get((size_t)batch * Mp * K);
-        int32_t* dC = (int32_t*)pool_get((size_t)batch * Mp * N * 4);
         packdev::gather_pack_a_b(*GQ, Araw, dAp, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch);
         // the whole batched B is one weight: pack once (all groups), cache, reuse.
         WKey wk{ b, (int)N, (int)K, (int)batch };
@@ -1513,6 +1518,20 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
             packdev::gather_pack_b_b(*GQ, Braw, dBp, (int)N, (int)K, (int)ldb_e, sb, (int)batch);
             g_wcache[wk] = dBp;
         }
+        // epilogue fusion (section 92, the user's ordered first cut): for epi 0/1 the
+        // publish is dequant + e4m3 only, so gemm_b_pub writes the FINAL strided output
+        // straight from the accumulator registers -- no int32 dC scratch, no separate
+        // publish kernel. epi 2/3 add the gate-activation polynomial, which needs
+        // fmul_rn (libdevice, banned in an ESIMD context), so those stay on the split
+        // path. The fused store uses esimd::convert<float>(acc) * scale -- the same
+        // pattern gemm_s8_v3_kernel.hpp uses in its green fused-requantize store.
+        if ((epi == 0u || epi == 1u) && (N % 64u) == 0u) {
+            s8v8::gemm_b_pub(*GQ, dAp, dBp, Cout, as, bs, (int)M, Mp, (int)N, (int)K,
+                             (int)batch, sc, ldc_, scale_stride, (sb != 0u) ? N : 0u, narrow);
+            pool_put(dAp);   // dBp is cache-owned (the whole batched weight)
+            return;
+        }
+        int32_t* dC = (int32_t*)pool_get((size_t)batch * Mp * N * 4);
         if ((N % 64u) == 0u) s8v8::gemm_b(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K, (int)batch);
         else                 s8v8::gemm32_b(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K, (int)batch);
         // publish: one launch over all groups (dequant scales indexed per group).
@@ -2391,11 +2410,12 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         const float* qs = (const float*)sized(scale, 4, "scale");
         const sycl::half* HeadW = head ? (const sycl::half*)sized(pooled, (size_t)C * 16u * 2, "head weights") : nullptr;
         // ---- LEG 1: gather + gemm + qkv_epilogue -> dQ,dK,dV (device scratch) ----
-        // device gather (section 92): the image is DEVICE memory, so the window gather
-        // and the e4m3 publish run on the GPU -- the old path downloaded the whole image
-        // to host, gathered there, then packed and uploaded (the section-73 trap forced
-        // the download; the download itself was the cost). Same index math as the host
-        // loop, one work-item per row.
+        // NOTE (section 92): a fused megakernel for this LEG (window_block_mega.hpp,
+        // proven bit-exact by gate_mega.cpp) was tried and is NOT faster -- the split
+        // f16v1::gemm tiles Mp x 96 across many workgroups (high occupancy) while the
+        // one-subgroup-per-row mega underfills. Kept the split path; the mega file stays
+        // as groundwork for a FULL window_block fusion (LEG1+2+3 in one workgroup, the
+        // shipped g.rblock shape) which is the only version that can win.
         sycl::half* dA = (sycl::half*)pool_get((size_t)rows * C * 2);
         GQ->parallel_for(sycl::range((size_t)rows), [=](sycl::item<1> it) {
             unsigned r = (unsigned)it.get_id(0);
