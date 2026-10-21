@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <vector>
 #include "gemm_s8_v8_kernel.hpp"
+#include "pack_device.hpp"
+#include "publish_kernel.hpp"
 using namespace sycl;
 int main(){
   device dev;
@@ -32,7 +34,7 @@ int main(){
     f().wait(); event e=f(); e.wait();
     double ms=(double)(e.get_profiling_info<info::event_profiling::command_end>()-
                        e.get_profiling_info<info::event_profiling::command_start>())/1e6;
-    printf("%-22s %8.3f ms   %6.2f TOPS\n", nm, ms, flops/ms/1e9);
+    printf("%-22s %8.3f ms   %6.2f TOPS\n", nm, ms, flops/ms/1e9); fflush(stdout);
   };
   for(int i=0;i<3;i++){ s8v8::gemm_b(q,Ap,Bp,C32,Mp,N,K,batch).wait(); }
   T("gemm_b (int32 store)",[&]{ return s8v8::gemm_b(q,Ap,Bp,C32,Mp,N,K,batch); });
@@ -40,5 +42,46 @@ int main(){
   T("gemm_b_pub (fused)",[&]{ return s8v8::gemm_b_pub(q,Ap,Bp,Cout,as,bs,M,Mp,N,K,batch,(size_t)M*256,256,0,0,true); });
   // dense ldc=N (no stride waste) to isolate the stride cost
   T("gemm_b_pub dense ldc=128",[&]{ return s8v8::gemm_b_pub(q,Ap,Bp,Cout,as,bs,M,Mp,N,K,batch,(size_t)M*N,128,0,0,true); });
+  // DERIVE the scaffolding cost: publish (dequant+e4m3+strided) and gather_pack_a_b
+  // individually, with GB/s to classify bandwidth- vs compute-bound.
+  int8_t* dAp2=(int8_t*)malloc_device((size_t)batch*Mp*K,q);
+  const int8_t* Araw=(const int8_t*)malloc_device((size_t)batch*M*64,q);
+  auto T2=[&](const char* nm, std::function<event()> f, double bytes){
+    f().wait(); event e=f(); e.wait();
+    double ms=(double)(e.get_profiling_info<info::event_profiling::command_end>()-
+                       e.get_profiling_info<info::event_profiling::command_start>())/1e6;
+    printf("%-26s %8.3f ms  %7.1f GB/s\n", nm, ms, bytes/ms/1e6); fflush(stdout);
+  };
+  // publish: reads dC int32 (batch*Mp*N*4), writes Cout half (batch*M*N*2)
+  double pub_bytes=(double)batch*Mp*N*4 + (double)batch*M*N*2;
+  for(int i=0;i<3;i++) q.parallel_for(range((size_t)batch*M*N),[=](item<1> it){
+    size_t idx=it.get_id(0); unsigned mn=M*N; unsigned g=(unsigned)(idx/mn); size_t rem=idx%mn;
+    unsigned r=(unsigned)(rem/N), col=(unsigned)(rem%N);
+    float v=cr_mul(cr_mul((float)C32[(size_t)g*Mp*N+(size_t)r*N+col], as[(size_t)g*Mp+r]), bs[(size_t)g*N+col]);
+    ((half*)Cout)[(size_t)g*M*256+(size_t)r*256+col]=half(qr_e4m3(v)); }).wait();
+  T2("publish (e4m3+dequant)",[&]{ return q.parallel_for(range((size_t)batch*M*N),[=](item<1> it){
+    size_t idx=it.get_id(0); unsigned mn=M*N; unsigned g=(unsigned)(idx/mn); size_t rem=idx%mn;
+    unsigned r=(unsigned)(rem/N), col=(unsigned)(rem%N);
+    float v=cr_mul(cr_mul((float)C32[(size_t)g*Mp*N+(size_t)r*N+col], as[(size_t)g*Mp+r]), bs[(size_t)g*N+col]);
+    ((half*)Cout)[(size_t)g*M*256+(size_t)r*256+col]=half(qr_e4m3(v)); }); }, pub_bytes);
+  // publish WITHOUT e4m3 (just dequant+store) to isolate the e4m3 cost
+  T2("publish (no e4m3)",[&]{ return q.parallel_for(range((size_t)batch*M*N),[=](item<1> it){
+    size_t idx=it.get_id(0); unsigned mn=M*N; unsigned g=(unsigned)(idx/mn); size_t rem=idx%mn;
+    unsigned r=(unsigned)(rem/N), col=(unsigned)(rem%N);
+    float v=cr_mul(cr_mul((float)C32[(size_t)g*Mp*N+(size_t)r*N+col], as[(size_t)g*Mp+r]), bs[(size_t)g*N+col]);
+    ((half*)Cout)[(size_t)g*M*256+(size_t)r*256+col]=half(v); }); }, pub_bytes);
+  // PREDICTION from the derivation: publish is latency-bound (33 GB/s << 500). Vectorize
+  // it: 4 elements per work-item -> 4 independent e4m3 chains -> ILP. Verify in bench.
+  auto pub4=[&](int per){ return q.parallel_for(range((size_t)batch*M*N/per),[=](item<1> it){
+    size_t base=it.get_id(0)*per;
+    for(int e=0;e<per;++e){ size_t idx=base+e; if(idx>=(size_t)batch*M*N) break;
+      unsigned mn=M*N; unsigned g=(unsigned)(idx/mn); size_t rem=idx%mn;
+      unsigned r=(unsigned)(rem/N), col=(unsigned)(rem%N);
+      float v=cr_mul(cr_mul((float)C32[(size_t)g*Mp*N+(size_t)r*N+col], as[(size_t)g*Mp+r]), bs[(size_t)g*N+col]);
+      ((half*)Cout)[(size_t)g*M*256+(size_t)r*256+col]=half(qr_e4m3(v)); } }); };
+  for(int i=0;i<3;i++) pub4(4).wait();
+  T2("publish 4-elem/item",[&]{ return pub4(4); }, pub_bytes);
+  for(int i=0;i<3;i++) pub4(8).wait();
+  T2("publish 8-elem/item",[&]{ return pub4(8); }, pub_bytes);
   return 0;
 }
