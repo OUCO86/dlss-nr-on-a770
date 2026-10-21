@@ -2470,6 +2470,24 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         const float* cp = (const float*)sized(cosine, (size_t)C * 4, "cosine");
         const float* qs = (const float*)sized(scale, 4, "scale");
         const sycl::half* HeadW = head ? (const sycl::half*)sized(pooled, (size_t)C * 16u * 2, "head weights") : nullptr;
+        // ---- OPT-IN full resident megakernel (section 92, option B) ----
+        // launch_full does all 7 stages (gather+QKV+normalize+scores+softmax+attnV+
+        // outproj+residual+publish) in ONE dispatch, one subgroup per window, Q/K/V/scores/
+        // probs/context never leaving SLM. This is the only construction that removes BOTH
+        // remaining walls (strided publish + gate-activation fusion). The bisect proved the
+        // single-subgroup-owns-a-window shape sidesteps the ESIMD multi-subgroup crash.
+        // Gated behind NR_FULL_MEGA because it is UNTESTED on a healthy device (the bisect
+        // crashes polluted the GPU); the 712ms split path below stays the default. Only the
+        // plain (non-pooling, non-head) form is covered; others fall through to split.
+        if (getenv("NR_FULL_MEGA") && !pooling && !head) {
+            sycl::half* dWq = cached_pack_b_f16(qkv, Wraw, (int)C, (int)NH);
+            sycl::half* dWp = cached_pack_b_f16(projection, Praw, (int)C, (int)C);
+            wbmega::launch_full(*GQ, image_half ? (const void*)ImgH : (const void*)ImgF, image_half,
+                                dWq, dWp, narrow ? (sycl::half*)Tgt : nullptr,
+                                narrow ? nullptr : (float*)Tgt, Bp, cp, qs,
+                                windows, height, width, across, top, left, epi, narrow);
+            return;
+        }
         // ---- LEG 1: gather + gemm + qkv_epilogue -> dQ,dK,dV (device scratch) ----
         // NOTE (section 92): a fused megakernel for this LEG (window_block_mega.hpp,
         // proven bit-exact by gate_mega.cpp) was tried and is NOT faster -- the split

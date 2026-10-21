@@ -31,6 +31,44 @@ static inline float eh_add(float a, float b) { return (float)(half)(a + b); }
 static inline float eh_hfma(float l, float r, float acc) { return (float)(half)(l * r + acc); }
 static inline float esqrt(float x) { esimd::simd<float, 1> v(x); return esimd::sqrt(v)[0]; }
 
+// cosine_recip_esimd: the ctree reduce order, ESIMD-native (used by launch_full stage 3).
+static inline float cosine_recip_esimd(const float* h) {
+    float partial[4][2];
+    for (int lane = 0; lane < 4; ++lane)
+        for (int parity = 0; parity < 2; ++parity) {
+            int ch = lane * 2 + parity;
+            float first  = eh_hfma(h[ch + 8],  h[ch + 8],  eh_mul(h[ch],       h[ch]));
+            float second = eh_hfma(h[ch + 24], h[ch + 24], eh_mul(h[ch + 16], h[ch + 16]));
+            partial[lane][parity] = eh_add(first, second);
+        }
+    float two[4][2], one[4][2];
+    for (int lane = 0; lane < 4; ++lane)
+        for (int p = 0; p < 2; p++) two[lane][p] = eh_add(partial[lane][p], partial[lane ^ 2][p]);
+    for (int lane = 0; lane < 4; ++lane)
+        for (int p = 0; p < 2; p++) one[lane][p] = eh_add(two[lane][p], two[lane ^ 1][p]);
+    float norm = eh_add(one[0][0], one[0][1]);
+    float floorv = eh_round(ctree::COSINE_NORM_FLOOR);
+    norm = norm > floorv ? norm : floorv;
+    return eh_round(1.0f / esqrt(norm));
+}
+// gate_esimd / pub_esimd: the epi2/3 gate polynomial + publish dispatch, ESIMD-native.
+static inline float gate_esimd(float x) {
+    float wide = (float)(half)x;
+    float clamped = wide < -4.0f ? -4.0f : (wide > 4.0f ? 4.0f : wide);
+    float ac = clamped < 0.0f ? -clamped : clamped;
+    float linear = ac * -0.055908203125f;
+    linear = (float)(half)(linear + 0.447265625f);
+    linear = (float)(half)(linear * clamped);
+    linear = (float)(half)(linear + 0.89453125f);
+    return (float)(half)(wide * linear);
+}
+static inline float pub_esimd(unsigned epi, float v) {
+    if (epi == 2u || epi == 3u) v = gate_esimd(v);
+    if (epi == 1u || epi == 3u) v = qr_e4m3_scalar(v);
+    if (epi == 4u) v = (float)(half)v;
+    return v;
+}
+
 // SLM byte layout (one subgroup): ROW 512B (8 tokens x 32 halves) | AFRG 512B (2 kc x
 // 128 halves) | VAL 1024B (8 tokens x 32 floats) | PAR 512B (8 rows x 16 floats pad).
 static const uint ROW_B  = 0u;
@@ -403,6 +441,217 @@ inline sycl::event launch_mega256(
                 } else {
                     for(int i=0;i<32;++i){ uint ch=(uint)(i/2)*8u+2u*l+(uint)(i%2);
                         dV[(size_t)(row0+r)*32u+ch]=half(qr_e4m3_scalar(h[i])); }
+                }
+                esimd::barrier();
+            }
+        });
+    });
+}
+
+
+// launch_full -- the COMPLETE resident window_block megakernel (section 92, option B).
+// ONE subgroup (32 threads) owns a whole 8x8 window (64 tokens); all 7 stages run in one
+// dispatch with Q/K/V/scores/probs/context never leaving SLM. The bisect (stage 10) proved
+// single-subgroup-owns-a-window is the shape that sidesteps the "SLM+dpas+multi-subgroup =
+// DEVICE_LOST" toolchain limit that killed the 256-thread .comp port. It is the only
+// construction that removes BOTH remaining walls at once (strided-publish + gate-activation
+// fusion): there is no separate publish kernel and no dCq round-trip.
+//
+// SLM byte map (<=32KB): Q[0,4096) K[4096,8192) V[8192,12288) | SCR (scores/probs, 64x64
+// half = 8192B) [12288,20480) | CTX (context/projected, 64x32 float = 8192B) [20480,28672)
+// | AFRG (512B) [28672,29184) | VAL (8x32 float = 1024B) [29184,30208) | ROW (8x32 half =
+// 512B) [30208,30720). Total 30720B.
+//
+// Stage 1-3 mirror launch_leg1 VERBATIM (proven bit-exact by gate_mega). Stages 4-7
+// transcribe window_block.comp's scores+bias, weights() softmax, attnV, outproj, residual
+// (the authority). gate/softmax use the ESIMD-native eh_* helpers (bit-exact per the two
+// landed wins). UNTESTED first draft -- the device was polluted by the bisect crashes;
+// gate_mega + WINDOW_BLOCK are the judges after reboot. Opt-in via NR_FULL_MEGA; the 712ms
+// split path stays the default.
+inline sycl::event launch_full(
+    sycl::queue& q, const void* Img, bool image_half,
+    const half* WqkvPacked, const half* WprojPacked,
+    half* Tgt, float* TgtF, const float* Bias, const float* Cos,
+    const float* QkvScale,
+    unsigned windows, unsigned image_h, unsigned image_w,
+    unsigned window_cols, unsigned pad_top, unsigned pad_left,
+    unsigned epilogue, bool narrow)
+{
+    return q.submit([&](handler& h) {
+        h.parallel_for(nd_range<1>(range((size_t)windows * 32u), range(32u)),
+            [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+            esimd::slm_init<31744u>();
+            const uint Q=0u, K=4096u, V=8192u, SCR=12288u, CTX=20480u,
+                       AFRG=28672u, VAL=29184u, ROW=31232u;
+            uint window=(uint)it.get_group(0), local=(uint)it.get_local_id(0);
+            int ybase=(int)((window/window_cols)*8u)-(int)pad_top;
+            int x0=(int)((window%window_cols)*8u)-(int)pad_left;
+
+            // ===== stage 1-3: gather + QKV gemm + normalize -> Q,K,V halves (leg1 verbatim) =====
+            for(uint sub=0;sub<8u;++sub){
+                int y=ybase+(int)sub; bool row_in=y>=0&&y<(int)image_h;
+                if(local<8u){ esimd::simd<half,32> v; int x=x0+(int)local;
+                    if(row_in&&x>=0&&x<(int)image_w){ size_t at=((size_t)y*image_w+(size_t)x)*32u;
+                        for(int e=0;e<32;++e){ float f=image_half?(float)((const half*)Img)[at+e]:((const float*)Img)[at+e]; v[e]=half(qr_e4m3_scalar(f)); } }
+                    else { for(int e=0;e<32;++e) v[e]=half(0.f); }
+                    esimd::slm_block_store(ROW+local*64u,v,esimd::overaligned_tag<16>{}); }
+                esimd::barrier();
+                if(local<4u){ uint kc=local/2u,rg=local%2u; esimd::simd<half,64> a;
+                    for(int j=0;j<4;++j){ esimd::simd<half,32> r=esimd::slm_block_load<half,32>(ROW+(rg*4u+j)*64u,esimd::overaligned_tag<16>{});
+                        esimd::simd<half,16> hh=(kc==0u)?r.template select<16,1>(0):r.template select<16,1>(16); a.template select<16,1>(j*16u)=hh; }
+                    esimd::slm_block_store(AFRG+kc*256u+rg*128u,a,esimd::overaligned_tag<16>{}); }
+                esimd::barrier();
+                for(int part=0;part<3;++part){
+                    esimd::simd<float,64> acc0(0.f),acc1(0.f),acc2(0.f),acc3(0.f);
+                    for(int kc=0;kc<2;++kc){
+                        esimd::simd<half,128> a0=esimd::slm_block_load<half,128>(AFRG+kc*256u,esimd::overaligned_tag<16>{});
+                        for(int tl=0;tl<2;++tl){ int tc=part*2+tl;
+                            esimd::simd<half,128> b0(WqkvPacked+(((size_t)kc*6u+tc)*2u+0u)*128u,esimd::overaligned_tag<16>{});
+                            esimd::simd<half,128> b1(WqkvPacked+(((size_t)kc*6u+tc)*2u+1u)*128u,esimd::overaligned_tag<16>{});
+                            if(tl==0){acc0=esimd::xmx::dpas<8,8,float>(acc0,b0,a0);acc1=esimd::xmx::dpas<8,8,float>(acc1,b1,a0);}
+                            else{acc2=esimd::xmx::dpas<8,8,float>(acc2,b0,a0);acc3=esimd::xmx::dpas<8,8,float>(acc3,b1,a0);} } }
+                    for(int r=0;r<8;++r){ esimd::simd<float,16> q0,q1;
+                        q0.template select<8,1>(0)=acc0.template select<8,1>(r*8); q0.template select<8,1>(8)=acc1.template select<8,1>(r*8);
+                        q1.template select<8,1>(0)=acc2.template select<8,1>(r*8); q1.template select<8,1>(8)=acc3.template select<8,1>(r*8);
+                        esimd::slm_block_store(VAL+r*128u,q0,esimd::overaligned_tag<16>{});
+                        esimd::slm_block_store(VAL+r*128u+64u,q1,esimd::overaligned_tag<16>{}); }
+                    esimd::barrier();
+                    uint r=local/4u,l=local%4u;
+                    esimd::simd<float,32> rv=esimd::slm_block_load<float,32>(VAL+r*128u,esimd::overaligned_tag<16>{});
+                    float h[32]; for(int i=0;i<32;++i) h[i]=rv[i];
+                    esimd::simd<half,32> out;
+                    if(part<2){
+                        for(int i=0;i<32;++i) h[i]=eh_round(h[i]);
+                        float recip=cosine_recip_esimd(h);
+                        float sc=part==0?eh_round(QkvScale[0]):1.0f;
+                        for(int i=0;i<32;++i){ float v=eh_mul(h[i],recip); if(part==0) v=eh_mul(v,sc); out[i]=half(qr_e4m3_scalar(v)); }
+                    } else {
+                        for(int i=0;i<32;++i) out[i]=half(qr_e4m3_scalar(h[i]));
+                    }
+                    uint base=(part==0?Q:(part==1?K:V));
+                    esimd::slm_block_store(base+(sub*8u+r)*64u,out,esimd::overaligned_tag<16>{});
+                    esimd::barrier();
+                }
+            }
+
+            // ===== stage 4: scores = Q.K^T + bias, softmax weights -> SCR (probs halves) =====
+            // 64 queries x 64 keys. One subgroup: process queries in 8-row blocks (r0=0..56).
+            // scores scratch reused in SCR; probs written back as halves (the .comp keeps
+            // weights as packed half2 in SCR).
+            for(uint q0=0;q0<64u;q0+=8u){
+                // acc[j] = 8x8 block (query rows q0..q0+7, key cols j*8..j*8+7), j=0..7
+                esimd::simd<float,64> sc8[8];
+                for(int j=0;j<8;++j) sc8[j]=esimd::simd<float,64>(0.f);
+                // A = Q rows q0..q0+7 (8 tokens x 32 ch) as f16 fragments; B = K cols.
+                // Rebuild A-fragment for these 8 rows into AFRG, then dpas over K.
+                if(local<4u){ uint kc=local/2u,rg=local%2u; esimd::simd<half,64> a;
+                    for(int j=0;j<4;++j){ esimd::simd<half,32> r=esimd::slm_block_load<half,32>(Q+(q0+rg*4u+j)*64u,esimd::overaligned_tag<16>{});
+                        esimd::simd<half,16> hh=(kc==0u)?r.template select<16,1>(0):r.template select<16,1>(16); a.template select<16,1>(j*16u)=hh; }
+                    esimd::slm_block_store(AFRG+kc*256u+rg*128u,a,esimd::overaligned_tag<16>{}); }
+                esimd::barrier();
+                for(int kc=0;kc<2;++kc){
+                    esimd::simd<half,128> a0=esimd::slm_block_load<half,128>(AFRG+kc*256u,esimd::overaligned_tag<16>{});
+                    for(int j=0;j<8;++j){
+                        // K fragment: keys j*8..j*8+7, channels kc*16..kc*16+15 (col-major B)
+                        esimd::simd<half,128> b0;
+                        for(int kr=0;kr<8;++kr){ esimd::simd<half,16> krow=esimd::slm_block_load<half,16>(K+(j*8u+kr)*64u+kc*32u,esimd::overaligned_tag<16>{});
+                            b0.template select<16,1>(kr*16u)=krow; }
+                        sc8[j]=esimd::xmx::dpas<8,8,float>(sc8[j],b0,a0);
+                    }
+                }
+                // add bias + softmax weights() per query row; store the 64 weights as HALF
+                // in VAL (8 rows x 64 x 2B = 1024B, exactly the VAL region).
+                for(int j=0;j<8;++j){
+                    for(int r=0;r<8;++r){
+                        esimd::simd<float,8> s=sc8[j].template select<8,1>(r*8);
+                        uint qrow=q0+r, kcol=j*8u;
+                        for(int e=0;e<8;++e){ float lg=s[e]+Bias[qrow*64u+kcol+e];
+                            float a=eh_add(eh_mul(eh_round(lg),0.044921875f),1.30078125f);
+                            a=a<1.03125f?1.03125f:(a>1.5693359375f?1.5693359375f:a);
+                            uint16_t bb=(uint16_t)(half)a;
+                            uint32_t tr=((uint32_t)bb<<5)+0x7FF88000u;
+                            s[e]=(float)(half)(uint16_t)(tr&0xFFFFu); }
+                        esimd::slm_block_store(VAL+r*256u+j*32u,s,esimd::overaligned_tag<16>{});
+                    }
+                }
+                esimd::barrier();
+                // per query row: total=sum 64 weights (sequential f32, golden :234), recip, e4m3
+                for(int r=0;r<8;++r){
+                    uint qrow=q0+r;
+                    float total=0.f; float wf[64];
+                    for(int j=0;j<8;++j){ esimd::simd<float,8> s=esimd::slm_block_load<float,8>(VAL+r*256u+j*32u,esimd::overaligned_tag<16>{});
+                        for(int e=0;e<8;++e){ float wv=s[e]; total+=wv; wf[j*8u+e]=wv; } }
+                    float trh=eh_round(total);
+                    float recip=eh_round(1.0f/trh);   // softmax recip = 1/half(total) (no sqrt)
+                    esimd::simd<half,64> w;
+                    for(int e=0;e<64;++e){ float v=eh_mul(wf[e],recip); w[e]=half(qr_e4m3_scalar(v)); }
+                    esimd::slm_block_store(SCR+qrow*128u,w,esimd::overaligned_tag<16>{});
+                }
+                esimd::barrier();
+            }
+
+            // ===== stage 5: attnV = probs.V -> CTX (64x32 float) =====
+            for(uint q0=0;q0<64u;q0+=8u){
+                if(local<4u){ uint kc=local/2u,rg=local%2u; esimd::simd<half,64> a;
+                    for(int j=0;j<4;++j){ esimd::simd<half,32> r=esimd::slm_block_load<half,32>(SCR+(q0+rg*4u+j)*128u,esimd::overaligned_tag<16>{});
+                        esimd::simd<half,16> hh=(kc==0u)?r.template select<16,1>(0):r.template select<16,1>(16); a.template select<16,1>(j*16u)=hh; }
+                    esimd::slm_block_store(AFRG+kc*256u+rg*128u,a,esimd::overaligned_tag<16>{}); }
+                esimd::barrier();
+                esimd::simd<float,64> ctx0(0.f),ctx1(0.f),ctx2(0.f),ctx3(0.f);
+                for(int kc=0;kc<4;++kc){   // K dim = 64 keys, 4 steps of 16
+                    esimd::simd<half,128> a0=esimd::slm_block_load<half,128>(AFRG+ (kc&1)*256u,esimd::overaligned_tag<16>{});
+                    for(int tl=0;tl<2;++tl){ int tc=tl;
+                        esimd::simd<half,128> b0;
+                        for(int kr=0;kr<8;++kr){ esimd::simd<half,16> vrow=esimd::slm_block_load<half,16>(V+(kc*16u+tl*8u+kr)*64u,esimd::overaligned_tag<16>{});
+                            b0.template select<16,1>(kr*16u)=vrow; }
+                        if(tc==0){ if(kc<2){ctx0=esimd::xmx::dpas<8,8,float>(ctx0,b0,a0);} else {ctx2=esimd::xmx::dpas<8,8,float>(ctx2,b0,a0);} }
+                        else   { if(kc<2){ctx1=esimd::xmx::dpas<8,8,float>(ctx1,b0,a0);} else {ctx3=esimd::xmx::dpas<8,8,float>(ctx3,b0,a0);} } } }
+                for(int r=0;r<8;++r){ esimd::simd<float,16> c0,c1;
+                    c0.template select<8,1>(0)=ctx0.template select<8,1>(r*8); c0.template select<8,1>(8)=ctx1.template select<8,1>(r*8);
+                    c1.template select<8,1>(0)=ctx2.template select<8,1>(r*8); c1.template select<8,1>(8)=ctx3.template select<8,1>(r*8);
+                    esimd::slm_block_store(CTX+(q0+r)*128u,c0,esimd::overaligned_tag<16>{});
+                    esimd::slm_block_store(CTX+(q0+r)*128u+64u,c1,esimd::overaligned_tag<16>{}); }
+                esimd::barrier();
+            }
+
+            // ===== stage 6+7: outproj (CTX->attended halves->projected) + residual + publish =====
+            // attended = e4m3(CTX) halves; projected = attended * Wproj (32x32); then
+            // total = fma(skip,cos,projected); publish(epi) -> Tgt at the token's image slot.
+            for(uint q0=0;q0<64u;q0+=8u){
+                // publish attended halves into AFRG-adjacent scratch (reuse VAL as 8x32 half)
+                for(int r=0;r<8;++r){ esimd::simd<float,32> cv=esimd::slm_block_load<float,32>(CTX+(q0+r)*128u,esimd::overaligned_tag<16>{});
+                    esimd::simd<half,32> ah; for(int i=0;i<32;++i) ah[i]=half(qr_e4m3_scalar(cv[i]));
+                    esimd::slm_block_store(VAL+r*64u,ah,esimd::overaligned_tag<16>{}); }
+                esimd::barrier();
+                if(local<4u){ uint kc=local/2u,rg=local%2u; esimd::simd<half,64> a;
+                    for(int j=0;j<4;++j){ esimd::simd<half,32> r=esimd::slm_block_load<half,32>(VAL+(rg*4u+j)*64u,esimd::overaligned_tag<16>{});
+                        esimd::simd<half,16> hh=(kc==0u)?r.template select<16,1>(0):r.template select<16,1>(16); a.template select<16,1>(j*16u)=hh; }
+                    esimd::slm_block_store(AFRG+kc*256u+rg*128u,a,esimd::overaligned_tag<16>{}); }
+                esimd::barrier();
+                esimd::simd<float,64> p0(0.f),p1(0.f),p2(0.f),p3(0.f);
+                for(int kc=0;kc<2;++kc){
+                    esimd::simd<half,128> a0=esimd::slm_block_load<half,128>(AFRG+kc*256u,esimd::overaligned_tag<16>{});
+                    for(int tl=0;tl<2;++tl){ int tc=tl;
+                        esimd::simd<half,128> b0(WprojPacked+(((size_t)kc*2u+tc)*2u+0u)*128u,esimd::overaligned_tag<16>{});
+                        esimd::simd<half,128> b1(WprojPacked+(((size_t)kc*2u+tc)*2u+1u)*128u,esimd::overaligned_tag<16>{});
+                        if(tl==0){p0=esimd::xmx::dpas<8,8,float>(p0,b0,a0);p1=esimd::xmx::dpas<8,8,float>(p1,b1,a0);}
+                        else{p2=esimd::xmx::dpas<8,8,float>(p2,b0,a0);p3=esimd::xmx::dpas<8,8,float>(p3,b1,a0);} } }
+                // residual + publish per token row
+                for(int r=0;r<8;++r){
+                    uint tok=q0+r; int x=x0+(int)(tok%8u); int yy=ybase+(int)(tok/8u);
+                    if(!(yy>=0&&yy<(int)image_h&&x>=0&&x<(int)image_w)) continue;
+                    size_t at=((size_t)yy*image_w+(size_t)x)*32u;
+                    esimd::simd<float,8> b0=p0.template select<8,1>(r*8),b1=p1.template select<8,1>(r*8);
+                    esimd::simd<float,8> b2=p2.template select<8,1>(r*8),b3=p3.template select<8,1>(r*8);
+                    float proj[32]; for(int i=0;i<8;++i){proj[i]=b0[i];proj[8+i]=b1[i];proj[16+i]=b2[i];proj[24+i]=b3[i];}
+                    for(int c=0;c<32;++c){
+                        float sk=image_half?(float)((const half*)Img)[at+c]:((const float*)Img)[at+c];
+                        // ONE fused rounding (matches the engine's sycl::fma; ESIMD contracts
+                        // sk*Cos[c]+proj[c] to an FMA, the same single rounding).
+                        float total=sk*Cos[c]+proj[c];
+                        float pub=pub_esimd(epilogue,total);
+                        if(narrow) Tgt[at+c]=half(pub); else TgtF[at+c]=pub;
+                    }
                 }
                 esimd::barrier();
             }
