@@ -34,8 +34,16 @@ EXPORTS
     xmx_window_block_init
     xmx_prepost_init
     xmx_specialize
+    xmx_sem_import_fence
     xmx_sem_import
     xmx_sem_import_fence
+    xmx_sem_value
+    xmx_extmem_wait
+    xmx_extmem_wait_clear
+    xmx_extmem_wait_pending
+    xmx_sem_import
+    xmx_sem_import_fence
+    xmx_sem_value
     xmx_extmem_wait
     xmx_extmem_wait_clear
     xmx_extmem_wait_pending

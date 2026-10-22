@@ -2538,6 +2538,17 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         packdev::pack_a16(*GQ, dA, dAp, (int)rows, Mp, (int)C);
         sycl::half* dBp = cached_pack_b_f16(qkv, Wraw, (int)C, (int)NH);   // weight: pack once
         f16v1::gemm(*GQ, dAp, dBp, dCq, Mp, (int)NH, (int)C);
+        if (getenv("NR_DUMP_RAW")) {   // dump split RAW gemm acc (dCq) BEFORE normalize, to compare vs resident stop=2
+            static bool s_rawdone = false;
+            if (!s_rawdone && !pooling && !head) {
+                s_rawdone = true;
+                std::vector<float> hraw((size_t)rows * NH);
+                GQ->memcpy(hraw.data(), dCq, hraw.size() * 4).wait();
+                FILE* fp = fopen("split_raw.bin", "wb");
+                fwrite(hraw.data(), 4, hraw.size(), fp); fclose(fp);
+                printf("[dump] split raw dCq %zu (rows=%u NH=%u)\n", hraw.size(), rows, NH);
+            }
+        }
         pool_put(dA);
         pool_put(dAp);
         sycl::half* dQ = (sycl::half*)pool_get((size_t)rows * C * 2);

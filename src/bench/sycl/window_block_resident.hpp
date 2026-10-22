@@ -129,6 +129,12 @@ inline sycl::event launch_resident(
                             multi_ptr<float,access::address_space::local_space>(f32 + scratch + j*8u), 32u,
                             jm::layout::row_major);
                     group_barrier(it.get_group());           // the 8x32 float tile is in place
+                    if (stop_stage == 2u && DumpKV && part == 1u) {  // dump the RAW K gemm acc (before normalize) for stage-localization vs split dCq. Stride 4096 (K in the first 2048) to match the extractor.
+                        if (local < 8u)
+                            for (int c = 0; c < 32; ++c)
+                                DumpKV[(size_t)window * 4096u + (row + local) * 32u + c] = f32[scratch + local*32u + c];
+                        return;
+                    }
                     // normalize: one lane per row (8 lanes). The .comp uses a 4-lane shuffle
                     // butterfly; this SYCL sub_group has no shuffle, so we take the whole row
                     // scalar (ctree::cosine_reciprocal) -- the EXACT chain the split epilogue
@@ -142,11 +148,23 @@ inline sycl::event launch_resident(
                     if (local < 8u) {
                         if (part < 2u) {
                             for (int c = 0; c < 32; ++c) hv[c] = qr_half_round(hv[c]);
+                            // call the PROVEN golden scalar function directly (gate_mega uses
+                            // it, WINDOW_BLOCK gate proves it bit-exact). bench_sqrt showed the
+                            // recip form (fdiv_rn(1,sycl::sqrt)) matches the ESIMD golden's
+                            // 1/esimd::sqrt 0/65536 -- so the earlier 97% was a transcription
+                            // bug in my hand-inlined butterfly, not the reciprocal.
                             float recip = ctree::cosine_reciprocal(hv);
                             float scale = part == 0u ? qr_half_round(QkvScale[0]) : 1.0f;
                             for (int c = 0; c < 32; ++c) {
                                 float value = ctree::cr_hmul(hv[c], recip);
                                 if (part == 0u) value = ctree::cr_hmul(value, scale);
+                                if (stop_stage == 1u && DumpKV && part == 1u) {
+                                    // dump hv (normalize input, K-slot) and value (pre-e4m3
+                                    // output, V-slot) for token row+local ch c: localizes the
+                                    // NaN to input (hv wrong) vs butterfly/recip (value wrong).
+                                    DumpKV[(size_t)window * 4096u + (row + local) * 32u + c] = half(hv[c]);
+                                    DumpKV[(size_t)window * 4096u + 2048u + (row + local) * 32u + c] = half(value);
+                                }
                                 h16[scratch*2u + local*32u + c] = half(qr_e4m3(value));
                             }
                         } else {
@@ -171,11 +189,13 @@ inline sycl::event launch_resident(
                 }
             }
             group_barrier(it.get_group());                   // every subgroup past the weights
-            if (stop_stage == 3u && DumpKV) {                // dump kreg/vreg REGISTERS per token (lane local<8 owns token row+local), before writeback: discriminates read-back/normalize (registers wrong) from writeback (registers right, K/V region wrong). Same [K(2048) V(2048)] layout as stop=4.
+            if (stop_stage == 3u && DumpKV) {                // dump hv (normalize INPUT float row, in K-slot) and kreg (normalize OUTPUT, in V-slot): discriminates a corrupt tile-read (hv wrong) from a corrupt butterfly (hv right, kreg wrong)
                 if (local < 8u) {
+                    float hvd[32];
+                    for (int c = 0; c < 32; ++c) hvd[c] = f32[scratch + local*32u + c];
                     for (int c = 0; c < 32; ++c) {
-                        DumpKV[(size_t)window * 4096u + (row + local) * 32u + c] = kreg[c];
-                        DumpKV[(size_t)window * 4096u + 2048u + (row + local) * 32u + c] = vreg[c];
+                        DumpKV[(size_t)window * 4096u + (row + local) * 32u + c] = half(hvd[c]);
+                        DumpKV[(size_t)window * 4096u + 2048u + (row + local) * 32u + c] = kreg[c];
                     }
                 }
                 return;
