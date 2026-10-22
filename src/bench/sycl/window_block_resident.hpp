@@ -222,6 +222,12 @@ inline sycl::event launch_resident(
             }
             // ---- stage 5: scores = Q.K^T + bias, weights() -> kept[8] (two half_keys rounds)
             uint kept[8];
+            if (stop_stage == 6u && DumpKV) {   // dump the Q tile (h16[scratch*2..+256]) this subgroup holds, for host Q.K^T check vs stop=5 scores
+                for (uint rr = 0; rr < 8u; ++rr)
+                    for (uint cc = 0; cc < 32u; ++cc)
+                        DumpKV[(size_t)window * 4096u + (row + rr) * 32u + cc] = h16[scratch*2u + rr*32u + cc];
+                return;
+            }
             {
                 jm::joint_matrix<decltype(sg),float,jm::use::accumulator,8,8,jm::layout::dynamic> acc[8];
                 for (uint j = 0; j < 8; ++j) jm::joint_matrix_fill(sg, acc[j], 0.f);
@@ -239,6 +245,11 @@ inline sycl::event launch_resident(
                             multi_ptr<float,access::address_space::local_space>(f32 + scratch + j*8u), 32u,
                             jm::layout::row_major);
                     group_barrier(it.get_group());           // logits tile in place
+                    if (stop_stage == 5u && DumpKV) {        // dump raw scores Q.K^T (no bias) 8x64 per window, before weights: localizes break to scores-gemm vs softmax/attnV
+                        for (uint rr = 0; rr < 8u; ++rr)
+                            for (uint cc = 0; cc < 32u; ++cc)
+                                DumpKV[(size_t)window * 4096u + (row + rr) * 64u + half_keys*32u + cc] = half(f32[scratch + rr*32u + cc]);
+                    }
                     for (uint t = 0; t < 4; ++t) {
                         uint at = local * 2u + t * 64u;      // float index into the 8x32 tile
                         uint lrow = at / 32u, lcol = at % 32u;

@@ -2588,6 +2588,17 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         packdev::pack_a16_b(*GQ, dQ, dAq, 64, 64, 32, (int)windows);
         packdev::pack_b16_t_b(*GQ, dK, dBk, 32, 64, (int)windows);
         f16v1::gemm_b(*GQ, dAq, dBk, dScores, 64, 64, 32, (int)windows);
+        if (getenv("NR_DUMP_SCORES")) {   // dump split scores (Q.K^T, no bias) for comparison vs resident stop=5
+            static bool s_sdone = false;
+            if (!s_sdone && !pooling && !head) {
+                s_sdone = true;
+                std::vector<float> hs((size_t)windows * 64u * 64u);
+                GQ->memcpy(hs.data(), dScores, hs.size() * 4).wait();
+                FILE* fp = fopen("split_scores.bin", "wb");
+                fwrite(hs.data(), 4, hs.size(), fp); fclose(fp);
+                printf("[dump] split scores %zu (windows=%u)\n", hs.size(), windows);
+            }
+        }
         GQ->parallel_for(sycl::range((size_t)windows*64u),
                          smax::softmax_kernel()(dScores, dProbs, windows*64u, 64u, Bp, 1u));
         packdev::pack_a16_b(*GQ, dProbs, dAp2, 64, 64, 64, (int)windows);
