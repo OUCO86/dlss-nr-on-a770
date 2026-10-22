@@ -2469,29 +2469,21 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         // only (non-pooling, non-head). Gated behind NR_RESIDENT_WB; the fused 4-run check
         // against the coopmat golden is the judge.
         if (getenv("NR_RESIDENT_WB") && !pooling && !head) {
-            if (getenv("NR_RESIDENT_STOP")) {   // stage-localization: dump resident K/V at stop_stage
+            if (getenv("NR_RESIDENT_STOP")) {
                 static bool s_rdone = false;
                 if (s_rdone) return;
                 s_rdone = true;
                 unsigned st = (unsigned)atoi(getenv("NR_RESIDENT_STOP"));
-                sycl::half* dKV = (sycl::half*)pool_get((size_t)windows * 2u * 64u * 32u * 2);
+                sycl::half* dKV = (sycl::half*)pool_get((size_t)windows * 4096u * 2);
                 wbres::launch_resident(*GQ, image_half ? (const void*)ImgH : (const void*)ImgF, image_half,
                                        Wraw, Praw, Tgt, Bp, cp, qs,
                                        windows, height, width, across, top, left, epi, narrow, st, dKV);
                 GQ->wait();
-                std::vector<sycl::half> hkv((size_t)windows * 2u * 64u * 32u);
+                std::vector<sycl::half> hkv((size_t)windows * 4096u);
                 GQ->memcpy(hkv.data(), dKV, hkv.size() * 2).wait();
-                // resident dump is interleaved per window: [K(2048) V(2048)] per window. De-interleave.
-                std::vector<sycl::half> hk((size_t)windows * 2048u), hv((size_t)windows * 2048u);
-                for (unsigned w = 0; w < windows; ++w) {
-                    for (unsigned i = 0; i < 2048u; ++i) {
-                        hk[(size_t)w * 2048u + i] = hkv[(size_t)w * 4096u + i];
-                        hv[(size_t)w * 2048u + i] = hkv[(size_t)w * 4096u + 2048u + i];
-                    }
-                }
-                FILE* fp = fopen("resident_kv.bin", "wb");
-                fwrite(hk.data(), 2, hk.size(), fp); fwrite(hv.data(), 2, hv.size(), fp); fclose(fp);
-                printf("[dump] resident K/V %zu elems each (stop=%u)\n", hk.size(), st);
+                FILE* fp = fopen("resident_dump.bin", "wb");
+                fwrite(hkv.data(), 2, hkv.size(), fp); fclose(fp);
+                printf("[dump] resident flat %zu (stop=%u)\n", hkv.size(), st);
                 pool_put(dKV);
                 return;
             }
@@ -2566,12 +2558,15 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             static bool s_done = false;
             if (!s_done && !pooling && !head) {
             s_done = true;
-            std::vector<sycl::half> hk((size_t)rows * C), hv((size_t)rows * C);
+            std::vector<sycl::half> hk((size_t)rows * C), hv((size_t)rows * C), hq((size_t)rows * C);
             GQ->memcpy(hk.data(), dK, hk.size() * 2).wait();
             GQ->memcpy(hv.data(), dV, hv.size() * 2).wait();
+            GQ->memcpy(hq.data(), dQ, hq.size() * 2).wait();
             FILE* fp = fopen("split_kv.bin", "wb");
             fwrite(hk.data(), 2, hk.size(), fp); fwrite(hv.data(), 2, hv.size(), fp); fclose(fp);
-            printf("[dump] split K/V %zu elems each (windows=%u)\n", hk.size(), windows);
+            FILE* fq = fopen("split_q.bin", "wb");
+            fwrite(hq.data(), 2, hq.size(), fq); fclose(fq);
+            printf("[dump] split K/V/Q %zu elems each (windows=%u)\n", hk.size(), windows);
             }
         }
         // ---- LEG 2: window attention (heads==1) -> dAttended (windows,64,32) half ----
@@ -2604,6 +2599,17 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         packdev::pack_a16_b(*GQ, dProbs, dAp2, 64, 64, 64, (int)windows);
         packdev::pack_b16_b(*GQ, dV, dBv, 64, 32, (int)windows);
         f16v1::gemm_b(*GQ, dAp2, dBv, dCtx, 64, 32, 64, (int)windows);
+        if (getenv("NR_DUMP_CTX")) {   // dump split attnV context for comparison vs resident stop=8
+            static bool s_cdone = false;
+            if (!s_cdone && !pooling && !head) {
+                s_cdone = true;
+                std::vector<float> hc((size_t)windows * 64u * 32u);
+                GQ->memcpy(hc.data(), dCtx, hc.size() * 4).wait();
+                FILE* fp = fopen("split_ctx.bin", "wb");
+                fwrite(hc.data(), 4, hc.size(), fp); fclose(fp);
+                printf("[dump] split ctx %zu (windows=%u)\n", hc.size(), windows);
+            }
+        }
         pool_put(dAq); pool_put(dBk); pool_put(dAp2); pool_put(dBv);
         pool_put(dScores); pool_put(dProbs);
         sycl::half* dAttended = (sycl::half*)pool_get((size_t)rows * C * 2);
@@ -2612,6 +2618,17 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             unsigned c = index % C, token = index / C;
             dAttended[index] = sycl::half(qr_e4m3(dCtx[(size_t)token * 32u + c]));
         });
+        if (getenv("NR_DUMP_ATT")) {   // dump split attended (e4m3 of ctx) for comparison vs resident stop=7
+            static bool s_adone = false;
+            if (!s_adone && !pooling && !head) {
+                s_adone = true;
+                std::vector<sycl::half> ha((size_t)rows * C);
+                GQ->memcpy(ha.data(), dAttended, ha.size() * 2).wait();
+                FILE* fp = fopen("split_att.bin", "wb");
+                fwrite(ha.data(), 2, ha.size(), fp); fclose(fp);
+                printf("[dump] split attended %zu (windows=%u)\n", ha.size(), windows);
+            }
+        }
         pool_put(dCtx); pool_put(dQ); pool_put(dK); pool_put(dV);
         // ---- LEG 3: window residual (attended, projection, image, cosine -> target) ----
         // device pack (section 92): dAttended and Praw are already on device -- pack them
@@ -2621,6 +2638,17 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         packdev::pack_a16(*GQ, dAttended, dAp3, (int)rows, Mp, (int)C);
         sycl::half* dBp3 = cached_pack_b_f16(projection, Praw, (int)C, (int)C);   // weight: pack once
         f16v1::gemm(*GQ, dAp3, dBp3, dC3, Mp, (int)C, (int)C);
+        if (getenv("NR_DUMP_C3")) {   // dump split outproj dC3 for comparison vs resident stop=9
+            static bool s_d3done = false;
+            if (!s_d3done && !pooling && !head) {
+                s_d3done = true;
+                std::vector<float> h3((size_t)rows * C);
+                GQ->memcpy(h3.data(), dC3, h3.size() * 4).wait();
+                FILE* fp = fopen("split_c3.bin", "wb");
+                fwrite(h3.data(), 4, h3.size(), fp); fclose(fp);
+                printf("[dump] split c3 %zu (windows=%u)\n", h3.size(), windows);
+            }
+        }
         float* dStage = pooling ? (float*)pool_get((size_t)rows * C * 4) : nullptr;
         sycl::half* dOut16 = head ? (sycl::half*)pool_get(img_elems * 2) : nullptr;
         GQ->parallel_for(sycl::range(blk_elems), [=](sycl::item<1> it) {
