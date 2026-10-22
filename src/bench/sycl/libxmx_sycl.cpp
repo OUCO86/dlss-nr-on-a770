@@ -2469,6 +2469,32 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         // only (non-pooling, non-head). Gated behind NR_RESIDENT_WB; the fused 4-run check
         // against the coopmat golden is the judge.
         if (getenv("NR_RESIDENT_WB") && !pooling && !head) {
+            if (getenv("NR_RESIDENT_STOP")) {   // stage-localization: dump resident K/V at stop_stage
+                static bool s_rdone = false;
+                if (s_rdone) return;
+                s_rdone = true;
+                unsigned st = (unsigned)atoi(getenv("NR_RESIDENT_STOP"));
+                sycl::half* dKV = (sycl::half*)pool_get((size_t)windows * 2u * 64u * 32u * 2);
+                wbres::launch_resident(*GQ, image_half ? (const void*)ImgH : (const void*)ImgF, image_half,
+                                       Wraw, Praw, Tgt, Bp, cp, qs,
+                                       windows, height, width, across, top, left, epi, narrow, st, dKV);
+                GQ->wait();
+                std::vector<sycl::half> hkv((size_t)windows * 2u * 64u * 32u);
+                GQ->memcpy(hkv.data(), dKV, hkv.size() * 2).wait();
+                // resident dump is interleaved per window: [K(2048) V(2048)] per window. De-interleave.
+                std::vector<sycl::half> hk((size_t)windows * 2048u), hv((size_t)windows * 2048u);
+                for (unsigned w = 0; w < windows; ++w) {
+                    for (unsigned i = 0; i < 2048u; ++i) {
+                        hk[(size_t)w * 2048u + i] = hkv[(size_t)w * 4096u + i];
+                        hv[(size_t)w * 2048u + i] = hkv[(size_t)w * 4096u + 2048u + i];
+                    }
+                }
+                FILE* fp = fopen("resident_kv.bin", "wb");
+                fwrite(hk.data(), 2, hk.size(), fp); fwrite(hv.data(), 2, hv.size(), fp); fclose(fp);
+                printf("[dump] resident K/V %zu elems each (stop=%u)\n", hk.size(), st);
+                pool_put(dKV);
+                return;
+            }
             wbres::launch_resident(*GQ, image_half ? (const void*)ImgH : (const void*)ImgF, image_half,
                                    Wraw, Praw, Tgt, Bp, cp, qs,
                                    windows, height, width, across, top, left, epi, narrow);
@@ -2525,6 +2551,18 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         // the first change the FLOPs/TOPS derivation pointed at that actually pays.
         wbmega::normalize_esimd(*GQ, dCq, dQ, dK, dV, qs, rows, NH, C);
         pool_put(dCq);
+        if (getenv("NR_DUMP_KV")) {   // stage-localization: dump split K/V for comparison vs resident
+            static bool s_done = false;
+            if (!s_done && !pooling && !head) {
+            s_done = true;
+            std::vector<sycl::half> hk((size_t)rows * C), hv((size_t)rows * C);
+            GQ->memcpy(hk.data(), dK, hk.size() * 2).wait();
+            GQ->memcpy(hv.data(), dV, hv.size() * 2).wait();
+            FILE* fp = fopen("split_kv.bin", "wb");
+            fwrite(hk.data(), 2, hk.size(), fp); fwrite(hv.data(), 2, hv.size(), fp); fclose(fp);
+            printf("[dump] split K/V %zu elems each (windows=%u)\n", hk.size(), windows);
+            }
+        }
         // ---- LEG 2: window attention (heads==1) -> dAttended (windows,64,32) half ----
         float* dScores = (float*)pool_get((size_t)windows * 64u * 64u * 4);
         sycl::half* dProbs = (sycl::half*)pool_get((size_t)windows * 64u * 64u * 2);

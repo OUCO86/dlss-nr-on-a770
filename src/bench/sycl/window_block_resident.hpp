@@ -52,7 +52,8 @@ inline sycl::event launch_resident(
     void* Cout, const float* Bias, const float* Cos, const float* QkvScale,
     unsigned windows, unsigned image_h, unsigned image_w,
     unsigned window_cols, unsigned pad_top, unsigned pad_left,
-    unsigned epilogue, bool narrow)
+    unsigned epilogue, bool narrow,
+    unsigned stop_stage = 0, half* DumpKV = nullptr)
 {
     return q.submit([&](handler& h) {
         local_accessor<float,1> SLM(range(4096u), h);
@@ -68,14 +69,22 @@ inline sycl::event launch_resident(
             const uint VALUES = 2048u;                       // V start, in halves
             uint window = (uint)it.get_group(0);
             auto sg = it.get_sub_group();
-            uint sub = sg.get_group_id(), local = sg.get_local_linear_id();
+            // CRITICAL (section 93, the root-cause fix): the compiler picks SIMD8 for this
+            // register-heavy kernel (probe: sg.get_local_range()=8, 32 subgroups), and
+            // reqd_sub_group_size(32) triggers an IGC divide-by-zero crash. So the LOGICAL
+            // row-group mapping must NOT use sg.get_group_id() (0..31 would blow scratch past
+            // the 4096-float SLM and row past 64 tokens). Use the workgroup-linear id: 8
+            // logical groups of 32 lanes. joint_matrix ops then run redundantly 4x per logical
+            // group (each physical subgroup loads the same operands, computes the same tile,
+            // stores the same values) -- correct, optimize later.
+            uint lid = (uint)it.get_local_id(0);
+            uint sub = lid / 32u, local = lid % 32u;
             uint row = sub * 8u;
-            uint scratch = 2048u + 256u * sub;               // this subgroup's kilobyte, floats
+            uint scratch = 2048u + 256u * sub;               // this logical group's kilobyte
             uint top = pad_top, left = pad_left;
             int y = (int)((window / window_cols) * 8u + sub) - (int)top;
             int x0 = (int)((window % window_cols) * 8u) - (int)left;
             bool row_in = y >= 0 && y < (int)image_h;
-            uint lid = (uint)it.get_local_id(0);
 
             // ---- stage 1: QKV weights (32x96 half = 6KB) into the K/V bytes ----
             // element-wise copy: local_accessor<float> is only 4-byte aligned, so a uint4*
@@ -162,6 +171,15 @@ inline sycl::event launch_resident(
                 }
             }
             group_barrier(it.get_group());                   // every subgroup past the weights
+            if (stop_stage == 3u && DumpKV) {                // dump kreg/vreg REGISTERS per token (lane local<8 owns token row+local), before writeback: discriminates read-back/normalize (registers wrong) from writeback (registers right, K/V region wrong). Same [K(2048) V(2048)] layout as stop=4.
+                if (local < 8u) {
+                    for (int c = 0; c < 32; ++c) {
+                        DumpKV[(size_t)window * 4096u + (row + local) * 32u + c] = kreg[c];
+                        DumpKV[(size_t)window * 4096u + 2048u + (row + local) * 32u + c] = vreg[c];
+                    }
+                }
+                return;
+            }
             {
                 // 8-lane write: each row lane drops its K and V half-rows into the shared
                 // K/V regions at the window's token index (row+local), 32 channels each.
@@ -173,6 +191,15 @@ inline sycl::event launch_resident(
                 }
             }
             group_barrier(it.get_group());                   // K and V in place
+            if (stop_stage == 4u && DumpKV) {                // stage-localization: each logical group reads back the region slots IT wrote (token row+local), so a per-sub writeback failure shows up as that sub's tokens wrong. Same [K(2048) V(2048)] layout as stop=3.
+                if (local < 8u) {
+                    for (int c = 0; c < 32; ++c) {
+                        DumpKV[(size_t)window * 4096u + (row + local) * 32u + c] = h16[(row + local) * 32u + c];
+                        DumpKV[(size_t)window * 4096u + 2048u + (row + local) * 32u + c] = h16[VALUES + (row + local) * 32u + c];
+                    }
+                }
+                return;
+            }
             // ---- stage 5: scores = Q.K^T + bias, weights() -> kept[8] (two half_keys rounds)
             uint kept[8];
             {
