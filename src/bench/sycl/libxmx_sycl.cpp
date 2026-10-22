@@ -21,6 +21,7 @@
 #include "cosine_tree_kernel.hpp"
 #include "softmax_kernel.hpp"
 #include "window_block_mega.hpp"
+#include "window_block_resident.hpp"
 #include "requant_kernel.hpp"
 #include "gemm_s8_v1_kernel.hpp"
 #include "gemm_s8_v3_kernel.hpp"
@@ -2456,6 +2457,23 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         // Gated behind NR_FULL_MEGA because it is UNTESTED on a healthy device (the bisect
         // crashes polluted the GPU); the 712ms split path below stays the default. Only the
         // plain (non-pooling, non-head) form is covered; others fall through to split.
+        // ---- OPT-IN resident megakernel (section 93, the DESIGN path) ----
+        // launch_resident is the standard-SYCL transcription of window_block.comp: ONE
+        // workgroup (256 thr / 8 subgroups) per 8x8 window, all 7 stages in one dispatch,
+        // Q/K/V/probs/context never leave SLM. This is the structure the coopmat chain's
+        // ~45ms rests on (its gemm ceiling is only 24.8 TOPS -- the fusion, not the算力).
+        // bench_jmf proved the keystone (joint_matrix+local_accessor+group_barrier, cross-
+        // subgroup 0/4096 wrong); bench_jmt proved the throughput gate. Uses the EXACT
+        // cr_*/qr_* primitives the split passes use (already 100% bit-exact vs the golden).
+        // Needs the RAW row-major weights (Wraw 32x96, Praw 32x32), not packed. Plain form
+        // only (non-pooling, non-head). Gated behind NR_RESIDENT_WB; the fused 4-run check
+        // against the coopmat golden is the judge.
+        if (getenv("NR_RESIDENT_WB") && !pooling && !head) {
+            wbres::launch_resident(*GQ, image_half ? (const void*)ImgH : (const void*)ImgF, image_half,
+                                   Wraw, Praw, Tgt, Bp, cp, qs,
+                                   windows, height, width, across, top, left, epi, narrow);
+            return;
+        }
         if (getenv("NR_FULL_MEGA") && !pooling && !head) {
             sycl::half* dWq = cached_pack_b_f16(qkv, Wraw, (int)C, (int)NH);
             sycl::half* dWp = cached_pack_b_f16(projection, Praw, (int)C, (int)C);
