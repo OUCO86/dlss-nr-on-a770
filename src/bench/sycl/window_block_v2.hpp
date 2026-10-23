@@ -116,6 +116,7 @@ inline sycl::event launch_v2(
             half* w = WS + (size_t)window * WSL;
             float* f32w = (float*)w;
             uint top = pad_top, left = pad_left;
+            if (stop_stage == 0xFFFFu || stop_stage == 0xFFFEu) return;  // probes: launch-only / fill+launch
 
             // ===== P0: gather 64 tokens x 32ch -> AQO pack. Thread = one token row. =====
             {

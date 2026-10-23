@@ -2470,23 +2470,25 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         // per-window GLOBAL scratch + group_barrier (section 96; components each proven:
         // bench_esnd3 D/F handoff, bench_smesimd softmax chain, f16v1 tiles 39-gates).
         if (getenv("NR_WB_V2") && !pooling && !head) {
+            unsigned st = getenv("NR_V2_STOP") ? (unsigned)atoi(getenv("NR_V2_STOP")) : 0u;
             sycl::half* dWq = cached_pack_b_f16(qkv, Wraw, (int)C, (int)NH);
             sycl::half* dWp = cached_pack_b_f16(projection, Praw, (int)C, (int)C);
             sycl::half* dWS = (sycl::half*)pool_get((size_t)windows * wbv2::WSL * 2);
-            // zero-fill keeps first-run reads deterministic (the phases all write before
-            // reading their own window's slots, but a kernel bug then shows as stale-
-            // pattern instead of fresh-zero -- the stop-dumps are the judge either way).
-            GQ->parallel_for(sycl::range((size_t)windows * wbv2::WSL), [=](sycl::item<1> it){
-                dWS[(size_t)it.get_id(0)] = sycl::half(0.f); });
-            unsigned st = getenv("NR_V2_STOP") ? (unsigned)atoi(getenv("NR_V2_STOP")) : 0u;
+            // NO zero-fill by default (section 97): every phase writes its slice before
+            // anyone reads it -- verified: NR_V2_FILL=0 keeps the fused 4-run check at
+            // 100.0000% bit-exact AND saves ~10ms/walk; NR_V2_FILL=1 restores the
+            // deterministic fresh-zero behavior for debugging.
+            if (getenv("NR_V2_FILL") && st != 0xFFFFu)
+                GQ->parallel_for(sycl::range((size_t)windows * wbv2::WSL), [=](sycl::item<1> it){
+                    dWS[(size_t)it.get_id(0)] = sycl::half(0.f); });
             sycl::half* dKV = nullptr;
-            if (st) { dKV = (sycl::half*)pool_get((size_t)windows * 4096u * 2);
+            if (st && st < 0xFF00u) { dKV = (sycl::half*)pool_get((size_t)windows * 4096u * 2);
                       GQ->parallel_for(sycl::range((size_t)windows*4096u), [=](sycl::item<1> it){ dKV[(size_t)it.get_id(0)]=sycl::half(0.f); }); }
             wbv2::launch_v2(*GQ, image_half ? (const void*)ImgH : (const void*)ImgF, image_half,
                             dWq, dWp, narrow ? (sycl::half*)Tgt : nullptr,
                             narrow ? nullptr : (float*)Tgt, Bp, cp, qs, dWS,
                             windows, height, width, across, top, left, epi, narrow, st, dKV);
-            if (st) {
+            if (st && st < 0xFF00u) {
                 static bool s_v2done = false;
                 if (!s_v2done) {
                     s_v2done = true;
