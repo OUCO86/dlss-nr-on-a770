@@ -22,6 +22,7 @@
 #include "softmax_kernel.hpp"
 #include "window_block_mega.hpp"
 #include "window_block_resident.hpp"
+#include "window_block_v2.hpp"
 #include "requant_kernel.hpp"
 #include "gemm_s8_v1_kernel.hpp"
 #include "gemm_s8_v3_kernel.hpp"
@@ -2465,6 +2466,42 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         // bench_jmf proved the keystone (joint_matrix+local_accessor+group_barrier, cross-
         // subgroup 0/4096 wrong); bench_jmt proved the throughput gate. Uses the EXACT
         // cr_*/qr_* primitives the split passes use (already 100% bit-exact vs the golden).
+        // ---- OPT-IN wbv2: fused window_block as ONE ESIMD workgroup, dpas tiles +
+        // per-window GLOBAL scratch + group_barrier (section 96; components each proven:
+        // bench_esnd3 D/F handoff, bench_smesimd softmax chain, f16v1 tiles 39-gates).
+        if (getenv("NR_WB_V2") && !pooling && !head) {
+            sycl::half* dWq = cached_pack_b_f16(qkv, Wraw, (int)C, (int)NH);
+            sycl::half* dWp = cached_pack_b_f16(projection, Praw, (int)C, (int)C);
+            sycl::half* dWS = (sycl::half*)pool_get((size_t)windows * wbv2::WSL * 2);
+            // zero-fill keeps first-run reads deterministic (the phases all write before
+            // reading their own window's slots, but a kernel bug then shows as stale-
+            // pattern instead of fresh-zero -- the stop-dumps are the judge either way).
+            GQ->parallel_for(sycl::range((size_t)windows * wbv2::WSL), [=](sycl::item<1> it){
+                dWS[(size_t)it.get_id(0)] = sycl::half(0.f); });
+            unsigned st = getenv("NR_V2_STOP") ? (unsigned)atoi(getenv("NR_V2_STOP")) : 0u;
+            sycl::half* dKV = nullptr;
+            if (st) { dKV = (sycl::half*)pool_get((size_t)windows * 4096u * 2);
+                      GQ->parallel_for(sycl::range((size_t)windows*4096u), [=](sycl::item<1> it){ dKV[(size_t)it.get_id(0)]=sycl::half(0.f); }); }
+            wbv2::launch_v2(*GQ, image_half ? (const void*)ImgH : (const void*)ImgF, image_half,
+                            dWq, dWp, narrow ? (sycl::half*)Tgt : nullptr,
+                            narrow ? nullptr : (float*)Tgt, Bp, cp, qs, dWS,
+                            windows, height, width, across, top, left, epi, narrow, st, dKV);
+            if (st) {
+                static bool s_v2done = false;
+                if (!s_v2done) {
+                    s_v2done = true;
+                    GQ->wait();
+                    std::vector<sycl::half> hkv((size_t)windows * 4096u);
+                    GQ->memcpy(hkv.data(), dKV, hkv.size() * 2).wait();
+                    FILE* fp = fopen("v2_dump.bin", "wb");
+                    fwrite(hkv.data(), 2, hkv.size(), fp); fclose(fp);
+                    printf("[dump] v2 flat %zu (stop=%u)\n", hkv.size(), st);
+                }
+                pool_put(dKV);
+            }
+            pool_put(dWS);
+            return;
+        }
         // Needs the RAW row-major weights (Wraw 32x96, Praw 32x32), not packed. Plain form
         // only (non-pooling, non-head). Gated behind NR_RESIDENT_WB; the fused 4-run check
         // against the coopmat golden is the judge.
@@ -2547,6 +2584,17 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         sycl::half* dAp = (sycl::half*)pool_get((size_t)Mp * C * 2);
         float* dCq = (float*)pool_get((size_t)Mp * NH * 4);
         packdev::pack_a16(*GQ, dA, dAp, (int)rows, Mp, (int)C);
+        if (getenv("NR_DUMP_AP")) {   // pack_a16 output for comparison vs v2 AQO
+            static bool s_apdone = false;
+            if (!s_apdone && !pooling && !head) {
+                s_apdone = true;
+                std::vector<sycl::half> hap((size_t)Mp * C);
+                GQ->memcpy(hap.data(), dAp, hap.size() * 2).wait();
+                FILE* fp = fopen("split_ap.bin", "wb");
+                fwrite(hap.data(), 2, hap.size(), fp); fclose(fp);
+                printf("[dump] split dAp %zu (Mp=%u C=%u)\n", hap.size(), Mp, C);
+            }
+        }
         sycl::half* dBp = cached_pack_b_f16(qkv, Wraw, (int)C, (int)NH);   // weight: pack once
         f16v1::gemm(*GQ, dAp, dBp, dCq, Mp, (int)NH, (int)C);
         if (getenv("NR_DUMP_RAW")) {   // dump split RAW gemm acc (dCq) BEFORE normalize, to compare vs resident stop=2
