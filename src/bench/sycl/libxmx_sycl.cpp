@@ -2495,6 +2495,25 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         if (getenv("NR_FULL_MEGA") && !pooling && !head) {
             sycl::half* dWq = cached_pack_b_f16(qkv, Wraw, (int)C, (int)NH);
             sycl::half* dWp = cached_pack_b_f16(projection, Praw, (int)C, (int)C);
+            if (getenv("NR_MEGA_STOP")) {   // stage-localization for the mega kernel (same dump shape as the joint resident: window*4096 stride, flat file)
+                static bool s_mdone = false;
+                if (s_mdone) return;
+                s_mdone = true;
+                unsigned st = (unsigned)atoi(getenv("NR_MEGA_STOP"));
+                sycl::half* dKV = (sycl::half*)pool_get((size_t)windows * 4096u * 2);
+                wbmega::launch_full(*GQ, image_half ? (const void*)ImgH : (const void*)ImgF, image_half,
+                                    dWq, dWp, narrow ? (sycl::half*)Tgt : nullptr,
+                                    narrow ? nullptr : (float*)Tgt, Bp, cp, qs,
+                                    windows, height, width, across, top, left, epi, narrow, st, dKV);
+                GQ->wait();
+                std::vector<sycl::half> hkv((size_t)windows * 4096u);
+                GQ->memcpy(hkv.data(), dKV, hkv.size() * 2).wait();
+                FILE* fp = fopen("mega_dump.bin", "wb");
+                fwrite(hkv.data(), 2, hkv.size(), fp); fclose(fp);
+                printf("[dump] mega flat %zu (stop=%u)\n", hkv.size(), st);
+                pool_put(dKV);
+                return;
+            }
             wbmega::launch_full(*GQ, image_half ? (const void*)ImgH : (const void*)ImgF, image_half,
                                 dWq, dWp, narrow ? (sycl::half*)Tgt : nullptr,
                                 narrow ? nullptr : (float*)Tgt, Bp, cp, qs,
@@ -2596,6 +2615,16 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         }
         GQ->parallel_for(sycl::range((size_t)windows*64u),
                          smax::softmax_kernel()(dScores, dProbs, windows*64u, 64u, Bp, 1u));
+        if (getenv("NR_DUMP_PROBS")) {   // dump split softmax probs (e4m3 halves) vs mega SCR
+            static bool s_pdone = false;
+            if (!s_pdone && !pooling && !head) {
+                s_pdone = true;
+                std::vector<sycl::half> hp((size_t)windows*64u*64u);
+                GQ->memcpy(hp.data(), dProbs, hp.size()*2).wait();
+                FILE* fp=fopen("split_probs.bin","wb"); fwrite(hp.data(),2,hp.size(),fp); fclose(fp);
+                printf("[dump] split probs %zu\n", hp.size());
+            }
+        }
         packdev::pack_a16_b(*GQ, dProbs, dAp2, 64, 64, 64, (int)windows);
         packdev::pack_b16_b(*GQ, dV, dBv, 64, 32, (int)windows);
         f16v1::gemm_b(*GQ, dAp2, dBv, dCtx, 64, 32, 64, (int)windows);

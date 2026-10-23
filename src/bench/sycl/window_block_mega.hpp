@@ -475,7 +475,8 @@ inline sycl::event launch_full(
     const float* QkvScale,
     unsigned windows, unsigned image_h, unsigned image_w,
     unsigned window_cols, unsigned pad_top, unsigned pad_left,
-    unsigned epilogue, bool narrow)
+    unsigned epilogue, bool narrow,
+    unsigned stop_stage = 0, half* DumpKV = nullptr)
 {
     return q.submit([&](handler& h) {
         h.parallel_for(nd_range<1>(range((size_t)windows * 32u), range(32u)),
@@ -588,8 +589,25 @@ inline sycl::event launch_full(
                     esimd::slm_block_store(SCR+qrow*128u,w,esimd::overaligned_tag<16>{});
                 }
                 esimd::barrier();
+                if (stop_stage == 4u && DumpKV) {   // dump VAL weights (8 rows x 64 f32 -> half) for this q0 block, BEFORE the softmax reduce: isolates scores+weights vs softmax
+                    for(int r=0;r<8;++r){
+                        for(uint j=0;j<8u;++j){
+                            esimd::simd<float,8> s=esimd::slm_block_load<float,8>(VAL+r*256u+j*32u,esimd::overaligned_tag<16>{});
+                            for(int e=0;e<8;++e)
+                                DumpKV[(size_t)window*4096u + (q0+r)*64u + j*8u+e]=half(s[e]);
+                        }
+                    }
+                    return;
+                }
             }
-
+            if (stop_stage == 5u && DumpKV) {   // dump SCR probs (64 tok x 64 col half) for cross-check vs split dProbs
+                for(uint r=local;r<64u;r+=32u)
+                    for(uint s=0;s<2u;++s){
+                        esimd::simd<half,32> v=esimd::slm_block_load<half,32>(SCR+r*128u+s*64u,esimd::overaligned_tag<16>{});
+                        for(int e=0;e<32;++e) DumpKV[(size_t)window*4096u + r*64u + s*32u + e]=v[e];
+                    }
+                return;
+            }
             // ===== stage 5: attnV = probs.V -> CTX (64x32 float) =====
             for(uint q0=0;q0<64u;q0+=8u){
                 if(local<4u){ uint kc=local/2u,rg=local%2u; esimd::simd<half,64> a;
@@ -614,6 +632,13 @@ inline sycl::event launch_full(
                 esimd::barrier();
             }
 
+            if (stop_stage == 8u && DumpKV) {   // dump CTX (attnV float 64x32 -> half) vs split dCtx
+                for(uint r=local;r<64u;r+=32u){
+                    esimd::simd<float,32> cv=esimd::slm_block_load<float,32>(CTX+r*128u,esimd::overaligned_tag<16>{});
+                    for(int e=0;e<32;++e) DumpKV[(size_t)window*4096u + r*32u + e]=half(cv[e]);
+                }
+                return;
+            }
             // ===== stage 6+7: outproj (CTX->attended halves->projected) + residual + publish =====
             // attended = e4m3(CTX) halves; projected = attended * Wproj (32x32); then
             // total = fma(skip,cos,projected); publish(epi) -> Tgt at the token's image slot.
