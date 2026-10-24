@@ -281,37 +281,54 @@ inline sycl::event launch_v2(
                 return;
             }
 
-            // ===== P4: softmax (bench_smesimd BIT-EXACT recipe), thread = row. Kept
-            // SCALAR: the vectorized attempt (section 97) hit a 0.5% bit-exact regression
-            // in the sequential total->recip chain (tiny-magnitude prob diffs) that could
-            // not be pinned by inspection; softmax is only +17ms so not worth the risk.
-            // P2 vectorization (the +23ms lever) is the win; this stays the proven form. =====
+            // ===== P4: softmax VECTORIZED (section 97, bench_p4vec2.cpp proved the chain
+            // bit-exact 0/16384 at every stage). The earlier attempt double-rounded the
+            // affine (mulh half-rounds the product, then convert<half> rounded AGAIN); the
+            // fix is the m0 spelling: hl*scale is EXACT in f32 (half x 4-bit mantissa), so
+            // keep it f32 and round ONCE after +bias -- matching the scalar chain's FMA
+            // contraction (the §92 trap). total stays a SCALAR sequential sum (the golden's
+            // sum order); probs use mulh+e4m3_vec (both bit-exact by construction). =====
             {
                 uint r = lid;
                 const float* row = f32w + DSC/2 + (size_t)r*64u;
                 size_t boff = (size_t)r * 64u;            // heads==1: (r%64)*64
-                float* wf = f32w + WGT/2 + (size_t)r*64u;   // per-thread global row (no stack)
+                float* wf = f32w + WGT/2 + (size_t)r*64u; // channel-order weights (f32) for the scalar total
+                esimd::simd<float,32> s0(row), s1(row+32);
+                esimd::simd<float,32> b0(Bias+boff), b1(Bias+boff+32);
+                esimd::simd<float,32> hl0 = esimd::convert<float>(esimd::convert<half>(s0 + b0));
+                esimd::simd<float,32> hl1 = esimd::convert<float>(esimd::convert<half>(s1 + b1));
+                esimd::simd<float,32> a0 = esimd::convert<float>(esimd::convert<half>(hl0*esimd::simd<float,32>(0.044921875f) + esimd::simd<float,32>(1.30078125f)));
+                esimd::simd<float,32> a1 = esimd::convert<float>(esimd::convert<half>(hl1*esimd::simd<float,32>(0.044921875f) + esimd::simd<float,32>(1.30078125f)));
+                a0 = (esimd::min)((esimd::max)(a0, esimd::simd<float,32>(1.03125f)), esimd::simd<float,32>(1.5693359375f));
+                a1 = (esimd::min)((esimd::max)(a1, esimd::simd<float,32>(1.03125f)), esimd::simd<float,32>(1.5693359375f));
+                // bit-pack (even,odd) pairs -> uint32 -> expand to channel-order halfs.
+                esimd::simd<half,16> he0=esimd::convert<half>(a0.template select<16,2>(0).read());
+                esimd::simd<half,16> ho0=esimd::convert<half>(a0.template select<16,2>(1).read());
+                esimd::simd<half,16> he1=esimd::convert<half>(a1.template select<16,2>(0).read());
+                esimd::simd<half,16> ho1=esimd::convert<half>(a1.template select<16,2>(1).read());
+                esimd::simd<uint16_t,16> e0; e0=he0.bit_cast_view<uint16_t>();
+                esimd::simd<uint16_t,16> o0; o0=ho0.bit_cast_view<uint16_t>();
+                esimd::simd<uint16_t,16> e1; e1=he1.bit_cast_view<uint16_t>();
+                esimd::simd<uint16_t,16> o1; o1=ho1.bit_cast_view<uint16_t>();
+                esimd::simd<uint32_t,16> p0=esimd::convert<uint32_t>(e0)|(esimd::convert<uint32_t>(o0)<<16);
+                esimd::simd<uint32_t,16> p1=esimd::convert<uint32_t>(e1)|(esimd::convert<uint32_t>(o1)<<16);
+                esimd::simd<uint32_t,16> t0=(p0<<5)+esimd::simd<uint32_t,16>(0x7FF88000u);
+                esimd::simd<uint32_t,16> t1=(p1<<5)+esimd::simd<uint32_t,16>(0x7FF88000u);
+                esimd::simd<half,32> w0; w0=t0.bit_cast_view<half>();
+                esimd::simd<half,32> w1; w1=t1.bit_cast_view<half>();
+                esimd::convert<float>(w0).copy_to(wf);
+                esimd::convert<float>(w1).copy_to(wf+32);
                 float total = 0.0f;
-                for (uint c = 0; c < 64u; c += 2u) {
-                    float hl0 = wbmega::eh_round(row[c]    + Bias[boff+c]);
-                    float hl1 = wbmega::eh_round(row[c+1u] + Bias[boff+c+1u]);
-                    float a0 = wbmega::eh_add(wbmega::eh_mul(hl0,0.044921875f),1.30078125f);
-                    float a1 = wbmega::eh_add(wbmega::eh_mul(hl1,0.044921875f),1.30078125f);
-                    a0 = a0<1.03125f?1.03125f:(a0>1.5693359375f?1.5693359375f:a0);
-                    a1 = a1<1.03125f?1.03125f:(a1>1.5693359375f?1.5693359375f:a1);
-                    uint32_t packed = (uint32_t)sycl::bit_cast<uint16_t>(sycl::half(a0))
-                                    | ((uint32_t)sycl::bit_cast<uint16_t>(sycl::half(a1)) << 16);
-                    uint32_t tr_ = (packed << 5) + 0x7FF88000u;
-                    sycl::half h0 = sycl::bit_cast<sycl::half>((uint16_t)(tr_ & 0xFFFFu));
-                    sycl::half h1 = sycl::bit_cast<sycl::half>((uint16_t)((tr_ >> 16) & 0xFFFFu));
-                    total += (float)h0; total += (float)h1;
-                    wf[c] = (float)h0; wf[c+1u] = (float)h1;
-                }
+                for (uint c = 0; c < 64u; ++c) total += wf[c];   // golden's sequential f32 sum
                 float trh = wbmega::eh_round(total);
                 float recip = wbmega::eh_round(ef_div(1.0f, trh));   // ESIMD hw div
-                for (uint c = 0; c < 64u; ++c)
-                    w[PPO + pa16_dest(r, c, 4u)] =
-                        half(qr_e4m3_scalar(wbmega::eh_round(ef_mul(wf[c], recip))));
+                esimd::simd<half,32> oh0 = esimd::convert<half>(e4m3_vec<32>(mulh(esimd::convert<float>(w0), recip)));
+                esimd::simd<half,32> oh1 = esimd::convert<half>(e4m3_vec<32>(mulh(esimd::convert<float>(w1), recip)));
+                uint tr=r>>4, strip=(r>>3)&1u, il=r&7u;
+                oh0.template select<16,1>(0).read().copy_to(w + PPO + ((tr*4u+0u)*2u+strip)*128u + il*16u);
+                oh0.template select<16,1>(16).read().copy_to(w + PPO + ((tr*4u+1u)*2u+strip)*128u + il*16u);
+                oh1.template select<16,1>(0).read().copy_to(w + PPO + ((tr*4u+2u)*2u+strip)*128u + il*16u);
+                oh1.template select<16,1>(16).read().copy_to(w + PPO + ((tr*4u+3u)*2u+strip)*128u + il*16u);
             }
             group_barrier(it.get_group());
             if (stop_stage == 6u) {                       // probs unpacked vs split_probs
