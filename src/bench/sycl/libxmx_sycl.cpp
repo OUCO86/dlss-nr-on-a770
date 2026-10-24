@@ -15,6 +15,7 @@
 // extern "C" + .def keep the C ABI intact for BOTH consumers (ctypes + nr_replay's
 // GetProcAddress function pointers). See §20 + the abibridge gate for the proven base.
 #include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/experimental/graph.hpp>
 #include <level_zero/ze_api.h>
 #include "quantize_row_kernel.hpp"
 #include "publish_kernel.hpp"
@@ -105,6 +106,13 @@ static void flop_note(const char* fam, double m, double n, double k, double batc
     g_shapes[fam][sb]++;
 }
 static std::atomic<long> g_wb_v2{0}, g_wb_split{0};
+// section 98: true while a command_graph is RECORDING this closure loop. Events returned
+// by submissions during recording belong to the graph and CANNOT be .wait()ed (runtime
+// throws). ev_sync() skips the wait in that case -- the memcpy is still recorded as a
+// graph node, so the device-side copy happens at replay; host-readback branches (dumps,
+// head/pooling legs) never execute during a game-walk recording anyway.
+static bool g_graphrecording = false;
+static void ev_sync(sycl::event e) { if (!g_graphrecording) e.wait(); }
 static long g_pool_mallocs = 0;          // section 92: pool misses = driver malloc round-trips
 static unsigned long long g_pool_malloc_bytes = 0;
 static void* pool_get(size_t n) {
@@ -414,14 +422,14 @@ int xmx_buf_import(unsigned long long handle, unsigned long long bytes) {
 int xmx_buf_upload(int id, const void* src, unsigned long long off, unsigned long long n) {
     if (!GQ) FAILMSG("not initialised");
     auto it = g_bufs.find(id); if (it == g_bufs.end()) FAILMSG("no such buffer");
-    GQ->memcpy((char*)it->second.p + off, src, n).wait();
+    ev_sync(GQ->memcpy((char*)it->second.p + off, src, n));
     wcache_invalidate(id);   // a re-upload changes the bytes: drop any packed cache for it
     return 0;
 }
 int xmx_buf_download(int id, void* dst, unsigned long long off, unsigned long long n) {
     if (!GQ) FAILMSG("not initialised");
     auto it = g_bufs.find(id); if (it == g_bufs.end()) FAILMSG("no such buffer");
-    GQ->memcpy(dst, (char*)it->second.p + off, n).wait();
+    ev_sync(GQ->memcpy(dst, (char*)it->second.p + off, n));
     return 0;
 }
 int xmx_buf_zero(int id) {
@@ -558,8 +566,67 @@ int xmx_graph_run(int id) {
             std::fflush(stdout);
             return passes;
         }
+        // SECTION 98: command_graph replay (the §2④ "one submit, no CPU handshake" mandate).
+        // begin_recording wraps the closure loop ONCE per graph id; the in_order queue infers
+        // the edges exactly as the plain path does. finalize() hoists JIT + graph build to a
+        // one-time cost; every later frame is ONE ext_oneapi_graph submit. The closures' host
+        // side effects (pool_get, cached_pack) run only during recording -- the captured device
+        // ops replay with the pointers frozen at record time, which is safe because the scratch
+        // pool hands out the SAME block sequence every run (§92 in-order proof). Guarded by
+        // NR_CGRAPH=0 opt-out; falls back to the plain loop on any recording exception.
+        static std::map<int, sycl::ext::oneapi::experimental::command_graph<
+            sycl::ext::oneapi::experimental::graph_state::executable>> s_execgraphs;
+        static std::set<int> s_graphtried;
+        static std::set<int> s_warmed;   // run 1 = plain loop (warms pool/wcache/JIT)
+        bool usecgraph = getenv("NR_CGRAPH") ? atoi(getenv("NR_CGRAPH")) != 0 : true;   // section 98: DEFAULT ON -- the DEVICE_LOST was the head-branch host-vector memcpy nodes (dangling at replay), fixed by device packs; full 691-closure graph replays 100.0000% bit-exact. NR_CGRAPH=0 = escape hatch.
+        if (usecgraph && s_warmed.count(id)) {   // record only AFTER one plain run:
+            // capture must see ZERO sycl::malloc_device (pool_get misses) -- allocations
+            // during stream capture poison the L0 graph (DEVICE_LOST at replay, proven
+            // 2026-10-24: recording on an empty pool crashed for BOTH v2 and split).
+            auto eg = s_execgraphs.find(id);
+            if (eg == s_execgraphs.end()) {
+                if (!s_graphtried.count(id)) {
+                    s_graphtried.insert(id);
+                    try {
+                        sycl::ext::oneapi::experimental::command_graph<
+                            sycl::ext::oneapi::experimental::graph_state::modifiable> cg(*GQ);
+                        cg.begin_recording(*GQ);
+                        g_graphrecording = true;
+                        int lim = getenv("NR_CGRAPH_LIMIT") ? atoi(getenv("NR_CGRAPH_LIMIT")) : (int)g_graphs[id].size();
+                        for (int fi = 0; fi < lim && fi < (int)g_graphs[id].size(); ++fi) g_graphs[id][fi]();   // record: no GPU execution
+                        g_graphrecording = false;
+                        cg.end_recording(*GQ);
+                        auto res = s_execgraphs.emplace(id, cg.finalize());
+                        eg = res.first;
+                        std::printf("[cgraph] recorded graph id=%d (%zu closures) last3=%s,%s,%s\n", id, g_graphs[id].size(),
+                            g_graph_names[id].size()>=(size_t)lim&&lim>=3?g_graph_names[id][lim-3]:"?",
+                            lim>=2&&lim-2<(int)g_graph_names[id].size()?g_graph_names[id][lim-2]:"?",
+                            lim-1<(int)g_graph_names[id].size()?g_graph_names[id][lim-1]:"?");
+                        std::fflush(stdout);
+                    } catch (const std::exception& e) {
+                        std::printf("[cgraph] RECORD FAILED id=%d: %.150s -- falling back to plain loop\n", id, e.what());
+                        std::fflush(stdout);
+                        usecgraph = false;
+                        GQ->wait();
+                    }
+                }
+            }
+            if (usecgraph && eg != s_execgraphs.end()) {
+                try {
+                    GQ->ext_oneapi_graph(eg->second).wait();   // ONE submit for the whole plan
+                } catch (const std::exception& e) {
+                    std::printf("[cgraph] REPLAY THREW id=%d: %.200s -- disabling cgraph\n", id, e.what());
+                    std::fflush(stdout);
+                    s_execgraphs.erase(eg);
+                    usecgraph = false;
+                }
+                if (getenv("NR_SUBMIT_PROBE")) { std::printf("[wb-route] TOTAL this run: v2-hits=%ld split-path-hits=%ld\n", g_wb_v2.load(), g_wb_split.load()); std::fflush(stdout); }
+                return passes;
+            }
+        }
         for (auto& fn : g_graphs[id]) fn();     // in-order queue: enqueue order = execution order
         GQ->wait();                             // one host sync for the whole graph (was ~2000)
+        s_warmed.insert(id);
         if (getenv("NR_SUBMIT_PROBE")) { std::printf("[wb-route] TOTAL this run: v2-hits=%ld split-path-hits=%ld\n", g_wb_v2.load(), g_wb_split.load()); std::fflush(stdout); }
     } catch (const std::exception& e) { FAILMSG("graph_run: %s", e.what()); }
     if (getenv("NR_POOL_STATS")) { std::printf("[pool] mallocs=%ld bytes=%llu MB\n",
@@ -900,8 +967,8 @@ int xmx_rec_gemm_qkv_window(int image, int weight, int q, int k, int v, int scal
         // (the section-73 trap -- dereferencing a device pointer in host code crashes).
         const size_t img_elems = (size_t)height * width * C;
         std::vector<sycl::half> hImgH; std::vector<float> hImgF;
-        if (image_half) { hImgH.resize(img_elems); GQ->memcpy(hImgH.data(), Img, img_elems * 2).wait(); }
-        else            { hImgF.resize(img_elems); GQ->memcpy(hImgF.data(), ImgF, img_elems * 4).wait(); }
+        if (image_half) { hImgH.resize(img_elems); ev_sync(GQ->memcpy(hImgH.data(), Img, img_elems * 2)); }
+        else            { hImgF.resize(img_elems); ev_sync(GQ->memcpy(hImgF.data(), ImgF, img_elems * 4)); }
         std::vector<sycl::half> hA((size_t)M * C);
         for (unsigned r = 0; r < M; ++r) {
             unsigned window = r / tokens, token = r % tokens;
@@ -921,14 +988,14 @@ int xmx_rec_gemm_qkv_window(int image, int weight, int q, int k, int v, int scal
         std::vector<sycl::half> hApad((size_t)Mp * C, sycl::half(0.f));
         std::memcpy(hApad.data(), hA.data(), (size_t)M * C * 2);
         std::vector<sycl::half> hB((size_t)C * NH), hAp((size_t)Mp * C), hBp((size_t)C * NH);
-        GQ->memcpy(hB.data(), Wraw, (size_t)C * NH * 2).wait();
+        ev_sync(GQ->memcpy(hB.data(), Wraw, (size_t)C * NH * 2));
         f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)C);
         f16v1::pack_b(hB.data(), hBp.data(), (int)C, (int)NH);
         sycl::half* dAp = (sycl::half*)pool_get((size_t)Mp * C * 2);
         sycl::half* dBp = (sycl::half*)pool_get((size_t)C * NH * 2);
         float* dC = (float*)pool_get((size_t)Mp * NH * 4);
-        GQ->memcpy(dAp, hAp.data(), (size_t)Mp * C * 2).wait();
-        GQ->memcpy(dBp, hBp.data(), (size_t)C * NH * 2).wait();
+        ev_sync(GQ->memcpy(dAp, hAp.data(), (size_t)Mp * C * 2));
+        ev_sync(GQ->memcpy(dBp, hBp.data(), (size_t)C * NH * 2));
         f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)NH, (int)C);
         // qkv_epilogue: in-place Q/K head norm on the f32 acc (QKV_READ = float(stage)),
         // then publish e4m3 -> half scatter. One device pass per (row, head) for the norm,
@@ -1014,16 +1081,16 @@ int xmx_rec_gemm_residual(int a, int b, int c, int skip, int cosine,
     g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         std::vector<sycl::half> hA((size_t)M * K), hApad(na, sycl::half(0.f)), hB(nb), hAp(na), hBp(nb);
-        GQ->memcpy(hA.data(), Araw, (size_t)M * K * 2).wait();
+        ev_sync(GQ->memcpy(hA.data(), Araw, (size_t)M * K * 2));
         std::memcpy(hApad.data(), hA.data(), (size_t)M * K * 2);
-        GQ->memcpy(hB.data(), Braw, nb * 2).wait();
+        ev_sync(GQ->memcpy(hB.data(), Braw, nb * 2));
         f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
         f16v1::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
         sycl::half* dAp = (sycl::half*)pool_get(na * 2);
         sycl::half* dBp = (sycl::half*)pool_get(nb * 2);
         float* dC = (float*)pool_get((size_t)Mp * N * 4);
-        GQ->memcpy(dAp, hAp.data(), na * 2).wait();
-        GQ->memcpy(dBp, hBp.data(), nb * 2).wait();
+        ev_sync(GQ->memcpy(dAp, hAp.data(), na * 2));
+        ev_sync(GQ->memcpy(dBp, hBp.data(), nb * 2));
         f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K);
         GQ->parallel_for(sycl::range((size_t)M * N),
                          [=](sycl::item<1> it) {
@@ -1096,16 +1163,16 @@ int xmx_rec_gemm_window_residual(int a, int b, int c, int skip, int cosine,
         const void* skp = sized(skip, k_need, "skip");
         const float* cp = (const float*)sized(cosine, (size_t)N * 4u, "cosine");
         std::vector<sycl::half> hA((size_t)M * K), hApad(na, sycl::half(0.f)), hB(nb), hAp(na), hBp(nb);
-        GQ->memcpy(hA.data(), Araw, (size_t)M * K * 2).wait();
+        ev_sync(GQ->memcpy(hA.data(), Araw, (size_t)M * K * 2));
         std::memcpy(hApad.data(), hA.data(), (size_t)M * K * 2);
-        GQ->memcpy(hB.data(), Braw, nb * 2).wait();
+        ev_sync(GQ->memcpy(hB.data(), Braw, nb * 2));
         f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
         f16v1::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
         sycl::half* dAp = (sycl::half*)pool_get(na * 2);
         sycl::half* dBp = (sycl::half*)pool_get(nb * 2);
         float* dC = (float*)pool_get((size_t)Mp * N * 4);
-        GQ->memcpy(dAp, hAp.data(), na * 2).wait();
-        GQ->memcpy(dBp, hBp.data(), nb * 2).wait();
+        ev_sync(GQ->memcpy(dAp, hAp.data(), na * 2));
+        ev_sync(GQ->memcpy(dBp, hBp.data(), nb * 2));
         f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K);
         GQ->parallel_for(sycl::range(blk_elems),
                          [=](sycl::item<1> it) {
@@ -2303,7 +2370,7 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
                 ((sycl::half*)Out)[index] = sycl::half(qr_e4m3(dCtx[at * 32u + (c % 32u)]));
             });
         } else {
-            GQ->memcpy(Out, dCtx, ctx_elems * 4).wait();
+            ev_sync(GQ->memcpy(Out, dCtx, ctx_elems * 4));
         }
         pool_put(dScores); pool_put(dProbs); pool_put(dCtx);
         pool_put(dAq); pool_put(dBk); pool_put(dAp); pool_put(dBv);
@@ -2357,17 +2424,17 @@ int xmx_rec_gemm_window_residual_pool(int a, int b, int skip_out, int skip, int 
         const float* cp = (const float*)sized(cosine, (size_t)N * 4u, "cosine");
         sycl::half* Pl = (sycl::half*)sized(pooled, (img_elems / 4u) * 2, "pooled");
         std::vector<sycl::half> hA((size_t)M * K), hApad(na, sycl::half(0.f)), hB(nb), hAp(na), hBp(nb);
-        GQ->memcpy(hA.data(), Araw, (size_t)M * K * 2).wait();
+        ev_sync(GQ->memcpy(hA.data(), Araw, (size_t)M * K * 2));
         std::memcpy(hApad.data(), hA.data(), (size_t)M * K * 2);
-        GQ->memcpy(hB.data(), Braw, nb * 2).wait();
+        ev_sync(GQ->memcpy(hB.data(), Braw, nb * 2));
         f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
         f16v1::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
         sycl::half* dAp = (sycl::half*)pool_get(na * 2);
         sycl::half* dBp = (sycl::half*)pool_get(nb * 2);
         float* dC = (float*)pool_get((size_t)Mp * N * 4);
         float* dStage = (float*)pool_get((size_t)M * N * 4);
-        GQ->memcpy(dAp, hAp.data(), na * 2).wait();
-        GQ->memcpy(dBp, hBp.data(), nb * 2).wait();
+        ev_sync(GQ->memcpy(dAp, hAp.data(), na * 2));
+        ev_sync(GQ->memcpy(dBp, hBp.data(), nb * 2));
         f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K);
         GQ->parallel_for(sycl::range(blk_elems), [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
@@ -2548,7 +2615,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                     s_v2done = true;
                     GQ->wait();
                     std::vector<sycl::half> hkv((size_t)windows * 4096u);
-                    GQ->memcpy(hkv.data(), dKV, hkv.size() * 2).wait();
+                    ev_sync(GQ->memcpy(hkv.data(), dKV, hkv.size() * 2));
                     FILE* fp = fopen("v2_dump.bin", "wb");
                     fwrite(hkv.data(), 2, hkv.size(), fp); fclose(fp);
                     printf("[dump] v2 flat %zu (stop=%u)\n", hkv.size(), st);
@@ -2576,7 +2643,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                                        windows, height, width, across, top, left, epi, narrow, st, dKV);
                 GQ->wait();
                 std::vector<sycl::half> hkv((size_t)windows * 4096u);
-                GQ->memcpy(hkv.data(), dKV, hkv.size() * 2).wait();
+                ev_sync(GQ->memcpy(hkv.data(), dKV, hkv.size() * 2));
                 FILE* fp = fopen("resident_dump.bin", "wb");
                 fwrite(hkv.data(), 2, hkv.size(), fp); fclose(fp);
                 printf("[dump] resident flat %zu (stop=%u)\n", hkv.size(), st);
@@ -2603,7 +2670,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                                     windows, height, width, across, top, left, epi, narrow, st, dKV);
                 GQ->wait();
                 std::vector<sycl::half> hkv((size_t)windows * 4096u);
-                GQ->memcpy(hkv.data(), dKV, hkv.size() * 2).wait();
+                ev_sync(GQ->memcpy(hkv.data(), dKV, hkv.size() * 2));
                 FILE* fp = fopen("mega_dump.bin", "wb");
                 fwrite(hkv.data(), 2, hkv.size(), fp); fclose(fp);
                 printf("[dump] mega flat %zu (stop=%u)\n", hkv.size(), st);
@@ -2648,7 +2715,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             if (!s_apdone && !pooling && !head) {
                 s_apdone = true;
                 std::vector<sycl::half> hap((size_t)Mp * C);
-                GQ->memcpy(hap.data(), dAp, hap.size() * 2).wait();
+                ev_sync(GQ->memcpy(hap.data(), dAp, hap.size() * 2));
                 FILE* fp = fopen("split_ap.bin", "wb");
                 fwrite(hap.data(), 2, hap.size(), fp); fclose(fp);
                 printf("[dump] split dAp %zu (Mp=%u C=%u)\n", hap.size(), Mp, C);
@@ -2661,7 +2728,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             if (!s_rawdone && !pooling && !head) {
                 s_rawdone = true;
                 std::vector<float> hraw((size_t)rows * NH);
-                GQ->memcpy(hraw.data(), dCq, hraw.size() * 4).wait();
+                ev_sync(GQ->memcpy(hraw.data(), dCq, hraw.size() * 4));
                 FILE* fp = fopen("split_raw.bin", "wb");
                 fwrite(hraw.data(), 4, hraw.size(), fp); fclose(fp);
                 printf("[dump] split raw dCq %zu (rows=%u NH=%u)\n", hraw.size(), rows, NH);
@@ -2685,9 +2752,9 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             if (!s_done && !pooling && !head) {
             s_done = true;
             std::vector<sycl::half> hk((size_t)rows * C), hv((size_t)rows * C), hq((size_t)rows * C);
-            GQ->memcpy(hk.data(), dK, hk.size() * 2).wait();
-            GQ->memcpy(hv.data(), dV, hv.size() * 2).wait();
-            GQ->memcpy(hq.data(), dQ, hq.size() * 2).wait();
+            ev_sync(GQ->memcpy(hk.data(), dK, hk.size() * 2));
+            ev_sync(GQ->memcpy(hv.data(), dV, hv.size() * 2));
+            ev_sync(GQ->memcpy(hq.data(), dQ, hq.size() * 2));
             FILE* fp = fopen("split_kv.bin", "wb");
             fwrite(hk.data(), 2, hk.size(), fp); fwrite(hv.data(), 2, hv.size(), fp); fclose(fp);
             FILE* fq = fopen("split_q.bin", "wb");
@@ -2714,7 +2781,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             if (!s_sdone && !pooling && !head) {
                 s_sdone = true;
                 std::vector<float> hs((size_t)windows * 64u * 64u);
-                GQ->memcpy(hs.data(), dScores, hs.size() * 4).wait();
+                ev_sync(GQ->memcpy(hs.data(), dScores, hs.size() * 4));
                 FILE* fp = fopen("split_scores.bin", "wb");
                 fwrite(hs.data(), 4, hs.size(), fp); fclose(fp);
                 printf("[dump] split scores %zu (windows=%u)\n", hs.size(), windows);
@@ -2727,7 +2794,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             if (!s_pdone && !pooling && !head) {
                 s_pdone = true;
                 std::vector<sycl::half> hp((size_t)windows*64u*64u);
-                GQ->memcpy(hp.data(), dProbs, hp.size()*2).wait();
+                ev_sync(GQ->memcpy(hp.data(), dProbs, hp.size()*2));
                 FILE* fp=fopen("split_probs.bin","wb"); fwrite(hp.data(),2,hp.size(),fp); fclose(fp);
                 printf("[dump] split probs %zu\n", hp.size());
             }
@@ -2740,7 +2807,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             if (!s_cdone && !pooling && !head) {
                 s_cdone = true;
                 std::vector<float> hc((size_t)windows * 64u * 32u);
-                GQ->memcpy(hc.data(), dCtx, hc.size() * 4).wait();
+                ev_sync(GQ->memcpy(hc.data(), dCtx, hc.size() * 4));
                 FILE* fp = fopen("split_ctx.bin", "wb");
                 fwrite(hc.data(), 4, hc.size(), fp); fclose(fp);
                 printf("[dump] split ctx %zu (windows=%u)\n", hc.size(), windows);
@@ -2759,7 +2826,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             if (!s_adone && !pooling && !head) {
                 s_adone = true;
                 std::vector<sycl::half> ha((size_t)rows * C);
-                GQ->memcpy(ha.data(), dAttended, ha.size() * 2).wait();
+                ev_sync(GQ->memcpy(ha.data(), dAttended, ha.size() * 2));
                 FILE* fp = fopen("split_att.bin", "wb");
                 fwrite(ha.data(), 2, ha.size(), fp); fclose(fp);
                 printf("[dump] split attended %zu (windows=%u)\n", ha.size(), windows);
@@ -2779,7 +2846,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             if (!s_d3done && !pooling && !head) {
                 s_d3done = true;
                 std::vector<float> h3((size_t)rows * C);
-                GQ->memcpy(h3.data(), dC3, h3.size() * 4).wait();
+                ev_sync(GQ->memcpy(h3.data(), dC3, h3.size() * 4));
                 FILE* fp = fopen("split_c3.bin", "wb");
                 fwrite(h3.data(), 4, h3.size(), fp); fclose(fp);
                 printf("[dump] split c3 %zu (windows=%u)\n", h3.size(), windows);
@@ -2836,27 +2903,26 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             // LEG 4: the compact head GEMM (test_window_block.py:151-152). out16 (pixels x
             // 32 half) @ head weights (32 x 16 half) -> f32; store only the first four
             // columns (compact_output, xmxres gemm leading=(0,0,4)) into the float32 target.
+            // SECTION 98: converted to DEVICE packs (packdev::pack_a16 pads rows >= pixels
+            // with zero exactly like the old host hOpad memset; cached_pack_b_f16 == the
+            // device twin of f16v1::pack_b, the same pair the split LEG1 uses at :2645).
+            // The old host download->pack->upload round-trip recorded memcpy nodes with
+            // HOST-vector pointers (hO/hOp/hW/hWp, dead after recording) -> dangling at
+            // replay -> UR_RESULT_ERROR_DEVICE_LOST (the K=691 crash, localized by the
+            // NR_CGRAPH_LIMIT bisect: 690 closures replay fine, the head closure poisons).
             const unsigned pixels = height * width;
             const int MpH = (int)(((pixels + 15u) / 16u) * 16u);
-            std::vector<sycl::half> hO((size_t)pixels * C), hOpad((size_t)MpH * C, sycl::half(0.f)),
-                hOp((size_t)MpH * C), hW((size_t)C * 16u), hWp((size_t)C * 16u);
-            GQ->memcpy(hO.data(), dOut16, (size_t)pixels * C * 2).wait();
-            std::memcpy(hOpad.data(), hO.data(), (size_t)pixels * C * 2);
-            GQ->memcpy(hW.data(), HeadW, (size_t)C * 16u * 2).wait();
-            f16v1::pack_a(hOpad.data(), hOp.data(), MpH, (int)C);
-            f16v1::pack_b(hW.data(), hWp.data(), (int)C, 16);
             sycl::half* dA4 = (sycl::half*)pool_get((size_t)MpH * C * 2);
-            sycl::half* dB4 = (sycl::half*)pool_get((size_t)C * 16u * 2);
+            sycl::half* dB4 = cached_pack_b_f16(pooled, HeadW, (int)C, 16);   // weight: pack once
             float* dH4 = (float*)pool_get((size_t)MpH * 16u * 4);
-            GQ->memcpy(dA4, hOp.data(), (size_t)MpH * C * 2).wait();
-            GQ->memcpy(dB4, hWp.data(), (size_t)C * 16u * 2).wait();
+            packdev::pack_a16(*GQ, dOut16, dA4, (int)pixels, MpH, (int)C);
             f16v1::gemm(*GQ, dA4, dB4, dH4, MpH, 16, (int)C);
             GQ->parallel_for(sycl::range((size_t)pixels * 4u), [=](sycl::item<1> it) {
                 size_t i = it.get_id(0);
                 unsigned pixel = (unsigned)(i / 4u), c = (unsigned)(i % 4u);
                 ((float*)Tgt)[i] = dH4[(size_t)pixel * 16u + c];   // compact: first four columns
             });
-            pool_put(dA4); pool_put(dB4); pool_put(dH4);
+            pool_put(dA4); pool_put(dH4);   // dB4 is cache-owned (the head weight)
             pool_put(dOut16);
         }
         pool_put(dAp3); pool_put(dBp3); pool_put(dC3); pool_put(dAttended);
@@ -2902,14 +2968,14 @@ int xmx_rec_gemm_s8(int a, int b, int c, unsigned M, unsigned N, unsigned K) {
     g_cmds.push_back([=]() {
         size_t na = (size_t)M * K, nb = (size_t)K * N;
         std::vector<int8_t> hA(na), hB(nb), hAp(na), hBp(nb);
-        GQ->memcpy(hA.data(), Araw, na).wait();
-        GQ->memcpy(hB.data(), Braw, nb).wait();
+        ev_sync(GQ->memcpy(hA.data(), Araw, na));
+        ev_sync(GQ->memcpy(hB.data(), Braw, nb));
         s8v1::pack_a(hA.data(), hAp.data(), (int)M, (int)K);
         s8v1::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
         int8_t* dAp = (int8_t*)pool_get(na);
         int8_t* dCp = (int8_t*)pool_get(nb);
-        GQ->memcpy(dAp, hAp.data(), na).wait();
-        GQ->memcpy(dCp, hBp.data(), nb).wait();
+        ev_sync(GQ->memcpy(dAp, hAp.data(), na));
+        ev_sync(GQ->memcpy(dCp, hBp.data(), nb));
         s8v1::gemm_s8(*GQ, dAp, dCp, C32, (int)M, (int)N, (int)K);
         pool_put(dAp); pool_put(dCp);
     });
@@ -2940,14 +3006,14 @@ int xmx_rec_gemm_s8rq(int a, int b, int c8, int col_scale, int new_scale,
     g_cmds.push_back([=]() {
         size_t na = (size_t)M * K, nb = (size_t)K * N;
         std::vector<int8_t> hA(na), hB(nb), hAp(na), hBp(nb);
-        GQ->memcpy(hA.data(), Araw, na).wait();
-        GQ->memcpy(hB.data(), Braw, nb).wait();
+        ev_sync(GQ->memcpy(hA.data(), Araw, na));
+        ev_sync(GQ->memcpy(hB.data(), Braw, nb));
         s8v3::pack_a(hA.data(), hAp.data(), (int)M, (int)K);
         s8v3::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
         int8_t* dAp = (int8_t*)pool_get(na);
         int8_t* dCp = (int8_t*)pool_get(nb);
-        GQ->memcpy(dAp, hAp.data(), na).wait();
-        GQ->memcpy(dCp, hBp.data(), nb).wait();
+        ev_sync(GQ->memcpy(dAp, hAp.data(), na));
+        ev_sync(GQ->memcpy(dCp, hBp.data(), nb));
         s8v3::gemm_s8(*GQ, dAp, dCp, cs, C8, ns, (int)M, (int)N, (int)K);
         pool_put(dAp); pool_put(dCp);
     });
@@ -2983,14 +3049,14 @@ int xmx_rec_gemm_s8rq32(int a, int b, int c8, int a_scale, int col_scale, int ne
     g_cmds.push_back([=]() {
         size_t na = (size_t)M * K, nb = (size_t)K * N;
         std::vector<int8_t> hA(na), hB(nb), hAp(na), hBp(nb);
-        GQ->memcpy(hA.data(), Araw, na).wait();
-        GQ->memcpy(hB.data(), Braw, nb).wait();
+        ev_sync(GQ->memcpy(hA.data(), Araw, na));
+        ev_sync(GQ->memcpy(hB.data(), Braw, nb));
         s8v7::pack_a(hA.data(), hAp.data(), (int)M, (int)K);
         s8v7::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
         int8_t* dAp = (int8_t*)pool_get(na);
         int8_t* dCp = (int8_t*)pool_get(nb);
-        GQ->memcpy(dAp, hAp.data(), na).wait();
-        GQ->memcpy(dCp, hBp.data(), nb).wait();
+        ev_sync(GQ->memcpy(dAp, hAp.data(), na));
+        ev_sync(GQ->memcpy(dCp, hBp.data(), nb));
         s8v7::gemm_s8rq32(*GQ, dAp, dCp, as, cs, C8, ns, (int)M, (int)N, (int)K);
         pool_put(dAp); pool_put(dCp);
     });
@@ -3242,14 +3308,14 @@ int xmx_rec_gemm_qkv_v(int a, int b, int v, int a_scale, int b_scale,
     g_cmds.push_back([=]() {
         size_t na = (size_t)M * channels, nb = (size_t)channels * channels;
         std::vector<int8_t> hA(na), hB(nb), hAp(na), hBp(nb);
-        GQ->memcpy(hA.data(), Araw, na).wait();
-        GQ->memcpy(hB.data(), Braw, nb).wait();
+        ev_sync(GQ->memcpy(hA.data(), Araw, na));
+        ev_sync(GQ->memcpy(hB.data(), Braw, nb));
         s8v5::pack_a(hA.data(), hAp.data(), (int)M, (int)channels);
         s8v5::pack_b(hB.data(), hBp.data(), (int)channels, (int)channels);
         int8_t* dAp = (int8_t*)pool_get(na);
         int8_t* dBp = (int8_t*)pool_get(nb);
-        GQ->memcpy(dAp, hAp.data(), na).wait();
-        GQ->memcpy(dBp, hBp.data(), nb).wait();
+        ev_sync(GQ->memcpy(dAp, hAp.data(), na));
+        ev_sync(GQ->memcpy(dBp, hBp.data(), nb));
         s8v5::gemm_qkv_v(*GQ, dAp, dBp, as, bs, V, (int)M, (int)channels,
                          (int)heads, (int)tokens).wait();
         pool_put(dAp); pool_put(dBp);
@@ -3284,14 +3350,14 @@ int xmx_rec_gemm_qkv_v_i8(int a, int b, int v8, int v_scale, int a_scale, int b_
     g_cmds.push_back([=]() {
         size_t na = (size_t)M * channels, nb = (size_t)channels * channels;
         std::vector<int8_t> hA(na), hB(nb), hAp(na), hBp(nb);
-        GQ->memcpy(hA.data(), Araw, na).wait();
-        GQ->memcpy(hB.data(), Braw, nb).wait();
+        ev_sync(GQ->memcpy(hA.data(), Araw, na));
+        ev_sync(GQ->memcpy(hB.data(), Braw, nb));
         s8v5::pack_a(hA.data(), hAp.data(), (int)M, (int)channels);
         s8v5::pack_b(hB.data(), hBp.data(), (int)channels, (int)channels);
         int8_t* dAp = (int8_t*)pool_get(na);
         int8_t* dBp = (int8_t*)pool_get(nb);
-        GQ->memcpy(dAp, hAp.data(), na).wait();
-        GQ->memcpy(dBp, hBp.data(), nb).wait();
+        ev_sync(GQ->memcpy(dAp, hAp.data(), na));
+        ev_sync(GQ->memcpy(dBp, hBp.data(), nb));
         s8v5::gemm_qkv_v_i8(*GQ, dAp, dBp, as, bs, V8, vs, (int)M, (int)channels,
                             (int)heads, (int)tokens).wait();
         pool_put(dAp); pool_put(dBp);
@@ -3321,14 +3387,14 @@ int xmx_rec_gemm_qkv_deq(int a, int b, int out, int a_scale, int b_scale,
     g_cmds.push_back([=]() {
         size_t na = (size_t)M * channels, nb = (size_t)channels * channels;
         std::vector<int8_t> hA(na), hB(nb), hAp(na), hBp(nb);
-        GQ->memcpy(hA.data(), Araw, na).wait();
-        GQ->memcpy(hB.data(), Braw, nb).wait();
+        ev_sync(GQ->memcpy(hA.data(), Araw, na));
+        ev_sync(GQ->memcpy(hB.data(), Braw, nb));
         s8v5::pack_a(hA.data(), hAp.data(), (int)M, (int)channels);
         s8v5::pack_b(hB.data(), hBp.data(), (int)channels, (int)channels);
         int8_t* dAp = (int8_t*)pool_get(na);
         int8_t* dBp = (int8_t*)pool_get(nb);
-        GQ->memcpy(dAp, hAp.data(), na).wait();
-        GQ->memcpy(dBp, hBp.data(), nb).wait();
+        ev_sync(GQ->memcpy(dAp, hAp.data(), na));
+        ev_sync(GQ->memcpy(dBp, hBp.data(), nb));
         s8v5::gemm_qkv_deq(*GQ, dAp, dBp, as, bs, OUT, (int)M, (int)channels);
         pool_put(dAp); pool_put(dBp);
     });
