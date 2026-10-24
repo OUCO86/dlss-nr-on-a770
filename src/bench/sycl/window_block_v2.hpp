@@ -376,20 +376,39 @@ inline sycl::event launch_v2(
                 return;
             }
 
-            // ===== P7: residual fma + publish -> image (thread = token row; in-kernel
-            // guard like launch_full's `if(...) continue` -- divergence-safe under ESIMD) =====
+            // ===== P7: residual fma + publish -> image (thread = token row). VECTORIZED
+            // (section 97): the probe confirmed the captured window_block uses epi=1
+            // (publish = e4m3 ONLY, NO gate) and narrow=1, so the whole row is a 32-wide
+            // load + single-FMA residual + e4m3_vec + one 32-half block store (image slots
+            // are 32-contiguous, at is a multiple of 32 -> 64B aligned). The gate path
+            // (epi 2/3) keeps a scalar fallback for generality (never taken in this walk). =====
             {
                 uint t = lid;
                 int y = (int)((window / window_cols) * 8u + (t >> 3)) - (int)top;
                 int x = (int)((window % window_cols) * 8u + (t & 7u)) - (int)left;
                 if (y >= 0 && y < (int)image_h && x >= 0 && x < (int)image_w) {
                     size_t at = ((size_t)y * image_w + (size_t)x) * 32u;
-                    for (uint c = 0; c < 32; ++c) {
-                        float sk = image_half ? (float)((const half*)Img)[at+c] : ((const float*)Img)[at+c];
-                        float total = ef_fma(sk, Cos[c], f32w[DPJ/2 + t*32u + c]);
-                        float pub = wbmega::pub_esimd(epilogue, total);
-                        if (narrow) Tgt[at + c] = half(pub); else TgtF[at + c] = pub;
+                    esimd::simd<float,32> sk, cosv, proj;
+                    if (image_half) {
+                        esimd::simd<half,32> h((const half*)Img + at, esimd::overaligned_tag<16>{});
+                        sk = esimd::convert<float>(h);
+                    } else sk.copy_from((const float*)Img + at);
+                    cosv.copy_from(Cos);
+                    proj.copy_from(f32w + DPJ/2 + t*32u);
+                    esimd::simd<float,32> total = sk * cosv + proj;   // ESIMD single FMA (== sycl::fma, §92)
+                    esimd::simd<float,32> pub;
+                    if (epilogue == 1u)      pub = e4m3_vec<32>(total);
+                    else if (epilogue == 0u) pub = total;
+                    else if (epilogue == 4u) pub = esimd::convert<float>(esimd::convert<half>(total));
+                    else {   // gate (epi 2/3): scalar fallback via the WGT scratch row (no stack
+                        float* tv = f32w + WGT/2 + (size_t)t*64u;   // array; never taken in this walk, epi==1)
+                        total.copy_to(tv);
+                        esimd::simd<float,32> pv;
+                        for (uint c = 0; c < 32; ++c) pv[c] = wbmega::pub_esimd(epilogue, tv[c]);
+                        pub = pv;
                     }
+                    if (narrow) esimd::convert<half>(pub).copy_to(Tgt + at);
+                    else pub.copy_to(TgtF + at);
                 }
             }
         });

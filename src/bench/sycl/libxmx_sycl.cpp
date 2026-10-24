@@ -2471,6 +2471,8 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         // bench_esnd3 D/F handoff, bench_smesimd softmax chain, f16v1 tiles 39-gates).
         if (getenv("NR_WB_V2") && !pooling && !head) {
             unsigned st = getenv("NR_V2_STOP") ? (unsigned)atoi(getenv("NR_V2_STOP")) : 0u;
+            if (st == 65531u) return;   // ABSOLUTE floor: closure does NOTHING (no pack, no pool, no launch)
+            if (st == 65530u) { static bool once=false; if(!once){once=true; printf("[wb-flags] epi=%u narrow=%d pooling=%d head=%d\n", epi, (int)narrow, (int)pooling, (int)head);} return; }
             sycl::half* dWq = cached_pack_b_f16(qkv, Wraw, (int)C, (int)NH);
             sycl::half* dWp = cached_pack_b_f16(projection, Praw, (int)C, (int)C);
             sycl::half* dWS = (st == 0xFFFFu) ? nullptr
@@ -2485,6 +2487,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             sycl::half* dKV = nullptr;
             if (st && st < 0xFF00u) { dKV = (sycl::half*)pool_get((size_t)windows * 4096u * 2);
                       GQ->parallel_for(sycl::range((size_t)windows*4096u), [=](sycl::item<1> it){ dKV[(size_t)it.get_id(0)]=sycl::half(0.f); }); }
+            if (st == 65532u) { if (dWS) pool_put(dWS); return; }   // floor probe: NO launch at all
             wbv2::launch_v2(*GQ, image_half ? (const void*)ImgH : (const void*)ImgF, image_half,
                             dWq, dWp, narrow ? (sycl::half*)Tgt : nullptr,
                             narrow ? nullptr : (float*)Tgt, Bp, cp, qs, dWS,
