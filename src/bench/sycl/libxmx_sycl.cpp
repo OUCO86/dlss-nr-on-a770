@@ -32,6 +32,7 @@
 #include "gemm_s8_v8_kernel.hpp"
 #include "gemm_s8_v9_kernel.hpp"
 #include "gemm_f16_v1_kernel.hpp"
+#include "gemm_f16_v2_kernel.hpp"
 #include "pack_device.hpp"
 #include "pre_kernel.hpp"
 #include "post_kernel.hpp"
@@ -2393,14 +2394,19 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
         // scores leg: Q(64x32) @ K^T(32x64) -> 64x64. K stored (64 tokens,32 ch) = (N,K).
         packdev::pack_a16_b(*GQ, Q, dAq, 64, 64, 32, (int)batches);
         packdev::pack_b16_t_b(*GQ, Kk, dBk, 32, 64, (int)batches);
-        f16v1::gemm_b(*GQ, dAq, dBk, dScores, 64, 64, 32, (int)batches);
+        // section 99: v2 workgroup-SLM-tiled f16 gemm (v1 = one 16x16 tile per GLOBAL
+        // load, 8 FLOP/byte = memory-bound; v2 stages BM=64 x BK=16 blocks in SLM with
+        // 4x reuse). Mp=64 is a multiple of BM. NR_F16V1=1 = escape hatch.
+        if (getenv("NR_F16V1")) f16v1::gemm_b(*GQ, dAq, dBk, dScores, 64, 64, 32, (int)batches);
+        else                    f16v2::gemm_b2<64>(*GQ, dAq, dBk, dScores, 64, 64, 32, (int)batches);
         // softmax over (batches*64) rows of 64, with bias (heads,64,64) -- one launch.
         GQ->parallel_for(sycl::range((size_t)batches*64u),
                          smax::softmax_kernel()(dScores, dProbs, batches*64u, 64u, Bp, heads));
         // attnV leg: P(64x64) @ V(64x32) -> 64x32. V stored (64 tokens,32 ch) = (K,N).
         packdev::pack_a16_b(*GQ, dProbs, dAp, 64, 64, 64, (int)batches);
         packdev::pack_b16_b(*GQ, V, dBv, 64, 32, (int)batches);
-        f16v1::gemm_b(*GQ, dAp, dBv, dCtx, 64, 32, 64, (int)batches);
+        if (getenv("NR_F16V1")) f16v1::gemm_b(*GQ, dAp, dBv, dCtx, 64, 32, 64, (int)batches);
+        else                    f16v2::gemm_b2<32>(*GQ, dAp, dBv, dCtx, 64, 32, 64, (int)batches);
         if (merged) {
             // merge_heads: (windows,heads,64,32) -> (windows,64,heads*32), publish e4m3, half
             const unsigned CH = heads * 32u;
