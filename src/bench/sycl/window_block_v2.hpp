@@ -281,7 +281,11 @@ inline sycl::event launch_v2(
                 return;
             }
 
-            // ===== P4: softmax (bench_smesimd BIT-EXACT recipe), thread = row =====
+            // ===== P4: softmax (bench_smesimd BIT-EXACT recipe), thread = row. Kept
+            // SCALAR: the vectorized attempt (section 97) hit a 0.5% bit-exact regression
+            // in the sequential total->recip chain (tiny-magnitude prob diffs) that could
+            // not be pinned by inspection; softmax is only +17ms so not worth the risk.
+            // P2 vectorization (the +23ms lever) is the win; this stays the proven form. =====
             {
                 uint r = lid;
                 const float* row = f32w + DSC/2 + (size_t)r*64u;
