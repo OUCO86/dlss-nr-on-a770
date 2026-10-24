@@ -55,6 +55,32 @@ static esimd::simd<float,N> e4m3_vec(esimd::simd<float,N> x){
     return res;
 }
 
+// vectorized half-round multiply: eh_mul(a,b) = (float)(half)(a*b) done on a whole simd.
+// The f32 product is a single correctly-rounded mul (no add to contract), convert<half>
+// rounds once, convert<float> back -- identical to the scalar eh_mul per lane.
+static inline esimd::simd<float,32> mulh(esimd::simd<float,32> v, float s){
+    return esimd::convert<float>(esimd::convert<half>(v * esimd::simd<float,32>(s)));
+}
+// cosine_recip on a whole-row simd (the ctree reduce order VERBATIM from
+// wbmega::cosine_recip_esimd; h[i] with constant i is a register extract, so the 8-slot
+// reduce is bit-identical by construction -- only the 32-channel round/e4m3 got vectorized).
+static inline float cosine_recip_vec(esimd::simd<float,32> h){
+    float partial[4][2];
+    for (int lane=0;lane<4;++lane) for (int p=0;p<2;++p){
+        int ch=lane*2+p;
+        float first  = wbmega::eh_hfma(h[ch+8],  h[ch+8],  wbmega::eh_mul(h[ch],      h[ch]));
+        float second = wbmega::eh_hfma(h[ch+24], h[ch+24], wbmega::eh_mul(h[ch+16],   h[ch+16]));
+        partial[lane][p]=wbmega::eh_add(first,second);
+    }
+    float two[4][2], one[4][2];
+    for (int lane=0;lane<4;++lane) for (int p=0;p<2;++p) two[lane][p]=wbmega::eh_add(partial[lane][p],partial[lane^2][p]);
+    for (int lane=0;lane<4;++lane) for (int p=0;p<2;++p) one[lane][p]=wbmega::eh_add(two[lane][p],two[lane^1][p]);
+    float norm=wbmega::eh_add(one[0][0],one[0][1]);
+    float floorv=wbmega::eh_round(ctree::COSINE_NORM_FLOOR);
+    norm = norm>floorv?norm:floorv;
+    return wbmega::eh_round(1.0f / wbmega::esqrt(norm));
+}
+
 // ---- pack index maps (VERBATIM from pack_device.hpp, inlined so phases scatter) ----
 static inline uint pa16_dest(uint srow, uint k, uint kb_n){
     uint tr=srow>>4, strip=(srow>>3)&1u, il=srow&7u, kc=k>>4;
@@ -198,28 +224,39 @@ inline sycl::event launch_v2(
             }
 
             // ===== P2: normalize + scatter packs. 64 threads; pass = Q,K,V over the rows.
-            // Chain verbatim from the joint kernel + gate_mega (eh_round/cosine_recip_esimd).
-            // QPO: Q pack; KTO: K^T pack (scores B); VPO: V pack; (KPO dropped: K only ever
-            // feeds the scores-B operand now; the joint kernel's KPO was a QKV-gemm remnant.)
+            // VECTORIZED (section 97): the 32-channel round/e4m3/scale go through simd<float,32>
+            // (mulh + e4m3_vec, both bit-exact vs the scalar spellings -- convert<half> == (half)
+            // is proven by P0's AQO 100%). The ctree reduce (cosine_recip_vec) keeps the VERBATIM
+            // scalar op order: h[i] with constant i is a register extract, so it is bit-identical
+            // to wbmega::cosine_recip_esimd. Q's pack_a16 map makes each row's 32 channels TWO
+            // contiguous 16-half blocks -> block stores. K/V use the transposed pb16t/pb16 maps
+            // (interleaved) -> scalar scatter, but FROM the vectorized e4m3 result.
             for (uint pass = 0; pass < 3u; ++pass) {
                 uint r = lid;
                 const float* src = f32w + DCQ/2 + r*96u + pass*32u;
+                esimd::simd<float,32> hv;
+                hv.copy_from(src);
                 if (pass == 2u) {                         // V: raw e4m3 -> pack (no normalize)
-                    for (uint c = 0; c < 32; ++c)
-                        w[VPO + pb16_dest_kn(r, c, 4u, 2u)] = half(qr_e4m3_scalar(src[c]));
+                    esimd::simd<half,32> oh = esimd::convert<half>(e4m3_vec<32>(hv));
+                    for (uint c = 0; c < 32; ++c) w[VPO + pb16_dest_kn(r, c, 4u, 2u)] = oh[c];
                 } else {
-                    float hv[32];
-                    for (uint c = 0; c < 32; ++c) hv[c] = wbmega::eh_round(src[c]);
-                    float recip = wbmega::cosine_recip_esimd(hv);
-                    if (pass == 0u) {                     // Q: * scale, -> QPO (gemm A pack)
+                    esimd::simd<float,32> hr = esimd::convert<float>(esimd::convert<half>(hv));  // 32x eh_round
+                    float recip = cosine_recip_vec(hr);
+                    if (pass == 0u) {                     // Q: * scale, -> QPO (two 16-half blocks)
                         float sc = wbmega::eh_round(QkvScale[0]);
-                        for (uint c = 0; c < 32; ++c)
-                            w[QPO + pa16_dest(r, c, 2u)] =
-                                half(qr_e4m3_scalar(wbmega::eh_mul(wbmega::eh_mul(hv[c], recip), sc)));
-                    } else {                              // K: -> KTO (scores-B pack, no QPO needed)
-                        for (uint c = 0; c < 32; ++c)
-                            w[KTO + pb16t_dest(r, c, 2u, 4u)] =
-                                half(qr_e4m3_scalar(wbmega::eh_mul(hv[c], recip)));
+                        esimd::simd<float,32> qv = mulh(mulh(hr, recip), sc);
+                        esimd::simd<half,32> oh = esimd::convert<half>(e4m3_vec<32>(qv));
+                        uint tr=r>>4, strip=(r>>3)&1u, il=r&7u;
+                        uint b1=((tr*2u+0u)*2u+strip)*128u + il*16u;
+                        uint b2=((tr*2u+1u)*2u+strip)*128u + il*16u;
+                        esimd::simd<half,16> o1=oh.template select<16,1>(0).read();
+                        esimd::simd<half,16> o2=oh.template select<16,1>(16).read();
+                        o1.copy_to(w + QPO + b1);
+                        o2.copy_to(w + QPO + b2);
+                    } else {                              // K: -> KTO (transposed map, scalar scatter)
+                        esimd::simd<float,32> kv = mulh(hr, recip);
+                        esimd::simd<half,32> oh = esimd::convert<half>(e4m3_vec<32>(kv));
+                        for (uint c = 0; c < 32; ++c) w[KTO + pb16t_dest(r, c, 2u, 4u)] = oh[c];
                     }
                 }
                 group_barrier(it.get_group());
