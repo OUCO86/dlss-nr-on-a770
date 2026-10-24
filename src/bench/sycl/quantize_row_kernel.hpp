@@ -14,6 +14,7 @@
 #pragma once
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/math.hpp>
+#include <sycl/ext/intel/esimd.hpp>
 
 static const unsigned QR_GRID = 65535u;   // x-extent cap, same as the GLSL
 
@@ -169,4 +170,112 @@ inline void qr_launch(sycl::queue& q, sycl::device& dev, K kern,
         h.parallel_for(sycl::nd_range<2>(sycl::range(256u * gxx, gyy), sycl::range(256u, 1u)),
             kern(dsrc, dpack, dscale, m, k, flags, image_h, image_w, window_cols, window_pad, dprod, drecip, la));
     });   // no .wait(): the in-order queue orders quant->consumer, graph_run drains once (section 92)
+}
+
+// ============================================================================
+// SECTION 99: ESIMD quantize_row -- the speed fix for the fdiv_rn wall.
+// bench_qvar A/B: the shipped plain kernel runs at 2-24 GB/s because the
+// per-element division is ext::intel::math::fdiv_rn = __imf_fdiv_rn, an IMF
+// SOFTWARE routine. Plain '/' and native::divide are fast but NOT bit-exact on
+// this stack (approximate reciprocal; the frame went 0%-bit-exact with it --
+// the §77 trap applies to runtime divisors too). esimd::div_ieee = __esimd_ieee_div
+// = the HARDWARE correctly-rounded fdiv, proven bit-identical to fdiv_rn by the
+// bench_v9 gate (0/8.3M diff). esimd intrinsics THROW at submit inside plain
+// kernels (gate l2/l0/tiny "submit ran the SYCL kernel" FAIL, 2026-10-25), so
+// the whole kernel goes ESIMD: 16-half vector chunks (32B loads / 16B stores =
+// P4 width), segmented shuffle_xor row-max (no local_accessor, no barrier),
+// rnde = ties-to-even == sycl::rint. Semantics identical to the .comp golden:
+// scale = (peak==0)?1:peak/127 (one correctly-rounded div), q = clip(rint(v/scale)).
+// Scope: the PLAIN path (flags==0, K%16==0) -- all 448 frame xmx_rec_quant passes.
+// gather/e4m3 variants (quant_window) keep the proven plain kernel for now.
+// ============================================================================
+inline auto qr_kernel_esimd() {
+    return [](sycl::half* a_src, sycl::uint2* packed, float* scales,
+              unsigned m, unsigned k) {
+        return [=](sycl::nd_item<2> it) SYCL_ESIMD_KERNEL {
+            namespace esimd = sycl::ext::intel::esimd;
+            esimd::slm_init<64 * 4>();    // per-lane row-max slots (LW=64: §96 GRF rule)
+            const unsigned words = k / 8u;          // 8-half words (16B)
+            const unsigned chunks = words / 2u;     // 16-half chunks (32B in / 16B out)
+            const unsigned SUB = it.get_sub_group().get_local_range().size();
+            const unsigned THREADS = it.get_local_range(0);
+            const unsigned WARPS = THREADS / SUB;
+            unsigned pr = (chunks >= SUB) ? SUB : 1u;
+            if (chunks < SUB && chunks > 1u) { unsigned v = chunks - 1u, lg = 0; while (v >>= 1) ++lg; pr = 1u << (lg + 1u); }
+            const unsigned per_row = pr;
+            const unsigned rows_per_warp = SUB / per_row;
+            unsigned gx = it.get_group(0), gy = it.get_group(1), lx = it.get_local_id(0);
+            unsigned warp = lx / SUB, lane = lx % SUB;
+            unsigned which = lane / per_row, within = lane % per_row;
+            unsigned row = (gy * QR_GRID + gx) * (WARPS * rows_per_warp) + warp * rows_per_warp + which;
+            // §96 barrier-deadlock rule: NO early return before esimd::barrier(). Out-of-
+            // range rows clamp to the last row (harmless reads; stores guarded below).
+            bool live = row < m;
+            unsigned held = live ? row : m - 1u;
+            const size_t base = (size_t)held * k;                      // halves
+            using f16 = esimd::simd<float, 16>;
+            f16 accmax(0.f);
+            for (unsigned c = within; c < chunks; c += per_row) {
+                esimd::simd<sycl::half,16> h = esimd::block_load<sycl::half,16>(
+                    a_src + base + (size_t)c * 16u, esimd::overaligned_tag<16>{});
+                accmax = esimd::max(accmax, esimd::abs(esimd::convert<float>(h)));
+            }
+            // cross-lane row-max: NO public shuffle in this ESIMD (the §20 note), so the
+            // SAME SLM+barrier shape the plain kernel uses (proven bit-exact: float max is
+            // associative/commutative). SLM slot = lx (256 floats).
+            esimd::slm_block_store(lx * 4, esimd::simd<float,1>(esimd::hmax<float,float,16>(accmax)),
+                                   esimd::overaligned_tag<16>{});
+            esimd::barrier();
+            // slot BYTE offset = lane*4 (matches the store). The segment base is
+            // (warp*SUB + which*per_row) LANES -> *4 bytes. BUG FIXED: was bl + i*4
+            // (base not scaled) -> read wrong slots -> wrong row-max -> 0% frame.
+            unsigned bl = (warp * SUB + which * per_row) * 4u;
+            float full = 0.f;
+            for (unsigned i = 0; i < per_row; ++i) {
+                float v = esimd::slm_block_load<float,1>(bl + i * 4u)[0];
+                full = full > v ? full : v;
+            }
+            const float peak = full;
+            const float scale = (peak == 0.0f) ? 1.0f : esimd::div_ieee<float,1>(esimd::simd<float,1>(peak), esimd::simd<float,1>(127.0f))[0];
+            if (live && within == 0u) scales[row] = scale;
+            sycl::uint4* dst4 = reinterpret_cast<sycl::uint4*>(packed);
+            const size_t row4 = (size_t)row * (words / 2u);            // uint4 units per row
+            for (unsigned c = within; c < chunks; c += per_row) {
+                esimd::simd<sycl::half,16> h = esimd::block_load<sycl::half,16>(
+                    a_src + base + (size_t)c * 16u, esimd::overaligned_tag<16>{});
+                f16 f = esimd::convert<float>(h);
+                f16 q = esimd::div_ieee<float,16>(f, f16(scale));
+                q = esimd::min(esimd::max(esimd::rnde<float,16>(q), f16(-127.f)), f16(127.f));
+                esimd::simd<int8_t,16> o = esimd::convert<int8_t>(esimd::convert<int>(q));
+                if (live) esimd::block_store<unsigned,4>(
+                    (unsigned*)(dst4 + row4 + c),
+                    o.template bit_cast_view<unsigned>());
+            }
+        };
+    };
+}
+
+// launcher for the ESIMD variant (plain path). Same over-dispatch rule as qr_launch
+// but per_row is computed from CHUNKS (16-half units), and no local_accessor.
+inline void qr_launch_esimd(sycl::queue& q, sycl::device& dev,
+                            sycl::half* dsrc, sycl::uint2* dpack, float* dscale,
+                            unsigned m, unsigned k) {
+    // LW=64 (4x SIMD16): §96/bench_v2crash proved ESIMD+barrier kernels with LW>=128
+    // HANG at scale (GRF rule ~128 live ESIMD threads). The plain kernel's 256-thread
+    // workgroup is NOT reusable here.
+    const unsigned LW = 64u;
+    const unsigned chunks = k / 16u;
+    auto sgs = dev.get_info<sycl::info::device::sub_group_sizes>();
+    unsigned SUB_max = 1u; for (unsigned s : sgs) if (s > SUB_max) SUB_max = s;
+    if (SUB_max > LW) SUB_max = LW;
+    unsigned lg = 0; { unsigned v = (chunks > 1u ? chunks - 1u : 0u); while (v >>= 1) ++lg; }
+    unsigned prub = (chunks >= SUB_max) ? SUB_max : (chunks <= 1u ? 1u : (1u << (lg + 1u)));
+    unsigned rows_per_wg = LW / prub;
+    unsigned ngroups = (m + rows_per_wg - 1u) / rows_per_wg;
+    unsigned gxx = ngroups < QR_GRID ? ngroups : QR_GRID;
+    unsigned gyy = (ngroups + gxx - 1u) / gxx;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<2>(sycl::range(LW * gxx, gyy), sycl::range(LW, 1u)),
+            qr_kernel_esimd()(dsrc, dpack, dscale, m, k));
+    });
 }

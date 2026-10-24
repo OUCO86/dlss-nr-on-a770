@@ -2612,7 +2612,13 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         // NR_WB_SPLIT=1 forces the old split path. The joint-resident (NR_RESIDENT_WB) and
         // mega (NR_FULL_MEGA) oracle paths must still win when explicitly requested, so v2
         // only takes over when none of those opt-ins is set.
-        if (!getenv("NR_WB_SPLIT") && !getenv("NR_RESIDENT_WB") && !getenv("NR_FULL_MEGA")
+        // SECTION 99 DEMOTION (the user's violation audit): the v2 fusion makes every
+        // window gemm an M=64 INDEPENDENT dispatch = the R8a small-M wall the plan forbids.
+        // The split path tiles the SAME math as ONE wide gemm over rows=windows*64=130560
+        // (M>=8160 = the healthy form, width-sweep 1.3-3.5x). v2 stays proven (NR_WB_V2=1,
+        // 100% bit-exact) as the ESIMD+dpas mechanism witness for shapes that cannot go
+        // wide; it is NOT the shipping route. Default = split wide-M.
+        if (getenv("NR_WB_V2") && !getenv("NR_RESIDENT_WB") && !getenv("NR_FULL_MEGA")
             && !pooling && !head) {
             g_wb_v2++;
             unsigned st = getenv("NR_V2_STOP") ? (unsigned)atoi(getenv("NR_V2_STOP")) : 0u;
@@ -2990,6 +2996,15 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
             GQ->memcpy(pk, (const int8_t*)a, (size_t)M * K);          // device int8 copy
             if (asbuf != scale)                                       // scales landed in a_scale's buf
                 GQ->memcpy(sc, (const float*)g_bufs[asbuf].p, (size_t)M * 4);
+        });
+        return 0;
+    }
+    // section 99: ESIMD HW-fdiv quantize is the DEFAULT (gate ALL OK + end-to-end
+    // 100.0000% + walk 463->351ms). NR_QR_PLAIN=1 = escape hatch to the old kernel.
+    static bool qrplain = getenv("NR_QR_PLAIN") != nullptr;
+    if (!qrplain && (K % 16u) == 0u) {
+        g_cmds.push_back([=]() {
+            qr_launch_esimd(*GQ, *GD, a, pk, sc, M, K);
         });
         return 0;
     }

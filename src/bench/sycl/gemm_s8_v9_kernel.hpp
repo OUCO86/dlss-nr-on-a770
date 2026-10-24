@@ -96,7 +96,7 @@ inline event gemm_b_rq(queue& q, const int8_t* Ap, const int8_t* Bp,
                        const float* as, const float* bs,
                        int M, int Mp, int N, int K, int batch,
                        size_t sc, unsigned ldc, unsigned scale_stride,
-                       unsigned col_stride, unsigned epi) {
+                       unsigned col_stride, unsigned epi, unsigned fold = 1u) {
     // store addressing EXACTLY like v8 gemm_b_pub: out = g*sc + r*ldc + col (the plan's
     // N=128 shapes have ldc=256 != N and interleaved group stride sc -- verified from
     // the plan call [M=32640 N=128 K=64 b=2 sa=0 sb=8192 sc=128 lda=64 ldb=64 ldc=256
@@ -190,7 +190,32 @@ inline event gemm_b_rq(queue& q, const int8_t* Ap, const int8_t* Bp,
                     simd<uint32_t,1>((uint32_t)(RMAX_BASE + lr1 * 4)), simd<float,1>(pm[8 + r]));
             }
             esimd::barrier();
-            // ---- phase 2: scale per row (quant semantics), requantize pub -> int8 ----
+            // ---- phase 2a (fold=0): v8 gemm_b_pub store, senior v2 WIDE geometry ----
+            if (fold == 0u) {
+                for (int r = 0; r < 8; ++r) {
+                    int rr0 = gr + r, rr1 = gr + 8 + r;
+                    if (rr0 < M) {
+                        float rs = gas[rr0];
+                        simd<float,8> f0 = convert<float>(c00.template select<8,1>(r*8).read()) * rs * cs_lo;
+                        simd<float,8> f1 = convert<float>(c01.template select<8,1>(r*8).read()) * rs * cs_hi;
+                        simd<float,16> pub;
+                        for (int e = 0; e < 8; ++e) pub[e] = s8v8::pub_esimd(epi, f0[e]);
+                        for (int e = 0; e < 8; ++e) pub[8 + e] = s8v8::pub_esimd(epi, f1[e]);
+                        convert<half>(pub).copy_to((half*)C8 + (size_t)g * sc / 2 + (size_t)rr0 * ldc + gc);
+                    }
+                    if (rr1 < M) {
+                        float rs = gas[rr1];
+                        simd<float,8> g0 = convert<float>(c10.template select<8,1>(r*8).read()) * rs * cs_lo;
+                        simd<float,8> g1 = convert<float>(c11.template select<8,1>(r*8).read()) * rs * cs_hi;
+                        simd<float,16> pub;
+                        for (int e = 0; e < 8; ++e) pub[e] = s8v8::pub_esimd(epi, g0[e]);
+                        for (int e = 0; e < 8; ++e) pub[8 + e] = s8v8::pub_esimd(epi, g1[e]);
+                        convert<half>(pub).copy_to((half*)C8 + (size_t)g * sc / 2 + (size_t)rr1 * ldc + gc);
+                    }
+                }
+                return;
+            }
+            // ---- phase 2b (fold=1): scale per row (quant semantics), requantize pub -> int8 ----
             simd<float, 16> rmaxv = slm_block_load<float, 16>(
                 RMAX_BASE + wi_row * 16 * 4, overaligned_tag<16>{});
             float* ns_g = ns + (size_t)g * scale_stride;
