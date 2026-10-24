@@ -33,6 +33,28 @@ static inline float ef_div(float a, float b){ return (esimd::simd<float,1>(a)/es
 // rounding) == plain-kernel sycl::fma (mega residual comment, gate-proven).
 static inline float ef_fma(float a, float b, float c){ return a * b + c; }
 
+// branch-free vectorized e4m3 (bench_e4m3vec.cpp: 0/4096 bit-exact vs qr_e4m3_scalar over
+// random +-500 + clamp/tie/-0.0 edges). esimd::rnde == the scalar floor+tie-to-even chain
+// for t in [0,16); sign via the (x<0) PREDICATE (mask converts to 0/1, so <<31), NOT the
+// sign bit -- -0.0 must map to +0 exactly like the golden's `x < 0.0f ? -r : r`.
+template<int N>
+static esimd::simd<float,N> e4m3_vec(esimd::simd<float,N> x){
+    esimd::simd<float,N> mag = esimd::abs(x);
+    mag = (esimd::min)(mag, esimd::simd<float,N>(448.0f));
+    esimd::simd<int32_t,N> mb; mb = mag.template bit_cast_view<int32_t>();
+    esimd::simd<int32_t,N> exp = (mb >> 23) & esimd::simd<int32_t,N>(0xFF);
+    exp = (esimd::max)(exp, esimd::simd<int32_t,N>(121)) - 3;
+    esimd::simd<int32_t,N> sb = exp << 23; esimd::simd<float,N> step; step = sb.template bit_cast_view<float>();
+    esimd::simd<int32_t,N> rb = (esimd::simd<int32_t,N>(254) - exp) << 23; esimd::simd<float,N> recip; recip = rb.template bit_cast_view<float>();
+    esimd::simd<float,N> t = mag * recip;
+    esimd::simd<float,N> r = esimd::rnde<float>(t) * step;
+    esimd::simd<int32_t,N> ri; ri = r.template bit_cast_view<int32_t>();
+    esimd::simd<int32_t,N> negm = x < esimd::simd<float,N>(0.0f);
+    esimd::simd<int32_t,N> out = (ri & esimd::simd<int32_t,N>(0x7FFFFFFF)) | (negm << 31);
+    esimd::simd<float,N> res; res = out.template bit_cast_view<float>();
+    return res;
+}
+
 // ---- pack index maps (VERBATIM from pack_device.hpp, inlined so phases scatter) ----
 static inline uint pa16_dest(uint srow, uint k, uint kb_n){
     uint tr=srow>>4, strip=(srow>>3)&1u, il=srow&7u, kc=k>>4;
@@ -93,7 +115,9 @@ constexpr uint PPO  = 28672;     // probs pack (M=64 K=64)             4096
 constexpr uint DCT  = 32768;     // ctx f32 64x32                      4096
 constexpr uint ATO  = 36864;     // attended pack (M=64 K=32)          2048
 constexpr uint DPJ  = 38912;     // projected f32 64x32                4096
-constexpr uint WSL  = 43008;     // slice total halfs (~84KB)
+constexpr uint NRM  = 43008;     // P2 per-thread hv[32] FLOATS (64 rows)  4096 halfs (kills hv[32] stack)
+constexpr uint WGT  = 47104;     // P4 per-thread wf[64] FLOATS (64 rows)  8192 halfs (kills wf[64] stack)
+constexpr uint WSL  = 55296;     // slice total halfs (~108KB)
 
 constexpr uint LW = 64u;         // threads per workgroup = one window (4x SIMD16)
 
@@ -118,21 +142,35 @@ inline sycl::event launch_v2(
             uint top = pad_top, left = pad_left;
             if (stop_stage == 0xFFFFu || stop_stage == 0xFFFEu) return;  // probes: launch-only / fill+launch
 
-            // ===== P0: gather 64 tokens x 32ch -> AQO pack. Thread = one token row. =====
+            // ===== P0: gather 64 tokens x 32ch -> AQO pack. Thread = one token row.
+            // VECTORIZED (section 97): one 32-wide e4m3_vec + two 16-half block stores
+            // (the pack_a16 map makes each token's 32 channels TWO contiguous 16-half
+            // blocks: kc=0 -> base1, kc=1 -> base2). Was 32x scalar qr_e4m3_scalar =
+            // masked-SIMD divergence; e4m3_vec is bit-exact (bench_e4m3vec 0/4096). =====
             {
                 uint t = lid;
                 int y = (int)((window / window_cols) * 8u + (t >> 3)) - (int)top;
                 int x = (int)((window % window_cols) * 8u + (t & 7u)) - (int)left;
+                uint tr=t>>4, strip=(t>>3)&1u, il=t&7u;
+                uint base1 = ((tr*2u+0u)*2u+strip)*128u + il*16u;   // channels 0..15
+                uint base2 = ((tr*2u+1u)*2u+strip)*128u + il*16u;   // channels 16..31
+                esimd::simd<float,32> v;
                 if (y >= 0 && y < (int)image_h && x >= 0 && x < (int)image_w) {
                     size_t at = ((size_t)y * image_w + (size_t)x) * 32u;
-                    for (uint c = 0; c < 32; ++c) {
-                        float f = image_half ? (float)((const half*)Img)[at+c]
-                                             : ((const float*)Img)[at+c];
-                        w[AQO + pa16_dest(t, c, 2u)] = half(qr_e4m3_scalar(f));
+                    if (image_half) {
+                        esimd::simd<half,32> hv((const half*)Img + at, esimd::overaligned_tag<16>{});
+                        v = esimd::convert<float>(hv);
+                    } else {
+                        v = esimd::simd<float,32>((const float*)Img + at, esimd::overaligned_tag<16>{});
                     }
                 } else {
-                    for (uint c = 0; c < 32; ++c) w[AQO + pa16_dest(t, c, 2u)] = half(0.f);
+                    v = esimd::simd<float,32>(0.0f);
                 }
+                esimd::simd<half,32> oh = esimd::convert<half>(e4m3_vec<32>(v));
+                esimd::simd<half,16> o1 = oh.template select<16,1>(0).read();
+                esimd::simd<half,16> o2 = oh.template select<16,1>(16).read();
+                o1.copy_to(w + AQO + base1);
+                o2.copy_to(w + AQO + base2);
             }
             group_barrier(it.get_group());
             if (stop_stage == 1u) {                       // AQO pack vs split dAp slice
@@ -141,6 +179,10 @@ inline sycl::event launch_v2(
                 return;
             }
 
+#if V2_TRIM
+            if (stop_stage >= 1u) {}   // keep the compiler honest about w/f32w liveness
+            return;                    // TRIM probe: body ends after P0
+#endif
             // ===== P1: QKV gemm M=64 x N=96, K=32: 24 tiles / 4 SGs = 6 each =====
             for (uint tile = sgid; tile < 24u; tile += 4u) {
                 uint tr = tile / 6u, tc = tile % 6u;
@@ -207,7 +249,8 @@ inline sycl::event launch_v2(
                 uint r = lid;
                 const float* row = f32w + DSC/2 + (size_t)r*64u;
                 size_t boff = (size_t)r * 64u;            // heads==1: (r%64)*64
-                float wf[64]; float total = 0.0f;
+                float* wf = f32w + WGT/2 + (size_t)r*64u;   // per-thread global row (no stack)
+                float total = 0.0f;
                 for (uint c = 0; c < 64u; c += 2u) {
                     float hl0 = wbmega::eh_round(row[c]    + Bias[boff+c]);
                     float hl1 = wbmega::eh_round(row[c+1u] + Bias[boff+c+1u]);

@@ -2473,7 +2473,8 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             unsigned st = getenv("NR_V2_STOP") ? (unsigned)atoi(getenv("NR_V2_STOP")) : 0u;
             sycl::half* dWq = cached_pack_b_f16(qkv, Wraw, (int)C, (int)NH);
             sycl::half* dWp = cached_pack_b_f16(projection, Praw, (int)C, (int)C);
-            sycl::half* dWS = (sycl::half*)pool_get((size_t)windows * wbv2::WSL * 2);
+            sycl::half* dWS = (st == 0xFFFFu) ? nullptr
+                            : (sycl::half*)pool_get((size_t)windows * wbv2::WSL * 2);
             // NO zero-fill by default (section 97): every phase writes its slice before
             // anyone reads it -- verified: NR_V2_FILL=0 keeps the fused 4-run check at
             // 100.0000% bit-exact AND saves ~10ms/walk; NR_V2_FILL=1 restores the
@@ -2501,7 +2502,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                 }
                 pool_put(dKV);
             }
-            pool_put(dWS);
+            if (dWS) pool_put(dWS);
             return;
         }
         // Needs the RAW row-major weights (Wraw 32x96, Praw 32x32), not packed. Plain form
