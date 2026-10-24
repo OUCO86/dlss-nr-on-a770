@@ -40,6 +40,7 @@
 #include <chrono>
 #include <algorithm>
 #include <map>
+#include <atomic>
 #include <vector>
 #include <unordered_map>
 #include <stdexcept>
@@ -103,6 +104,7 @@ static void flop_note(const char* fam, double m, double n, double k, double batc
     char sb[96]; snprintf(sb, sizeof sb, "M=%.0f N=%.0f K=%.0f b=%.0f", m, n, k, batch);
     g_shapes[fam][sb]++;
 }
+static std::atomic<long> g_wb_v2{0}, g_wb_split{0};
 static long g_pool_mallocs = 0;          // section 92: pool misses = driver malloc round-trips
 static unsigned long long g_pool_malloc_bytes = 0;
 static void* pool_get(size_t n) {
@@ -529,8 +531,36 @@ int xmx_graph_run(int id) {
             GQ->wait();   // the closures may enqueue without per-pass waits; drain before returning
             return passes;
         }
+        // DISPATCH-OVERHEAD PROBE (section 97): split the CPU enqueue cost from the GPU
+        // drain cost. If the enqueue loop alone is ~290ms, the engine is CPU-bound on the
+        // 691 SYCL submits (coopmat pays this once via a single Vulkan command buffer).
+        if (getenv("NR_SUBMIT_PROBE")) {
+            // per-closure ENQUEUE time (GPU drain excluded): where does the 455ms go?
+            std::vector<double> en; en.reserve(g_graphs[id].size());
+            for (auto& fn : g_graphs[id]) {
+                auto t0 = std::chrono::steady_clock::now();
+                fn();
+                en.push_back(std::chrono::duration<double,std::milli>(
+                    std::chrono::steady_clock::now() - t0).count());
+            }
+            GQ->wait();
+            double tot=0; for(double e:en) tot+=e;
+            std::printf("[submit_probe] total enqueue=%.1f ms (%zu closures)\n", tot, en.size());
+            std::vector<int> ord(en.size()); for(size_t i=0;i<en.size();++i) ord[i]=(int)i;
+            std::sort(ord.begin(), ord.end(), [&](int a,int b){return en[a]>en[b];});
+            std::map<std::string,double> byname;
+            for(size_t i=0;i<en.size();++i){ const char* nm=(int)i<(int)g_graph_names[id].size()?g_graph_names[id][i]:"?"; byname[nm]+=en[i]; }
+            std::vector<std::pair<std::string,double>> v(byname.begin(),byname.end());
+            std::sort(v.begin(),v.end(),[](auto&a,auto&b){return a.second>b.second;});
+            std::printf("[submit_probe] per-family ENQUEUE://n");
+            for(auto&kv:v) std::printf("   %-34s %8.1f ms\n", kv.first.c_str(), kv.second);
+            std::printf("[wb-route] TOTAL this run: v2-hits=%ld split-path-hits=%ld\n", g_wb_v2.load(), g_wb_split.load());
+            std::fflush(stdout);
+            return passes;
+        }
         for (auto& fn : g_graphs[id]) fn();     // in-order queue: enqueue order = execution order
         GQ->wait();                             // one host sync for the whole graph (was ~2000)
+        if (getenv("NR_SUBMIT_PROBE")) { std::printf("[wb-route] TOTAL this run: v2-hits=%ld split-path-hits=%ld\n", g_wb_v2.load(), g_wb_split.load()); std::fflush(stdout); }
     } catch (const std::exception& e) { FAILMSG("graph_run: %s", e.what()); }
     if (getenv("NR_POOL_STATS")) { std::printf("[pool] mallocs=%ld bytes=%llu MB\n",
         g_pool_mallocs, g_pool_malloc_bytes >> 20); std::fflush(stdout); }
@@ -773,7 +803,7 @@ int xmx_rec_pre(int colour, int motion, int history, int features, int plan,
                         pitch, source_h, source_w, flags };
     g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
-        GQ->parallel_for(sycl::range((size_t)pixels), prepass::pre_kernel(A)).wait();
+        GQ->parallel_for(sycl::range((size_t)pixels), prepass::pre_kernel(A));
     });
     return 0;
 }
@@ -808,7 +838,7 @@ int xmx_rec_post(int colour, int head, int history, int result, int table, int n
                           pitch, source_h, source_w };
     g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
-        GQ->parallel_for(sycl::range((size_t)pixels), postpass::post_kernel(A)).wait();
+        GQ->parallel_for(sycl::range((size_t)pixels), postpass::post_kernel(A));
     });
     return 0;
 }
@@ -2475,13 +2505,18 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         // only takes over when none of those opt-ins is set.
         if (!getenv("NR_WB_SPLIT") && !getenv("NR_RESIDENT_WB") && !getenv("NR_FULL_MEGA")
             && !pooling && !head) {
+            g_wb_v2++;
             unsigned st = getenv("NR_V2_STOP") ? (unsigned)atoi(getenv("NR_V2_STOP")) : 0u;
             if (st == 65531u) return;   // ABSOLUTE floor: closure does NOTHING (no pack, no pool, no launch)
             if (st == 65530u) { static bool once=false; if(!once){once=true; printf("[wb-flags] epi=%u narrow=%d pooling=%d head=%d\n", epi, (int)narrow, (int)pooling, (int)head);} return; }
+            static bool s_v2brk = getenv("NR_V2_BREAKDOWN") != nullptr;
+            auto bT0 = std::chrono::steady_clock::now();
             sycl::half* dWq = cached_pack_b_f16(qkv, Wraw, (int)C, (int)NH);
             sycl::half* dWp = cached_pack_b_f16(projection, Praw, (int)C, (int)C);
+            auto bT1 = std::chrono::steady_clock::now();
             sycl::half* dWS = (st == 0xFFFFu) ? nullptr
                             : (sycl::half*)pool_get((size_t)windows * wbv2::WSL * 2);
+            auto bT2 = std::chrono::steady_clock::now();
             // NO zero-fill by default (section 97): every phase writes its slice before
             // anyone reads it -- verified: NR_V2_FILL=0 keeps the fused 4-run check at
             // 100.0000% bit-exact AND saves ~10ms/walk; NR_V2_FILL=1 restores the
@@ -2497,6 +2532,16 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                             dWq, dWp, narrow ? (sycl::half*)Tgt : nullptr,
                             narrow ? nullptr : (float*)Tgt, Bp, cp, qs, dWS,
                             windows, height, width, across, top, left, epi, narrow, st, dKV);
+            auto bT3 = std::chrono::steady_clock::now();
+            if (s_v2brk) {
+                static double accP=0,accG=0,accL=0; static int cnt=0;
+                double dp=std::chrono::duration<double,std::milli>(bT1-bT0).count();
+                double dg=std::chrono::duration<double,std::milli>(bT2-bT1).count();
+                double dl=std::chrono::duration<double,std::milli>(bT3-bT2).count();
+                accP+=dp; accG+=dg; accL+=dl; ++cnt;
+                if (cnt<=3 || cnt%20==0) std::printf("[v2brk #%d] pack=%.2f pool=%.2f launch=%.2f ms\n",cnt,dp,dg,dl);
+                std::fflush(stdout);
+            }
             if (st && st < 0xFF00u) {
                 static bool s_v2done = false;
                 if (!s_v2done) {
@@ -2513,6 +2558,9 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             if (dWS) pool_put(dWS);
             return;
         }
+        g_wb_split++;
+        if (g_wb_v2+g_wb_split == 55 || (g_wb_v2+g_wb_split)%40==1)
+            std::printf("[wb-route] v2-hits=%ld split-path-hits=%ld\n", g_wb_v2.load(), g_wb_split.load());
         // Needs the RAW row-major weights (Wraw 32x96, Praw 32x32), not packed. Plain form
         // only (non-pooling, non-head). Gated behind NR_RESIDENT_WB; the fused 4-run check
         // against the coopmat golden is the judge.
@@ -2862,7 +2910,7 @@ int xmx_rec_gemm_s8(int a, int b, int c, unsigned M, unsigned N, unsigned K) {
         int8_t* dCp = (int8_t*)pool_get(nb);
         GQ->memcpy(dAp, hAp.data(), na).wait();
         GQ->memcpy(dCp, hBp.data(), nb).wait();
-        s8v1::gemm_s8(*GQ, dAp, dCp, C32, (int)M, (int)N, (int)K).wait();
+        s8v1::gemm_s8(*GQ, dAp, dCp, C32, (int)M, (int)N, (int)K);
         pool_put(dAp); pool_put(dCp);
     });
     return 0;
@@ -2900,7 +2948,7 @@ int xmx_rec_gemm_s8rq(int a, int b, int c8, int col_scale, int new_scale,
         int8_t* dCp = (int8_t*)pool_get(nb);
         GQ->memcpy(dAp, hAp.data(), na).wait();
         GQ->memcpy(dCp, hBp.data(), nb).wait();
-        s8v3::gemm_s8(*GQ, dAp, dCp, cs, C8, ns, (int)M, (int)N, (int)K).wait();
+        s8v3::gemm_s8(*GQ, dAp, dCp, cs, C8, ns, (int)M, (int)N, (int)K);
         pool_put(dAp); pool_put(dCp);
     });
     return 0;
@@ -2943,7 +2991,7 @@ int xmx_rec_gemm_s8rq32(int a, int b, int c8, int a_scale, int col_scale, int ne
         int8_t* dCp = (int8_t*)pool_get(nb);
         GQ->memcpy(dAp, hAp.data(), na).wait();
         GQ->memcpy(dCp, hBp.data(), nb).wait();
-        s8v7::gemm_s8rq32(*GQ, dAp, dCp, as, cs, C8, ns, (int)M, (int)N, (int)K).wait();
+        s8v7::gemm_s8rq32(*GQ, dAp, dCp, as, cs, C8, ns, (int)M, (int)N, (int)K);
         pool_put(dAp); pool_put(dCp);
     });
     return 0;
@@ -2972,7 +3020,7 @@ int xmx_rec_unary32(int source, int dst, unsigned count, unsigned epilogue) {
     unsigned n4 = count / 4u;
     g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
-        GQ->parallel_for(sycl::range(n4), unary_kernel()(sp, dp, n4, epilogue)).wait();
+        GQ->parallel_for(sycl::range(n4), unary_kernel()(sp, dp, n4, epilogue));
     });
     return 0;
 }
@@ -2994,7 +3042,7 @@ int xmx_rec_unary_i8(int source, int scale, int dst, unsigned count, unsigned co
     float* dp = (float*)d->second.p;
     g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
-        GQ->parallel_for(sycl::range(count), unary_i8_kernel()(sp, scp, dp, count, cols, epilogue)).wait();
+        GQ->parallel_for(sycl::range(count), unary_i8_kernel()(sp, scp, dp, count, cols, epilogue));
     });
     return 0;
 }
@@ -3013,7 +3061,7 @@ int xmx_rec_cosine_norm(int source, int dst, unsigned rows, unsigned vit) {
     g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         GQ->parallel_for(sycl::range(rows),
-                         ctree::cosine_norm_kernel()(sp, dp, rows, vit, nullptr, 0)).wait();
+                         ctree::cosine_norm_kernel()(sp, dp, rows, vit, nullptr, 0));
     });
     return 0;
 }
@@ -3034,7 +3082,7 @@ int xmx_rec_cosine_norm_q(int source, int dst, int scale, unsigned rows, unsigne
     g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         GQ->parallel_for(sycl::range(rows),
-                         ctree::cosine_norm_kernel()(sp, dp, rows, vit, scp, heads)).wait();
+                         ctree::cosine_norm_kernel()(sp, dp, rows, vit, scp, heads));
     });
     return 0;
 }
@@ -3060,7 +3108,7 @@ int xmx_rec_cosine_norm_i8(int source, int out8, int scale, unsigned rows, unsig
     g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         GQ->parallel_for(sycl::range(rows),
-                         ctree::cosine_norm_i8_kernel()(sp, op, cp, rows, vit, qsp, heads)).wait();
+                         ctree::cosine_norm_i8_kernel()(sp, op, cp, rows, vit, qsp, heads));
     });
     return 0;
 }
@@ -3134,7 +3182,7 @@ int xmx_rec_softmax_i8(int acc, int q_scale, int k_scale, int bias, int out8, in
         // gate, same staged rhythm as the rest of the skeleton.)
         sycl::half* scratch = (sycl::half*)sycl::malloc_shared((size_t)rows * cols * 2, *GQ);
         GQ->parallel_for(sycl::range(rows),
-                         smax::softmax_i8_kernel()(ap, qp, kp, bp, scratch, op, scp, rows, cols)).wait();
+                         smax::softmax_i8_kernel()(ap, qp, kp, bp, scratch, op, scp, rows, cols));
         pool_put(scratch);
     });
     return 0;
@@ -3162,7 +3210,7 @@ int xmx_rec_requant_i8(int acc, int a_scale, int b_scale, int out8, int scale,
     g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         GQ->parallel_for(sycl::range(rows),
-                         requant::requant_i8_kernel()(ap, as, bs, op, scp, rows, cols)).wait();
+                         requant::requant_i8_kernel()(ap, as, bs, op, scp, rows, cols));
     });
     return 0;
 }
@@ -3281,7 +3329,7 @@ int xmx_rec_gemm_qkv_deq(int a, int b, int out, int a_scale, int b_scale,
         int8_t* dBp = (int8_t*)pool_get(nb);
         GQ->memcpy(dAp, hAp.data(), na).wait();
         GQ->memcpy(dBp, hBp.data(), nb).wait();
-        s8v5::gemm_qkv_deq(*GQ, dAp, dBp, as, bs, OUT, (int)M, (int)channels).wait();
+        s8v5::gemm_qkv_deq(*GQ, dAp, dBp, as, bs, OUT, (int)M, (int)channels);
         pool_put(dAp); pool_put(dBp);
     });
     return 0;
@@ -3300,7 +3348,7 @@ int xmx_rec_qkv_scatter(int src, int dst, unsigned rows, unsigned heads, unsigne
     unsigned n = rows * heads * 32u;
     g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
-        GQ->parallel_for(sycl::range(n), qkv_scatter_kernel()(sp, dp, rows, heads, tokens)).wait();
+        GQ->parallel_for(sycl::range(n), qkv_scatter_kernel()(sp, dp, rows, heads, tokens));
     });
     return 0;
 }
