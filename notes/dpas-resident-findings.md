@@ -52,3 +52,13 @@
   1-ULP is a sub-ULP f32 difference in the affine that lands on a half tie at the bit-pack.
   Could not pin it by inspection in the time budget. DECISION: keep P4 SCALAR (proven 100%);
   softmax's +17ms is not worth risking the bit-exact gate. P7 (+4.7) has the gate-FMA trap too.
+
+## v2 VALIDATED end-to-end on the RECORDED walk (section 97, the shipping gate)
+- NR_DUMP_OUT on the real captured path (not synth): split.1301.bin vs v2.1301.bin, the full
+  composed-frame buffer (2088960 u32) = 100.0000% bit-exact, 0 mismatch.
+- async wall recorded walk: v2 run1-3 = 454.1/453.7/452.9 (warm 453.6ms) vs split
+  461.5/459.8/461.2 (460.8ms) -> v2 wins ~7ms steady.
+- So the user's bypass mechanism (ESIMD nd + dpas tiles + per-window global scratch +
+  group_barrier + P2/P6 vectorized elementwise) is BOTH correct (byte-identical on the real
+  path) AND faster than the shipped split path. P4 softmax / P7 publish stay scalar (P4 has
+  an unpinable 1-ULP affine divergence; P7 has the gate-FMA trap) -- the safe frontier.
