@@ -337,8 +337,13 @@ inline sycl::event launch_v2(
             // ===== P6: attended e4m3 -> ATO pack (thread=row), outproj 8 tiles =====
             {
                 uint r = lid;
-                for (uint c = 0; c < 32; ++c)
-                    w[ATO + pa16_dest(r, c, 2u)] = half(qr_e4m3_scalar(f32w[DCT/2 + r*32u + c]));
+                // vectorized (section 97): same shape as P2's Q pack (proven 100%) --
+                // e4m3_vec on a 32-wide row load, two contiguous 16-half pa16 block stores.
+                esimd::simd<float,32> cv; cv.copy_from(f32w + DCT/2 + r*32u);
+                esimd::simd<half,32> oh = esimd::convert<half>(e4m3_vec<32>(cv));
+                uint tr=r>>4, strip=(r>>3)&1u, il=r&7u;
+                oh.template select<16,1>(0).read().copy_to(w + ATO + ((tr*2u+0u)*2u+strip)*128u + il*16u);
+                oh.template select<16,1>(16).read().copy_to(w + ATO + ((tr*2u+1u)*2u+strip)*128u + il*16u);
             }
             group_barrier(it.get_group());
             for (uint tile = sgid; tile < 8u; tile += 4u) {
