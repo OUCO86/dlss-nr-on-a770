@@ -2406,3 +2406,28 @@ colour 用真实游戏量级（encode [0,1500) 进 R11G11B10，nr_pre 注释这�
 提交链本轮: b02e87a(机制确认) 898df65/fe4d003(探针) f32a61b(v2crash) c4a9a66(v2 100%)
 04d4460(诊断) 411b53f(P2vec) b22b819(P4拒) cc5f243(P6vec) 1568fd9(P4探针) cfa96c0(P4vec修)
 22abdbf(P7vec全向量化) 78dc92d(v2 默认)。
+
+## 98. 🏆 CPU 握手彻底去掉：command_graph 一次提交 = 默认路径（§2④ 兑现）
+- 用户点破"为什么还有 CPU 握手"后做的这一件事，做完了：graph_run 现在对每个 graph id
+  先 plain 跑一遍（warm pool/wcache/JIT），然后 begin_recording 录 691 closure、
+  finalize 一次，之后每帧 = 一次 ext_oneapi_graph submit。NR_CGRAPH=0 回退。
+- 三步改动：(1) 删 14 个 closure 尾冗余 launch .wait()（§92 欠的 next step）；
+  (2) 61 个 memcpy .wait() -> ev_sync()（recording 中 event.wait() 非法会 throw）；
+  (3) **DEVICE_LOST 崩因不是工具链墙，是我自己的 bug**：NR_CGRAPH_LIMIT 二分定位到
+  最后 1 个 closure = window_block head 分支 LEG4 的 host download->pack->upload——
+  recording 把 memcpy 录成节点后，host vector（hO/hOp/hW/hWp）析构=悬空指针。修=转
+  设备 pack（packdev::pack_a16 + cached_pack_b_f16，与 split LEG1 同款）。
+- 隔离探针链（回答"和 joint_matrix 墙有关系吗"）：bench_cgisolate（plain/ESIMD/dpas/
+  nd+barrier/691x dpas 全部 REPLAY OK）、bench_cgstream（stream-capture OOO/IN_ORDER/
+  explicit-add 全 OK）、bench_cgrace（in_order capture 保串行、memcpy 节点不抢跑）。
+  => command_graph 对 ESIMD+dpas 核完全可用。joint_matrix 墙=IGC 编译器对 coop-matrix
+  抽象的代码生成 bug（fragment 污染/SIMD32 除零），靠换 ESIMD+dpas 抽象绕过；cgraph
+  崩溃=运行时/我代码的悬空 host 指针。两者无关，教训也不同：前者换抽象层绕，后者查自己。
+- 收益实测：recorded walk 434 -> 405ms steady（一次 submit 省 ~30ms：省掉 691 次
+  submit 的 CPU 时间 + 驱动 per-list 开销，且 graph 内节点可被驱动优化排布）。
+  端到端 100.0000% 0 mismatch；确定性 2-run 100%；fused 4-run 100%；39 门绿。
+- 已部署：work/libxmx.dll = md5 dfc4e5ec（含 v2 默认 + cgraph 默认）。coopmat 备份不变。
+- 剩余账本：405ms vs coopmat 49ms。GPU 侧 TOPS 普查（batched 1.5 / qkv 2.5 / residual
+  1.9 vs 前辈宽 M 8-30）= 下一战场=R8a 宽形态重建（§2/§9/§11 的 B1 路线），cgraph 已
+  为它铺好"一次提交"地基。
+提交链本轮: 3c84bb1(删wait) fd1b82c(cgraph 全量+head 修+部署)。
