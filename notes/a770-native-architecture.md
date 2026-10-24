@@ -2351,3 +2351,58 @@ colour 用真实游戏量级（encode [0,1500) 进 R11G11B10，nr_pre 注释这�
 **进游戏只剩 step 5**：备份 work/libxmx.dll → 换我的 dll → 用户双击 LOP 面板 A/B（画面差退回）。
 换 dll 是文件操作（可逆有备份），游戏启动只许用户双击（铁律①）。
 提交链本轮: 8614b64(fused walk)。
+
+## 95. 🔓 用户"绕开走"机制确认：普通/ESIMD 核直接调 esimd::xmx::dpas（JIT，无需 ocloc/AOT）
+- 精读本地克隆 refs/sycl-tla + refs/vllm-xpu-kernels（生产实现：nd_range + XE_DPAS_TT +
+  local_accessor + group_barrier + sub_group_size<16> + grf_size<256>；inline GenISA asm
+  需 -fsycl-targets=spir64_gen + ocloc AOT）。
+- bench_dpasm5 A/B 决定性：同一 dpas 函数体，ESIMD 核=16.0、**普通 nd 核(无标记)=16.0**
+  => 机制成立且 JIT 路可用。sycl-tla 的 inline-asm 路需要 ocloc（已下载解压
+  toolchain-mamba/ocloc/bin 32.0.101.8974 + 拷进 compiler bin，icx 能找到但 -device 转发
+  语法未打通——现已无关，intrinsic 路不需要 AOT）。
+- 坑：普通核里 esimd::simd 是 **SIMD1 冗余执行**（bench_lanesplit P1: 全 lane 同值 +
+  sg 探针=1）=> 要真 SIMD16 必须 SYCL_ESIMD_KERNEL 标记。
+- 坑：普通核里 esimd::simd 从 local_accessor 取操作数=静默 0（bench_srcmodes M3-M6 全灭,
+  含标量填法）；global 块加载 tag<16>/<8> 正常（M1/M2）。
+
+## 96. v2 蓝图 + 形状命门：ESIMD nd + per-window GLOBAL scratch + group_barrier（禁 slm_init）
+- bench_esnd3 D/F：SYCL_ESIMD_KERNEL + nd_range 多 subgroup，核内标量写 global scratch +
+  group_barrier + tag<16> 块读 + dpas => 128/128 lane 全见跨组写、无 staleness、不崩。
+  （旧 DEVICE_LOST 毒点=esimd::slm_init+dpas+多 subgroup；global scratch 完全绕开。）
+- bench_v2crash 分形：**LW>=128 的 ESIMD+barrier 核大规模挂死**（连无 barrier/无 dpas 的
+  纯 scatter 也死；LW<=64 全 2040 窗稳）= §39 GRF 规则量化：~128 live ESIMD threads。
+  => v2 每窗 LW=64（4×SIMD16）。
+- window_block_v2.hpp 建成：P0 gather+pack -> P1 QKV dpas tiles(f16v1 逐字 tile8/store16)
+  -> P2 normalize+pack scatter -> P3 scores -> P4 softmax -> P5 attnV -> P6 attended+
+  outproj -> P7 residual+publish。pack 索引图内联（pack_a16/pb16t/pb16, 39 门已证映射）。
+  stop-dump 体系与 joint 核同构（stop=1/2/3/5/6/8/9 六档全 100% vs split golden）。
+- 坑（修过）：stop 早退必须**全体线程** return（部分 return 卡 barrier 死锁）；qr_e4m3_scalar
+  在 publish_kernel 全局不在 wbmega；esimd 里 a*b+c 自动单 FMA == plain sycl::fma；
+  NRM/WGT scratch 按 FLOAT 定尺寸（按 half 定=越界踩邻区, 1.53% 回归教训）。
+
+## 97. 🏆 v2 四段全向量化 + 设为默认 + 已部署进游戏（待面板 A/B）
+- 向量化积木（全 bit-exact by construction，可复用）：e4m3_vec（bench_e4m3vec 0/4096,
+  rnde+bit_cast_view+谓词<<31 符号, -0.0->+0 陷阱）、mulh、cosine_recip_vec（ctree 标量
+  op 序逐字保留, h[i] 常数下标=寄存器抽取）。
+- P4 softmax 首攻失败=**affine 双重舍入**（mulh 已 half-round 乘积又 convert<half>）。
+  bench_p4vec2 逐中间量探针（hl/a/w 三段各自 dump 对照）定位: hl*scale 在 f32 精确
+  (half×4bit 尾数), 保持 f32, +bias 只舍一次 = 匹配标量链 FMA contraction（§92 陷阱在
+  向量路重现）。修后 softmax 段 +17.1 -> +6.3ms。
+- P7 publish: 探针(stop=65530)确认捕获 window_block 用 **epi=1 narrow=1**（纯 e4m3 无
+  gate）=> 32-wide 行融合安全。gate 路径留标量 fallback（不走）。
+- 诊断反转记录（防再犯）：sync per-op 有 ~79ms "假地板"=NR_RUN_TIMING 每闭包 wait 开销
+  （stop=65531 closure 啥都不做仍 79ms, 但 async=292ms）。真实账本=async wall 差值。
+  launch 本身稳态仅 0.080ms（bench_launchcost A2）；大 body/栈数组都不是地板原因（TRIM/
+  stack-kill 实验否证）。
+- 最终阶梯（sync, 含假地板, 增量可信）：P0+5.8 QKV+10.1 norm+6.3 scores+7.4 softmax+6.3
+  attnV+0.8 outproj+2.8 P7+2.8 => 无更多安全标量杠杆（QKV 是 f16v1 已证形状）。
+- **v2 = 默认引擎**（NOT NR_WB_SPLIT && NOT NR_RESIDENT_WB && NOT NR_FULL_MEGA &&
+  !pooling && !head）。recorded-walk async **434 vs split 460 = 赢 ~26ms**；RECORDED
+  端到端整帧 buffer1301 **100.0000% 0 mismatch**（默认 vs NR_WB_SPLIT 两路字节相同）；
+  fused 4-run 100%；39 门绿。
+- **已部署**：work/libxmx.dll <- 新引擎（md5 9d788097, 用部署产物本身跑 walk 434ms 零崩）；
+  coopmat 备份 libxmx.dll.bak-1020-coopmat（md5 7abaf0ab）完好；游戏目录 7 adapter 在位。
+  回退=swap_engine.bat revert。**剩最后一步=用户双击游戏 Insert 面板 A/B 真画质验收**。
+提交链本轮: b02e87a(机制确认) 898df65/fe4d003(探针) f32a61b(v2crash) c4a9a66(v2 100%)
+04d4460(诊断) 411b53f(P2vec) b22b819(P4拒) cc5f243(P6vec) 1568fd9(P4探针) cfa96c0(P4vec修)
+22abdbf(P7vec全向量化) 78dc92d(v2 默认)。
