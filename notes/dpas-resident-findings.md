@@ -40,3 +40,15 @@
   pack_b16/b16_t maps (bit-exact), ctree normalize+weights_pair_u32+recip chain (joint
   100% oracle), publish/residual chains (joint 100%). Old DEVICE_LOST poison = slm_init
   only; global-scratch handoff sidesteps it (D/F prove).
+
+## P4 softmax vectorization: REJECTED (section 97, bench_p4vec.cpp)
+- Current ladder (post P2/P6 vectorization, recorded walk, warm avg): empty=75.7, +P0=81.5,
+  +QKV=90.3, +norm=97.2 (norm now only +6.9, was +23), +scores=105.0, +softmax=122.1
+  (softmax +17.1 = the biggest remaining single item), +attnV=122.5, +outproj=126.3, full~131.
+- bench_p4vec A/B (scalar chain vs the v2 vectorized chain, same random rows): weights differ
+  2111/131072 (1.6%), first at row0 col58: 0.00018692 vs 0.000183105 (1 ULP). The divergence
+  is in the affine->clamp->bit-pack path BEFORE total/recip, so it is NOT the sequential-sum
+  order (that was the earlier hypothesis). convert<half> is RNE (P2 uses it at 100%), so the
+  1-ULP is a sub-ULP f32 difference in the affine that lands on a half tie at the bit-pack.
+  Could not pin it by inspection in the time budget. DECISION: keep P4 SCALAR (proven 100%);
+  softmax's +17ms is not worth risking the bit-exact gate. P7 (+4.7) has the gate-FMA trap too.
