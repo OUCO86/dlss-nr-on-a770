@@ -30,6 +30,7 @@
 #include "gemm_s8_v5_kernel.hpp"
 #include "gemm_s8_v7_kernel.hpp"
 #include "gemm_s8_v8_kernel.hpp"
+#include "gemm_s8_v9_kernel.hpp"
 #include "gemm_f16_v1_kernel.hpp"
 #include "pack_device.hpp"
 #include "pre_kernel.hpp"
@@ -106,6 +107,11 @@ static void flop_note(const char* fam, double m, double n, double k, double batc
     g_shapes[fam][sb]++;
 }
 static std::atomic<long> g_wb_v2{0}, g_wb_split{0};
+// section 99: §29 rule 1 -- quantize folds into the producer GEMM's store loop. The
+// fused producer registers the SOURCE buffer id of the quant pass it just absorbed;
+// xmx_rec_quant sees the id and records a no-op (the plan's op stream is untouched --
+// the bridge and plan stay frozen per the 10-18 order).
+static std::map<int,int> g_fused_quant;   // quant-source cb -> a_scale buf (new_scale lives there)
 // section 98: true while a command_graph is RECORDING this closure loop. Events returned
 // by submissions during recording belong to the graph and CANNOT be .wait()ed (runtime
 // throws). ev_sync() skips the wait in that case -- the memcpy is still recorded as a
@@ -1662,6 +1668,42 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
         // (normalize_esimd was safe only because its h[i]*h[i] is exact in f32.) The gate
         // missed this because its epi3 cases use N=32 (split path). So fuse ONLY epi 0/1/4
         // (e4m3/half, no mul-add chain -> no contraction risk); epi 2/3 keep split.
+        // v9 fused-quant producer (section 99): N==128 (BN=128 wide producer, senior v2
+        // geometry) + epi 1/3 (e4m3 / gate+e4m3 -- the two the frame's N=128 rows use) +
+        // narrow output: the GEMM writes int8 + new_scale DIRECTLY, and the following
+        // xmx_rec_quant over this buffer becomes a no-op (g_fused_quant). bench_v9 gate =
+        // BIT-EXACT vs the split chain (gemm_b_pub + quantize_row) on all five frame-real
+        // N=128 shapes, both epi. Strides verified against the plan call:
+        //   A row stride lda, group stride sa (bytes); C8 row stride ldc_, group stride
+        //   sc*2 (the half buffer's byte stride -> int8 element stride); as row-stride
+        //   scale_stride, ns written to the SAME scale buffer with the SAME stride;
+        //   bs col-stride N (sb!=0) or 0.
+        // BLOCKED by plan structure (section 99 finding): every frame N=128 batched call
+        // is multi-group INTERLEAVED (sc=128 < ldc=256) and its quant row-max SPANS BOTH
+        // groups' 256 columns (verified from the plan call: quant [1274,1272,1273,32640,256]
+        // reads c as flat 32640x256 = 2 groups interleaved). A per-workgroup fused
+        // requantize cannot see the other group's columns -> the fold is invalid for these
+        // shapes. gate P1-broadcast-2blocks went RED exactly this way. The v9 kernel +
+        // bench_v9 BIT-EXACT gate stay as the building block for single-group N=128 shapes.
+        if (false && N == 128u && (K % 32u) == 0u && (epi == 1u || epi == 3u) && narrow) {
+            int8_t* dAp9 = (int8_t*)pool_get((size_t)batch * Mp * K);
+            s8v9::pack_a9(*GQ, Araw, dAp9, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch);
+            WKey wk9{ b, (int)N, (int)K, 1000 + (int)batch };   // v9 layout (row-major B), distinct key
+            auto wc9 = g_wcache.find(wk9);
+            int8_t* dBp9;
+            if (wc9 != g_wcache.end()) dBp9 = (int8_t*)wc9->second;
+            else {
+                dBp9 = (int8_t*)sycl::malloc_device((size_t)batch * K * N, *GQ);
+                s8v9::pack_b9(*GQ, Braw, dBp9, (int)K, (int)N, (int)ldb_e, sb, (int)batch);
+                g_wcache[wk9] = dBp9;
+            }
+            s8v9::gemm_b_rq(*GQ, dAp9, dBp9, (int8_t*)Cout, (float*)as,
+                            as, bs, (int)M, Mp, (int)N, (int)K, (int)batch,
+                            sc, ldc_, scale_stride, (sb != 0u) ? N : 0u, epi);
+            pool_put(dAp9);
+            g_fused_quant[c] = a_scale;
+            return;
+        }
         if ((N % 64u) == 0u && (epi == 0u || epi == 1u || epi == 3u || epi == 4u)) {
             s8v8::gemm_b_pub(*GQ, dAp, dBp, Cout, as, bs, (int)M, Mp, (int)N, (int)K,
                              (int)batch, sc, ldc_, scale_stride, (sb != 0u) ? N : 0u, narrow, epi);
@@ -2941,6 +2983,16 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
     sycl::uint2* pk = (sycl::uint2*)p->second.p;
     float* sc = (float*)c->second.p;
     g_cmd_names.push_back(__func__);
+    auto fq = g_fused_quant.find(source);
+    if (fq != g_fused_quant.end()) {   // section 99: the producer already wrote int8 + new_scale
+        int asbuf = fq->second;
+        g_cmds.push_back([=]() {
+            GQ->memcpy(pk, (const int8_t*)a, (size_t)M * K);          // device int8 copy
+            if (asbuf != scale)                                       // scales landed in a_scale's buf
+                GQ->memcpy(sc, (const float*)g_bufs[asbuf].p, (size_t)M * 4);
+        });
+        return 0;
+    }
     g_cmds.push_back([=]() {
         qr_launch(*GQ, *GD, qr_kernel(), a, pk, sc, M, K, 0u, 0u, 0u, 0u, 0u, nullptr, nullptr);
     });
