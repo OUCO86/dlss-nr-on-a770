@@ -2466,10 +2466,15 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         // bench_jmf proved the keystone (joint_matrix+local_accessor+group_barrier, cross-
         // subgroup 0/4096 wrong); bench_jmt proved the throughput gate. Uses the EXACT
         // cr_*/qr_* primitives the split passes use (already 100% bit-exact vs the golden).
-        // ---- OPT-IN wbv2: fused window_block as ONE ESIMD workgroup, dpas tiles +
-        // per-window GLOBAL scratch + group_barrier (section 96; components each proven:
-        // bench_esnd3 D/F handoff, bench_smesimd softmax chain, f16v1 tiles 39-gates).
-        if (getenv("NR_WB_V2") && !pooling && !head) {
+        // ---- wbv2: fused window_block as ONE ESIMD workgroup, dpas tiles + per-window
+        // GLOBAL scratch + group_barrier (section 96/97). NOW THE DEFAULT (section 97):
+        // proven 100.0000% bit-exact end-to-end on the RECORDED walk (real captured frame,
+        // buffer 1301) AND wins ~26ms async vs split (434 vs 460). Escape hatch:
+        // NR_WB_SPLIT=1 forces the old split path. The joint-resident (NR_RESIDENT_WB) and
+        // mega (NR_FULL_MEGA) oracle paths must still win when explicitly requested, so v2
+        // only takes over when none of those opt-ins is set.
+        if (!getenv("NR_WB_SPLIT") && !getenv("NR_RESIDENT_WB") && !getenv("NR_FULL_MEGA")
+            && !pooling && !head) {
             unsigned st = getenv("NR_V2_STOP") ? (unsigned)atoi(getenv("NR_V2_STOP")) : 0u;
             if (st == 65531u) return;   // ABSOLUTE floor: closure does NOTHING (no pack, no pool, no launch)
             if (st == 65530u) { static bool once=false; if(!once){once=true; printf("[wb-flags] epi=%u narrow=%d pooling=%d head=%d\n", epi, (int)narrow, (int)pooling, (int)head);} return; }
