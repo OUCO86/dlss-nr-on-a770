@@ -111,6 +111,7 @@ static void flop_note(const char* fam, double m, double n, double k, double batc
     g_shapes[fam][sb]++;
 }
 static std::atomic<long> g_wb_v2{0}, g_wb_split{0};
+static unsigned g_wbf3_poolhead = 0;   // section 100: one-shot proof the pool/head forms ride the fused leg
 // section 99: §29 rule 1 -- quantize folds into the producer GEMM's store loop. The
 // fused producer registers the SOURCE buffer id of the quant pass it just absorbed;
 // xmx_rec_quant sees the id and records a no-op (the plan's op stream is untouched --
@@ -3179,18 +3180,48 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         sycl::half* dBp3 = cached_pack_b_f16(projection, Praw, (int)C, (int)C);   // weight: pack once (host cache, no launch)
         // SECTION 99 LEG-3 FUSION: outproj gemm + residual + publish in ONE kernel
         // (f16v3::gemm_resid_pub) -- the 16.7MB dC3 f32 scratch and the separate
-        // residual launch both disappear. Plain form only (no pool/head, epi 0/1/4,
-        // C==32); NR_WB_FUSE=0 escapes to the two-pass path.
+        // residual launch both disappear. NR_WB_FUSE=0 escapes to the two-pass path.
+        // SECTION 100 A1: the POOL and HEAD forms ride the SAME fused kernel with
+        // their proven outlets (the scalar leg's stores reproduced bit-for-bit):
+        //   head: dOut16 = half(total) == narrow epi=0 outlet; Tgt stays with leg4.
+        //   pool: target = half(e4m3(total)) (pool_outlet), Stage = the raw total at
+        //     the BLOCK index r*C+c == the scalar leg's dStage write; the independent
+        //     pool pass reads it unchanged. The all-or-none crop guarantee (even
+        //     extents/pads, libxmx.c:2648 -- the guard we already enforce) means
+        //     every tap the pool reads was written by leg3: the fused Stage write
+        //     sits under the SAME per-token guard as the scalar one.
         static bool wbfuse = getenv("NR_WB_FUSE") ? atoi(getenv("NR_WB_FUSE")) != 0 : true;
-        const bool fused3 = wbfuse && !pooling && !head && C == 32u &&
-                            (epi == 0u || epi == 1u || epi == 4u) && wbstop > 8u;
+        float* dStage = pooling ? (float*)pool_get((size_t)rows * C * 4) : nullptr;
+        sycl::half* dOut16 = head ? (sycl::half*)pool_get(img_elems * 2) : nullptr;
+        const bool fused3 = wbfuse && C == 32u && wbstop > 8u &&
+                            !(pooling && head) &&
+                            (pooling || head || epi == 0u || epi == 1u || epi == 4u);
         if (fused3) {
+            if ((pooling || head) && g_wbf3_poolhead < 8u) {
+                g_wbf3_poolhead++;
+                std::printf("[wb-fuse3] %s form on the fused leg (epi=%u image_half=%d)\n",
+                            pooling ? "pool" : "head", epi, (int)image_half);
+            }
             packdev::pack_a16(*GQ, dAttended, dAp3, (int)rows, Mp, (int)C);
-            f16v3::gemm_resid_pub(*GQ, dAp3, dBp3,
-                image_half ? (const sycl::half*)ImgH : nullptr,
-                image_half ? nullptr : ImgF, image_half,
-                cp, narrow ? (sycl::half*)Tgt : nullptr, narrow ? nullptr : (float*)Tgt,
-                narrow, (int)rows, Mp, (int)C, height, width, across, top, left, epi);
+            if (head)
+                f16v3::gemm_resid_pub(*GQ, dAp3, dBp3,
+                    image_half ? (const sycl::half*)ImgH : nullptr,
+                    image_half ? nullptr : ImgF, image_half,
+                    cp, dOut16, nullptr, true,
+                    (int)rows, Mp, (int)C, height, width, across, top, left, 0u);
+            else if (pooling)
+                f16v3::gemm_resid_pub(*GQ, dAp3, dBp3,
+                    image_half ? (const sycl::half*)ImgH : nullptr,
+                    image_half ? nullptr : ImgF, image_half,
+                    cp, (sycl::half*)Tgt, nullptr, true,
+                    (int)rows, Mp, (int)C, height, width, across, top, left, 0u,
+                    dStage, true);
+            else
+                f16v3::gemm_resid_pub(*GQ, dAp3, dBp3,
+                    image_half ? (const sycl::half*)ImgH : nullptr,
+                    image_half ? nullptr : ImgF, image_half,
+                    cp, narrow ? (sycl::half*)Tgt : nullptr, narrow ? nullptr : (float*)Tgt,
+                    narrow, (int)rows, Mp, (int)C, height, width, across, top, left, epi);
         } else if (wbstop > 8u) {
         packdev::pack_a16(*GQ, dAttended, dAp3, (int)rows, Mp, (int)C);
         f16v1::gemm(*GQ, dAp3, dBp3, dC3, Mp, (int)C, (int)C);
@@ -3206,8 +3237,6 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                 printf("[dump] split c3 %zu (windows=%u)\n", h3.size(), windows);
             }
         }
-        float* dStage = pooling ? (float*)pool_get((size_t)rows * C * 4) : nullptr;
-        sycl::half* dOut16 = head ? (sycl::half*)pool_get(img_elems * 2) : nullptr;
         if (wbstop > 9u && !fused3) {
         static bool wbplainleg = getenv("NR_WB_PLAINLEG") != nullptr;   // escape hatch
         if (!wbplainleg && wb_leg3_esimd_ok(epi, pooling, head)) {

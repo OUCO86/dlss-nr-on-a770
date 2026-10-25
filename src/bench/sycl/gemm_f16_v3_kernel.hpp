@@ -22,8 +22,16 @@
 //    sk*cv + acc lowers to ONE HW FMA == sycl::fma (§92 mega-residual, gate
 //    proven), publish = wbv2::e4m3_vec<32> (bench_e4m3vec 0/4096 bit-exact).
 //  - the crop guard is per-token (same as the scalar leg), NOT per-row-block.
-// Scope: the PLAIN form only (no pooling, no head; epi 0/1/4). The recorder
-// keeps the old two-pass path for everything else.
+// Scope: the PLAIN form (epi 0/1/4) plus, section 100, the POOL and HEAD forms
+// through two extra outlets:
+//   Stage (pool): when non-null, the RAW total is stored at the BLOCK layout
+//     index r*N+c -- exactly what the split scalar leg wrote to dStage before the
+//     independent pool pass (:3228-3229's contract); the pool pass reads it back
+//     unchanged. The published outlet is epi=1+narrow (half(e4m3(total)) ==
+//     qr_e4m3 scalar, bench_e4m3vec bit-exact).
+//   head: no outlet change -- dOut16 IS the narrow target with epi=0
+//     (half(total) == the scalar leg's dOut16 store, :3224), image layout `at`.
+// The recorder keeps the old two-pass path for everything else.
 #pragma once
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/esimd.hpp>
@@ -40,7 +48,8 @@ static inline sycl::event gemm_resid_pub(sycl::queue& q, const half* Ap, const h
                                          const float* cosv, half* TgtH, float* TgtF, bool narrow,
                                          int M, int Mp, int K, unsigned height, unsigned width,
                                          unsigned across, unsigned top, unsigned left,
-                                         unsigned epi) {
+                                         unsigned epi, float* Stage = nullptr,
+                                         bool pool_outlet = false) {
     const int N = 32;
     int tr_n = Mp / TS, kb_n = K / TS;
     return q.submit([&](handler& h) {
@@ -96,8 +105,11 @@ static inline sycl::event gemm_resid_pub(sycl::queue& q, const half* Ap, const h
                 else            sk = esimd::block_load<float,32>(
                     ImgF + at, esimd::overaligned_tag<16>{});
                 esimd::simd<float,32> total = sk * cv + acc;      // ONE HW FMA per lane (§92)
+                if (Stage) esimd::block_store<float,32>(
+                    Stage + (size_t)r * N, total, esimd::overaligned_tag<16>{});
                 esimd::simd<float,32> pub;
-                if (epi == 1u)      pub = wbv2::e4m3_vec<32>(total);
+                if (pool_outlet)  pub = wbv2::e4m3_vec<32>(total);   // == scalar qr_e4m3 (bench_e4m3vec)
+                else if (epi == 1u)      pub = wbv2::e4m3_vec<32>(total);
                 else if (epi == 0u) pub = total;
                 else                pub = esimd::convert<float>(esimd::convert<half>(total)); // epi 4
                 if (narrow) esimd::block_store<half,32>(TgtH + at,
