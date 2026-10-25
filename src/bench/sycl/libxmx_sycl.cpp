@@ -2844,6 +2844,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         // early returns changed pool state and made LATER closures miss the pool,
         // which is what inflated the old deltas). Only the launches are guarded.
         static const unsigned wbstop = getenv("NR_WB_STOP") ? (unsigned)atoi(getenv("NR_WB_STOP")) : 99u;
+        static bool wbplaingather = getenv("NR_WB_PLAINLEG") != nullptr;   // gather/merge/leg3 vector switch
         // ---- LEG 1: gather + gemm + qkv_epilogue -> dQ,dK,dV (device scratch) ----
         // NOTE (section 92): a fused megakernel for this LEG (window_block_mega.hpp,
         // proven bit-exact by gate_mega.cpp) was tried and is NOT faster -- the split
@@ -2853,7 +2854,6 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         // shipped g.rblock shape) which is the only version that can win.
         sycl::half* dA = (sycl::half*)pool_get((size_t)rows * C * 2);
         if (wbstop > 0u) {
-        static bool wbplaingather = getenv("NR_WB_PLAINLEG") != nullptr;
         if (!wbplaingather && C == 32u) {
             // section 99: 32-wide ESIMD gather (image row + dA row both contiguous;
             // e4m3_vec<32> bit-exact vs qr_e4m3 scalar, bench_e4m3vec 0/4096).
@@ -3013,6 +3013,16 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         pool_put(dScores); pool_put(dProbs);
         sycl::half* dAttended = (sycl::half*)pool_get((size_t)rows * C * 2);
         if (wbstop > 7u)
+        if (!wbplaingather && C == 32u) {   // section 99: 32-wide merge (both sides contiguous)
+            GQ->parallel_for(sycl::range((size_t)rows), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
+                namespace esimd = sycl::ext::intel::esimd;
+                unsigned token = (unsigned)it.get_id(0);
+                esimd::simd<float,32> v = esimd::block_load<float,32>(
+                    dCtx + (size_t)token * 32u, esimd::overaligned_tag<16>{});
+                esimd::block_store<sycl::half,32>(dAttended + (size_t)token * 32u,
+                    esimd::convert<sycl::half>(wbv2::e4m3_vec<32>(v)), esimd::overaligned_tag<16>{});
+            });
+        } else
         GQ->parallel_for(sycl::range((size_t)rows * C), [=](sycl::item<1> it) {   // merge, heads==1
             unsigned index = (unsigned)it.get_id(0);
             unsigned c = index % C, token = index / C;
