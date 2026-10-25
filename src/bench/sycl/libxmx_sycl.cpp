@@ -2517,6 +2517,48 @@ int xmx_rec_gemm_window_residual_pool(int a, int b, int skip_out, int skip, int 
     });
     return 0;
 }
+// // SECTION 99: ESIMD vectorized LEG-3 residual (split window_block). The scalar leg ran
+// 32 per-row element ops with masked-SIMD divergence (NR_WB_STOP delta = 71.6ms for
+// 20 calls = 3.6ms/call at ~1.5GB/s). Vector form: ONE work-item per 32-channel row --
+// 128B dC3 load, 64B image-half load, 32-wide FMA (a*b+c lowers to ONE HW fma in an
+// ESIMD kernel, == sycl::fma: the gate-proven mega-residual equivalence, wbv2 header
+// note), wbv2::e4m3_vec<32> (bit-exact vs qr_e4m3_scalar, bench_e4m3vec 0/4096),
+// 64B half store. epi 0/1/4 covered (epi=4 narrow == direct convert<half>: the
+// half->float->half round-trip is exact); epi 2/3 (gate) and pooling/head keep the
+// scalar leg. All addresses are 32*C-aligned (C=32) -> tag<16> everywhere.
+static inline bool wb_leg3_esimd_ok(unsigned epi, bool pooling, bool head) {
+    return !pooling && !head && (epi == 0u || epi == 1u || epi == 4u);
+}
+static inline void wb_leg3_esimd(sycl::queue& q, const sycl::half* ImgH, const float* ImgF,
+    bool image_half, const float* cp, const float* dC3, void* Tgt,
+    bool narrow, unsigned epi, unsigned rows, unsigned height, unsigned width,
+    unsigned across, unsigned top, unsigned left, unsigned C)
+{
+    q.parallel_for(sycl::range((size_t)rows), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
+        namespace esimd = sycl::ext::intel::esimd;
+        unsigned r = (unsigned)it.get_id(0);
+        unsigned window = r / 64u, token = r % 64u;
+        unsigned y = (window / across) * 8u + token / 8u;
+        unsigned x = (window % across) * 8u + token % 8u;
+        if (y < top || x < left || y - top >= height || x - left >= width) return;
+        size_t out = ((size_t)(y - top) * width + (x - left)) * C;
+        esimd::simd<float,32> c3 = esimd::block_load<float,32>(
+            dC3 + (size_t)r * C, esimd::overaligned_tag<16>{});
+        esimd::simd<float,32> sk;
+        if (image_half) sk = esimd::convert<float>(esimd::block_load<sycl::half,32>(
+            ImgH + out, esimd::overaligned_tag<16>{}));
+        else            sk = esimd::block_load<float,32>(
+            ImgF + out, esimd::overaligned_tag<16>{});
+        esimd::simd<float,32> cv = esimd::block_load<float,32>(
+            cp, esimd::overaligned_tag<16>{});
+        esimd::simd<float,32> total = sk * cv + c3;          // ONE HW FMA per lane
+        esimd::simd<float,32> pub = (epi == 1u) ? wbv2::e4m3_vec<32>(total) : total;
+        if (narrow) esimd::block_store<sycl::half,32>((sycl::half*)Tgt + out,
+            esimd::convert<sycl::half>(pub), esimd::overaligned_tag<16>{});
+        else        esimd::block_store<float,32>((float*)Tgt + out, pub,
+            esimd::overaligned_tag<16>{});
+    });
+}
 // int xmx_rec_window_block(int image, int qkv, int projection, int target, int bias,
 //                          int cosine, int scale, int pooled, unsigned windows,
 //                          unsigned height, unsigned width, unsigned across, unsigned pad,
@@ -2922,7 +2964,14 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         }
         float* dStage = pooling ? (float*)pool_get((size_t)rows * C * 4) : nullptr;
         sycl::half* dOut16 = head ? (sycl::half*)pool_get(img_elems * 2) : nullptr;
-        if (wbstop > 9u)
+        if (wbstop > 9u) {
+        static bool wbplainleg = getenv("NR_WB_PLAINLEG") != nullptr;   // escape hatch
+        if (!wbplainleg && wb_leg3_esimd_ok(epi, pooling, head)) {
+            wb_leg3_esimd(*GQ, image_half ? (const sycl::half*)ImgH : nullptr,
+                          image_half ? nullptr : ImgF, image_half,
+                          cp, dC3, Tgt, narrow, epi, rows, height, width,
+                          across, top, left, C);
+        } else
         GQ->parallel_for(sycl::range(blk_elems), [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             unsigned r = (unsigned)(i / C), col = (unsigned)(i % C);
@@ -2945,6 +2994,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             } else if (narrow) ((sycl::half*)Tgt)[out] = sycl::half(qr_publish(epi, total));
             else               ((float*)Tgt)[out] = qr_publish(epi, total);
         });
+        }
         if (pooling) {
             // the 2x2 pool (gemm_staged.comp:371-390): taps (token,token+8,token+1,token+9)
             // summed in that order (precise), *0.25, e4m3 -> half, into pooled at the
