@@ -2431,3 +2431,45 @@ colour 用真实游戏量级（encode [0,1500) 进 R11G11B10，nr_pre 注释这�
   1.9 vs 前辈宽 M 8-30）= 下一战场=R8a 宽形态重建（§2/§9/§11 的 B1 路线），cgraph 已
   为它铺好"一次提交"地基。
 提交链本轮: 3c84bb1(删wait) fd1b82c(cgraph 全量+head 修+部署)。
+
+## §99 终账（10-25 深夜，用户验收后）：健康链路排查完结 + 游戏确认新 dll
+
+**游戏侧确认（用户 22:36 报告"画面没问题、比之前快"）**：
+- `work/libxmx.dll` md5=ba35cfc2、mtime 22:01（本轮 row-thread quant 部署点）。
+- 游戏 OptiScaler.log 22:33-22:34：gap run work=247-249ms（24 次采样），与回放 walk
+  232-250ms 同量级 = **跑的确实是新 SYCL split 引擎**（旧 coopmat 会 ~49ms；更早的
+  v2/463ms 时代会 350+）。用户在面板反复 NrEnabled on/off = A/B 切换，画面无差异投诉。
+- 注意：游戏 247ms vs 前辈 coopmat 49ms 仍有 5x 差距——这正是下窗口的靶子。
+
+**健康链路排查清单（本轮做完）**：
+1. 记录闭包内残留 .wait()：4 处全部无害——xmx_buf_zero（plan 初始化 setup）、
+   NR_RUN_TIMING 诊断、cgraph 失败回退、v2 stop-dump 首趟。热路径零 wait。✓
+2. qr_launch_esimd row-thread 分派：无 wait，异步提交。✓
+3. 默认路由：无 env = split 宽 M（v2/v3/resident/mega 全 opt-in）。✓
+4. v9b（sa=0 宽 N 合并）：正确但慢（BM=32/NT=32=16 accs P1 惩罚），默认关 opt-in 存证。✓
+5. rcp-multiply quant：0% gross bug 当场回滚，HEAD 无残骸。✓
+6. pool/head ESIMD-leg3：门红 2 例当场回滚（出口语义不同：pool 要 2x2 pooled 再 publish、
+   head 喂 compact GEMM）。✓
+7. 腿级账本（async STOP 扫描，健康链路直接测）：window_block 48ms = gather 1.2 /
+   qkv 0.8 / norm 3.3 / **scores 19** / softmax 2 / attnV 6 / outproj 4 /
+   **leg3-pool+head 42**。
+
+**下窗口优化清单（按预期收益排序，全部走"健康链路+整合+大宽"标准）**：
+1. **scores 腿 19ms**（window_block STOP=3→5 差值）：它是 f16v1 gemm M=64N=64K=32 每窗
+   一 dispatch? 不——split 路径 scores 在 window_attention 腿里（xmx_rec_window_attention
+   31.5ms 的另一半）。查 STOP=3→5 到底是哪条 launch（scores gemm vs softmax vs attnV），
+   然后按 v8 的 BM=128 批量几何重排（rows=windows*64 宽 M 已做——查 gemm 是否真走
+   f16v1::gemm_b batched 还是每窗循环）。
+2. **pool/head leg3 42ms**：按前辈 gemm_window_residual_pool/head 真实出口语义写
+   ESIMD 融合（pool form: residual+publish+2x2 pool 一趟整合 = 顺带消独立 pool pass，
+   正是"整合省中间开销"）。WINDOW_BLOCK 门已有这两 case 的期望值。
+3. **batched GEMM 族 49ms（0.31ms/趟 vs 前辈 0.071）**：v8 gemm_b_pub 的 pub+store 尾
+   比 dpas 本体贵（bench_batched: gemm_b 0.114 vs +pub 0.209）。前辈 pattern=acc 先存
+   shared 再 publish（publish.glsl 注释"publish happens on scalars, after an untouched
+   store to shared memory"）。照做：dpas 后 acc 进 SLM（B 区已死），barrier，SLM 读回
+   做 dequant+pub+global 写——GRF 压力减半消 spill。
+4. **rcp-multiply quant（前辈"一行一次除法"）**：先给 QUANT 门加 rcp-form numpy golden
+   分支（numpy: np.round(v*127/peak)），门绿再翻链。预期 quant 再 2-3x。
+5. **v9c fold staging**：前辈 KC-循环单缓冲（gemm_staged 的 SA/SB 布局）拉 occupancy，
+   0.79→0.107ms 目标；然后接 sa≠0 72 对（A 每组滑窗但 ldc 行仍整行归一）。
+6. 游戏内帧时间由用户 LOP 实测为准；回放 walk 232ms 只是内部账本。
