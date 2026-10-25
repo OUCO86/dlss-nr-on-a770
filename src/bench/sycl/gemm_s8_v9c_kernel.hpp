@@ -78,22 +78,24 @@ static inline esimd::simd<float,N> pub_vec_v9b(unsigned epi, esimd::simd<float,N
     return v;
 }
 
-static const int BM = 64, BK = 32, NT = 64;
+static const int BK = 32;
+template<int BMv,int NTr> struct Geo { static const int BM=BMv, NT=NTr, WI_ROWS=BMv/16; };
 
 // A: (M x K) row-major int8, lda -> Ap BM=64 blocks:
 //   dest = ((w*kb_n + kb)*4 + wi)*512 + row*32 + k  (w over Mp/64, wi<4, row<16)
+template<int BMv>
 inline void pack_a9b(queue& q, const int8_t* Araw, int8_t* Ap,
                      int M, int Mp, int K, int lda) {
     const int kb_n = K / BK;
-    size_t n = (size_t)(Mp / BM) * kb_n * 4 * 512;
+    size_t n = (size_t)(Mp / BMv) * kb_n * (BMv / 16) * 512;
     q.parallel_for(range(n), [=](item<1> it) {
         size_t d = it.get_id(0);
         int off = (int)(d % 512); size_t rest = d / 512;
-        int wi = (int)(rest % 4u); rest /= 4;
+        int wi = (int)(rest % (unsigned)(BMv / 16)); rest /= (BMv / 16);
         int kb = (int)(rest % (size_t)kb_n); rest /= kb_n;
         int w = (int)rest;
         int row = off / 32, k = off % 32;
-        int srow = w * BM + wi * 16 + row;
+        int srow = w * BMv + wi * 16 + row;
         Ap[d] = srow < M ? Araw[(size_t)srow * lda + kb * BK + k] : (int8_t)0;
     });
 }
@@ -118,7 +120,7 @@ inline void pack_b9b(queue& q, const int8_t* Braw, int8_t* Bp,
 
 // the fused kernel: C8 = int8 (Mp x ldc, the c buffer reinterpreted), ns = float[Mp]
 // (the a_scale buffer). bs = concatenated float[ldc]. as = float[M] (staged to SLM).
-template <int BN, bool FOLD>
+template <int BN, bool FOLD, int BMv, int NTr>
 inline event gemm_b_rq9b(queue& q, const int8_t* Ap, const int8_t* Bp,
                          sycl::half* C8, float* ns,
                          const float* as, const float* bs,
@@ -129,17 +131,18 @@ inline event gemm_b_rq9b(queue& q, const int8_t* Ap, const int8_t* Bp,
     // requantizing the f32 pub == requantizing the half-rounded pub the split chain
     // would have re-read (the bench_v9 argument). rmax = SLM atomic-fmax over the
     // workgroup's WIs (the workgroup owns the WHOLE ldc row -- v9b geometry).
-    static_assert(BN == 256 || BN == 512, "v9b: ldc is 256 or 512 in the frame");
-    const int WI_ROWS = BM / 16;                 // 4
-    const int WI_COLS = BN / 16;                 // 16 or 32 col-tiles
-    const int SLM_A = BM * BK;                   // 1024 B per buffer
-    const int SLM_B = BK * BN;                   // 8KB / 16KB per buffer
-    const int SLM_B_BASE = 2 * SLM_A;            // 2048
-    const int ASS = 2 * SLM_A + 2 * SLM_B;       // row-scale stage, 128 B
-    const int RMAXB = ASS + BM * 4;              // fold: row absmax, 128 B
-    const int SLMTOT = RMAXB + (FOLD ? BM * 4 : 0);  // <= 34.4KB
-    const int TILES = WI_ROWS * WI_COLS;         // 64 / 128
-    const int TPT = TILES / NT;                  // 1 / 2 tiles per thread (4 / 8 accs)
+    static_assert(BN == 256 || BN == 512, "v9c: ldc is 256 or 512 in the frame");
+    const int BM = BMv, NT = NTr;
+    const int WI_ROWS = BM / 16;
+    const int WI_COLS = BN / 16;
+    const int SLM_A = BM * BK;
+    const int SLM_B = BK * BN;
+    const int SLM_B_BASE = 2 * SLM_A;
+    const int ASS = 2 * SLM_A + 2 * SLM_B;
+    const int RMAXB = ASS + BM * 4;
+    const int SLMTOT = RMAXB + (FOLD ? BM * 4 : 0);
+    const int TILES = WI_ROWS * WI_COLS;
+    const int TPT = (TILES + NT - 1) / NT;
     int wg = Mp / BM;
     size_t apb = (size_t)Mp * K, bpb = (size_t)K * BN;
     return q.submit([&](handler& h) {
@@ -150,9 +153,9 @@ inline event gemm_b_rq9b(queue& q, const int8_t* Ap, const int8_t* Bp,
                                             // the old /NT made every workgroup compute the
                                             // wrong row block (frame 0%).
             // stage row scales cooperatively
-            esimd::slm_block_store(ASS + lid * 4, esimd::simd<float,1>(as[w * BM + lid]), esimd::overaligned_tag<16>{});
-            if (FOLD) esimd::slm_block_store(RMAXB + lid * 4, esimd::simd<float,1>(0.f), esimd::overaligned_tag<16>{});
-            const int8_t* apb_g = Ap + (size_t)w * (size_t)(K / BK) * 4 * 512;
+            if (lid < BM) esimd::slm_block_store(ASS + lid * 4, esimd::simd<float,1>(as[w * BM + lid]), esimd::overaligned_tag<16>{});
+            if (FOLD && lid < BM) esimd::slm_block_store(RMAXB + lid * 4, esimd::simd<float,1>(0.f), esimd::overaligned_tag<16>{});
+            const int8_t* apb_g = Ap + (size_t)w * (size_t)(K / BK) * (BM / 16) * 512;
             const int8_t* bp_g  = Bp;
             auto load_block = [=](int buf, int kb) SYCL_ESIMD_FUNCTION {
                 esimd::simd<int8_t, 32> av = esimd::block_load<int8_t, 32>(
@@ -188,6 +191,7 @@ inline event gemm_b_rq9b(queue& q, const int8_t* Ap, const int8_t* Bp,
                 #pragma unroll
                 for (int t = 0; t < TPT; ++t) {
                     int tile = t * NT + lid;
+                    if (tile >= TILES) continue;
                     int tr = tile / WI_COLS, tc = tile % WI_COLS;
                     load_grf(cur, tr, tc, a0, a1, b0, b1);
                     acc[t][0] = esimd::xmx::dpas<8, 8, int32_t>(acc[t][0], b0, a0);
@@ -204,6 +208,7 @@ inline event gemm_b_rq9b(queue& q, const int8_t* Ap, const int8_t* Bp,
             #pragma unroll
             for (int t = 0; t < TPT; ++t) {
                 int tile = t * NT + lid;
+                if (tile >= TILES) continue;
                 int tr = tile / WI_COLS, tc = tile % WI_COLS;
                 int gr = w * BM + tr * 16, gc = tc * 16;
                 esimd::simd<float, 16> bsv = esimd::block_load<float,16>(bs + gc, esimd::overaligned_tag<16>{});
@@ -253,6 +258,7 @@ inline event gemm_b_rq9b(queue& q, const int8_t* Ap, const int8_t* Bp,
                 #pragma unroll
                 for (int t = 0; t < TPT; ++t) {
                     int tile = t * NT + lid;
+                    if (tile >= TILES) continue;
                     int tr = tile / WI_COLS, tc = tile % WI_COLS;
                     int gr = w * BM + tr * 16, gc = tc * 16;
                     esimd::simd<float, 16> bsv = esimd::block_load<float,16>(bs + gc, esimd::overaligned_tag<16>{});
