@@ -129,6 +129,9 @@ run(128, 64, 64, 1, 0, 0, 0, 0, 0, 0, 0, 4352, "D1-batch1-eq-plain")
 run(256, 128, 64, 2, 0, 8192, 128, 64, 64, 256, 0, 4864, "P1-broadcast-2blocks")
 # P2 (plan v2 structure, M shrunk): A col-sliced lda=2K sa=K; N=32 -> gemm32 tail
 run(256, 32, 128, 2, 128, 4096, 32, 256, 128, 64, 0, 4352, "P2-colsliced-A-N32")
+# P3 (FRAME SHAPE #2, section 99): M=8160 N=128 K=128 b=4 sa=0 ldc=512 epi3 -- the
+# v9b BN=512 branch, never gated before (the frame went 0% with BN=256 green).
+run(8160, 128, 128, 4, 0, 16384, 128, 128, 128, 512, 0, 4864, "P3-frame-broadcast-4blocks")
 # T1: batch=4 per-group row scales (scale_stride=M, an invented stress case)
 run(128, 64, 32, 4, 0, 2048, 64, 0, 0, 256, 128, 4352, "T1-4group-scalestride")
 

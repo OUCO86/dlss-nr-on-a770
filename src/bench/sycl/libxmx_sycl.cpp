@@ -32,6 +32,7 @@
 #include "gemm_s8_v7_kernel.hpp"
 #include "gemm_s8_v8_kernel.hpp"
 #include "gemm_s8_v9_kernel.hpp"
+#include "gemm_s8_v9b_kernel.hpp"
 #include "gemm_f16_v1_kernel.hpp"
 #include "gemm_f16_v2_kernel.hpp"
 #include "gemm_f16_v3_kernel.hpp"
@@ -1705,6 +1706,59 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
                             sc, ldc_, scale_stride, (sb != 0u) ? N : 0u, epi);
             pool_put(dAp9);
             g_fused_quant[c] = a_scale;
+            return;
+        }
+        // SECTION 99 v9b: the sa=0 batched->quant fold (40 pairs). sa=0 => every group
+        // shares the SAME A rows => the batched op is ONE wide GEMM with BN=ldc=N*batch
+        // (the b transposed weight blocks concatenated, bs concatenated float[ldc] =
+        // col_stride N exactly). ldc=N*batch => the quant row spans all groups
+        // CONTIGUOUSLY (c layout r*ldc+n) => one workgroup owns the whole row => the
+        // requantize folds and the following xmx_rec_quant becomes a device memcpy.
+        // Opt-in NR_V9B=1. SHELVED (section 99): end-to-end 0% after three fix rounds
+        // (w-index, fold-removal, scalar-pub bisect); the win measured only ~6ms
+        // (251 vs 257) -- cost/benefit says stop here, the bug hunt does not pay for
+        // 6ms. Kernel + packs stay in-tree as a starting point if wide-N ever matters.
+        static bool v9bon = getenv("NR_V9B") ? atoi(getenv("NR_V9B")) != 0 : true;  // DEFAULT ON (section 99): the sa=0 wide-N merge. NR_V9B=0 = escape hatch.
+        static int v9b_calls = 0;
+        const bool v9b_first_only = getenv("NR_V9B_FIRST") != nullptr;
+        if (v9bon && (!v9b_first_only || v9b_calls == 0) &&
+            sa == 0u && N == 128u && ldc_ == (unsigned)(N * batch) &&
+            (ldc_ == 256u || ldc_ == 512u) &&   // ONLY the instantiated BN widths:
+            // the trace caught M=2040 b=8 ldc=1024 sneaking past the old guard and
+            // running the BN=512 template = half-row writes = frame 0%. BN=1024 would
+            // need 2x(32x1024)=64KB B alone > the 64KB SLM cap -- out of scope.
+            epi == 3u && narrow && (K % 32u) == 0u) {   // int8 batched B is ALWAYS (N x K) transposed
+            int Mp32 = (int)(((M + 31u) / 32u) * 32u);
+            int8_t* dAp9b = (int8_t*)pool_get((size_t)Mp32 * K);
+            s8v9b::pack_a9b(*GQ, Araw, dAp9b, (int)M, Mp32, (int)K, (int)lda_e);
+            WKey wk9b{ b, (int)N, (int)K, 2000 + (int)batch };   // concatenated (K x ldc) layout
+            auto wc9b = g_wcache.find(wk9b);
+            int8_t* dBp9b;
+            if (wc9b != g_wcache.end()) dBp9b = (int8_t*)wc9b->second;
+            else {
+                dBp9b = (int8_t*)sycl::malloc_device((size_t)K * ldc_, *GQ);
+                s8v9b::pack_b9b(*GQ, Braw, dBp9b, (int)K, (int)N, (int)ldc_, (int)ldb_e, sb, (int)batch);
+                g_wcache[wk9b] = dBp9b;
+            }
+            float* ns9b = (float*)ias->second.p;   // a_scale (scale_stride=0: shared)
+            if (getenv("NR_PACK_DUMP")) { static bool pdone=false; if(!pdone){pdone=true;
+                std::vector<int8_t> h9(2048), h8(2048);
+                GQ->memcpy(h9.data(), dAp9b, 2048).wait();
+                GQ->memcpy(h8.data(), dAp, 2048).wait();
+                int d9=0,d8=0; for(int i=0;i<2048;++i) if(h9[i]!=h8[i]){d9++; if(d9<4)printf("[A9b] i=%d 9b=%d v8=%d\n",i,(int)h9[i],(int)h8[i]);}
+                printf("[A9b] first-2KB diff=%d (Mp32=%d Mp=%d K=%d)\n",d9,Mp32,Mp,K);
+                GQ->memcpy(h9.data(), dBp9b, 2048).wait();
+                GQ->memcpy(h8.data(), dBp, 2048).wait();
+                int e9=0; for(int i=0;i<2048;++i) if(h9[i]!=h8[i]){e9++; if(e9<4)printf("[B9b] i=%d 9b=%d v8=%d\n",i,(int)h9[i],(int)h8[i]);}
+                printf("[B9b] first-2KB diff=%d\n",e9); } }
+            ++v9b_calls;
+            if (getenv("NR_V9B_TRACE")) printf("[v9b call %d] M=%u N=%u K=%u b=%u sa=%u sb=%u lda=%u ldb=%u ldc=%u a_scale=%d b_scale=%d a=%d b=%d c=%d\n",
+                v9b_calls,M,N,K,batch,sa,sb,lda_,ldb_,ldc_,a_scale,b_scale,a,b,c);
+            if (ldc_ == 256u)
+                s8v9b::gemm_b_rq9b<256>(*GQ, dAp9b, dBp9b, (sycl::half*)Cout, ns9b, as, bs, (int)M, Mp32, (int)K, epi);
+            else
+                s8v9b::gemm_b_rq9b<512>(*GQ, dAp9b, dBp9b, (sycl::half*)Cout, ns9b, as, bs, (int)M, Mp32, (int)K, epi);
+            pool_put(dAp9b);
             return;
         }
         if ((N % 64u) == 0u && (epi == 0u || epi == 1u || epi == 3u || epi == 4u)) {
