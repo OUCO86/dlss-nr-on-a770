@@ -2737,6 +2737,11 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                                 windows, height, width, across, top, left, epi, narrow);
             return;
         }
+        // NR_WB_STOP=N (section 99 leg attribution, launch-guard form): the pool
+        // get/put sequence stays IDENTICAL to the full path (no early returns --
+        // early returns changed pool state and made LATER closures miss the pool,
+        // which is what inflated the old deltas). Only the launches are guarded.
+        static const unsigned wbstop = getenv("NR_WB_STOP") ? (unsigned)atoi(getenv("NR_WB_STOP")) : 99u;
         // ---- LEG 1: gather + gemm + qkv_epilogue -> dQ,dK,dV (device scratch) ----
         // NOTE (section 92): a fused megakernel for this LEG (window_block_mega.hpp,
         // proven bit-exact by gate_mega.cpp) was tried and is NOT faster -- the split
@@ -2745,6 +2750,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         // as groundwork for a FULL window_block fusion (LEG1+2+3 in one workgroup, the
         // shipped g.rblock shape) which is the only version that can win.
         sycl::half* dA = (sycl::half*)pool_get((size_t)rows * C * 2);
+        if (wbstop > 0u)
         GQ->parallel_for(sycl::range((size_t)rows), [=](sycl::item<1> it) {
             unsigned r = (unsigned)it.get_id(0);
             unsigned window = r / tokens, token = r % tokens;
@@ -2763,7 +2769,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         });
         sycl::half* dAp = (sycl::half*)pool_get((size_t)Mp * C * 2);
         float* dCq = (float*)pool_get((size_t)Mp * NH * 4);
-        packdev::pack_a16(*GQ, dA, dAp, (int)rows, Mp, (int)C);
+        if (wbstop > 1u) packdev::pack_a16(*GQ, dA, dAp, (int)rows, Mp, (int)C);
         if (getenv("NR_DUMP_AP")) {   // pack_a16 output for comparison vs v2 AQO
             static bool s_apdone = false;
             if (!s_apdone && !pooling && !head) {
@@ -2776,7 +2782,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             }
         }
         sycl::half* dBp = cached_pack_b_f16(qkv, Wraw, (int)C, (int)NH);   // weight: pack once
-        f16v1::gemm(*GQ, dAp, dBp, dCq, Mp, (int)NH, (int)C);
+        if (wbstop > 2u) f16v1::gemm(*GQ, dAp, dBp, dCq, Mp, (int)NH, (int)C);
         if (getenv("NR_DUMP_RAW")) {   // dump split RAW gemm acc (dCq) BEFORE normalize, to compare vs resident stop=2
             static bool s_rawdone = false;
             if (!s_rawdone && !pooling && !head) {
@@ -2799,7 +2805,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         // active, log-depth reduce through SLM -- ESIMD has no shuffle) at 0.94ms: 4.3x
         // faster AND bit-exact (bench_wb 4300800/4300800 vs the scalar epilogue). This is
         // the first change the FLOPs/TOPS derivation pointed at that actually pays.
-        wbmega::normalize_esimd(*GQ, dCq, dQ, dK, dV, qs, rows, NH, C);
+        if (wbstop > 3u) wbmega::normalize_esimd(*GQ, dCq, dQ, dK, dV, qs, rows, NH, C);
         pool_put(dCq);
         if (getenv("NR_DUMP_KV")) {   // stage-localization: dump split K/V for comparison vs resident
             static bool s_done = false;
@@ -2827,9 +2833,11 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         sycl::half* dBk = (sycl::half*)pool_get((size_t)windows * 32u * 64u * 2);
         sycl::half* dAp2 = (sycl::half*)pool_get((size_t)windows * 64u * 64u * 2);
         sycl::half* dBv = (sycl::half*)pool_get((size_t)windows * 64u * 32u * 2);
+        if (wbstop > 4u) {
         packdev::pack_a16_b(*GQ, dQ, dAq, 64, 64, 32, (int)windows);
         packdev::pack_b16_t_b(*GQ, dK, dBk, 32, 64, (int)windows);
         f16v1::gemm_b(*GQ, dAq, dBk, dScores, 64, 64, 32, (int)windows);
+        }
         if (getenv("NR_DUMP_SCORES")) {   // dump split scores (Q.K^T, no bias) for comparison vs resident stop=5
             static bool s_sdone = false;
             if (!s_sdone && !pooling && !head) {
@@ -2841,6 +2849,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                 printf("[dump] split scores %zu (windows=%u)\n", hs.size(), windows);
             }
         }
+        if (wbstop > 5u)
         GQ->parallel_for(sycl::range((size_t)windows*64u),
                          smax::softmax_kernel()(dScores, dProbs, windows*64u, 64u, Bp, 1u));
         if (getenv("NR_DUMP_PROBS")) {   // dump split softmax probs (e4m3 halves) vs mega SCR
@@ -2853,9 +2862,11 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                 printf("[dump] split probs %zu\n", hp.size());
             }
         }
+        if (wbstop > 6u) {
         packdev::pack_a16_b(*GQ, dProbs, dAp2, 64, 64, 64, (int)windows);
         packdev::pack_b16_b(*GQ, dV, dBv, 64, 32, (int)windows);
         f16v1::gemm_b(*GQ, dAp2, dBv, dCtx, 64, 32, 64, (int)windows);
+        }
         if (getenv("NR_DUMP_CTX")) {   // dump split attnV context for comparison vs resident stop=8
             static bool s_cdone = false;
             if (!s_cdone && !pooling && !head) {
@@ -2870,6 +2881,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         pool_put(dAq); pool_put(dBk); pool_put(dAp2); pool_put(dBv);
         pool_put(dScores); pool_put(dProbs);
         sycl::half* dAttended = (sycl::half*)pool_get((size_t)rows * C * 2);
+        if (wbstop > 7u)
         GQ->parallel_for(sycl::range((size_t)rows * C), [=](sycl::item<1> it) {   // merge, heads==1
             unsigned index = (unsigned)it.get_id(0);
             unsigned c = index % C, token = index / C;
@@ -2892,9 +2904,11 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         // in place, no download/upload round-trip (the host pack was the remaining cost).
         sycl::half* dAp3 = (sycl::half*)pool_get((size_t)Mp * C * 2);
         float* dC3 = (float*)pool_get((size_t)Mp * C * 4);
+        sycl::half* dBp3 = cached_pack_b_f16(projection, Praw, (int)C, (int)C);   // weight: pack once (host cache, no launch)
+        if (wbstop > 8u) {
         packdev::pack_a16(*GQ, dAttended, dAp3, (int)rows, Mp, (int)C);
-        sycl::half* dBp3 = cached_pack_b_f16(projection, Praw, (int)C, (int)C);   // weight: pack once
         f16v1::gemm(*GQ, dAp3, dBp3, dC3, Mp, (int)C, (int)C);
+        }
         if (getenv("NR_DUMP_C3")) {   // dump split outproj dC3 for comparison vs resident stop=9
             static bool s_d3done = false;
             if (!s_d3done && !pooling && !head) {
@@ -2908,6 +2922,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         }
         float* dStage = pooling ? (float*)pool_get((size_t)rows * C * 4) : nullptr;
         sycl::half* dOut16 = head ? (sycl::half*)pool_get(img_elems * 2) : nullptr;
+        if (wbstop > 9u)
         GQ->parallel_for(sycl::range(blk_elems), [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             unsigned r = (unsigned)(i / C), col = (unsigned)(i % C);
