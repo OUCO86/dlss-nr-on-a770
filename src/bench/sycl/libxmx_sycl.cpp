@@ -1816,7 +1816,17 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
             return;
         }
         if ((N % 64u) == 0u && (epi == 0u || epi == 1u || epi == 3u || epi == 4u)) {
-            s8v8::gemm_b_pub(*GQ, dAp, dBp, Cout, as, bs, (int)M, Mp, (int)N, (int)K,
+            // section 100 C2: the N=128 batched family rides the senior's acc-via-SLM
+            // tail (bench_batched: BIT-EXACT diff 0, 0.148->0.112 / 0.227->0.210 /
+            // 0.196->0.150 at the frame's three N=128 shapes). N=64 keeps the register
+            // tail -- the 32KB stage costs occupancy there (0.033->0.074, the v9c
+            // lesson). NR_PUB_SLM=0 reverts the whole family to gemm_b_pub.
+            static bool pubslm = getenv("NR_PUB_SLM") ? atoi(getenv("NR_PUB_SLM")) != 0 : true;
+            if (pubslm && N == 128u)
+                s8v8::gemm_b_pub_slm<false>(*GQ, dAp, dBp, Cout, as, bs, (int)M, Mp, (int)N, (int)K,
+                                 (int)batch, sc, ldc_, scale_stride, (sb != 0u) ? N : 0u, narrow, epi);
+            else
+                s8v8::gemm_b_pub(*GQ, dAp, dBp, Cout, as, bs, (int)M, Mp, (int)N, (int)K,
                              (int)batch, sc, ldc_, scale_stride, (sb != 0u) ? N : 0u, narrow, epi);
             pool_put(dAp);   // dBp is cache-owned (the whole batched weight)
             return;
