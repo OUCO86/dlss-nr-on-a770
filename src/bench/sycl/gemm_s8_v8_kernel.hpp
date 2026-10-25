@@ -508,6 +508,164 @@ static inline sycl::event gemm_b_pub(sycl::queue& q, const int8_t* Ap, const int
     });
 }
 
+// gemm_b_pub_slm -- section 100 §99-item-3: the acc-via-SLM publish tail (the senior's
+// pattern, gemm_staged.comp:309-322 -- "the publish happens on scalars, after an
+// UNTOUCHED STORE TO SHARED MEMORY"). bench_batched's honest split: gemm_b (raw int32
+// store) 0.096-0.142ms but gemm_b_pub 0.112-0.244 -- the PUBLISH TAIL costs more than
+// the dpas body: c00..c11 (4 x simd<int32,64> = 256 int32/thread) stay live through
+// the whole tail (GRF pressure -> spill) and every row is re-assembled from two
+// select<8,1> slices (register shuffles). The senior's cure, translated: after the
+// loop the accumulators go WHOLE into the operand SLM the last load_grf already killed
+// (C-stage aliases SLM_A/SLM_B: the tile is BM x BN int32 = 32KB, the allocation is
+// 2*SLM_A + 2*SLM_B = 45056B), one barrier, then each thread reads back CONTIGUOUS
+// 16-wide rows (one LDS, zero assembly) and runs the pub_vec_v8 chain VERBATIM (bit-
+// exact by construction -- same ops, same order as the green gemm_b_pub tail) with a
+// 32B contiguous global store. Accumulators die at the SLM store -> the tail's live
+// set drops. HALF=1 stages only the tile's LOW half (16KB) and keeps the proven
+// register tail for the high half -- the occupancy probe (the v9c lesson: SLM size
+// costs WG/SM; bench decides which wins). The stage map is the exact inverse of the
+// read map: thread (wi_row,wi_col) owns tile rows wi_row*16+{0..15}, cols
+// wi_col*16+{0..15}; fragment c0q row r = cols wi_col*16 + q*8.. (matches the dpas
+// layout the green tail already assembles from).
+template <bool HALF>
+static inline sycl::event gemm_b_pub_slm(sycl::queue& q, const int8_t* Ap, const int8_t* Bp,
+                                     void* Cout, const float* as, const float* bs,
+                                     int M, int Mp, int N, int K, int batch,
+                                     size_t sc, unsigned ldc, unsigned scale_stride,
+                                     unsigned col_stride, bool narrow, unsigned epi) {
+    int wg = (Mp / BM) * (N / BN);
+    size_t apb = (size_t)Mp * K, bpb = (size_t)N * K;
+    // the tile's int32 C-stage in BYTES. Full = the tile layout, BM*BN*4 = 32768.
+    // HALF = a COMPACT per-thread block: thread (wi_row,wi_col) stages only its low
+    // 8 rows x 16 cols at (wi_row*4+wi_col)*128 + r*16 + {0..15} -- 32 threads x 128
+    // int32 = 16KB total (the row-index space of the full map would still reach
+    // 30.5KB; the compact map is what makes the occupancy probe real). Both overlap the 12KB
+    // operand region -- legal, operands are dead after the loop's final barrier.
+    return q.submit([&](handler& h) {
+        h.parallel_for(nd_range(range((size_t)wg * batch * NT), range(NT)), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+            esimd::slm_init<HALF ? 16384 : 32768>();
+            int gid = (int)it.get_group(0);
+            int lid = (int)it.get_local_id(0);
+            int g = gid / wg; int loc = gid % wg;
+            int NB = N / BN;
+            int wg_row = loc / NB, wg_col = loc % NB;
+            int wi_row = lid / 4, wi_col = lid % 4;
+            const int8_t* apb_g = Ap + (size_t)g * apb;
+            const int8_t* bp_g  = Bp + (size_t)g * bpb;
+            const int8_t* apb = apb_g + (size_t)(wg_row * (K / BK)) * 8 * 512;
+            const int8_t* bp = bp_g + (size_t)wg_col * (BN / 8) * 256;
+            auto load_block = [=](int buf, int kb) SYCL_ESIMD_FUNCTION {
+                esimd::simd<int8_t, 128> av = esimd::block_load<int8_t, 128>(
+                    apb + (size_t)kb * SLM_A + lid * 128, esimd::overaligned_tag<16>{});
+                esimd::slm_block_store(buf * SLM_A + lid * 128, av, esimd::overaligned_tag<16>{});
+                esimd::simd<int8_t, 64> bv = esimd::block_load<int8_t, 64>(
+                    bp + (size_t)kb * N * 32 + lid * 64, esimd::overaligned_tag<16>{});
+                esimd::slm_block_store(SLM_B_BASE + buf * SLM_B + lid * 64, bv, esimd::overaligned_tag<16>{});
+            };
+            auto load_grf = [=](int buf, esimd::simd<int8_t,256>& a0, esimd::simd<int8_t,256>& a1,
+                                esimd::simd<int8_t,256>& b0, esimd::simd<int8_t,256>& b1) SYCL_ESIMD_FUNCTION {
+                uint32_t offA = buf * SLM_A + wi_row * 512;
+                uint32_t offB = SLM_B_BASE + buf * SLM_B + wi_col * 512;
+                a0 = esimd::slm_block_load<int8_t, 256>(offA + 0, esimd::overaligned_tag<16>{});
+                a1 = esimd::slm_block_load<int8_t, 256>(offA + 256, esimd::overaligned_tag<16>{});
+                b0 = esimd::slm_block_load<int8_t, 256>(offB + 0, esimd::overaligned_tag<16>{});
+                b1 = esimd::slm_block_load<int8_t, 256>(offB + 256, esimd::overaligned_tag<16>{});
+            };
+            esimd::simd<int8_t, 256> a0, a1, b0, b1;
+            esimd::simd<int32_t, 64> c00(0), c01(0), c10(0), c11(0);
+            load_block(0, 0);
+            esimd::barrier();
+            int kb_n = K / BK;
+            for (int b = 0; b < kb_n; ++b) {
+                int cur = b & 1, nxt = cur ^ 1;
+                if (b + 1 < kb_n) load_block(nxt, b + 1);
+                load_grf(cur, a0, a1, b0, b1);
+                c00 = esimd::xmx::dpas<8, 8, int32_t>(c00, b0, a0);
+                c01 = esimd::xmx::dpas<8, 8, int32_t>(c01, b1, a0);
+                c10 = esimd::xmx::dpas<8, 8, int32_t>(c10, b0, a1);
+                c11 = esimd::xmx::dpas<8, 8, int32_t>(c11, b1, a1);
+                esimd::barrier();
+            }
+            // the untouched store: accumulators -> the dead operand SLM (alias base 0).
+            // FULL: the tile's own layout -- thread (wi_row,wi_col) owns rows
+            // wi_row*16+{0..15}, cols wi_col*16+{0..15}; 8-lane fragments at the dpas
+            // positions, byte offsets = element*4 (the §36 rule; 32B/64B fragments,
+            // tag<16>). HALF: a COMPACT block -- thread's low 8 rows x 16 cols at
+            // (wi_row*4+wi_col)*128 + r*16 + {0..15}, so the stage region is 16KB.
+            if (!HALF) {
+                for (int r = 0; r < 8; ++r) {
+                    esimd::slm_block_store<int32_t, 8>((uint32_t)((wi_row * 16 + r) * BN + wi_col * 16) * 4u,
+                        c00.template select<8,1>(r * 8), esimd::overaligned_tag<16>{});
+                    esimd::slm_block_store<int32_t, 8>((uint32_t)((wi_row * 16 + r) * BN + wi_col * 16 + 8) * 4u,
+                        c01.template select<8,1>(r * 8), esimd::overaligned_tag<16>{});
+                    esimd::slm_block_store<int32_t, 8>((uint32_t)((wi_row * 16 + 8 + r) * BN + wi_col * 16) * 4u,
+                        c10.template select<8,1>(r * 8), esimd::overaligned_tag<16>{});
+                    esimd::slm_block_store<int32_t, 8>((uint32_t)((wi_row * 16 + 8 + r) * BN + wi_col * 16 + 8) * 4u,
+                        c11.template select<8,1>(r * 8), esimd::overaligned_tag<16>{});
+                }
+            } else {
+                for (int r = 0; r < 8; ++r) {
+                    esimd::slm_block_store<int32_t, 8>((uint32_t)((wi_row * 4 + wi_col) * 128 + r * 16) * 4u,
+                        c00.template select<8,1>(r * 8), esimd::overaligned_tag<16>{});
+                    esimd::slm_block_store<int32_t, 8>((uint32_t)((wi_row * 4 + wi_col) * 128 + r * 16 + 8) * 4u,
+                        c01.template select<8,1>(r * 8), esimd::overaligned_tag<16>{});
+                }
+            }
+            // NO barrier here (unlike the senior's :323): the stage map is
+            // THREAD-LOCAL -- 8 wi_row x 4 wi_col = 32 disjoint 16x16 blocks cover the
+            // 128x64 tile and every thread reads back exactly what it wrote. The SLM
+            // detour's whole job here is killing the accumulator live-set (GRF spill),
+            // not exchanging data; the cross-thread barriers inside the K loop stay.
+            int gr = wg_row * BM + wi_row * 16, gc = wg_col * BN + wi_col * 16;
+            const float* gas = as + (size_t)g * scale_stride;
+            const float* gbs = bs + (size_t)g * col_stride;
+            esimd::simd<float, 16> cs = esimd::block_load<float, 16>(
+                gbs + gc, esimd::overaligned_tag<16>{});
+            for (int r = 0; r < 8; ++r) {
+                int rr0 = gr + r;
+                if (rr0 < M) {
+                    float rs = gas[rr0];
+                    uint32_t roff = HALF
+                        ? (uint32_t)((wi_row * 4 + wi_col) * 128 + r * 16) * 4u
+                        : (uint32_t)((wi_row * 16 + r) * BN + wi_col * 16) * 4u;
+                    esimd::simd<int32_t, 16> acc = esimd::slm_block_load<int32_t, 16>(
+                        roff, esimd::overaligned_tag<16>{});
+                    esimd::simd<float, 16> pub = pub_vec_v8<16>(epi, esimd::convert<float>(acc) * rs * cs);
+                    size_t out = (size_t)g * sc + (size_t)rr0 * ldc + gc;
+                    if (narrow) esimd::convert<half>(pub).copy_to((half*)Cout + out);
+                    else        pub.copy_to((float*)Cout + out);
+                }
+                if (HALF) continue;
+                int rr1 = gr + 8 + r;
+                if (rr1 < M) {
+                    float rs = gas[rr1];
+                    esimd::simd<int32_t, 16> acc = esimd::slm_block_load<int32_t, 16>(
+                        (uint32_t)((wi_row * 16 + 8 + r) * BN + wi_col * 16) * 4u, esimd::overaligned_tag<16>{});
+                    esimd::simd<float, 16> pub = pub_vec_v8<16>(epi, esimd::convert<float>(acc) * rs * cs);
+                    size_t out = (size_t)g * sc + (size_t)rr1 * ldc + gc;
+                    if (narrow) esimd::convert<half>(pub).copy_to((half*)Cout + out);
+                    else        pub.copy_to((float*)Cout + out);
+                }
+            }
+            if (HALF) {   // the high half keeps the proven register tail (c10/c11 live)
+                for (int r = 0; r < 8; ++r) {
+                    int rr1 = gr + 8 + r;
+                    if (rr1 < M) {
+                        float rs = gas[rr1];
+                        esimd::simd<int32_t, 16> acc(0);
+                        acc.template select<8,1>(0) = c10.template select<8,1>(r*8);
+                        acc.template select<8,1>(8) = c11.template select<8,1>(r*8);
+                        esimd::simd<float, 16> pub = pub_vec_v8<16>(epi, esimd::convert<float>(acc) * rs * cs);
+                        size_t out = (size_t)g * sc + (size_t)rr1 * ldc + gc;
+                        if (narrow) esimd::convert<half>(pub).copy_to((half*)Cout + out);
+                        else        pub.copy_to((float*)Cout + out);
+                    }
+                }
+            }
+        });
+    });
+}
+
 // gemm_b_res -- the int8_residual fused store (section 92, same lever as gemm_b_pub).
 // The residual epilogue is stage=deq(acc)*as[r]*bs[col]; total=fma(skip[i],cos[col],stage);
 // publish(epi). The engine uses sycl::fma = ONE fused rounding; in an ESIMD kernel the

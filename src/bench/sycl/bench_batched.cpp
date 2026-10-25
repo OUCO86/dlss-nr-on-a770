@@ -53,10 +53,33 @@ int main(){
       auto t0=e.get_profiling_info<info::event_profiling::command_end>();
       bestp=std::min(bestp,(double)(t0-s0)/1e6);
     }
+    // section 100 §99-item-3: acc-via-SLM publish tail, full (32KB) and half (16KB)
+    double bestf=1e9,besth=1e9;
+    half* dCf=(half*)malloc_device((size_t)b*Mp*N*2,q);
+    half* dCh=(half*)malloc_device((size_t)b*Mp*N*2,q);
+    for(int it=0;it<7;++it){
+      event e=s8v8::gemm_b_pub_slm<false>(q,dAp,dBp,(void*)dCf,das,dbs,M,Mp,N,K,b,(size_t)Mp*N,(unsigned)N,0u,0u,true,3u); e.wait();
+      auto s0=e.get_profiling_info<info::event_profiling::command_start>();
+      auto t0=e.get_profiling_info<info::event_profiling::command_end>();
+      bestf=std::min(bestf,(double)(t0-s0)/1e6);
+    }
+    for(int it=0;it<7;++it){
+      event e=s8v8::gemm_b_pub_slm<true>(q,dAp,dBp,(void*)dCh,das,dbs,M,Mp,N,K,b,(size_t)Mp*N,(unsigned)N,0u,0u,true,3u); e.wait();
+      auto s0=e.get_profiling_info<info::event_profiling::command_start>();
+      auto t0=e.get_profiling_info<info::event_profiling::command_end>();
+      besth=std::min(besth,(double)(t0-s0)/1e6);
+    }
+    // bit-exactness vs the GATED gemm_b_pub output (same inputs, same epi)
+    std::vector<half> hp((size_t)b*Mp*N), hf((size_t)b*Mp*N), hh((size_t)b*Mp*N);
+    q.memcpy(hp.data(),dC,hp.size()*2).wait();
+    q.memcpy(hf.data(),dCf,hf.size()*2).wait();
+    q.memcpy(hh.data(),dCh,hh.size()*2).wait();
+    size_t df=0,dh=0;
+    for(size_t i=0;i<hp.size();++i){ if(memcmp(&hp[i],&hf[i],2)) df++; if(memcmp(&hp[i],&hh[i],2)) dh++; }
     double gf=2.0*M*N*K*b/1e9;
-    printf("M=%-6d N=%-4d K=%-4d b=%d  gemm_b=%8.4f ms %6.1f GF/s | gemm_b_pub=%8.4f ms %6.1f GF/s\n",
-      M,N,K,b,bestb,gf/bestb,bestp,gf/bestp);
-    free(dC32,q);
+    printf("M=%-6d N=%-4d K=%-4d b=%d  gemm_b=%8.4f | pub=%8.4f | pub_slm=%8.4f (diff %zu) | pub_slm_half=%8.4f (diff %zu) ms\n",
+      M,N,K,b,bestb,bestp,bestf,df,besth,dh);
+    free(dC32,q); free(dCf,q); free(dCh,q);
     free(dA,q);free(dB,q);free(dAp,q);free(dBp,q);free(das,q);free(dbs,q);free(dC,q);
   }
   return 0;
