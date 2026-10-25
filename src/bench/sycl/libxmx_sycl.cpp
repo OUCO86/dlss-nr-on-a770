@@ -24,6 +24,7 @@
 #include "window_block_mega.hpp"
 #include "window_block_resident.hpp"
 #include "window_block_v2.hpp"
+#include "window_block_v3.hpp"
 #include "requant_kernel.hpp"
 #include "gemm_s8_v1_kernel.hpp"
 #include "gemm_s8_v3_kernel.hpp"
@@ -2727,6 +2728,28 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         // (M>=8160 = the healthy form, width-sweep 1.3-3.5x). v2 stays proven (NR_WB_V2=1,
         // 100% bit-exact) as the ESIMD+dpas mechanism witness for shapes that cannot go
         // wide; it is NOT the shipping route. Default = split wide-M.
+        // SECTION 99 v3: v2's fused window_block with the per-window scratch in SLM
+        // (45KB lifetime-aliased map, 64KB IGC cap proven by bench_slm128) -- the §2
+        // rule-2 GLOBAL round-trip is GONE. NR_WB_V3=1; same stage-dump judges as v2.
+        if (getenv("NR_WB_V3") && !getenv("NR_RESIDENT_WB") && !getenv("NR_FULL_MEGA")
+            && !pooling && !head) {
+            g_wb_v2++;
+            unsigned st = getenv("NR_V2_STOP") ? (unsigned)atoi(getenv("NR_V2_STOP")) : 0u;
+            if (st == 65531u) return;
+            if (st == 65530u) { static bool once3=false; if(!once3){once3=true; printf("[wb-flags] epi=%u narrow=%d pooling=%d head=%d\n", epi, (int)narrow, (int)pooling, (int)head);} return; }
+            sycl::half* dWq = cached_pack_b_f16(qkv, Wraw, (int)C, (int)NH);
+            sycl::half* dWp = cached_pack_b_f16(projection, Praw, (int)C, (int)C);
+            sycl::half* dKV = nullptr;
+            if (st && st < 0xFF00u) { dKV = (sycl::half*)pool_get((size_t)windows * 4096u * 2);
+                      GQ->parallel_for(sycl::range((size_t)windows*4096u), [=](sycl::item<1> it){ dKV[(size_t)it.get_id(0)]=sycl::half(0.f); }); }
+            if (st == 65532u) return;   // floor probe: no launch
+            wbv3::launch_v3(*GQ, image_half ? (const void*)ImgH : (const void*)ImgF, image_half,
+                            dWq, dWp, narrow ? (sycl::half*)Tgt : nullptr,
+                            narrow ? nullptr : (float*)Tgt, Bp, cp, qs,
+                            windows, height, width, across, top, left, epi, narrow, st, dKV);
+            if (dKV) pool_put(dKV);
+            return;
+        }
         if (getenv("NR_WB_V2") && !getenv("NR_RESIDENT_WB") && !getenv("NR_FULL_MEGA")
             && !pooling && !head) {
             g_wb_v2++;
