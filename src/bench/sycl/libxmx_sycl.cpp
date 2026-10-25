@@ -3191,11 +3191,15 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         //     every tap the pool reads was written by leg3: the fused Stage write
         //     sits under the SAME per-token guard as the scalar one.
         static bool wbfuse = getenv("NR_WB_FUSE") ? atoi(getenv("NR_WB_FUSE")) != 0 : true;
-        float* dStage = pooling ? (float*)pool_get((size_t)rows * C * 4) : nullptr;
-        sycl::half* dOut16 = head ? (sycl::half*)pool_get(img_elems * 2) : nullptr;
+        static bool wbphfuse = getenv("NR_WB_FUSE_PH") ? atoi(getenv("NR_WB_FUSE_PH")) != 0 : true;  // A/B + revert hatch for the A1 inclusion
         const bool fused3 = wbfuse && C == 32u && wbstop > 8u &&
+                            (pooling || head ? wbphfuse : true) &&
                             !(pooling && head) &&
                             (pooling || head || epi == 0u || epi == 1u || epi == 4u);
+        // A2: the fused pool path closes the pool IN the kernel -- no Stage buffer at
+        // all; the scalar path keeps the dStage + independent pool pass contract.
+        float* dStage = (pooling && !fused3) ? (float*)pool_get((size_t)rows * C * 4) : nullptr;
+        sycl::half* dOut16 = head ? (sycl::half*)pool_get(img_elems * 2) : nullptr;
         if (fused3) {
             if ((pooling || head) && g_wbf3_poolhead < 8u) {
                 g_wbf3_poolhead++;
@@ -3215,7 +3219,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                     image_half ? nullptr : ImgF, image_half,
                     cp, (sycl::half*)Tgt, nullptr, true,
                     (int)rows, Mp, (int)C, height, width, across, top, left, 0u,
-                    dStage, true);
+                    nullptr, true, Pl);   // A2: the pool closes IN the kernel -- no Stage, no pass
             else
                 f16v3::gemm_resid_pub(*GQ, dAp3, dBp3,
                     image_half ? (const sycl::half*)ImgH : nullptr,
@@ -3268,7 +3272,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             else               ((float*)Tgt)[out] = qr_publish(epi, total);
         });
         }
-        if (pooling) {
+        if (pooling && !fused3) {
             // the 2x2 pool (gemm_staged.comp:371-390): taps (token,token+8,token+1,token+9)
             // summed in that order (precise), *0.25, e4m3 -> half, into pooled at the
             // half-resolution image index. token = (pixel/4)*16 + (pixel%4)*2 over the
