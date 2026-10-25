@@ -374,6 +374,51 @@ static inline float pub_esimd(unsigned epi, float v) {
     if (epi == 4u) v = (float)(half)v;
     return v;
 }
+// ---- section 99 (RE-APPLIED, grep-verified): VECTORIZED publish for the fused stores.
+// bench_pubvec A/B: epi 0/1/3/4 scalar-vs-vector IDENTICAL over 1M values; epi2 differs
+// only on -0.0 sign (kept on the scalar path). e4m3_vec = the wbv2 proven block
+// (bench_e4m3vec 0/4096); gate chain = gate_esimd's statement structure on 8 lanes
+// (simd ops are separate instructions, no FMA contraction -- §92). gemm_b_pub only:
+// gemm_b_res's scalar sk*c+f CONTRACTIONS are golden semantics (the earlier vector
+// res form broke the frame 0% -- do NOT vectorize res's fma). ----
+template <int N>
+static inline esimd::simd<float,N> e4m3_vec_v8(esimd::simd<float,N> x){
+    esimd::simd<float,N> mag = esimd::abs(x);
+    mag = (esimd::min)(mag, esimd::simd<float,N>(448.0f));
+    esimd::simd<int32_t,N> mb; mb = mag.template bit_cast_view<int32_t>();
+    esimd::simd<int32_t,N> exp = (mb >> 23) & esimd::simd<int32_t,N>(0xFF);
+    exp = (esimd::max)(exp, esimd::simd<int32_t,N>(121)) - 3;
+    esimd::simd<int32_t,N> sb = exp << 23; esimd::simd<float,N> step; step = sb.template bit_cast_view<float>();
+    esimd::simd<int32_t,N> rb = (esimd::simd<int32_t,N>(254) - exp) << 23; esimd::simd<float,N> recip; recip = rb.template bit_cast_view<float>();
+    esimd::simd<float,N> t = mag * recip;
+    esimd::simd<float,N> r = esimd::rnde<float>(t) * step;
+    esimd::simd<int32_t,N> ri; ri = r.template bit_cast_view<int32_t>();
+    esimd::simd<int32_t,N> negm = x < esimd::simd<float,N>(0.0f);
+    esimd::simd<int32_t,N> out = (ri & esimd::simd<int32_t,N>(0x7FFFFFFF)) | (negm << 31);
+    esimd::simd<float,N> res; res = out.template bit_cast_view<float>();
+    return res;
+}
+template <int N>
+static inline esimd::simd<float,N> gate_vec_v8(esimd::simd<float,N> x) {
+    esimd::simd<float,N> wide = esimd::convert<float>(esimd::convert<half>(x));
+    esimd::simd<float,N> clamped = (esimd::min)((esimd::max)(wide, esimd::simd<float,N>(-4.0f)), esimd::simd<float,N>(4.0f));
+    esimd::simd<float,N> ac = esimd::abs(clamped);
+    esimd::simd<float,N> L = ac * esimd::simd<float,N>(-0.055908203125f);
+    L = L + esimd::simd<float,N>(0.447265625f);
+    esimd::simd<float,N> l0 = esimd::convert<float>(esimd::convert<half>(L));
+    esimd::simd<float,N> M = l0 * clamped;
+    M = M + esimd::simd<float,N>(0.89453125f);
+    esimd::simd<float,N> l1 = esimd::convert<float>(esimd::convert<half>(M));
+    esimd::simd<float,N> R = wide * l1;
+    return esimd::convert<float>(esimd::convert<half>(R));
+}
+template <int N>
+static inline esimd::simd<float,N> pub_vec_v8(unsigned epi, esimd::simd<float,N> v) {
+    if (epi == 2u || epi == 3u) v = gate_vec_v8<N>(v);
+    if (epi == 1u || epi == 3u) v = e4m3_vec_v8<N>(v);
+    if (epi == 4u) v = esimd::convert<float>(esimd::convert<half>(v));
+    return v;
+}
 static inline sycl::event gemm_b_pub(sycl::queue& q, const int8_t* Ap, const int8_t* Bp,
                                      void* Cout, const float* as, const float* bs,
                                      int M, int Mp, int N, int K, int batch,
@@ -440,22 +485,20 @@ static inline sycl::event gemm_b_pub(sycl::queue& q, const int8_t* Ap, const int
                 int rr0 = gr + r, rr1 = gr + 8 + r;
                 if (rr0 < M) {
                     float rs = gas[rr0];
-                    esimd::simd<float, 8> f0 = esimd::convert<float>(c00.select<8,1>(r*8).read()) * rs * csl;
-                    esimd::simd<float, 8> f1 = esimd::convert<float>(c01.select<8,1>(r*8).read()) * rs * csh;
-                    esimd::simd<float, 16> pub;
-                    for (int e = 0; e < 8; ++e) pub[e] = pub_esimd(epi, f0.read()[e]);
-                    for (int e = 0; e < 8; ++e) pub[8 + e] = pub_esimd(epi, f1.read()[e]);
+                    esimd::simd<int32_t, 16> acc(0);
+                    acc.template select<8,1>(0) = c00.template select<8,1>(r*8);
+                    acc.template select<8,1>(8) = c01.template select<8,1>(r*8);
+                    esimd::simd<float, 16> pub = pub_vec_v8<16>(epi, esimd::convert<float>(acc) * rs * cs);
                     size_t out = (size_t)g * sc + (size_t)rr0 * ldc + gc;
                     if (narrow) esimd::convert<half>(pub).copy_to((half*)Cout + out);
                     else        pub.copy_to((float*)Cout + out);
                 }
                 if (rr1 < M) {
                     float rs = gas[rr1];
-                    esimd::simd<float, 8> g0 = esimd::convert<float>(c10.select<8,1>(r*8).read()) * rs * csl;
-                    esimd::simd<float, 8> g1 = esimd::convert<float>(c11.select<8,1>(r*8).read()) * rs * csh;
-                    esimd::simd<float, 16> pub;
-                    for (int e = 0; e < 8; ++e) pub[e] = pub_esimd(epi, g0.read()[e]);
-                    for (int e = 0; e < 8; ++e) pub[8 + e] = pub_esimd(epi, g1.read()[e]);
+                    esimd::simd<int32_t, 16> acc(0);
+                    acc.template select<8,1>(0) = c10.template select<8,1>(r*8);
+                    acc.template select<8,1>(8) = c11.template select<8,1>(r*8);
+                    esimd::simd<float, 16> pub = pub_vec_v8<16>(epi, esimd::convert<float>(acc) * rs * cs);
                     size_t out = (size_t)g * sc + (size_t)rr1 * ldc + gc;
                     if (narrow) esimd::convert<half>(pub).copy_to((half*)Cout + out);
                     else        pub.copy_to((float*)Cout + out);

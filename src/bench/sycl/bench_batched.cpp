@@ -34,21 +34,29 @@ int main(){
     int8_t *dAp=(int8_t*)malloc_device(Ap.size(),q),*dBp=(int8_t*)malloc_device(Bp.size(),q);
     float *das=(float*)malloc_device(as.size()*4,q),*dbs=(float*)malloc_device(bs.size()*4,q);
     half* dC=(half*)malloc_device((size_t)b*Mp*N*2,q);
+    int32_t* dC32=(int32_t*)malloc_device((size_t)b*Mp*N*4,q);
     q.memcpy(dA,A.data(),A.size()).wait(); q.memcpy(dB,B.data(),B.size()).wait();
     q.memcpy(das,as.data(),as.size()*4).wait(); q.memcpy(dbs,bs.data(),bs.size()*4).wait();
     packdev::gather_pack_a_b(q,dA,dAp,M,Mp,K,K,0,b);
     packdev::gather_pack_b_b(q,dB,dBp,N,K,K,0,b);
     q.wait();
-    double best=1e9;
+    double bestb=1e9,bestp=1e9;
     for(int it=0;it<7;++it){
-      event e=s8v8::gemm_b_pub(q,dAp,dBp,dC,das,dbs,M,Mp,N,K,b,(size_t)Mp*N,(unsigned)N,(unsigned)Mp,(unsigned)N,false,1u);
-      e.wait();
+      event e=s8v8::gemm_b(q,dAp,dBp,dC32,Mp,N,K,b); e.wait();
       auto s0=e.get_profiling_info<info::event_profiling::command_start>();
       auto t0=e.get_profiling_info<info::event_profiling::command_end>();
-      best=std::min(best,(double)(t0-s0)/1e6);
+      bestb=std::min(bestb,(double)(t0-s0)/1e6);
+    }
+    for(int it=0;it<7;++it){
+      event e=s8v8::gemm_b_pub(q,dAp,dBp,(void*)dC,das,dbs,M,Mp,N,K,b,(size_t)Mp*N,(unsigned)N,0u,0u,true,3u); e.wait();
+      auto s0=e.get_profiling_info<info::event_profiling::command_start>();
+      auto t0=e.get_profiling_info<info::event_profiling::command_end>();
+      bestp=std::min(bestp,(double)(t0-s0)/1e6);
     }
     double gf=2.0*M*N*K*b/1e9;
-    printf("M=%-6d N=%-4d K=%-4d b=%d  gemm_b_pub=%8.4f ms  %7.0f GF/s\n",M,N,K,b,best,gf/best);
+    printf("M=%-6d N=%-4d K=%-4d b=%d  gemm_b=%8.4f ms %6.1f GF/s | gemm_b_pub=%8.4f ms %6.1f GF/s\n",
+      M,N,K,b,bestb,gf/bestb,bestp,gf/bestp);
+    free(dC32,q);
     free(dA,q);free(dB,q);free(dAp,q);free(dBp,q);free(das,q);free(dbs,q);free(dC,q);
   }
   return 0;
