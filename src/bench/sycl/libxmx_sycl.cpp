@@ -2343,6 +2343,63 @@ int xmx_rec_unary2(unsigned kind, int a, int b, int c, int d, int second, unsign
     });
     return 0;
 }
+// // SECTION 99: ESIMD vectorized softmax leg (split path). The scalar smax::softmax_kernel
+// runs one work-item per ROW with 64 sequential per-element scalar ops (NR_WB_STOP
+// alternating delta = 60ms for 20 calls = 3ms/call). The vector form is the v2 P4
+// recipe VERBATIM (bench_p4vec2.cpp stage-by-stage bit-exact 0/16384 vs the shipped
+// softmax_kernel; the m0 spelling keeps hl*scale EXACT in f32 and rounds ONCE after
+// +bias -- the §92 FMA-contraction trap; total stays the golden's SEQUENTIAL f32 sum).
+// Generalized here: boff = ((r/64)%heads)*4096 + (r%64)*64 (heads==1 in window_block,
+// heads>1 in window_attention), and probs store ROW-MAJOR half (the split layout)
+// instead of the pa16 pack map.
+static inline bool smaxplain2() { static bool v = getenv("NR_SMAX_PLAIN") != nullptr; return v; }
+static inline void smax_esimd(sycl::queue& q, const float* dScores, sycl::half* dProbs,
+                              unsigned rows, const float* Bias, unsigned heads)
+{
+    q.parallel_for(sycl::range((size_t)rows), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
+        namespace esimd = sycl::ext::intel::esimd;
+        unsigned r = (unsigned)it.get_id(0);
+        const float* row = dScores + (size_t)r * 64u;
+        size_t boff = Bias ? ((size_t)((r / 64u) % (heads ? heads : 1u)) * 4096u
+                            + (size_t)(r % 64u) * 64u) : 0;
+        esimd::simd<float,32> s0(row), s1(row+32);
+        esimd::simd<float,32> b0(0.f), b1(0.f);
+        if (Bias) { b0 = esimd::simd<float,32>(Bias+boff); b1 = esimd::simd<float,32>(Bias+boff+32); }
+        esimd::simd<float,32> hl0 = esimd::convert<float>(esimd::convert<sycl::half>(s0 + b0));
+        esimd::simd<float,32> hl1 = esimd::convert<float>(esimd::convert<sycl::half>(s1 + b1));
+        esimd::simd<float,32> a0 = esimd::convert<float>(esimd::convert<sycl::half>(
+            hl0*esimd::simd<float,32>(0.044921875f) + esimd::simd<float,32>(1.30078125f)));
+        esimd::simd<float,32> a1 = esimd::convert<float>(esimd::convert<sycl::half>(
+            hl1*esimd::simd<float,32>(0.044921875f) + esimd::simd<float,32>(1.30078125f)));
+        a0 = (esimd::min)((esimd::max)(a0, esimd::simd<float,32>(1.03125f)), esimd::simd<float,32>(1.5693359375f));
+        a1 = (esimd::min)((esimd::max)(a1, esimd::simd<float,32>(1.03125f)), esimd::simd<float,32>(1.5693359375f));
+        esimd::simd<sycl::half,16> he0=esimd::convert<sycl::half>(a0.template select<16,2>(0).read());
+        esimd::simd<sycl::half,16> ho0=esimd::convert<sycl::half>(a0.template select<16,2>(1).read());
+        esimd::simd<sycl::half,16> he1=esimd::convert<sycl::half>(a1.template select<16,2>(0).read());
+        esimd::simd<sycl::half,16> ho1=esimd::convert<sycl::half>(a1.template select<16,2>(1).read());
+        esimd::simd<uint16_t,16> e0; e0=he0.bit_cast_view<uint16_t>();
+        esimd::simd<uint16_t,16> o0; o0=ho0.bit_cast_view<uint16_t>();
+        esimd::simd<uint16_t,16> e1; e1=he1.bit_cast_view<uint16_t>();
+        esimd::simd<uint16_t,16> o1; o1=ho1.bit_cast_view<uint16_t>();
+        esimd::simd<uint32_t,16> p0=esimd::convert<uint32_t>(e0)|(esimd::convert<uint32_t>(o0)<<16);
+        esimd::simd<uint32_t,16> p1=esimd::convert<uint32_t>(e1)|(esimd::convert<uint32_t>(o1)<<16);
+        esimd::simd<uint32_t,16> t0=(p0<<5)+esimd::simd<uint32_t,16>(0x7FF88000u);
+        esimd::simd<uint32_t,16> t1=(p1<<5)+esimd::simd<uint32_t,16>(0x7FF88000u);
+        esimd::simd<sycl::half,32> w0; w0=t0.bit_cast_view<sycl::half>();
+        esimd::simd<sycl::half,32> w1; w1=t1.bit_cast_view<sycl::half>();
+        esimd::simd<float,32> f0 = esimd::convert<float>(w0);
+        esimd::simd<float,32> f1 = esimd::convert<float>(w1);
+        float total = 0.0f;
+        for (unsigned cc = 0; cc < 32u; ++cc) total += f0[cc];
+        for (unsigned cc = 0; cc < 32u; ++cc) total += f1[cc];   // golden's sequential f32 sum 0..63
+        float trh = wbmega::eh_round(total);
+        float recip = wbmega::eh_round(wbv2::ef_div(1.0f, trh));   // ESIMD hw div
+        esimd::simd<sycl::half,32> oh0 = esimd::convert<sycl::half>(wbv2::e4m3_vec<32>(wbv2::mulh(esimd::convert<float>(w0), recip)));
+        esimd::simd<sycl::half,32> oh1 = esimd::convert<sycl::half>(wbv2::e4m3_vec<32>(wbv2::mulh(esimd::convert<float>(w1), recip)));
+        oh0.copy_to(dProbs + (size_t)r * 64u);
+        oh1.copy_to(dProbs + (size_t)r * 64u + 32u);
+    });
+}
 // int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
 //                              unsigned batches, unsigned heads, unsigned merged)
 // swap-in #9 (section 85): the fused window attention, COMPOSED from the four gated
@@ -2400,6 +2457,9 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
         if (getenv("NR_F16V1")) f16v1::gemm_b(*GQ, dAq, dBk, dScores, 64, 64, 32, (int)batches);
         else                    f16v2::gemm_b2<64>(*GQ, dAq, dBk, dScores, 64, 64, 32, (int)batches);
         // softmax over (batches*64) rows of 64, with bias (heads,64,64) -- one launch.
+        static bool smaxplain = getenv("NR_SMAX_PLAIN") != nullptr;   // escape hatch
+        if (!smaxplain) smax_esimd(*GQ, dScores, dProbs, batches*64u, Bp, heads);
+        else
         GQ->parallel_for(sycl::range((size_t)batches*64u),
                          smax::softmax_kernel()(dScores, dProbs, batches*64u, 64u, Bp, heads));
         // attnV leg: P(64x64) @ V(64x32) -> 64x32. V stored (64 tokens,32 ch) = (K,N).
@@ -2891,9 +2951,12 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                 printf("[dump] split scores %zu (windows=%u)\n", hs.size(), windows);
             }
         }
-        if (wbstop > 5u)
+        if (wbstop > 5u) {
+        if (!smaxplain2()) smax_esimd(*GQ, dScores, dProbs, windows*64u, Bp, 1u);
+        else
         GQ->parallel_for(sycl::range((size_t)windows*64u),
                          smax::softmax_kernel()(dScores, dProbs, windows*64u, 64u, Bp, 1u));
+        }
         if (getenv("NR_DUMP_PROBS")) {   // dump split softmax probs (e4m3 halves) vs mega SCR
             static bool s_pdone = false;
             if (!s_pdone && !pooling && !head) {
