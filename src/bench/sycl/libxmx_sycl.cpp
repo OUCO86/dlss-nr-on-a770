@@ -33,6 +33,7 @@
 #include "gemm_s8_v9_kernel.hpp"
 #include "gemm_f16_v1_kernel.hpp"
 #include "gemm_f16_v2_kernel.hpp"
+#include "gemm_f16_v3_kernel.hpp"
 #include "pack_device.hpp"
 #include "pre_kernel.hpp"
 #include "post_kernel.hpp"
@@ -3046,7 +3047,21 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         sycl::half* dAp3 = (sycl::half*)pool_get((size_t)Mp * C * 2);
         float* dC3 = (float*)pool_get((size_t)Mp * C * 4);
         sycl::half* dBp3 = cached_pack_b_f16(projection, Praw, (int)C, (int)C);   // weight: pack once (host cache, no launch)
-        if (wbstop > 8u) {
+        // SECTION 99 LEG-3 FUSION: outproj gemm + residual + publish in ONE kernel
+        // (f16v3::gemm_resid_pub) -- the 16.7MB dC3 f32 scratch and the separate
+        // residual launch both disappear. Plain form only (no pool/head, epi 0/1/4,
+        // C==32); NR_WB_FUSE=0 escapes to the two-pass path.
+        static bool wbfuse = getenv("NR_WB_FUSE") ? atoi(getenv("NR_WB_FUSE")) != 0 : true;
+        const bool fused3 = wbfuse && !pooling && !head && C == 32u &&
+                            (epi == 0u || epi == 1u || epi == 4u) && wbstop > 8u;
+        if (fused3) {
+            packdev::pack_a16(*GQ, dAttended, dAp3, (int)rows, Mp, (int)C);
+            f16v3::gemm_resid_pub(*GQ, dAp3, dBp3,
+                image_half ? (const sycl::half*)ImgH : nullptr,
+                image_half ? nullptr : ImgF, image_half,
+                cp, narrow ? (sycl::half*)Tgt : nullptr, narrow ? nullptr : (float*)Tgt,
+                narrow, (int)rows, Mp, (int)C, height, width, across, top, left, epi);
+        } else if (wbstop > 8u) {
         packdev::pack_a16(*GQ, dAttended, dAp3, (int)rows, Mp, (int)C);
         f16v1::gemm(*GQ, dAp3, dBp3, dC3, Mp, (int)C, (int)C);
         }
@@ -3063,7 +3078,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         }
         float* dStage = pooling ? (float*)pool_get((size_t)rows * C * 4) : nullptr;
         sycl::half* dOut16 = head ? (sycl::half*)pool_get(img_elems * 2) : nullptr;
-        if (wbstop > 9u) {
+        if (wbstop > 9u && !fused3) {
         static bool wbplainleg = getenv("NR_WB_PLAINLEG") != nullptr;   // escape hatch
         if (!wbplainleg && wb_leg3_esimd_ok(epi, pooling, head)) {
             wb_leg3_esimd(*GQ, image_half ? (const sycl::half*)ImgH : nullptr,
