@@ -13,7 +13,12 @@ chained through plan buffers (gemm_qkv_window -> window_attention -> gemm_window
 recorder: its whole job is to reproduce the passes it replaces, so they agree bit for bit.
 
 captured window_block = 10 calls: plain 8 (flags 0x1100 / 0x0), pool 1 (0x800000), head 1
-(0x1000000). The head form needs the compact-head GEMM leg -- NOT_YET in the recorder.
+(0x1000000). The head form's chain leg = the compact-head GEMM (test_window_block.py:151-152
+rt.gemm(out16, weights, target, pixels, 16, 32, compact_output=True) -- xmxres.py:1791-1800
+carries it as bt bit 0x10000 with N=16, ldc=4, plain FP32; the shipping guard libxmx.c:2290
+pins the same requirements). The inline recorder already built that leg (section 88 #16);
+the head case here is its gate, and the expected values the section-99 pool/head ESIMD
+fusion must keep bit-exact.
 """
 import ctypes, os, pathlib, sys
 import numpy as np
@@ -46,6 +51,7 @@ for nm, at in (
     ("xmx_rec_window_attention", [ctypes.c_int] * 5 + [ctypes.c_uint] * 3),
     ("xmx_rec_gemm_window_residual", [ctypes.c_int] * 5 + [ctypes.c_uint] * 8),
     ("xmx_rec_gemm_window_residual_pool", [ctypes.c_int] * 6 + [ctypes.c_uint] * 8),
+    ("xmx_rec_gemm", [ctypes.c_int] * 3 + [ctypes.c_uint] * 14),
 ):
     getattr(lib, nm).argtypes = at
     getattr(lib, nm).restype = ctypes.c_int
@@ -78,6 +84,7 @@ def run(height, width, top, left, flags, label):
     pad = (top << 16) | left
     image_half = bool(flags & 0x8000)
     pooling = bool(flags & 0x800000)
+    head = bool(flags & 0x1000000)
     narrow = bool(flags & 0x1000)
     wsz = 2 if (narrow or pooling) else 4
     pixels = height * width
@@ -89,6 +96,12 @@ def run(height, width, top, left, flags, label):
     bias = rng.normal(0, 1.0, size=64 * 64).astype(np.float32)
     cosine = rng.uniform(-1.5, 1.5, size=C).astype(np.float32)
     qkv_scale = (0.5 + rng.random(heads).astype(np.float32)).astype(np.float32)
+    # the head form's weights (test_window_block.py:125-127): 32x16, only four columns
+    # matter for the compact store; fill all sixteen so a wrong column would be caught.
+    headw = np.zeros((C, 16), np.float16)
+    headw[:, :4] = rng.normal(0, 0.3, (C, 4)).astype(np.float16)
+    headw[:, 4:] = rng.normal(0, 0.3, (C, 12)).astype(np.float16)
+    te = pixels * 4 * 4 if head else pixels * C * wsz   # target bytes: compact f32 x4, else image
 
     him = lib.xmx_buf_create_kind(pixels * C * (2 if image_half else 4), 2 if image_half else 4)
     hw = lib.xmx_buf_create_kind(C * NH * 2, 2)
@@ -96,22 +109,26 @@ def run(height, width, top, left, flags, label):
     hb = lib.xmx_buf_create_kind(64 * 64 * 4, 4)
     hco = lib.xmx_buf_create_kind(C * 4, 4)
     hs = lib.xmx_buf_create_kind(heads * 4, 4)
-    hgot = lib.xmx_buf_create_kind(pixels * C * wsz, wsz)
-    hwant = lib.xmx_buf_create_kind(pixels * C * wsz, wsz)
+    hgot = lib.xmx_buf_create_kind(te, 4 if head else wsz)
+    hwant = lib.xmx_buf_create_kind(te, 4 if head else wsz)
     hq = lib.xmx_buf_create_kind(rows * C * 2, 2); hk = lib.xmx_buf_create_kind(rows * C * 2, 2)
     hv = lib.xmx_buf_create_kind(rows * C * 2, 2); hatt = lib.xmx_buf_create_kind(rows * C * 2, 2)
     hpooled = -1; hpw = -1
     if pooling:
         hpooled = lib.xmx_buf_create_kind(pixels // 4 * C * 2, 2)
         hpw = lib.xmx_buf_create_kind(pixels // 4 * C * 2, 2)
+    if head:
+        hpw = lib.xmx_buf_create_kind(C * 16 * 2, 2)   # the head weights ride the `pooled` slot
     ok(min(him, hw, hp, hb, hco, hs, hgot, hwant, hq, hk, hv, hatt) > 0 and (hpooled > 0 if pooling else True),
        f"{label}: buffers")
     up(him, imgbuf); up(hw, W); up(hp, P); up(hb, bias); up(hco, cosine); up(hs, qkv_scale)
     for h in (hgot, hwant, hq, hk, hv, hatt): lib.xmx_buf_zero(h)
     if pooling: lib.xmx_buf_zero(hpooled); lib.xmx_buf_zero(hpw)
+    if head: up(hpw, headw.ravel())
 
     ok(lib.xmx_begin() == 0, f"{label}: begin(wb)")
-    rc = lib.xmx_rec_window_block(him, hw, hp, hgot, hb, hco, hs, hpooled if pooling else -1,
+    rc = lib.xmx_rec_window_block(him, hw, hp, hgot, hb, hco, hs,
+                                  (hpooled if pooling else hpw),
                                   windows, height, width, across, pad, flags)
     ok(rc == 0, f"{label}: rec_window_block" + ("" if rc == 0 else " err=" + lib.xmx_error().decode(errors="replace")))
     ok(lib.xmx_submit() == 0, f"{label}: submit(wb)")
@@ -124,7 +141,20 @@ def run(height, width, top, left, flags, label):
     ok(r1 == 0, f"{label}: rec_gemm_qkv_window" + ("" if r1 == 0 else " err=" + lib.xmx_error().decode(errors="replace")))
     r2 = lib.xmx_rec_window_attention(hq, hk, hv, hb, hatt, windows, heads, 1)
     ok(r2 == 0, f"{label}: rec_window_attention" + ("" if r2 == 0 else " err=" + lib.xmx_error().decode(errors="replace")))
-    if pooling:
+    if head:
+        # leg 3 = the narrow residual into out16 (pixels x 32 half), leg 4 = the compact
+        # head GEMM (test_window_block.py:148-152; xmxres.py:1791-1800: leading=(0,0,4),
+        # batch strides dense, sc=rows*4, bt bit 0x10000, plain FP32).
+        r3 = lib.xmx_rec_gemm_window_residual(
+            hatt, hp, hv, him, hco, rows, C, C,
+            (flags & ~0x1000000 & ~0x8000) | 0x1000 | (0x40000 if image_half else 0),
+            height, width, across, pad)
+        ok(r3 == 0, f"{label}: rec_gemm_window_residual(narrow)" + ("" if r3 == 0 else " err=" + lib.xmx_error().decode(errors="replace")))
+        r4 = lib.xmx_rec_gemm(hv, hpw, hwant, pixels, 16, C, 1,
+                              pixels * C, C * 16, pixels * 4, 0x10000,
+                              0, 0, 4, 0, 0, 0)
+        ok(r4 == 0, f"{label}: rec_gemm(compact head)" + ("" if r4 == 0 else " err=" + lib.xmx_error().decode(errors="replace")))
+    elif pooling:
         r3 = lib.xmx_rec_gemm_window_residual_pool(
             hatt, hp, hwant, him, hco, hpw, rows, C, C,
             (flags & ~0x800000 & ~0x8000) | (0x40000 if image_half else 0),
@@ -138,8 +168,8 @@ def run(height, width, top, left, flags, label):
         ok(r3 == 0, f"{label}: rec_gemm_window_residual" + ("" if r3 == 0 else " err=" + lib.xmx_error().decode(errors="replace")))
     ok(lib.xmx_submit() == 0, f"{label}: submit(3-leg)")
 
-    g = np.zeros(pixels * C * wsz, np.uint8); lib.xmx_buf_download(hgot, g.ctypes.data, 0, pixels * C * wsz)
-    w = np.zeros(pixels * C * wsz, np.uint8); lib.xmx_buf_download(hwant, w.ctypes.data, 0, pixels * C * wsz)
+    g = np.zeros(te, np.uint8); lib.xmx_buf_download(hgot, g.ctypes.data, 0, te)
+    w = np.zeros(te, np.uint8); lib.xmx_buf_download(hwant, w.ctypes.data, 0, te)
     same = bool(np.array_equal(g, w))
     tag = "target"
     if pooling and same:
@@ -164,6 +194,10 @@ run(40, 56, 0, 0, 0x0000, "WB-40x56-f32out")
 # the POOL form (block 0): even extents/pads, target half by definition, +the pooled output.
 run(16, 24, 0, 0, 0x800000, "WB-16x24-pool-floatimage")
 run(20, 36, 4, 4, 0x808000, "WB-20x36-crop-pool-halfimage")
+# the HEAD form (block 70): compact f32 target (pixels x 4), head weights in the pooled
+# slot, chain = narrow residual -> out16 + compact GEMM (0x10000).
+run(20, 36, 4, 4, 0x1000000, "WB-20x36-crop-head")
+run(16, 24, 0, 0, 0x1008000, "WB-16x24-head-halfimage")
 
 print(f"\nWINDOW_BLOCK {'GREEN' if not fails else 'RED'} ({fails} fails)")
 sys.exit(1 if fails else 0)

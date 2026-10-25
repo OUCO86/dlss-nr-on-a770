@@ -1518,6 +1518,13 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
     void* Cout = ic->second.p;
     const unsigned epi = (bt >> 8) & 0xFu;
     const bool narrow = (bt & 0x1000u) != 0u;
+    // 0x10000 = the compact head store (xmxres.gemm compact_output, xmxres.py:1791-1800):
+    // store only the first four of sixteen columns. The shipping guard (libxmx.c:2287-2291)
+    // pins it to N=16, ldc=4, plain FP32, no epilogue -- same guard here, then the publish
+    // loop skips columns 4..15 (the scatter is exactly the compact head's four).
+    const bool compact = (bt & 0x10000u) != 0u;
+    if (compact && (N != 16u || ldc != 4u || epi || narrow))
+        FAILMSG("compact head requires N=16, ldc=4 and plain FP32 output (libxmx.c:2290)");
     const unsigned lda_e = lda ? lda : K, ldb_e = ldb ? ldb : (transposed ? K : N), ldc_e = ldc ? ldc : N;
     const int Mp = (int)(((M + 15u) / 16u) * 16u);
     g_cmd_names.push_back(__func__);
@@ -1550,6 +1557,7 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
             size_t mn = (size_t)M * N;
             unsigned g = (unsigned)(i / mn); size_t rem = i % mn;
             unsigned r = (unsigned)(rem / N), col = (unsigned)(rem % N);
+            if (compact && col >= 4u) return;   // the compact head keeps four columns
             float value = qr_publish(epi, dC[g * (size_t)Mp * N + (size_t)r * N + col]);
             size_t out = oc + g * sc + (size_t)r * ldc_e + col;
             if (narrow) ((sycl::half*)Cout)[out] = sycl::half(value);
