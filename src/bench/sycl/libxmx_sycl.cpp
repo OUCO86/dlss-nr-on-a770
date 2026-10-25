@@ -2852,7 +2852,32 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         // as groundwork for a FULL window_block fusion (LEG1+2+3 in one workgroup, the
         // shipped g.rblock shape) which is the only version that can win.
         sycl::half* dA = (sycl::half*)pool_get((size_t)rows * C * 2);
-        if (wbstop > 0u)
+        if (wbstop > 0u) {
+        static bool wbplaingather = getenv("NR_WB_PLAINLEG") != nullptr;
+        if (!wbplaingather && C == 32u) {
+            // section 99: 32-wide ESIMD gather (image row + dA row both contiguous;
+            // e4m3_vec<32> bit-exact vs qr_e4m3 scalar, bench_e4m3vec 0/4096).
+            GQ->parallel_for(sycl::range((size_t)rows), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
+                namespace esimd = sycl::ext::intel::esimd;
+                unsigned r = (unsigned)it.get_id(0);
+                unsigned window = r / tokens, token = r % tokens;
+                int y = (int)((window / across) * 8u + token / 8u) - (int)top;
+                int x = (int)((window % across) * 8u + token % 8u) - (int)left;
+                esimd::simd<sycl::half,32> out;
+                if (y < 0 || x < 0 || y >= (int)height || x >= (int)width) {
+                    out = esimd::simd<sycl::half,32>(sycl::half(0.f));
+                } else {
+                    size_t at = ((size_t)y * width + x) * C;
+                    esimd::simd<float,32> v;
+                    if (image_half) v = esimd::convert<float>(esimd::block_load<sycl::half,32>(
+                        (const sycl::half*)ImgH + at, esimd::overaligned_tag<16>{}));
+                    else v = esimd::block_load<float,32>((const float*)ImgF + at,
+                        esimd::overaligned_tag<16>{});
+                    out = esimd::convert<sycl::half>(wbv2::e4m3_vec<32>(v));
+                }
+                esimd::block_store<sycl::half,32>(dA + (size_t)r * C, out, esimd::overaligned_tag<16>{});
+            });
+        } else
         GQ->parallel_for(sycl::range((size_t)rows), [=](sycl::item<1> it) {
             unsigned r = (unsigned)it.get_id(0);
             unsigned window = r / tokens, token = r % tokens;
@@ -2869,6 +2894,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                 dA[(size_t)r * C + c] = sycl::half(val);
             }
         });
+        }
         sycl::half* dAp = (sycl::half*)pool_get((size_t)Mp * C * 2);
         float* dCq = (float*)pool_get((size_t)Mp * NH * 4);
         if (wbstop > 1u) packdev::pack_a16(*GQ, dA, dAp, (int)rows, Mp, (int)C);
