@@ -15,6 +15,7 @@
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/math.hpp>
 #include <sycl/ext/intel/esimd.hpp>
+#include <cstdlib>
 
 static const unsigned QR_GRID = 65535u;   // x-extent cap, same as the GLSL
 
@@ -260,10 +261,10 @@ inline auto qr_kernel_esimd() {
 inline void qr_launch_esimd(sycl::queue& q, sycl::device& dev,
                             sycl::half* dsrc, sycl::uint2* dpack, float* dscale,
                             unsigned m, unsigned k) {
-    // LW=64 (4x SIMD16): §96/bench_v2crash proved ESIMD+barrier kernels with LW>=128
-    // HANG at scale (GRF rule ~128 live ESIMD threads). The plain kernel's 256-thread
-    // workgroup is NOT reusable here.
-    const unsigned LW = 64u;
+    // LW: §96/bench_v2crash proved the BIG-state v2 ESIMD+barrier kernels HANG at
+    // LW>=128 (GRF rule). The quant kernel's state is small (one 32-wide vector), so
+    // the rule may not bind here -- NR_QR_LW lets the experiment pick. Default 64.
+    const unsigned LW = getenv("NR_QR_LW") ? (unsigned)atoi(getenv("NR_QR_LW")) : 64u;
     const unsigned chunks = k / 16u;
     auto sgs = dev.get_info<sycl::info::device::sub_group_sizes>();
     unsigned SUB_max = 1u; for (unsigned s : sgs) if (s > SUB_max) SUB_max = s;
