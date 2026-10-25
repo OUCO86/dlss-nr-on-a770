@@ -2381,6 +2381,9 @@ colour 用真实游戏量级（encode [0,1500) 进 R11G11B10，nr_pre 注释这�
   NRM/WGT scratch 按 FLOAT 定尺寸（按 half 定=越界踩邻区, 1.53% 回归教训）。
 
 ## 97. 🏆 v2 四段全向量化 + 设为默认 + 已部署进游戏（待面板 A/B）
+> ⚠️ 更正（10-25 夜，§99）：本节"v2 = 默认引擎"与 md5 9d788097 已过期——v2 每窗 M=64
+> 撞 R8a 小 M 墙（用户点破的违规①），默认已改回 **split 宽 M**；当前引擎=§99 终账
+> （md5 ba35cfc2，walk ~232ms，游戏已验收）。本节保留作 v2 机制存证，状态别照抄。
 - 向量化积木（全 bit-exact by construction，可复用）：e4m3_vec（bench_e4m3vec 0/4096,
   rnde+bit_cast_view+谓词<<31 符号, -0.0->+0 陷阱）、mulh、cosine_recip_vec（ctree 标量
   op 序逐字保留, h[i] 常数下标=寄存器抽取）。
