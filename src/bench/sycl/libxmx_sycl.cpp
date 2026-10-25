@@ -116,6 +116,13 @@ static std::atomic<long> g_wb_v2{0}, g_wb_split{0};
 // xmx_rec_quant sees the id and records a no-op (the plan's op stream is untouched --
 // the bridge and plan stay frozen per the 10-18 order).
 static std::map<int,int> g_fused_quant;   // quant-source cb -> a_scale buf (new_scale lives there)
+// SECTION 99 v9b FOLD pairing (record-time registration, exec-time lookup): the
+// batched recorder, when its v9b condition holds, records its own cmd index under the
+// c buffer id; the ADJACENT quant recorder back-fills (packed,scale) into that slot.
+// All recording precedes all execution, so the producer closure reads a complete slot.
+struct FoldBind { int cbuf = -1; void* packed = nullptr; void* scale = nullptr; };
+static size_t g_pending_fold_slot = SIZE_MAX;    // the LAST v9b producer's slot (adjacency)
+static std::vector<FoldBind> g_fold_slot;         // producer cmd index -> quant buffers
 // section 98: true while a command_graph is RECORDING this closure loop. Events returned
 // by submissions during recording belong to the graph and CANNOT be .wait()ed (runtime
 // throws). ev_sync() skips the wait in that case -- the memcpy is still recorded as a
@@ -1641,6 +1648,19 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
         flop_note("batched",M,N,K,batch);
         g_epi["batched"][(flags >> 8) & 0xFu]++;
         if (getenv("NR_SHAPE_DUMP")) { char eb[128]; snprintf(eb,sizeof eb,"batched M=%u N=%u K=%u b=%u epi%u",M,N,K,batch,(flags>>8)&0xFu); g_shapes["epishape"][eb]++; }
+    // v9b fires? decide at RECORD time so the slot index is exact (the closure below is
+    // the cmd at index g_cmds.size(); the adjacent quant back-fills this slot).
+    static bool v9bon_r = getenv("NR_V9B") ? atoi(getenv("NR_V9B")) != 0 : true;
+    const unsigned ldc_r = ldc ? ldc : N;
+    static int v9b_rec_calls = 0;
+    const bool v9b_first_r = getenv("NR_V9B_FIRST") != nullptr;
+    static int v9b_max = getenv("NR_V9B_MAX") ? atoi(getenv("NR_V9B_MAX")) : 1000000;
+    const bool v9b_will = v9bon_r && (v9b_rec_calls < v9b_max) &&
+        sa == 0u && N == 128u && ldc_r == N * batch &&
+        (ldc_r == 256u || ldc_r == 512u) &&
+        (((flags >> 8) & 0xFu) == 3u) && ((flags & 0x1000u) != 0u) && (K % 32u) == 0u;
+    size_t v9b_slot = 0;
+    if (v9b_will) { ++v9b_rec_calls; v9b_slot = g_cmds.size(); g_pending_fold_slot = v9b_slot; g_fold_slot.resize(v9b_slot + 1); g_fold_slot[v9b_slot].cbuf = c; }
     g_cmds.push_back([=]() {
         const unsigned lda_e = lda ? lda : K, ldb_e = ldb ? ldb : K;
         // R8a shape-merge (section 92): ONE dispatch per stage for the whole op -- the
@@ -1718,10 +1738,15 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
         // (w-index, fold-removal, scalar-pub bisect); the win measured only ~6ms
         // (251 vs 257) -- cost/benefit says stop here, the bug hunt does not pay for
         // 6ms. Kernel + packs stay in-tree as a starting point if wide-N ever matters.
-        static bool v9bon = getenv("NR_V9B") ? atoi(getenv("NR_V9B")) != 0 : true;  // DEFAULT ON (section 99): the sa=0 wide-N merge. NR_V9B=0 = escape hatch.
+        // v9b DEFAULT OFF after the same-heat A/B (section 99): the wide-N merge is
+        // CORRECT (end-to-end 100% with and without FOLD) but SLOWER than v8's
+        // batched gemm_b_pub (275-278 vs 271-272). Why: v9b runs BM=32/NT=32 =
+        // 16 accs/thread (P1's ">8 accs" penalty zone); v8 runs BM=128/NT=64 =
+        // 8 accs/thread. The width-sweep's wide-N win needs the WIDE BM too, which
+        // BM=32 cannot give inside 64KB SLM at ldc=512. NR_V9B=1 = opt-in witness.
         static int v9b_calls = 0;
         const bool v9b_first_only = getenv("NR_V9B_FIRST") != nullptr;
-        if (v9bon && (!v9b_first_only || v9b_calls == 0) &&
+        if (v9bon_r && (!v9b_first_only || v9b_calls == 0) &&
             sa == 0u && N == 128u && ldc_ == (unsigned)(N * batch) &&
             (ldc_ == 256u || ldc_ == 512u) &&   // ONLY the instantiated BN widths:
             // the trace caught M=2040 b=8 ldc=1024 sneaking past the old guard and
@@ -1754,10 +1779,30 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
             ++v9b_calls;
             if (getenv("NR_V9B_TRACE")) printf("[v9b call %d] M=%u N=%u K=%u b=%u sa=%u sb=%u lda=%u ldb=%u ldc=%u a_scale=%d b_scale=%d a=%d b=%d c=%d\n",
                 v9b_calls,M,N,K,batch,sa,sb,lda_,ldb_,ldc_,a_scale,b_scale,a,b,c);
-            if (ldc_ == 256u)
-                s8v9b::gemm_b_rq9b<256>(*GQ, dAp9b, dBp9b, (sycl::half*)Cout, ns9b, as, bs, (int)M, Mp32, (int)K, epi);
+            FoldBind fb = g_fold_slot[v9b_slot];
+            if (getenv("NR_V9B_TRACE")) { static int tc9=0; ++tc9; if(tc9>=15&&tc9<=25){
+                printf("[v9b pair %d] M=%u K=%u b=%u ldc=%u c=%d a=%d a_scale=%d b_scale=%d -> pk=%p sc=%p (sc==as? %d, a==pk? %d)\n",
+                    tc9,M,K,batch,ldc_,c,a,a_scale,b_scale,fb.packed,fb.scale,
+                    (void*)fb.scale==(void*)ias->second.p, (size_t)fb.packed==(size_t)ia->second.p); } }
+            if (getenv("NR_V9B_TRACE_OLD")) { static int tc9o=0; if(tc9o<3){tc9o++;
+                printf("[v9b exec] slot=%u bound=%d packed=%p scale=%p ldc=%u M=%u\n",
+                    (unsigned)v9b_slot, fb.packed!=nullptr, fb.packed, fb.scale, ldc_, M); } }
+            if (getenv("NR_PK_DUMP") && fb.packed) { static int pd9=0; if(pd9<1){pd9++;
+                GQ->wait();
+                std::vector<int8_t> hp(512); GQ->memcpy(hp.data(), fb.packed, 512).wait();
+                std::vector<float> hsc(8); GQ->memcpy(hsc.data(), fb.scale, 32).wait();
+                printf("[pk9b] r0c0-15:"); for(int i=0;i<16;++i) printf(" %d",(int)hp[i]);
+                printf("  r1c0-7:"); for(int i=256;i<264;++i) printf(" %d",(int)hp[i]);
+                printf("  sc0-7:"); for(int i=0;i<8;++i) printf(" %.6g",hsc[i]); printf("\n"); } }
+            if (fb.packed) {   // FOLD: int8+scale straight into the quant's buffers
+                if (ldc_ == 256u)
+                    s8v9b::gemm_b_rq9b<256,true>(*GQ, dAp9b, dBp9b, (sycl::half*)fb.packed, (float*)fb.scale, as, bs, (int)M, Mp32, (int)K, epi);
+                else
+                    s8v9b::gemm_b_rq9b<512,true>(*GQ, dAp9b, dBp9b, (sycl::half*)fb.packed, (float*)fb.scale, as, bs, (int)M, Mp32, (int)K, epi);
+            } else if (ldc_ == 256u)
+                s8v9b::gemm_b_rq9b<256,false>(*GQ, dAp9b, dBp9b, (sycl::half*)Cout, ns9b, as, bs, (int)M, Mp32, (int)K, epi);
             else
-                s8v9b::gemm_b_rq9b<512>(*GQ, dAp9b, dBp9b, (sycl::half*)Cout, ns9b, as, bs, (int)M, Mp32, (int)K, epi);
+                s8v9b::gemm_b_rq9b<512,false>(*GQ, dAp9b, dBp9b, (sycl::half*)Cout, ns9b, as, bs, (int)M, Mp32, (int)K, epi);
             pool_put(dAp9b);
             return;
         }
@@ -3251,6 +3296,32 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
     sycl::uint2* pk = (sycl::uint2*)p->second.p;
     float* sc = (float*)c->second.p;
     g_cmd_names.push_back(__func__);
+    // v9b FOLD: the ADJACENT producer registered a slot for this source buffer ->
+    // bind (packed,scale) into it; this quant becomes a no-op (producer writes int8+scale).
+    {
+        static bool foldon = getenv("NR_V9B_FOLD") != nullptr;   // FOLD gate: default OFF
+        if (foldon && g_pending_fold_slot != SIZE_MAX &&
+            !g_fold_slot[g_pending_fold_slot].packed &&
+            g_fold_slot[g_pending_fold_slot].cbuf == source &&
+            g_cmds.size() == g_pending_fold_slot + 1 &&
+            p->second.p == s->second.p && c->second.p == g_bufs.find(scale)->second.p) {
+            // IN-PLACE quant only (packed buffer == source, scale == a_scale): the
+            // producer writes the exact buffer the downstream reads. The trace caught
+            // pair 21 = a NON-in-place quant (separate packed/scale scratch buffers);
+            // folding it wrote a recycled pool buffer -> frame 0%. Non-in-place pairs
+            // keep the split chain (correct, just not folded).
+            g_fold_slot[g_pending_fold_slot] = FoldBind{ source, (void*)pk, (void*)sc };
+            g_pending_fold_slot = SIZE_MAX;
+            g_cmd_names.push_back(__func__);
+            g_cmds.push_back([](){});
+            return 0;
+        }
+        if (foldon && g_pending_fold_slot != SIZE_MAX &&
+            g_fold_slot[g_pending_fold_slot].cbuf == source &&
+            g_cmds.size() == g_pending_fold_slot + 1)
+            g_pending_fold_slot = SIZE_MAX;   // adjacent but NOT in-place: cancel the
+                                              // pending fold, this pair keeps the split chain
+    }
     auto fq = g_fused_quant.find(source);
     if (fq != g_fused_quant.end()) {   // section 99: the producer already wrote int8 + new_scale
         int asbuf = fq->second;
@@ -3272,6 +3343,13 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
     }
     g_cmds.push_back([=]() {
         qr_launch(*GQ, *GD, qr_kernel(), a, pk, sc, M, K, 0u, 0u, 0u, 0u, 0u, nullptr, nullptr);
+        if (getenv("NR_PK_DUMP")) { static int pdSP=0; if(pdSP<1){pdSP++;
+            GQ->wait();
+            std::vector<int8_t> hp(512); GQ->memcpy(hp.data(), pk, 512).wait();
+            std::vector<float> hsc(8); GQ->memcpy(hsc.data(), sc, 32).wait();
+            printf("[pkSP] r0c0-15:"); for(int i=0;i<16;++i) printf(" %d",(int)hp[i]);
+            printf("  r1c0-7:"); for(int i=256;i<264;++i) printf(" %d",(int)hp[i]);
+            printf("  sc0-7:"); for(int i=0;i<8;++i) printf(" %.6g",hsc[i]); printf("\n"); } }
     });
     return 0;
 }

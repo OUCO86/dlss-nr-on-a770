@@ -116,19 +116,25 @@ inline void pack_b9b(queue& q, const int8_t* Braw, int8_t* Bp,
 
 // the fused kernel: C8 = int8 (Mp x ldc, the c buffer reinterpreted), ns = float[Mp]
 // (the a_scale buffer). bs = concatenated float[ldc]. as = float[M] (staged to SLM).
-template <int BN>
+template <int BN, bool FOLD>
 inline event gemm_b_rq9b(queue& q, const int8_t* Ap, const int8_t* Bp,
                          sycl::half* C8, float* ns,
                          const float* as, const float* bs,
                          int M, int Mp, int K, unsigned epi) {
+    // FOLD=1: C8 is reinterpreted int8* (the quant pass's PACKED buffer, M x ldc flat),
+    // ns = the quant pass's SCALE buffer (float[M]). The producer writes int8+scale
+    // DIRECTLY; the xmx_rec_quant closure becomes a no-op. pub is e4m3-grid exact ->
+    // requantizing the f32 pub == requantizing the half-rounded pub the split chain
+    // would have re-read (the bench_v9 argument). rmax = SLM atomic-fmax over the
+    // workgroup's WIs (the workgroup owns the WHOLE ldc row -- v9b geometry).
     static_assert(BN == 256 || BN == 512, "v9b: ldc is 256 or 512 in the frame");
     const int WI_COLS = BN / 16;                 // 16 or 32 col-tiles
     const int SLM_A = BM * BK;                   // 1024 B per buffer
     const int SLM_B = BK * BN;                   // 8KB / 16KB per buffer
     const int SLM_B_BASE = 2 * SLM_A;            // 2048
-    const int RMAX = 2 * SLM_A + 2 * SLM_B;      // 18432 / 34816
-    const int ASS = RMAX + BM * 4;               // row-scale stage, 128 B
-    const int SLMTOT = ASS + BM * 4;             // <= 35KB
+    const int ASS = 2 * SLM_A + 2 * SLM_B;       // row-scale stage, 128 B
+    const int RMAXB = ASS + BM * 4;              // fold: row absmax, 128 B
+    const int SLMTOT = RMAXB + (FOLD ? BM * 4 : 0);  // <= 34.4KB
     const int TILES = 2 * WI_COLS;               // 32 / 64
     const int TPT = TILES / NT;                  // 1 / 2 tiles per thread
     int wg = Mp / BM;
@@ -142,6 +148,7 @@ inline event gemm_b_rq9b(queue& q, const int8_t* Ap, const int8_t* Bp,
                                             // wrong row block (frame 0%).
             // stage row scales cooperatively
             esimd::slm_block_store(ASS + lid * 4, esimd::simd<float,1>(as[w * BM + lid]), esimd::overaligned_tag<16>{});
+            if (FOLD) esimd::slm_block_store(RMAXB + lid * 4, esimd::simd<float,1>(0.f), esimd::overaligned_tag<16>{});
             const int8_t* apb_g = Ap + (size_t)w * (size_t)(K / BK) * 2 * 512;
             const int8_t* bp_g  = Bp;
             auto load_block = [=](int buf, int kb) SYCL_ESIMD_FUNCTION {
@@ -187,11 +194,10 @@ inline event gemm_b_rq9b(queue& q, const int8_t* Ap, const int8_t* Bp,
                 }
                 esimd::barrier();
             }
-            // ---- fused pub store: half[r*ldc+n] EXACTLY like gemm_b_pub (the c buffer
-            // is a HALF buffer; the requantize fold is NOT possible here because the
-            // quant pass's packed/scale buffer ids are invisible to the producer --
-            // v9b's win is the WIDE-N merge: A loaded once and reused across ldc cols,
-            // one dispatch for all b groups, B concatenated+cached). ----
+            // ---- store phase. FOLD=0: half[r*ldc+n] like gemm_b_pub (the c buffer).
+            // FOLD=1: phase A = pub + row absmax atomic-fmax; barrier; phase B = scale +
+            // requantize + int8[r*ldc+n] + ns[r]. pub recomputed in phase B from the
+            // SAME acc registers (deterministic, bit-identical -- no SLM pub staging). ----
             #pragma unroll
             for (int t = 0; t < TPT; ++t) {
                 int tile = t * NT + lid;
@@ -209,17 +215,78 @@ inline event gemm_b_rq9b(queue& q, const int8_t* Ap, const int8_t* Bp,
                     esimd::simd<float,8> f1 = esimd::convert<float>(acc[t][1].template select<8,1>(r*8).read()) * rs0 * hi;
                     esimd::simd<float,8> g0 = esimd::convert<float>(acc[t][2].template select<8,1>(r*8).read()) * rs1 * lo;
                     esimd::simd<float,8> g1 = esimd::convert<float>(acc[t][3].template select<8,1>(r*8).read()) * rs1 * hi;
-                    if (rr0 < M) {
-                        esimd::simd<float,16> pub(0.f);
-                        for (int e = 0; e < 8; ++e) pub[e] = s8v8::pub_esimd(epi, f0.read()[e]);
-                        for (int e = 0; e < 8; ++e) pub[8 + e] = s8v8::pub_esimd(epi, f1.read()[e]);
-                        esimd::convert<sycl::half>(pub).copy_to((sycl::half*)C8 + (size_t)rr0 * BN + gc);
+                    if (!FOLD) {
+                        if (rr0 < M) {
+                            esimd::simd<float,16> pub(0.f);
+                            for (int e = 0; e < 8; ++e) pub[e] = s8v8::pub_esimd(epi, f0.read()[e]);
+                            for (int e = 0; e < 8; ++e) pub[8 + e] = s8v8::pub_esimd(epi, f1.read()[e]);
+                            esimd::convert<sycl::half>(pub).copy_to((sycl::half*)C8 + (size_t)rr0 * BN + gc);
+                        }
+                        if (rr1 < M) {
+                            esimd::simd<float,16> pub(0.f);
+                            for (int e = 0; e < 8; ++e) pub[e] = s8v8::pub_esimd(epi, g0.read()[e]);
+                            for (int e = 0; e < 8; ++e) pub[8 + e] = s8v8::pub_esimd(epi, g1.read()[e]);
+                            esimd::convert<sycl::half>(pub).copy_to((sycl::half*)C8 + (size_t)rr1 * BN + gc);
+                        }
+                    } else {
+                        // phase A: pub + absmax
+                        esimd::simd<float,8> p0 = pub_vec_v9b<8>(epi, f0);
+                        esimd::simd<float,8> p1 = pub_vec_v9b<8>(epi, f1);
+                        esimd::simd<float,8> q0 = pub_vec_v9b<8>(epi, g0);
+                        esimd::simd<float,8> q1 = pub_vec_v9b<8>(epi, g1);
+                        float m0 = (esimd::max)(esimd::hmax<float,float,8>(esimd::abs(p0)),
+                                                esimd::hmax<float,float,8>(esimd::abs(p1)));
+                        float m1 = (esimd::max)(esimd::hmax<float,float,8>(esimd::abs(q0)),
+                                                esimd::hmax<float,float,8>(esimd::abs(q1)));
+                        esimd::slm_atomic_update<esimd::atomic_op::fmax, float, 1>(
+                            esimd::simd<uint32_t,1>((uint32_t)(RMAXB + (tr*16u + r) * 4u)), esimd::simd<float,1>(m0));
+                        esimd::slm_atomic_update<esimd::atomic_op::fmax, float, 1>(
+                            esimd::simd<uint32_t,1>((uint32_t)(RMAXB + (tr*16u + 8 + r) * 4u)), esimd::simd<float,1>(m1));
                     }
-                    if (rr1 < M) {
-                        esimd::simd<float,16> pub(0.f);
-                        for (int e = 0; e < 8; ++e) pub[e] = s8v8::pub_esimd(epi, g0.read()[e]);
-                        for (int e = 0; e < 8; ++e) pub[8 + e] = s8v8::pub_esimd(epi, g1.read()[e]);
-                        esimd::convert<sycl::half>(pub).copy_to((sycl::half*)C8 + (size_t)rr1 * BN + gc);
+                }
+            }
+            if (FOLD) {
+                esimd::barrier();
+                #pragma unroll
+                for (int t = 0; t < TPT; ++t) {
+                    int tile = t * NT + lid;
+                    int tr = tile / WI_COLS, tc = tile % WI_COLS;
+                    int gr = w * BM + tr * 16, gc = tc * 16;
+                    esimd::simd<float, 16> bsv = esimd::block_load<float,16>(bs + gc, esimd::overaligned_tag<16>{});
+                    esimd::simd<float,8> lo = bsv.template select<8,1>(0).read();
+                    esimd::simd<float,8> hi = bsv.template select<8,1>(8).read();
+                    #pragma unroll
+                    for (int r = 0; r < 8; ++r) {
+                        int rr0 = gr + r, rr1 = gr + 8 + r;
+                        float rm0 = esimd::slm_block_load<float,1>(RMAXB + (tr*16u + r)*4u)[0];
+                        float rm1 = esimd::slm_block_load<float,1>(RMAXB + (tr*16u + 8 + r)*4u)[0];
+                        float sc0 = (rm0 == 0.f) ? 1.f : esimd::div_ieee<float,1>(esimd::simd<float,1>(rm0), esimd::simd<float,1>(127.0f))[0];
+                        float sc1 = (rm1 == 0.f) ? 1.f : esimd::div_ieee<float,1>(esimd::simd<float,1>(rm1), esimd::simd<float,1>(127.0f))[0];
+                        if (tc == 0) {
+                            if (rr0 < M) ns[rr0] = sc0;
+                            if (rr1 < M) ns[rr1] = sc1;
+                        }
+                        float rs0 = esimd::slm_block_load<float,1>(ASS + (tr*16u + r)*4u)[0];
+                        float rs1 = esimd::slm_block_load<float,1>(ASS + (tr*16u + 8 + r)*4u)[0];
+                        esimd::simd<float,8> f0 = esimd::convert<float>(acc[t][0].template select<8,1>(r*8).read()) * rs0 * lo;
+                        esimd::simd<float,8> f1 = esimd::convert<float>(acc[t][1].template select<8,1>(r*8).read()) * rs0 * hi;
+                        esimd::simd<float,8> g0 = esimd::convert<float>(acc[t][2].template select<8,1>(r*8).read()) * rs1 * lo;
+                        esimd::simd<float,8> g1 = esimd::convert<float>(acc[t][3].template select<8,1>(r*8).read()) * rs1 * hi;
+                        auto rq8 = [](esimd::simd<float,8> p, float sc) {
+                            esimd::simd<float,8> q = esimd::div_ieee<float,8>(p, esimd::simd<float,8>(sc));
+                            q = esimd::rnde<float,8>(q);
+                            q = (esimd::min)((esimd::max)(q, esimd::simd<float,8>(-127.f)), esimd::simd<float,8>(127.f));
+                            return esimd::convert<int8_t>(esimd::convert<int>(q));
+                        };
+                        int8_t* C8i = (int8_t*)C8;
+                        if (rr0 < M) {
+                            esimd::block_store<int8_t,8>(C8i + (size_t)rr0 * BN + gc, rq8(pub_vec_v9b<8>(epi, f0), sc0));
+                            esimd::block_store<int8_t,8>(C8i + (size_t)rr0 * BN + gc + 8, rq8(pub_vec_v9b<8>(epi, f1), sc0));
+                        }
+                        if (rr1 < M) {
+                            esimd::block_store<int8_t,8>(C8i + (size_t)rr1 * BN + gc, rq8(pub_vec_v9b<8>(epi, g0), sc1));
+                            esimd::block_store<int8_t,8>(C8i + (size_t)rr1 * BN + gc + 8, rq8(pub_vec_v9b<8>(epi, g1), sc1));
+                        }
                     }
                 }
             }
