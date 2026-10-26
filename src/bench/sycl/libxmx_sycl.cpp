@@ -72,6 +72,7 @@ static char GERR[256] = {0};
 // our import releases only our reference, the producer keeps the allocation alive.
 struct Buf { void* p; size_t bytes; size_t esz; bool imported = false; };
 static std::unordered_map<int, Buf> g_bufs;
+static void mem_probe(int id, void* p, size_t bytes, const char* tag);  // fwd (ze world)
 static int g_nextbuf = 1;
 
 // recording
@@ -140,6 +141,7 @@ static void* pool_get(size_t n) {
         g_pool_mallocs++; g_pool_malloc_bytes += bucket;   // section 92: driver round-trip count
         void* p = sycl::malloc_device(bucket, *GQ);
         if (p) g_pool_sz[p] = bucket;
+        if (p && bucket >= (16ull<<20)) mem_probe(-1, p, bucket, "POOL");  // D11 census
         return p;
     }
     void* p = it->second.back(); it->second.pop_back();
@@ -342,6 +344,7 @@ int xmx_buf_create_kind(unsigned long long bytes, int kind) {
     if (!p) FAILMSG("out of device memory");
     int id = g_nextbuf++;
     g_bufs[id] = { p, (size_t)bytes, (size_t)(kind == 0 ? 2 : kind) };
+    mem_probe(id, p, bytes, "buf");   // section 100 D11 (defined with the ze world)
     return id;
 }
 int xmx_buf_create(unsigned long long bytes) { return xmx_buf_create_kind(bytes, 2); }
@@ -358,6 +361,34 @@ int xmx_buf_create(unsigned long long bytes) { return xmx_buf_create_kind(bytes,
 static ze_driver_handle_t g_zdrv = nullptr;
 static ze_context_handle_t g_zctx = nullptr;
 static ze_device_handle_t  g_zdev = nullptr;
+static int ensure_ze_world();   // forward (defined just below; static linkage)
+// section 100 D11: the memory-type census behind the leg3 stop-ladder fact (writing
+// the prepare-time plan target costs +38.5ms over writing a run-time pool buffer of
+// the same size with the SAME kernel and SAME addresses; contig-vs-scatter is free).
+// Suspect = the driver placed one in a HOST_VISIBLE/BAR region (the old "24.9MB to
+// system memory = 4.91ms" hazard class). NR_MEM_PROBE=1 prints ze type for every
+// >=16MB allocation (type: 1=HOST, 2=DEVICE, 3=SHARED per ze_api.h).
+static void mem_probe(int id, void* p, size_t bytes, const char* tag) {
+    if (!getenv("NR_MEM_PROBE") || bytes < (16ull<<20)) return;
+    // the pointer came from SYCL's allocator -- query it with SYCL's OWN ze context
+    // (the gate_coexist/gate_d3d_import lesson: under the level_zero filter
+    // get_native<level_zero> on the queue context succeeds; our private ze context
+    // would not recognize a foreign-allocated pointer).
+    try {
+        ze_context_handle_t zc = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(
+            GQ->get_context());
+        if (!zc) return;
+        ze_memory_allocation_properties_t prop = { ZE_STRUCTURE_TYPE_MEMORY_ALLOCATION_PROPERTIES };
+        ze_device_handle_t mdev = nullptr;
+        ze_result_t rc = zeMemGetAllocProperties(zc, p, &prop, &mdev);
+        if (rc == ZE_RESULT_SUCCESS)
+            std::printf("[mem-probe] %s id=%d bytes=%zu type=%u ptr=%p\n",
+                        tag, id, bytes, (unsigned)prop.type, p);
+        else
+            std::printf("[mem-probe] %s id=%d bytes=%zu query rc=0x%x ptr=%p\n",
+                        tag, id, bytes, (unsigned)rc, p);
+    } catch (...) { }
+}
 // bring up OUR OWN ze world once (never SYCL get_native: the paired-process opencl-adapter
 // trap of section 60 only bites when borrowing SYCL handles). The section-18/59 probes'
 // form: zeInit(GPU_ONLY), pick the Intel Arc, create our context. Same card, same driver,
@@ -3264,6 +3295,22 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                     nullptr, false, nullptr, true, false, 0, true);
                 pool_put(dBig);
             }
+            else if (wbstop == 95u) {
+                // section 100 D10 probe (completes the 2x2): CONTIGUOUS stores into
+                // the REAL plan target (same buffer as stop=99, same full tail), the
+                // only variable vs 99 is the address ORDER and vs 98 the buffer
+                // IDENTITY. {scatter,contig} x {pool,plan}: three cells measured --
+                // scatter->pool 189.3, contig->pool 189.3, scatter->plan 228.5. If
+                // contig->plan ~ 189 -> the cost is the scatter ORDER hitting THIS
+                // buffer (interleave with its other readers?); if ~228 -> the buffer
+                // itself makes every write slow regardless of order.
+                f16v3::gemm_resid_pub(*GQ, dAp3, dBp3,
+                    image_half ? (const sycl::half*)ImgH : nullptr,
+                    image_half ? nullptr : ImgF, image_half,
+                    cp, narrow ? (sycl::half*)Tgt : nullptr, narrow ? nullptr : (float*)Tgt,
+                    narrow, (int)rows, Mp, (int)C, height, width, across, top, left, epi,
+                    nullptr, false, nullptr, true, false, 0, true);
+            }
             else if (wbstop == 96u) {
                 // section 100 D9 probe (one variable vs 99 AND vs 97): the REAL
                 // scatter index (at = image slot) but into a device-local pool
@@ -3293,14 +3340,46 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                     cp, (sycl::half*)Tgt, nullptr, true,
                     (int)rows, Mp, (int)C, height, width, across, top, left, 0u,
                     nullptr, true, Pl);   // A2: the pool closes IN the kernel -- no Stage, no pass
-            else
-                f16v3::gemm_resid_pub(*GQ, dAp3, dBp3,
-                    image_half ? (const sycl::half*)ImgH : nullptr,
-                    image_half ? nullptr : ImgF, image_half,
-                    cp, narrow ? (sycl::half*)Tgt : nullptr, narrow ? nullptr : (float*)Tgt,
-                    narrow, (int)rows, Mp, (int)C, height, width, across, top, left, epi,
-                    nullptr, false, nullptr, true,
-                    wbstop == 88u, (int)(wbstop == 89u));   // D4/D5 tail probes
+            else {
+                // section 100 D12 (the 40ms fix): the sync-closure ledger says the
+                // leg3 kernel itself costs the SAME whether it writes the plan
+                // target or a pool buffer (63 vs 60ms per-closure) -- the 38.5ms
+                // async gap is the driver's cache DRAIN between our writer and the
+                // downstream FFN_MERGE reader of the same plan buffer. Cure: write
+                // a POOL staging buffer (no downstream reader -> no drain), then ONE
+                // device->device memcpy into the target -- the DMA copy op is the
+                // driver's coherence path and does not pay the compute-to-compute
+                // flush. Health check: all-device, zero CPU, raw f16/f32 bytes, no
+                // quantization -- a 33MB staging costs ~0.2ms at 300GB/s against
+                // the 38.5 it removes. NR_LEG3_STG=0 reverts.
+                // the 33MB staging + memcpy is a PURE EXTRA cost: the same-heat A/B
+                // says it is speed-NEUTRAL (228 both ways), and the sync-closure
+                // ledger shows writing the plan target is NOT slow per-closure (99 vs
+                // 96 = 63 vs 60) -- 96's async "win" was the illusion of a target with
+                // no downstream reader. Default OFF (kept as the mechanism witness).
+                static bool leg3stg = getenv("NR_LEG3_STG") ? atoi(getenv("NR_LEG3_STG")) != 0 : false;
+                if (leg3stg) {
+                    const size_t wsz2 = narrow ? 2u : 4u;
+                    sycl::half* dStg = (sycl::half*)pool_get(img_elems * wsz2);
+                    // the crop-skipped slots keep the target's original value in the
+                    // direct form -- and the plan target is written ONLY by this pass
+                    // (the plan census: 1265 has one writer), so those slots are the
+                    // zero the create left behind. Zero the staging to match exactly.
+                    GQ->memset(dStg, 0, img_elems * wsz2);
+                    f16v3::gemm_resid_pub(*GQ, dAp3, dBp3,
+                        image_half ? (const sycl::half*)ImgH : nullptr,
+                        image_half ? nullptr : ImgF, image_half,
+                        cp, narrow ? dStg : nullptr, narrow ? nullptr : (float*)dStg,
+                        narrow, (int)rows, Mp, (int)C, height, width, across, top, left, epi);
+                    GQ->memcpy(Tgt, dStg, img_elems * wsz2);
+                    pool_put(dStg);
+                } else
+                    f16v3::gemm_resid_pub(*GQ, dAp3, dBp3,
+                        image_half ? (const sycl::half*)ImgH : nullptr,
+                        image_half ? nullptr : ImgF, image_half,
+                        cp, narrow ? (sycl::half*)Tgt : nullptr, narrow ? nullptr : (float*)Tgt,
+                        narrow, (int)rows, Mp, (int)C, height, width, across, top, left, epi);
+            }
             }   // wbstop != 85u
             }   // wbstop != 86u
         } else if (wbstop > 8u) {
