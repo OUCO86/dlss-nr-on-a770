@@ -25,6 +25,7 @@
 #include "window_block_resident.hpp"
 #include "window_block_v2.hpp"
 #include "window_block_v3.hpp"
+#include "window_block_v4.hpp"
 #include "requant_kernel.hpp"
 #include "gemm_s8_v1_kernel.hpp"
 #include "gemm_s8_v3_kernel.hpp"
@@ -2959,6 +2960,28 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         // SECTION 99 v3: v2's fused window_block with the per-window scratch in SLM
         // (45KB lifetime-aliased map, 64KB IGC cap proven by bench_slm128) -- the §2
         // rule-2 GLOBAL round-trip is GONE. NR_WB_V3=1; same stage-dump judges as v2.
+        // section 100 P1 v4: the senior's stage discipline on our untouched operator
+        // (bench_v4full 9662c40: seven regions bit-exact vs v3, FULL 2.12x). PROMOTED
+        // to the default for the plain form (same-heat A/B 3 rounds: v4 wins EVERY
+        // pair by 6-11ms; end-to-end 100.0000%% x2). Escape hatches: NR_WB_V3=1 /
+        // NR_WB_SPLIT=1 restore v3 / the split chain. pool/head keep their fused legs.
+        if (!getenv("NR_WB_SPLIT") && !getenv("NR_WB_V3") && !getenv("NR_RESIDENT_WB")
+            && !getenv("NR_FULL_MEGA") && !pooling && !head) {
+            g_wb_v2++;
+            unsigned st = getenv("NR_V2_STOP") ? (unsigned)atoi(getenv("NR_V2_STOP")) : 0u;
+            if (st == 65531u) return;
+            if (st == 65530u) return;
+            sycl::half* dWq = cached_pack_b_f16(qkv, Wraw, (int)C, (int)NH);
+            sycl::half* dWp = cached_pack_b_f16(projection, Praw, (int)C, (int)C);
+            sycl::half* dKV = nullptr;
+            if (st && st < 0xFF00u) dKV = (sycl::half*)pool_get((size_t)windows * 4096u * 2);
+            wbv4::launch_v4full(*GQ, image_half ? (const void*)ImgH : (const void*)ImgF, image_half,
+                                dWq, dWp, narrow ? (sycl::half*)Tgt : nullptr,
+                                narrow ? nullptr : (float*)Tgt, Bp, cp, qs,
+                                windows, height, width, across, top, left, epi, narrow, st, dKV);
+            if (dKV) pool_put(dKV);
+            return;
+        }
         if (getenv("NR_WB_V3") && !getenv("NR_RESIDENT_WB") && !getenv("NR_FULL_MEGA")
             && !pooling && !head) {
             g_wb_v2++;
