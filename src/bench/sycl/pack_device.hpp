@@ -47,6 +47,42 @@ static inline void pack_a(sycl::queue& q, const int8_t* A, int8_t* Ap, int M, in
 // f32 per row, row-major) -- the recorder passes the quant's scale buffer.
 static inline void pack_a_fused(sycl::queue& q, const sycl::half* A_f16, int8_t* Ap,
                                 float* scales, int M, int Mp, int K) {
+    // SHAPE DISPATCH (bench_qfused2 35bdfc1): row-parallel wins 1.5-2.5x on every
+    // frame shape; the (row x kb-group) two-level variant wins where Mp underfills
+    // the 512 EU x 32 lanes (K>=2048 && Mp<=512: K=4096/M=192 -> 3.71x vs two-pass).
+    const int kb_n = K / 32;
+    if (K >= 2048 && Mp <= 512){
+        const int GRP = 8;                 // kb blocks per item; Mp*kb_n/GRP items
+        const int ngrp = kb_n / GRP;
+        q.parallel_for(sycl::range((size_t)Mp * ngrp), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
+            namespace esimd = sycl::ext::intel::esimd;
+            const int BM = 128, BK = 32;
+            size_t d=(size_t)it.get_id(0);
+            int srow=(int)(d/ngrp), g=(int)(d%ngrp);
+            int w=srow/BM, rem=srow%BM, wi=rem/16, row=rem%16;
+            size_t per_blk=((size_t)w*kb_n)*8+wi;
+            if (srow>=M){ esimd::simd<int8_t,32> z((int8_t)0);
+                for(int kb=g*GRP;kb<(g+1)*GRP;++kb)
+                    esimd::block_store<int8_t,32>(Ap+(per_blk+(size_t)kb*8)*512+row*32,z,esimd::overaligned_tag<16>{});
+                return; }
+            esimd::simd<float,32> mx(esimd::simd<float,32>(0.f));
+            for(int kb=0;kb<kb_n;++kb){          // full row peak (redundant across g;
+                esimd::simd<float,32> reg=esimd::convert<float>(esimd::block_load<sycl::half,32>(
+                    A_f16+(size_t)srow*K+kb*BK, esimd::overaligned_tag<16>{}));   // row<=8KB: L1)
+                mx=esimd::max(mx,esimd::abs(reg)); }
+            float peak=esimd::hmax<float,float,32>(mx);
+            const float scale=(peak==0.f)?1.f:esimd::div_ieee<float,1>(esimd::simd<float,1>(peak),esimd::simd<float,1>(127.f))[0];
+            scales[srow]=scale;                  // idempotent across g
+            for(int kb=g*GRP;kb<(g+1)*GRP;++kb){
+                esimd::simd<float,32> reg=esimd::convert<float>(esimd::block_load<sycl::half,32>(
+                    A_f16+(size_t)srow*K+kb*BK, esimd::overaligned_tag<16>{}));
+                esimd::simd<float,32> qq=esimd::div_ieee<float,32>(reg,esimd::simd<float,32>(scale));
+                qq=esimd::min(esimd::max(esimd::rnde<float,32>(qq),esimd::simd<float,32>(-127.f)),esimd::simd<float,32>(127.f));
+                esimd::block_store<int8_t,32>(Ap+(per_blk+(size_t)kb*8)*512+row*32,
+                    esimd::convert<int8_t>(esimd::convert<int>(qq)),esimd::overaligned_tag<16>{}); }
+        });
+        return;
+    }
     // ESIMD vectorized (the scalar first cut was 100%%-correct but 86ms SLOWER --
     // the ledger caught it): dest k runs CONTIGUOUS 32 within a block, and the
     // source 32 halves are contiguous -- one simd<float,32> pair per (row,kb).
@@ -54,7 +90,6 @@ static inline void pack_a_fused(sycl::queue& q, const sycl::half* A_f16, int8_t*
     // the qr_kernel_rowthread/quantize chain VERBATIM: fdiv_rn(peak,127) scale,
     // fdiv_rn(v,scale) per element, rint (roundEven), clamp [-127,127], int8.
     const int BM = 128, BK = 32;
-    int kb_n = K / BK;
     q.parallel_for(sycl::range((size_t)Mp), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
         namespace esimd = sycl::ext::intel::esimd;
         int srow = (int)it.get_id(0);
