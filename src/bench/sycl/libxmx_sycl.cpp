@@ -113,6 +113,30 @@ static void flop_note(const char* fam, double m, double n, double k, double batc
 }
 static std::atomic<long> g_wb_v2{0}, g_wb_split{0};
 static unsigned g_wbf3_poolhead = 0;   // section 100: one-shot proof the pool/head forms ride the fused leg
+// section 100 D14: the preallocated probe target for stop=94 (33.4MB, allocated in
+// xmx_init like the plan buffers, but NEVER registered in g_bufs and never read).
+static void* g_probe33 = nullptr;
+// section 100 D16 (stop=90): the fix candidate probe. The law the ladder pinned:
+// writing a buffer allocated BEFORE recording (plan buffers at prepare, probe33 at
+// init) costs +39ms in this engine; writing one allocated DURING recording (pool)
+// is free; and moving bytes INTO an early buffer at run (D12 memcpy) pays the same
+// tax. So: keep the data in a recording-time staging buffer and alias BOTH the
+// writer (window_block target) and the reader (ffn_merge skip) to it -- the plan
+// buffer leaves the hot path entirely. Probe aliases 1265 only (block 0's skip,
+// the 33MB hand-off). Frame is garbage by design for OTHER reasons? NO -- the
+// bytes flow writer->staging->reader, so 90 must be BIT-EXACT end to end; that is
+// the probe's second judge.
+static std::map<int, void*> g_alias;   // plan buf id -> recording-time staging
+static void* pool_get(size_t n);       // fwd (defined below with the scratch pool)
+// the alias swap: called at RECORD time (pool_get = recording-time allocation, the
+// one placement the whole engine writes fast). Idempotent per plan id.
+static void* alias_buf(int id, size_t bytes) {
+    auto it = g_alias.find(id);
+    if (it != g_alias.end()) return it->second;
+    void* p = pool_get(bytes);
+    g_alias[id] = p;
+    return p;
+}
 // section 99: §29 rule 1 -- quantize folds into the producer GEMM's store loop. The
 // fused producer registers the SOURCE buffer id of the quant pass it just absorbed;
 // xmx_rec_quant sees the id and records a no-op (the plan's op stream is untouched --
@@ -323,6 +347,17 @@ int xmx_init(void) {
         // per-pass host .wait() (the ~2000 sync points were the low GPU utilisation the
         // user saw in-game). graph_run/submit wait once at the end.
         GQ = new sycl::queue(dev, sycl::property::queue::in_order{});
+        // section 100 D14 probe: a PREALLOCATED standalone 33.4MB buffer (allocated
+        // here, before prepare's OP_BUF steps, NEVER registered in g_bufs, never
+        // read by anything). stop=94 writes all fused leg3 calls into it. vs stop=99
+        // (plan buffer 1265, prepare-time + g_bufs) and stop=96 (pool buffer,
+        // run-time, recycled): separates "plan-buffer registration" from "early big
+        // allocation" as the cause of the 40ms async writer cost.
+        {
+            const char* wbs = getenv("NR_WB_STOP");
+            int st = wbs ? atoi(wbs) : 99;
+            if (st == 94 || st == 91) g_probe33 = sycl::malloc_device(34000000, *GQ);
+        }
         GERR[0] = 0;
         return 0;
     } catch (const std::exception& e) { FAILMSG("xmx_init: %s", e.what()); }
@@ -340,7 +375,20 @@ int xmx_init(void) {
 int xmx_buf_create_kind(unsigned long long bytes, int kind) {
     if (!GQ) FAILMSG("not initialised");
     if (!bytes) FAILMSG("bad buffer request");
-    void* p = sycl::malloc_device<unsigned char>(bytes, *GQ);
+    // section 100 D16 (stop=90): THE fix candidate, minimal form. Plan buffer 1265
+    // (the 33MB block0 -> ffn_merge skip hand-off) gets its POINTER from pool_get
+    // instead of a fresh malloc_device -- i.e. recycled from the pool the engine
+    // writes fast, allocated at the same prepare moment. Writer and reader both
+    // address it through g_bufs, so one swap covers both sides; the byte stream
+    // (writer->1265->reader) is untouched, so stop=90 MUST be bit-exact end to end
+    // (buffer 1301 is the judge). If this is fast, the cure is "route hot hand-off
+    // buffers through the pool" -- a recorder-layer change, plan/bridge frozen.
+    void* p = nullptr;
+    {
+        static int st90 = getenv("NR_WB_STOP") ? atoi(getenv("NR_WB_STOP")) : 99;
+        if (st90 == 90 && bytes == 33423360ull && kind == 0) p = pool_get(bytes);
+    }
+    if (!p) p = sycl::malloc_device<unsigned char>(bytes, *GQ);
     if (!p) FAILMSG("out of device memory");
     int id = g_nextbuf++;
     g_bufs[id] = { p, (size_t)bytes, (size_t)(kind == 0 ? 2 : kind) };
@@ -1369,6 +1417,13 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
         FAILMSG("bad ffn_merge operand");
     const sycl::half* Src = (const sycl::half*)isrc->second.p;   // level above (half)
     const sycl::half* Skp = (const sycl::half*)isk->second.p;    // full-resolution skip (half)
+    // section 100 D15 (stop=91): the READER aliased to the same preallocated probe
+    // buffer the writer (stop=91 leg3) writes -- the full hand-off moves OFF plan
+    // buffer 1265. Ledger probe only (frame garbage by design).
+    {
+        static const char* wbs = getenv("NR_WB_STOP");
+        if (wbs && atoi(wbs) == 91 && g_probe33) Skp = (const sycl::half*)g_probe33;
+    }
     const float* SC = (const float*)isc->second.p;               // sin then cos, f32[64]
     const sycl::half* Eraw = (const sycl::half*)iex->second.p;   // expand (32 x 128)
     const sycl::half* Praw = (const sycl::half*)ipr->second.p;   // projection (128 x 32)
@@ -1378,6 +1433,15 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
     const bool narrow = (flags & 0x1000u) != 0u;
     const int Mp = (int)(((M + 15u) / 16u) * 16u);
     g_cmd_names.push_back(__func__);
+    // section 100 D13 probe (NR_SKIP_FFN_MERGE=1, diagnostic ledger only -- the
+    // frame is garbage by design): the writer leg3 costs 40ms in the async graph
+    // ONLY when it writes plan buffer 1265, and per-closure sync says the kernel
+    // itself is ~4ms either way. 1265's only reader is THIS pass's Skp (ffn_merge).
+    // Skipping the reader tests the writer<->reader interaction hypothesis head-on.
+    if (getenv("NR_SKIP_FFN_MERGE")) {
+        g_cmds.push_back([](){});
+        return 0;
+    }
     g_cmds.push_back([=]() {
         // ---- pass A: merged4 on device -> dMerged f32 (the skip) + e4m3-half -> host ----
         float* dMerged = (float*)pool_get((size_t)M * 32 * 4);   // raw, kept for pass C
@@ -3326,6 +3390,22 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                     cp, dBig, nullptr, true,
                     (int)rows, Mp, (int)C, height, width, across, top, left, epi);
                 pool_put(dBig);
+            }
+            else if ((wbstop == 94u || wbstop == 91u) && g_probe33) {                // section 100 D14/D15: the fused leg3 writes the PREALLOCATED
+                // standalone buffer (init-time, never in g_bufs). 94: writer side
+                // only (ffn_merge still reads the untouched plan buffer) -- the
+                // discriminator "early allocation + unregistered" vs 96's "run-time
+                // pool". 91: BOTH sides aliased (ffn_merge's Skp points at the same
+                // probe buffer; 1265 leaves the frame entirely) -- the fix candidate:
+                // if the 40ms is a property of the hand-off THROUGH 1265, aliasing
+                // writer+reader to one buffer kills it while keeping the byte stream
+                // (frame garbage by design -- ledger probe only).
+                f16v3::gemm_resid_pub(*GQ, dAp3, dBp3,
+                    image_half ? (const sycl::half*)ImgH : nullptr,
+                    image_half ? nullptr : ImgF, image_half,
+                    cp, narrow ? (sycl::half*)g_probe33 : nullptr,
+                    narrow ? nullptr : (float*)g_probe33,
+                    narrow, (int)rows, Mp, (int)C, height, width, across, top, left, epi);
             }
             else if (head)
                 f16v3::gemm_resid_pub(*GQ, dAp3, dBp3,
