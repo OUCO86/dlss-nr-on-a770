@@ -47,10 +47,15 @@ global_attn 11.2 | ffn_merge 10.8 | ffn_stem 10.4 | unary 4.9 | gemm_int8 4.6
 
 ## 三、作战序列（按 家族账本大小 × 前辈对应实现 排，每刀独立提交独立三关）
 
-### P1【最大单项】window_block op 转 resident（账本 42.8+wb-window-res 17.4+quant_window 15.1+qkv 尾巴 20.8+attention 往返，整链 sync 口径 160.6ms → 前辈对应 ~12ms）
-- 参照：window_block.comp（前辈整块 resident：gather+QKV+norm+scores+softmax+PV+outproj+residual+publish 一个 launch，Q/K/V/scores/probs/ctx 全留 SLM）；我的已证机制=wbv3（NR_WB_V3 opt-in，45KB SLM 别名布局，bit-exact 已录）。
-- 做法：把 wbv3 转正为默认，先 plain 形态，再 pool/head 形态；split 路留 NR_WB_SPLIT=1 逃生舱。
-- 目标：window_block 家族 42.8→~8ms（前辈 0.62/个×10=6.2）。**预期 -35~50ms**。
+### P1 window_block 内部机制 resident 化（账本 42.8+wb-window-res 17.4+quant_window 15.1+qkv 尾巴 20.8+attention 往返，整链 sync 口径 160.6ms → 前辈对应 ~12ms）
+
+**★ 核心算子不动原则（用户 10-26 13:08 明令，实测背书）**：P1 修的是【中间数据住哪 + stage 数据流纪律】这个**内部机制**，不是计算核心。账本已证明我们的核心是健康的：QKV 宽 GEMM 本体 5.7ms/30call（0.09-0.56ms/个=前辈区）；前辈 coopmat 在 A770 只有 24.8 TOPS 上限，我们的 dpas 宽 tile 是他的 3-4x——**他的核心不是 A770 最优，他的价值只在数据流组织**。v3/v4 的计算继续用已证的 dpas tile8/store16（f16v1 逐字，39 门绿）+ 大宽数据。
+
+**前辈 workgroup 形状实测否证（10-26 15:25）**：他的 256 线程/WG（8×32 coopmat）在 ESIMD 下直接 HANG——bench_v2crash mode=0 nd(2040×256) 无返回（90s 掐断；§96 旧账 LW>=128 ESIMD+barrier hangs，LW=64×2040 windows 是验证过的安全区）。**不搬他的形状，只搬他的 stage 纪律**：每阶段 scratch 复用（他每 subgroup 仅 1KB）、权重一次进 SLM 常驻（他的实测教训 1.6ms of 7.1ms）、双层 barrier（subgroup 内自 barrier、跨行才 group barrier）、K 转置 ColumnMajor 读法。
+
+- 首刀已否证（a36c9dc）：wbv3 直接转正失败——46.1 vs 42.9（每对 split 赢）。根因=v3 的 stage 机制糙：45KB 别名区、7 阶段全组 barrier、每阶段只 4 个 SIMD16 subgroup 并行度。**resident 思路没错（前辈 0.62ms/call 证），v3 的实现没执行到位。**
+- P1 正确做法：对 v3 做 **stage 级 bisect**（NR_V2_STOP 已有）找出 5.7ms/call 里哪段最肥 → 按前辈纪律逐段修（scratch 复用、SLM 常驻权重、barrier 分层），算子保持 dpas 宽 tile。每修一段跑一次 NR_WB_V3 同热 A/B，转正判据=家族账 window_block 42.9 → 目标 <15ms（不必到前辈 6.2——我们的 tile 更大，合理预期 3-4ms/call 级）。
+- 目标：window_block 家族 42.8→~10-15ms 起步，**预期 -30~50ms**（含 wb-window-res/quant_window/qkv 尾巴/attention 往返被吸收）。
 
 ### P2 quant 家族折进生产者（29.2+15.1=44.3ms → 前辈 1.64ms）
 - 参照：gemm_staged_int8.comp 的 store 出口直接出 int8+scale；quantize_row.comp 只剩非 GEMM 生产者。
