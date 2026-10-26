@@ -144,6 +144,31 @@ static void* alias_buf(int id, size_t bytes) {
 // xmx_rec_quant sees the id and records a no-op (the plan's op stream is untouched --
 // the bridge and plan stay frozen per the 10-18 order).
 static std::map<int,int> g_fused_quant;   // quant-source cb -> a_scale buf (new_scale lives there)
+// SECTION 100 P2 CONSUMER-SIDE FUSION (the user's "dissolve the kernel" direction):
+// the census (plan_960x544.c, precise buffer-position parse) proved 448/448 quants have
+// pk SINGLE-READER = the very next gemm (gap 2), f16 source ALIVE until that gemm
+// (0 overwritten), zero in-place, and the quant's scale buf == the gemm's a_scale buf
+// (432/448; the 16 that differ stay two-pass). So the gemm's pack_a reads the f16
+// ACTIVATION, quantizes row-wise inline (the qr_kernel_rowthread arithmetic, fdiv_rn
+// per element = numpy-exact), and writes the packed int8 -- the standalone quant
+// launch AND its pk buffer disappear. bench_qfused: FUSED-PACK tile-diff 0 scale-diff
+// 0 on every frame shape. Gate NR_Q_FUSE (default OFF until the three gates pass).
+struct QuantFused { size_t qcmd; int src; int sc; unsigned M; unsigned K; };
+static std::map<int,QuantFused> g_quant_pk;   // pk buf id -> the quant that wrote it
+static bool qfuse_on() { static bool v = getenv("NR_Q_FUSE") != nullptr; return v; }
+// called by a gemm recorder: if `a` is a fused-quant pk whose scale buf == this gemm's
+// a_scale and whose M,K match, no-op the quant closure and return its info.
+static bool qfuse_take(int a, int a_scale, unsigned M, unsigned K, QuantFused& out){
+    if (!qfuse_on()) return false;
+    auto it = g_quant_pk.find(a);
+    if (it == g_quant_pk.end()) return false;
+    if (it->second.sc != a_scale || it->second.M != M || it->second.K != K) return false;
+    out = it->second;
+    g_cmds[out.qcmd] = [](){};                 // the quant launch dissolves
+    g_cmd_names[out.qcmd] = "quant(FUSED-pack)";
+    g_quant_pk.erase(it);
+    return true;
+}
 // SECTION 99 v9b FOLD pairing (record-time registration, exec-time lookup): the
 // batched recorder, when its v9b condition holds, records its own cmd index under the
 // c buffer id; the ADJACENT quant recorder back-fills (packed,scale) into that slot.
@@ -1698,12 +1723,15 @@ int xmx_rec_gemm_int8(int a, int b, int c, int a_scale, int b_scale,
     const size_t na = (size_t)Mp * K, nb = (size_t)N * K;
     g_cmd_names.push_back(__func__);
         flop_note("int8",M,N,K,1);
+    QuantFused qf; const bool fused = qfuse_take(a, a_scale, M, K, qf);
+    sycl::half* a16 = fused ? (sycl::half*)g_bufs[qf.src].p : nullptr;
     g_cmds.push_back([=]() {
         // device pack (section 92 phase-2): the operands stay on device -- the host
         // round-trip (download -> CPU pack -> upload) was the whole 89s/frame, and the
         // gather is bit-exact vs the host pack (PACK_DEVICE gate).
         int8_t* dAp = (int8_t*)pool_get(na);
-        packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K);
+        if (fused) packdev::pack_a_fused(*GQ, a16, dAp, (float*)as, (int)M, Mp, (int)K);
+        else packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K);
         int8_t* dBp = cached_pack_b_i8(b, Braw, (int)N, (int)K);   // weight: pack once, reuse
         // DERIVED (section 92): pure publish (dequant + qr_publish, no residual fma) and
         // N%64==0 is a hard requirement -- exactly gemm_b_pub's shape (batch=1, dense ldc=N,
@@ -3729,6 +3757,8 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
         g_cmds.push_back([=]() {
             qr_launch_esimd(*GQ, *GD, a, pk, sc, M, K);
         });
+        if (qfuse_on())   // register for a downstream gemm to dissolve us (P2 fusion)
+            g_quant_pk[packed] = QuantFused{ g_cmds.size()-1, source, scale, M, K };
         return 0;
     }
     g_cmds.push_back([=]() {
