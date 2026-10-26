@@ -13,6 +13,7 @@
 #include <functional>
 #include <algorithm>
 #include <cmath>
+#include <exception>
 using namespace sycl;
 namespace esimd = sycl::ext::intel::esimd;
 
@@ -65,6 +66,44 @@ auto k_fused(){  // f16 -> dAp directly (quant inline at the pack stage)
     };
 }
 
+
+// ---- the REAL-SHAPE variant: row-per-item, 16-chunk loop, pack-tile destination ----
+// (what the gemm recorders' pack will actually run: quant inline + scatter into the
+// dpas A-tile layout, exactly the pack_a16 index math proven in pack_device.hpp)
+template <int KMAX>
+auto k_fused_pack(){
+    return [=](sycl::half* a_src, int8_t* Ap, float* scales, unsigned m, unsigned Mp){
+        return [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
+            unsigned row = (unsigned)it.get_id(0);
+            const int kb_n = KMAX/16;
+            // pass 1: row peak (16-chunk loads)
+            esimd::simd<float,16> mx(esimd::simd<float,16>(0.f));
+            for (int kc = 0; kc < kb_n; ++kc){
+                esimd::simd<float,16> reg = esimd::convert<float>(esimd::block_load<sycl::half,16>(
+                    a_src + (size_t)row*KMAX + kc*16u, esimd::overaligned_tag<16>{}));
+                mx = esimd::max(mx, esimd::abs(reg));
+            }
+            float peak = esimd::hmax<float,float,16>(mx);
+            const float scale = (peak == 0.0f) ? 1.0f
+                : esimd::div_ieee<float,1>(esimd::simd<float,1>(peak), esimd::simd<float,1>(127.0f))[0];
+            scales[row] = scale;
+            // pass 2: quantize + scatter into the pack tile (same dest math as pack_a16:
+            // d = ((tr*kb_n+kc)*2+strip)*128 + il*16 + k ; row = tr*16+strip*8+il)
+            if (row < Mp){
+                int tr = (int)(row/16u), strip=(int)((row/8u)&1u), il=(int)(row&7u);
+                for (int kc = 0; kc < kb_n; ++kc){
+                    esimd::simd<float,16> reg = esimd::convert<float>(esimd::block_load<sycl::half,16>(
+                        a_src + (size_t)row*KMAX + kc*16u, esimd::overaligned_tag<16>{}));
+                    esimd::simd<float,16> q = esimd::div_ieee<float,16>(reg, esimd::simd<float,16>(scale));
+                    q = esimd::min(esimd::max(esimd::rnde<float,16>(q), esimd::simd<float,16>(-127.f)), esimd::simd<float,16>(127.f));
+                    esimd::block_store<int8_t,16>(Ap + (((size_t)(tr*kb_n+kc)*2u+strip)*128u + il*16u),
+                        esimd::convert<int8_t>(esimd::convert<int>(q)), esimd::overaligned_tag<16>{});
+                }
+            }
+        };
+    };
+}
+
 template <int KMAX>
 static void one(queue& q, unsigned m, const char* lbl){
     size_t n=(size_t)m*KMAX;
@@ -85,26 +124,43 @@ static void one(queue& q, unsigned m, const char* lbl){
           double t=0; for(auto&e:es) t+=double(e.get_profiling_info<info::event_profiling::command_end>()
                                               - e.get_profiling_info<info::event_profiling::command_start>());
           best=std::min(best,t/1e6);} return best;};
-    // two-pass: time the PAIR (sum of both kernels' GPU time; the frame pays one
-    // graph-node gap on top for the second launch -- that gap is what the skip probe
-    // counted at ~28us/call, NOT measured here).
     double t2 = timeit([&]{
         event e1=q.parallel_for(range(m), k_quant<KMAX>()(src,pkA,sA,m));
         event e2=q.parallel_for(range(n/16u), k_pack()(pkA,dpA,n)); return std::vector<event>{e1,e2}; });
     double tf = timeit([&]{ return std::vector<event>{q.parallel_for(range(m), k_fused<KMAX>()(src,dpB,sB,m))}; });
+    int Mp=(int)((m+15u)/16u)*16;
+    size_t npk=(size_t)Mp*KMAX;
+    int8_t* dAp = malloc_device<int8_t>(npk,q); q.memset(dAp,0,npk); q.wait();
+    float* sC = malloc_device<float>(m,q);
+    double tg = timeit([&]{ return std::vector<event>{q.parallel_for(range(m), k_fused_pack<KMAX>()(src,dAp,sC,m,(unsigned)Mp))}; });
+    // captures FIRST (host copies of the device results)
     std::vector<int8_t> a(n), b(n);
     q.memcpy(a.data(),dpA,n).wait(); q.memcpy(b.data(),dpB,n).wait();
+    std::vector<int8_t> tile(npk); q.memcpy(tile.data(),dAp,npk).wait();
+    std::vector<float> hc(m),hg(m);
+    q.memcpy(hc.data(),sC,m*4).wait(); q.memcpy(hg.data(),sA,m*4).wait();
     size_t diff=0; for(size_t i=0;i<n;++i) if(a[i]!=b[i]) diff++;
-    printf("%-16s M=%6u K=%4d  two-pass %7.3fms  fused %7.3fms  ratio %.2fx  | packed-diff %zu %s\n",
-        lbl,m,KMAX,t2,tf,t2/tf,diff,diff?"NOT-EXACT":"EXACT");
-    free(src,q);free(pkA,q);free(dpA,q);free(dpB,q);free(sA,q);free(sB,q);
+    size_t bad=0;
+    for(size_t d0=0; d0<npk; d0+=16u){
+        size_t rest=d0/16u; int il=(int)(rest%8u); rest/=8u; int strip=(int)(rest%2u); size_t blk=rest/2u;
+        int kc=(int)(blk%(size_t)(KMAX/16)); int tr=(int)(blk/(size_t)(KMAX/16));
+        size_t srow=(size_t)tr*16u+strip*8u+il;
+        if (srow<m) for(int k=0;k<16;++k) if(tile[d0+k]!=b[srow*KMAX+kc*16+k]) bad++;
+    }
+    size_t sbad=0; for(unsigned i2=0;i2<m;++i2) if(hc[i2]!=hg[i2]) sbad++;
+    printf("%-16s M=%6u K=%4d  two-pass %7.3fms  fused-contig %7.3fms (%.2fx)  FUSED-PACK %7.3fms (%.2fx)  | contig-diff %zu tile-diff %zu scale-diff %zu %s\n",
+        lbl,m,KMAX,t2,tf,t2/tf,tg,t2/tg,diff,bad,sbad,(diff||bad||sbad)?"NOT-EXACT":"EXACT");
+    free(src,q);free(pkA,q);free(dpA,q);free(dpB,q);free(sA,q);free(sB,q);free(dAp,q);free(sC,q);
 }
 
 int main(){
   device dev;
   for(auto&d:device::get_devices(info::device_type::gpu))
     if(d.get_backend()==backend::ext_oneapi_level_zero&&d.get_info<info::device::name>().find("Arc")!=std::string::npos){dev=d;break;}
-  queue q(dev,property::queue::enable_profiling{});
+  queue q(dev, [=](exception_list els){
+      for(auto& e : els){ try{ std::rethrow_exception(e); }
+        catch(const std::exception& ex){ fprintf(stderr,"ASYNC EXC: %s\n", ex.what()); } }
+  }, property::queue::enable_profiling{});
   one<64>(q, 32640, "x16 K64");
   one<128>(q, 8160, "x24 K128");
   one<256>(q, 2040, "x32 K256");

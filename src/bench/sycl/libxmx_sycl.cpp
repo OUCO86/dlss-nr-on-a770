@@ -2165,11 +2165,14 @@ int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale,
     const size_t na = (size_t)Mp * K, nb = (size_t)N * K;
     g_cmd_names.push_back(__func__);
         flop_note("int8_residual",M,N,K,1);
+    QuantFused qfr; const bool fused_r = qfuse_take(a, a_scale, M, K, qfr);
+    sycl::half* a16r = fused_r ? (sycl::half*)g_bufs[qfr.src].p : nullptr;
     g_cmds.push_back([=]() {
         // device pack (section 92): Araw/Braw are already on device -- pack in place,
         // no download/upload round-trip (same conversion as gemm_int8, packdev gate).
         int8_t* dAp = (int8_t*)pool_get(na);
-        packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K);
+        if (fused_r) packdev::pack_a_fused(*GQ, a16r, dAp, (float*)as, (int)M, Mp, (int)K);
+        else packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K);
         int8_t* dBp = cached_pack_b_i8(b, Braw, (int)N, (int)K);   // weight: pack once
         // DERIVED (section 92): same lever as batched -- fuse the publish into the gemm
         // store, killing the int32 dC scratch + the separate publish pass. The residual
@@ -2245,6 +2248,8 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
     const unsigned top = pad >> 16, left = pad & 0xffffu;
     g_cmd_names.push_back(__func__);
         flop_note("win_int8_res",M,N,K,1);
+    QuantFused qfw; const bool fused_w = qfuse_take(a, a_scale, M, K, qfw);
+    const int srcid_w = fused_w ? qfw.src : 0;
     g_cmds.push_back([=]() {
         // RUN-TIME fresh lookups shadowing the capture-time pointers (see the lesson
         // above): sizes are checked HERE because the scratch recording's placeholder
@@ -2270,6 +2275,10 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
         const float* cp  = (const float*)sized(cosine, (size_t)N * 4u, "cosine");
         // device pack (section 92): Araw/Braw already on device -- pack in place.
         int8_t* dAp = (int8_t*)pool_get(na);
+        if (fused_w) {   // P2: the closure captured (fused_w, srcid_w) by value at
+            sycl::half* a16w = (sycl::half*)sized(srcid_w, (size_t)M * K * 2u, "A(f16 fused)");
+            packdev::pack_a_fused(*GQ, a16w, dAp, (float*)as, (int)M, Mp, (int)K);
+        } else
         packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K);
         int8_t* dBp = cached_pack_b_i8(b, Braw, (int)N, (int)K);   // weight: pack once
         // DERIVED (section 92): same fused-publish lever as int8_residual/batched. The
