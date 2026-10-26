@@ -2009,9 +2009,16 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
         // device pack (section 92): Araw/Braw already on device -- pack in place.
         int8_t* dAp = (int8_t*)pool_get(na);
         int32_t* dC = (int32_t*)pool_get((size_t)Mp * NH * 4);
-        packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)C);
+        // section 100 QKV-internal ledger (NR_QKV_STOP=N, launch-guard form, time
+        // ledger only -- the frame is garbage here by design): 1 = skip norm_scatter
+        // (pack+gemm only), 2 = skip gemm too (pack only), 3 = skip pack too (floor).
+        // qkv family = 32.5ms/30 calls; this splits pack vs gemm vs the dC-reading
+        // epilogue pass so the fold (senior's 0x100000 qkv_epilogue IN the gemm
+        // store) targets the right segment.
+        static int qkvstop = getenv("NR_QKV_STOP") ? atoi(getenv("NR_QKV_STOP")) : 0;
+        if (qkvstop < 3) packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)C);
         int8_t* dBp = cached_pack_b_i8(b, Braw, (int)NH, (int)C);   // weight: pack once
-        s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)NH, (int)C);
+        if (qkvstop < 2) s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)NH, (int)C);
         // stage 2: deq + in-place Q/K head norm (the epilogue's order; V deqt only).
         // DERIVED (section 92): the non-vit normalize is the same scalar cosine chain that
         // the 4-lane ESIMD butterfly just made 4.3x faster in window_block; qkv_norm_esimd
@@ -2020,6 +2027,7 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
         if (!vit) {
             // DERIVED (section 92): merge stage-2 normalise + stage-3 e4m3/scatter into ONE
             // kernel -- no dC float-bits round-trip, one fewer launch. Non-vit only.
+            if (qkvstop < 1)
             wbmega::qkv_norm_scatter_esimd(*GQ, dC, Q, Kk, V, as, bs, qs, M, heads, C, NH, tokens);
         } else {
         GQ->parallel_for(sycl::range((size_t)M * heads),
