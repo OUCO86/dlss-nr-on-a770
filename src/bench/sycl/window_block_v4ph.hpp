@@ -28,7 +28,7 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
     unsigned epilogue, bool narrow,
     unsigned stop_stage = 0, half* DumpKV = nullptr,
     bool pooling = false, bool head = false, half* Pl = nullptr, const half* HeadWp = nullptr,
-    half* HeadADump = nullptr)
+    half* HeadADump = nullptr, float* ProjFDump = nullptr, float* TotalDump = nullptr)
 {
     constexpr uint LW = 64u;
     return q.submit([&](handler& h) {
@@ -237,9 +237,12 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
                 wbv3::store16s(S_SCR + sgid*SCR_SG + tc*16u*4u, 32, c00,c01,c10,c11);
             }
             esimd::barrier();
-            if (stop_stage == 9u) {   // projected rows (v3 stop=9 form)
-                uint sg = lid >> 4, rr = lid & 15u;
+            if (stop_stage == 9u) {   // projected rows, FULL f32 (the section-100
+                uint sg = lid >> 4, rr = lid & 15u;   // outproj-order judge vs A2's dC3)
                 uint scr = S_SCR + sg*SCR_SG;
+                if (ProjFDump) for (uint c = 0; c < 32; ++c)
+                    ProjFDump[(size_t)window*2048u + lid*32u + c] =
+                        esimd::slm_block_load<float,1>(scr + (rr*32u+c)*4u)[0];
                 if (DumpKV) for (uint c = 0; c < 32; ++c)
                     DumpKV[(size_t)window*4096u + lid*32u + c] =
                         half(esimd::slm_block_load<float,1>(scr + (rr*32u+c)*4u)[0]);
@@ -247,6 +250,13 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
             }
 
             // ===== P7 residual fma + publish; form outlets (pool/head), plain tail =====
+            // FMA-CONTRACTION FIX (section 100, the ULP root cause pinned by the
+            // witness experiment: A2 total == fma-numpy 100%%, old v4ph total ==
+            // muladd-numpy 100%%): the loads and the expression must be ADJACENT in
+            // one straight-line block -- sk pre-initialized to 0 and conditionally
+            // reassigned made it a phi node and blocked the single-HW-FMA lowering
+            // A2's f16v3 gets (its row loop does `if(out) continue; sk=load;
+            // total=sk*cv+acc;` -- same shape as the `if(inimg){...}` here).
             {
                 uint r2 = lane, r = sgid*16u + lane;
                 uint scr = S_SCR + sgid*SCR_SG;
@@ -254,24 +264,27 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
                 int x = (int)((window % window_cols) * 8u + (r & 7u)) - (int)left;
                 bool inimg = y >= 0 && y < (int)image_h && x >= 0 && x < (int)image_w;
                 size_t at = ((size_t)(inimg ? y : 0) * image_w + (size_t)(inimg ? x : 0)) * 32u;
-                esimd::simd<float,32> sk(0.f), cosv(0.f), proj;
+                esimd::simd<float,32> sk, cosv, proj, total;
                 if (inimg) {
                     if (image_half) {
                         esimd::simd<half,32> hh((const half*)Img + at, esimd::overaligned_tag<16>{});
                         sk = esimd::convert<float>(hh);
                     } else sk.copy_from((const float*)Img + at);
                     cosv.copy_from(Cos);
+                    proj = esimd::slm_block_load<float,32>(scr + r2*32u*4u, esimd::overaligned_tag<16>{});
+                    total = sk * cosv + proj;     // adjacent -> ONE HW FMA (senior :442)
+                } else { sk = cosv = proj = total = esimd::simd<float,32>(0.f); }
+                if (stop_stage == 13u && ProjFDump) {   // the sk|cosv|proj witness (block
+                    auto skv = sk.read(); auto cvv = cosv.read(); auto prv = proj.read(); // layout)
+                    float* d = ProjFDump + ((size_t)window*64u + (size_t)r) * 96u;
+                    for (uint c = 0; c < 32u; ++c){ d[c]=skv[c]; d[32+c]=cvv[c]; d[64+c]=prv[c]; }
+                    return;
                 }
-                proj = esimd::slm_block_load<float,32>(scr + r2*32u*4u, esimd::overaligned_tag<16>{});
-                esimd::simd<float,32> total = sk * cosv + proj;   // one hw FMA (senior :442)
                 if (head) {
                     // senior :445-447 + leg4: published halves stay on-chip as the head
-                    // GEMM's A, pa16-packed into the scratch's SECOND half. RACE RULE
-                    // (THE head-ULP root cause, section 100): hbase = scr+2048 OVERLAPS
-                    // the proj rows of lanes 8..15 -- every lane must have LOADED its
-                    // proj row (done: `total` is register-resident now) before ANY lane
-                    // writes the pack. The barrier below enforces exactly that.
-                    esimd::barrier();
+                    // GEMM's A, pa16-packed into the scratch's SECOND half. Out-of-image
+                    // rows -> total=0 -> kh=0 (the senior's kept init-zero :432).
+                    esimd::barrier();               // every lane read proj before packing
                     esimd::simd<half,32> kh = esimd::convert<half>(total);
                     if (HeadADump && inimg) {   // crop-order A dump == the split chain's
                         auto kv = kh.read();    // dOut16 layout. y,x are ALREADY crop-local
@@ -301,6 +314,11 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
                     if (inimg)
                         esimd::convert<half>(wbv3::e4m3_vec<32>(total)).copy_to(Tgt + at);
                     esimd::slm_block_store(scr + r2*32u*4u, total, esimd::overaligned_tag<16>{});
+                    if (TotalDump && inimg) {   // the f32 total in the BLOCK layout
+                        auto tv = total.read(); // (window*64 + token)*32 + c == A2's
+                        float* d = TotalDump + ((size_t)window*64u + (size_t)r) * 32u;  // Stage
+                        for (uint c = 0; c < 32u; ++c) d[c] = tv[c];
+                    }
                     esimd::barrier();
                     // fold per-subgroup: rows 2*sgid,2*sgid+1 (tokens sgid*16..+15) = pooled
                     // row py=sgid. senior :522-527 tap order ((UL+LL)+UR)+LR, *0.25, e4m3.

@@ -26,6 +26,7 @@
 #include "window_block_v2.hpp"
 #include "window_block_v3.hpp"
 #include "window_block_v4.hpp"
+#include "window_block_v4ph.hpp"
 #include "requant_kernel.hpp"
 #include "gemm_s8_v1_kernel.hpp"
 #include "gemm_s8_v3_kernel.hpp"
@@ -2982,6 +2983,58 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             if (dKV) pool_put(dKV);
             return;
         }
+        // section 100 P1 v4ph route (POOL): separate kernel, the senior's fold outlet.
+        // HEAD stays on the A2 legs (the resident-head open item: on-chip P6 outproj
+        // is f32-EXACT vs the non-fused f16v1 wide-M (0/16.7M), but the A2 FUSED leg3
+        // (f16v3 gemm_resid_pub) is the shipping comparison -- its total witness vs the
+        // v4ph total witness localizes the 4-Tgt-slot ULP question. NR_DUMP_PL rides
+        // both sides' witnesses.)
+        static bool v4pool_on = getenv("NR_WB_V4_NO_POOL") ? atoi(getenv("NR_WB_V4_NO_POOL")) == 0 : true;
+        if (v4pool_on && pooling && !head && !getenv("NR_WB_SPLIT") && !getenv("NR_WB_V3")
+            && !getenv("NR_RESIDENT_WB") && !getenv("NR_FULL_MEGA")) {
+            g_wb_v2++;
+            unsigned st = getenv("NR_V2_STOP") ? (unsigned)atoi(getenv("NR_V2_STOP")) : 0u;
+            if (st == 65531u || st == 65530u) return;
+            sycl::half* dWq = cached_pack_b_f16(qkv, Wraw, (int)C, (int)NH);
+            sycl::half* dWp = cached_pack_b_f16(projection, Praw, (int)C, (int)C);
+            sycl::half* dKV = nullptr;
+            if (st && st < 0xFF00u) dKV = (sycl::half*)pool_get((size_t)windows * 4096u * 2);
+            float* dTD = (getenv("NR_DUMP_PL")) ? (float*)pool_get((size_t)windows * 64u * C * 4) : nullptr;
+            if (dTD) GQ->memset(dTD, 0, (size_t)windows * 64u * C * 4);
+            size_t pfsz = (st == 9u) ? (size_t)windows * 2048u : (st == 13u ? (size_t)windows * 64u * 96u : 0u);
+            float* dPF = (pfsz && getenv("NR_DUMP_PROJF")) ? (float*)pool_get(pfsz * 4) : nullptr;
+            if (dPF) GQ->memset(dPF, 0, pfsz * 4);
+            wbv4ph::launch_v4ph(*GQ, image_half ? (const void*)ImgH : (const void*)ImgF, image_half,
+                                dWq, dWp, (sycl::half*)Tgt,
+                                narrow ? nullptr : (float*)Tgt, Bp, cp, qs,
+                                windows, height, width, across, top, left, epi, narrow, st, dKV,
+                                pooling, head, Pl, nullptr, nullptr, dPF, dTD);
+            if (dPF) {
+                std::vector<float> h(pfsz);
+                GQ->memcpy(h.data(), dPF, h.size() * 4).wait();
+                static int pf_n = 0; ++pf_n;
+                char fn[64]; snprintf(fn, sizeof fn, "projf_v4ph_%d.bin", pf_n);
+                FILE* fp = fopen(fn, "wb"); fwrite(h.data(), 4, h.size(), fp); fclose(fp);
+                printf("[dump] projf v4ph #%d %zu floats\n", pf_n, h.size());
+                pool_put(dPF);
+            }
+            if (dTD) {
+                std::vector<float> h((size_t)windows * 64u * C);
+                GQ->memcpy(h.data(), dTD, h.size() * 4).wait();
+                static int td_n = 0; ++td_n;
+                char fn[64]; snprintf(fn, sizeof fn, "total_v4ph_%d.bin", td_n);
+                FILE* fp = fopen(fn, "wb"); fwrite(h.data(), 4, h.size(), fp); fclose(fp);
+                printf("[dump] total v4ph #%d %zu floats\n", td_n, h.size());
+                std::vector<sycl::half> ht((size_t)height * width * C);
+                GQ->memcpy(ht.data(), (sycl::half*)Tgt, ht.size() * 2).wait();
+                snprintf(fn, sizeof fn, "tgt_v4ph_%d.bin", td_n);
+                fp = fopen(fn, "wb"); fwrite(ht.data(), 2, ht.size(), fp); fclose(fp);
+                printf("[dump] Tgt v4ph #%d %zu halves\n", td_n, ht.size());
+                pool_put(dTD);
+            }
+            if (dKV) pool_put(dKV);
+            return;
+        }
         if (getenv("NR_WB_V3") && !getenv("NR_RESIDENT_WB") && !getenv("NR_FULL_MEGA")
             && !pooling && !head) {
             g_wb_v2++;
@@ -3343,6 +3396,8 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         // all; the scalar path keeps the dStage + independent pool pass contract.
         float* dStage = (pooling && !fused3) ? (float*)pool_get((size_t)rows * C * 4) : nullptr;
         sycl::half* dOut16 = head ? (sycl::half*)pool_get(img_elems * 2) : nullptr;
+        float* dStgW = (pooling && getenv("NR_DUMP_PL"))
+                     ? (float*)pool_get((size_t)rows * C * 4) : nullptr;   // the raw-total
         if (fused3) {
             if ((pooling || head) && g_wbf3_poolhead < 8u) {
                 g_wbf3_poolhead++;
@@ -3457,7 +3512,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                     image_half ? nullptr : ImgF, image_half,
                     cp, (sycl::half*)Tgt, nullptr, true,
                     (int)rows, Mp, (int)C, height, width, across, top, left, 0u,
-                    nullptr, true, Pl);   // A2: the pool closes IN the kernel -- no Stage, no pass
+                    dStgW, true, Pl);   // A2 pool; NR_DUMP_PL rides the Stage witness
             else {
                 // section 100 D12 (the 40ms fix): the sync-closure ledger says the
                 // leg3 kernel itself costs the SAME whether it writes the plan
@@ -3506,7 +3561,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         }
         if (getenv("NR_DUMP_C3")) {   // dump split outproj dC3 for comparison vs resident stop=9
             static bool s_d3done = false;
-            if (!s_d3done && !pooling && !head) {
+            if (!s_d3done && !head && (!pooling || getenv("NR_DUMP_C3_POOL"))) {
                 s_d3done = true;
                 std::vector<float> h3((size_t)rows * C);
                 ev_sync(GQ->memcpy(h3.data(), dC3, h3.size() * 4));
@@ -3594,6 +3649,23 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             });
             pool_put(dA4); pool_put(dH4);   // dB4 is cache-owned (the head weight)
             pool_put(dOut16);
+        }
+        if (dStgW) {
+            std::vector<float> h((size_t)rows * C);
+            GQ->memcpy(h.data(), dStgW, h.size() * 4).wait();
+            static int tw = 0; ++tw;
+            char fn[64]; snprintf(fn, sizeof fn, "total_A2_%d.bin", tw);
+            FILE* fp = fopen(fn, "wb"); fwrite(h.data(), 4, h.size(), fp); fclose(fp);
+            printf("[dump] total A2 #%d %zu floats\n", tw, h.size());
+            pool_put(dStgW);
+        }
+        if (pooling && getenv("NR_DUMP_PL")) {   // the A2 published-skip Tgt (1265)
+            std::vector<sycl::half> ht((size_t)height * width * C);
+            GQ->memcpy(ht.data(), (sycl::half*)Tgt, ht.size() * 2).wait();
+            static int ta = 0; ++ta;
+            char fn[64]; snprintf(fn, sizeof fn, "tgt_A2_%d.bin", ta);
+            FILE* fp = fopen(fn, "wb"); fwrite(ht.data(), 2, ht.size(), fp); fclose(fp);
+            printf("[dump] Tgt A2 #%d %zu halves\n", ta, ht.size());
         }
         pool_put(dAp3); pool_put(dBp3); pool_put(dC3); pool_put(dAttended);
     });
