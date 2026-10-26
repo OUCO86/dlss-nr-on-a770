@@ -155,7 +155,7 @@ static std::map<int,int> g_fused_quant;   // quant-source cb -> a_scale buf (new
 // 0 on every frame shape. Gate NR_Q_FUSE (default OFF until the three gates pass).
 struct QuantFused { size_t qcmd; int src; int sc; unsigned M; unsigned K; };
 static std::map<int,QuantFused> g_quant_pk;   // pk buf id -> the quant that wrote it
-static bool qfuse_on() { static bool v = getenv("NR_Q_FUSE") != nullptr; return v; }
+static bool qfuse_on() { static bool v = !getenv("NR_Q_FUSE") || atoi(getenv("NR_Q_FUSE")) != 0; return v; }
 // called by a gemm recorder: if `a` is a fused-quant pk whose scale buf == this gemm's
 // a_scale and whose M,K match, no-op the quant closure and return its info.
 static bool qfuse_take(int a, int a_scale, unsigned M, unsigned K, QuantFused& out){
