@@ -1754,7 +1754,14 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
         if (getenv("NR_SHAPE_DUMP")) { char eb[128]; snprintf(eb,sizeof eb,"batched M=%u N=%u K=%u b=%u epi%u",M,N,K,batch,(flags>>8)&0xFu); g_shapes["epishape"][eb]++; }
     // v9b fires? decide at RECORD time so the slot index is exact (the closure below is
     // the cmd at index g_cmds.size(); the adjacent quant back-fills this slot).
-    static bool v9bon_r = getenv("NR_V9B") ? atoi(getenv("NR_V9B")) != 0 : true;
+    // section 100 FIX: the DEFAULT WAS true -- contradicting the section-99 verdict
+    // written right below ("v9b DEFAULT OFF after the same-heat A/B: the wide-N merge
+    // is CORRECT but SLOWER than v8's batched gemm_b_pub"). The same-heat A/B re-run
+    // today: v9b-ON 240.2-243.2 vs v9b-OFF 225.0-227.5 = EVERY PAIR by ~16ms. The
+    // 40 frame calls (32640x128x64b2 x16 + 8160x128x128b4 x24) run 0.53-0.80ms in
+    // v9b vs 0.11-0.21 through v8 gemm_b_pub_slm -- and the v9b default was MASKING
+    // C2 (those calls never reached pub_slm). NR_V9B=1 re-enables the witness.
+    static bool v9bon_r = getenv("NR_V9B") ? atoi(getenv("NR_V9B")) != 0 : false;
     const unsigned ldc_r = ldc ? ldc : N;
     static int v9b_rec_calls = 0;
     const bool v9b_first_r = getenv("NR_V9B_FIRST") != nullptr;
