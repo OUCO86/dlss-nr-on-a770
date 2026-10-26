@@ -2990,13 +2990,16 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         // v4ph total witness localizes the 4-Tgt-slot ULP question. NR_DUMP_PL rides
         // both sides' witnesses.)
         static bool v4pool_on = getenv("NR_WB_V4_NO_POOL") ? atoi(getenv("NR_WB_V4_NO_POOL")) == 0 : true;
-        if (v4pool_on && pooling && !head && !getenv("NR_WB_SPLIT") && !getenv("NR_WB_V3")
+        static bool v4head_on = getenv("NR_WB_V4_NO_HEAD") ? atoi(getenv("NR_WB_V4_NO_HEAD")) == 0 : true;
+        if ((v4pool_on || (v4head_on && head)) && (pooling || head) && !(pooling && head)
+            && !getenv("NR_WB_SPLIT") && !getenv("NR_WB_V3")
             && !getenv("NR_RESIDENT_WB") && !getenv("NR_FULL_MEGA")) {
             g_wb_v2++;
             unsigned st = getenv("NR_V2_STOP") ? (unsigned)atoi(getenv("NR_V2_STOP")) : 0u;
             if (st == 65531u || st == 65530u) return;
             sycl::half* dWq = cached_pack_b_f16(qkv, Wraw, (int)C, (int)NH);
             sycl::half* dWp = cached_pack_b_f16(projection, Praw, (int)C, (int)C);
+            sycl::half* dWh = head ? cached_pack_b_f16(pooled, HeadW, (int)C, 16) : nullptr;
             sycl::half* dKV = nullptr;
             if (st && st < 0xFF00u) dKV = (sycl::half*)pool_get((size_t)windows * 4096u * 2);
             float* dTD = (getenv("NR_DUMP_PL")) ? (float*)pool_get((size_t)windows * 64u * C * 4) : nullptr;
@@ -3008,7 +3011,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                                 dWq, dWp, (sycl::half*)Tgt,
                                 narrow ? nullptr : (float*)Tgt, Bp, cp, qs,
                                 windows, height, width, across, top, left, epi, narrow, st, dKV,
-                                pooling, head, Pl, nullptr, nullptr, dPF, dTD);
+                                pooling, head, Pl, dWh, nullptr, dPF, dTD);
             if (dPF) {
                 std::vector<float> h(pfsz);
                 GQ->memcpy(h.data(), dPF, h.size() * 4).wait();
