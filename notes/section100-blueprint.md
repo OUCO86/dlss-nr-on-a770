@@ -101,3 +101,7 @@ global_attn 11.2 | ffn_merge 10.8 | ffn_stem 10.4 | unary 4.9 | gemm_int8 4.6
 2. 先门后码：给该 op 加/用既有独立门，期望值先钉。
 3. 改完：39 门 → 端到端 walk 两遍 → 同热 A/B → 自查（小M?中间量化?额外开销?CPU?）→ 提交推送 → 部署 md5 入账 → 用户游戏验收。
 4. 任何一关红：git revert，当场落盘失败原因（否证也是资产）。
+
+### P1 stage-ladder CORRECTED (10-26 15:40, family-total clean口径)
+floor(split 42 calls)=20.1 | v3-full family=46.6 -> **v3 8 plain calls = 26.5ms = 1.3ms/call** (NOT 5.7 -- a36c9dc's mean was stage-dump-contaminated; correction recorded). Per-stage (dump-contaminated but shape-telling): P0 0.5 / P1 0.9 / P2 0.8 / P3 0.6 / P4-P7 0.3 ms/call -- cost EVENLY spread over tiny stages = BARRIER+OCCUPANCY bound, not arithmetic. v3 SLM=65536B = 1 WG/EU, only 2 real subgroups/WG -> latency unhiding. Senior: 16KB + 8 subgroups = 4 WG/EU.
+**v4 design (operator UNTOUCHED = dpas tile8/store16)**: kill the f32 DCQ slab (24KB) by the senior's row-block-in-registers structure (subgroup owns 8 rows; its QKV outputs normalize IN the computing subgroup; K/V to 4KB packs; 1KB scratch per subgroup reused per stage); stage weights into SLM once (his measured lesson). SLM target <=24KB -> 2-3 WG/EU. First step = bench_v4slice: P0+P1+P2 only, dump-compare vs v3 stop=3 (bit-exact), time it. Barrier discipline: subgroup-local where rows are local; group barrier only at pack handoffs (P0->P1, P2->P3, P4->P5, P5->P6).
