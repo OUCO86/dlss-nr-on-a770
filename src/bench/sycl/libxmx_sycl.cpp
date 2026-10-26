@@ -3216,8 +3216,71 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                 std::printf("[wb-fuse3] %s form on the fused leg (epi=%u image_half=%d)\n",
                             pooling ? "pool" : "head", epi, (int)image_half);
             }
+            // section 100 D1 (engine-internal bisect of the 43.5ms leg3):
+            //   NR_WB_STOP=85 -> pack_a16 only (gemm_resid_pub skipped)
+            //   NR_WB_STOP=86 -> neither (leg3 empty inside the fused route)
+            // pub cost = (99 - 85), pack cost = (85 - 86). launch-guard form: the
+            // pool/head/leg4 tails still run on whatever dOut16/dStage hold (garbage
+            // values, no frame judge -- this stop exists for the TIME ledger only).
+            if (wbstop == 86u) { /* leg3 empty */ }
+            else {
             packdev::pack_a16(*GQ, dAttended, dAp3, (int)rows, Mp, (int)C);
-            if (head)
+            if (wbstop != 85u) {
+            if (wbstop == 87u) {
+                // section 100 D2 probe: the fused kernel with tail=false -- every
+                // accumulator row stored RAW as f32 into dC3 (the old scratch, right
+                // size), no image read / FMA / e4m3. (99-87) = the GEMM body + pack +
+                // the f32 store; (87-85) isolates the tail arithmetic + image read.
+                // Diagnostic stop only -- the frame head is garbage by design here.
+                f16v3::gemm_resid_pub(*GQ, dAp3, dBp3, nullptr, dC3, false,
+                    cp, nullptr, dC3, false,
+                    (int)rows, Mp, (int)C, height, width, across, top, left, 0u,
+                    nullptr, false, nullptr, false);
+            }
+            else if (wbstop == 98u) {
+                // section 100 D7 probe: the FULL tail (image read + FMA + e4m3 +
+                // publish arithmetic) but the store goes CONTIGUOUS into dC3 (f32)
+                // instead of the scattered image slot. (98-87) = pure arithmetic +
+                // image read; (99-98) = the scatter store's price alone.
+                f16v3::gemm_resid_pub(*GQ, dAp3, dBp3,
+                    image_half ? (const sycl::half*)ImgH : nullptr,
+                    image_half ? nullptr : ImgF, image_half,
+                    cp, nullptr, dC3, false,
+                    (int)rows, Mp, (int)C, height, width, across, top, left, epi,
+                    nullptr, false, nullptr, true, false, 0, true);
+            }
+            else if (wbstop == 97u) {
+                // section 100 D8 probe (one variable vs 98): CONTIGUOUS half stores
+                // into an IMAGE-SIZED scratch (height*width*32 half, the same 33MB
+                // footprint class as the real target) instead of the 16.7MB dC3.
+                // If 97 ~ 98 -> the price is the SCATTER pattern; if 97 ~ 99 -> it
+                // is writing a cold image-sized buffer, pattern irrelevant.
+                sycl::half* dBig = (sycl::half*)pool_get((size_t)height * width * C * 2);
+                f16v3::gemm_resid_pub(*GQ, dAp3, dBp3,
+                    image_half ? (const sycl::half*)ImgH : nullptr,
+                    image_half ? nullptr : ImgF, image_half,
+                    cp, dBig, nullptr, true,
+                    (int)rows, Mp, (int)C, height, width, across, top, left, epi,
+                    nullptr, false, nullptr, true, false, 0, true);
+                pool_put(dBig);
+            }
+            else if (wbstop == 96u) {
+                // section 100 D9 probe (one variable vs 99 AND vs 97): the REAL
+                // scatter index (at = image slot) but into a device-local pool
+                // buffer sized like the image. vs 99: only the TARGET BUFFER
+                // changes (plan buffer -> pool); vs 97: only the ADDRESS PATTERN
+                // changes (contig -> scatter). If 96 ~ 97 -> the plan target buffer
+                // has a property the pool lacks (host-visible?); if 96 ~ 99 -> the
+                // scatter pattern itself is the cost.
+                sycl::half* dBig = (sycl::half*)pool_get((size_t)height * width * C * 2);
+                f16v3::gemm_resid_pub(*GQ, dAp3, dBp3,
+                    image_half ? (const sycl::half*)ImgH : nullptr,
+                    image_half ? nullptr : ImgF, image_half,
+                    cp, dBig, nullptr, true,
+                    (int)rows, Mp, (int)C, height, width, across, top, left, epi);
+                pool_put(dBig);
+            }
+            else if (head)
                 f16v3::gemm_resid_pub(*GQ, dAp3, dBp3,
                     image_half ? (const sycl::half*)ImgH : nullptr,
                     image_half ? nullptr : ImgF, image_half,
@@ -3235,7 +3298,11 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                     image_half ? (const sycl::half*)ImgH : nullptr,
                     image_half ? nullptr : ImgF, image_half,
                     cp, narrow ? (sycl::half*)Tgt : nullptr, narrow ? nullptr : (float*)Tgt,
-                    narrow, (int)rows, Mp, (int)C, height, width, across, top, left, epi);
+                    narrow, (int)rows, Mp, (int)C, height, width, across, top, left, epi,
+                    nullptr, false, nullptr, true,
+                    wbstop == 88u, (int)(wbstop == 89u));   // D4/D5 tail probes
+            }   // wbstop != 85u
+            }   // wbstop != 86u
         } else if (wbstop > 8u) {
         packdev::pack_a16(*GQ, dAttended, dAp3, (int)rows, Mp, (int)C);
         f16v1::gemm(*GQ, dAp3, dBp3, dC3, Mp, (int)C, (int)C);

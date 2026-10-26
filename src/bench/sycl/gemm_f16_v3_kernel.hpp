@@ -62,9 +62,169 @@ static inline sycl::event gemm_resid_pub(sycl::queue& q, const half* Ap, const h
                                          int M, int Mp, int K, unsigned height, unsigned width,
                                          unsigned across, unsigned top, unsigned left,
                                          unsigned epi, float* Stage = nullptr,
-                                         bool pool_outlet = false, half* Pool = nullptr) {
+                                         bool pool_outlet = false, half* Pool = nullptr,
+                                         bool tail = true, bool skip_image = false,
+                                         int no_e4m3 = 0, bool contig_store = false) {
     const int N = 32;
     int tr_n = Mp / TS, kb_n = K / TS;
+    // section 100 D3 (the senior's acc-via-SLM pattern, gemm_staged.comp:309-322):
+    // the four档 probe pinned leg3 = GEMM 2.6ms + TAIL 40.5ms -- the tail lives with
+    // 8 x simd<float,64> accumulators (512 f32/thread = 4x the 128-register GRF)
+    // alive through every row's assembly + arithmetic = spill avalanche. Fix: after
+    // the dpas loop the whole 16x32 block goes to SLM (2KB, the operand tiles are
+    // dead), accumulators die, and each tail row reads back CONTIGUOUS 32 floats
+    // (zero assembly). One 32-lane subgroup per workgroup owns one tile, so the
+    // SLM slot is that subgroup's own -- no barrier needed (self-written, self-read).
+    // Bit-exact by construction: identical values (SLM is lossless for f32),
+    // identical op order. NR_V3_SLM=0 keeps the old register tail (A/B hatch).
+    // section 100 D3 MEASURED DEAD: the same-heat A/B says acc-via-SLM makes v3
+    // SLOWER (262 vs 240) -- the accumulators here are only 16 f32/lane (no spill to
+    // fix, unlike v8's int32 tail), and the detour ADDS 2KB of SLM per tile. Default
+    // OFF; the branch stays as the mechanism witness (NR_V3_SLM=1 to re-enable).
+    static const bool use_slm = getenv("NR_V3_SLM") ? atoi(getenv("NR_V3_SLM")) != 0 : false;
+    if (use_slm) {
+    return q.submit([&](handler& h) {
+        // nd_range discipline (the v8 idiom): global = groups * local -- tr_n alone
+        // is not divisible by 32 and the submit throws (the D3b gate RED). One 32-lane
+        // subgroup per workgroup = one tile-owner per group, the plain parallel_for's
+        // ESIMD work-item shape.
+        h.parallel_for(nd_range(range((size_t)tr_n * 32), range(32)), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+            esimd::slm_init<TS * N * 4>();     // 2KB: this subgroup's 16x32 f32 block
+            int tr = (int)it.get_group(0);
+            esimd::simd<float,64> c00(0.f),c01(0.f),c10(0.f),c11(0.f);   // tc=0: cols 0..15
+            esimd::simd<float,64> d00(0.f),d01(0.f),d10(0.f),d11(0.f);   // tc=1: cols 16..31
+            for (int kc = 0; kc < kb_n; ++kc) {
+                const half* ab = Ap + ((size_t)(tr * kb_n + kc) * 2) * 128;
+                const half* bb = Bp + ((size_t)(kc * 2 + 0) * 2) * 128;
+                const half* cb = Bp + ((size_t)(kc * 2 + 1) * 2) * 128;
+                esimd::simd<half,128> a0(ab, esimd::overaligned_tag<16>{});
+                esimd::simd<half,128> a1(ab + 128, esimd::overaligned_tag<16>{});
+                esimd::simd<half,128> b0(bb, esimd::overaligned_tag<16>{});
+                esimd::simd<half,128> b1(bb + 128, esimd::overaligned_tag<16>{});
+                esimd::simd<half,128> e0(cb, esimd::overaligned_tag<16>{});
+                esimd::simd<half,128> e1(cb + 128, esimd::overaligned_tag<16>{});
+                c00 = esimd::xmx::dpas<8,8,float>(c00, b0, a0);
+                c01 = esimd::xmx::dpas<8,8,float>(c01, b1, a0);
+                c10 = esimd::xmx::dpas<8,8,float>(c10, b0, a1);
+                c11 = esimd::xmx::dpas<8,8,float>(c11, b1, a1);
+                d00 = esimd::xmx::dpas<8,8,float>(d00, e0, a0);
+                d01 = esimd::xmx::dpas<8,8,float>(d01, e1, a0);
+                d10 = esimd::xmx::dpas<8,8,float>(d10, e0, a1);
+                d11 = esimd::xmx::dpas<8,8,float>(d11, e1, a1);
+            }
+            // the untouched store: 8 fragments x 8 rows -> the subgroup's SLM block.
+            // dpas fragment (c/d)(q0/q1)(row rl) = tile row q*8+rl, cols (tc*16)+q'*8..
+            for (int rl = 0; rl < 8; ++rl) {
+                esimd::slm_block_store<float,8>((uint32_t)(rl * N + 0) * 4u,
+                    c00.template select<8,1>(rl*8), esimd::overaligned_tag<16>{});
+                esimd::slm_block_store<float,8>((uint32_t)(rl * N + 8) * 4u,
+                    c01.template select<8,1>(rl*8), esimd::overaligned_tag<16>{});
+                esimd::slm_block_store<float,8>((uint32_t)(rl * N + 16) * 4u,
+                    d00.template select<8,1>(rl*8), esimd::overaligned_tag<16>{});
+                esimd::slm_block_store<float,8>((uint32_t)(rl * N + 24) * 4u,
+                    d01.template select<8,1>(rl*8), esimd::overaligned_tag<16>{});
+                esimd::slm_block_store<float,8>((uint32_t)((8 + rl) * N + 0) * 4u,
+                    c10.template select<8,1>(rl*8), esimd::overaligned_tag<16>{});
+                esimd::slm_block_store<float,8>((uint32_t)((8 + rl) * N + 8) * 4u,
+                    c11.template select<8,1>(rl*8), esimd::overaligned_tag<16>{});
+                esimd::slm_block_store<float,8>((uint32_t)((8 + rl) * N + 16) * 4u,
+                    d10.template select<8,1>(rl*8), esimd::overaligned_tag<16>{});
+                esimd::slm_block_store<float,8>((uint32_t)((8 + rl) * N + 24) * 4u,
+                    d11.template select<8,1>(rl*8), esimd::overaligned_tag<16>{});
+            }
+            // accumulators dead from here -- the tail runs on the SLM block
+            esimd::simd<float,32> cv = esimd::block_load<float,32>(
+                cosv, esimd::overaligned_tag<16>{});
+            if (!tail) {
+                for (int rr = 0; rr < TS; ++rr) {
+                    int r = tr * TS + rr;
+                    if (r >= M) break;
+                    esimd::simd<float,32> acc = esimd::slm_block_load<float,32>(
+                        (uint32_t)(rr * N) * 4u, esimd::overaligned_tag<16>{});
+                    esimd::block_store<float,32>(TgtF + (size_t)r * N, acc,
+                        esimd::overaligned_tag<16>{});
+                }
+                return;
+            }
+            // tap-order rows when Pool is live (the A2 structure, verbatim): UL,LL,UR,LR
+            // per px; the senior chain closes in three registers. rr from (px,tap).
+            // section 100 D6: the div-free row map. The six-stop ladder says the 40ms
+            // is neither the image read (stop=88: free) nor the e4m3 chain (stop=89:
+            // free) -- it is the PER-ROW address math: r/64, window/across,
+            // window%across are software integer divisions (~tens of cycles each on
+            // Xe-HPG, no HW int-div), and window/across + window%across run on EVERY
+            // row though window is per-work-item CONSTANT. r = tr*16+rr with rr<16
+            // gives window = tr>>2, token = 16*(tr&3)+rr EXACTLY; the two window/
+            // across ops hoist out (one div + one mod per item). Pure address math:
+            // values and op order untouched (bit-exact by construction; the
+            // WINDOW_BLOCK gate is the judge).
+            const unsigned wbase = (unsigned)tr >> 2;            // = r/64 for every row
+            const unsigned tbase = 16u * ((unsigned)tr & 3u);    // token = tbase + rr
+            const unsigned yband = (wbase / across) * 8u + 2u * ((unsigned)tr & 3u);  // token/8 = 2*(tr&3)+rr>>3
+            const unsigned xband = (wbase % across) * 8u;        // ONE mod per item
+            esimd::simd<float,32> pUL, pLL, pUR;
+            for (int j = 0; j < TS; ++j) {
+                int rr;
+                if (Pool) {
+                    int px = j >> 2, tap = j & 3;
+                    rr = 2*px + ((tap == 0) ? 0 : (tap == 1) ? 8 : (tap == 2) ? 1 : 9);
+                } else rr = j;
+                int r = tr * TS + rr;
+                if (r >= M) continue;
+                unsigned token = tbase + (unsigned)rr;           // = r % 64 exactly
+                unsigned y = yband + ((unsigned)rr >> 3);        // token/8 = 2*(tr&3)+rr/8
+                unsigned x = xband + ((unsigned)rr & 7u);        // token%8 = rr&7
+                if (y < top || x < left || y - top >= height || x - left >= width) continue;
+                size_t at = ((size_t)(y - top) * width + (x - left)) * N;
+                esimd::simd<float,32> acc = esimd::slm_block_load<float,32>(
+                    (uint32_t)(rr * N) * 4u, esimd::overaligned_tag<16>{});
+                esimd::simd<float,32> sk;
+                if (skip_image) sk = esimd::simd<float,32>(0.f);   // D4 probe: no image read
+                else if (image_half) sk = esimd::convert<float>(esimd::block_load<half,32>(
+                    ImgH + at, esimd::overaligned_tag<16>{}));
+                else            sk = esimd::block_load<float,32>(
+                    ImgF + at, esimd::overaligned_tag<16>{});
+                esimd::simd<float,32> total = sk * cv + acc;      // ONE HW FMA per lane (§92)
+                if (Pool) {
+                    int tap = j & 3;
+                    if (tap == 0)      pUL = total;
+                    else if (tap == 1) pLL = total;
+                    else if (tap == 2) pUR = total;
+                    else {
+                        esimd::simd<float,32> s = (pUL + pLL) + pUR;
+                        s = s + total;                          // ((UL+LL)+UR)+LR
+                        s = s * 0.25f;                          // exact (power of two)
+                        size_t po = ((size_t)((y - top) / 2u) * (width / 2u)
+                                     + ((x - left) / 2u)) * N;
+                        esimd::block_store<half,32>(Pool + po,
+                            esimd::convert<half>(wbv2::e4m3_vec<32>(s)),
+                            esimd::overaligned_tag<16>{});
+                    }
+                }
+                if (Stage) esimd::block_store<float,32>(
+                    Stage + (size_t)r * N, total, esimd::overaligned_tag<16>{});
+                esimd::simd<float,32> pub;
+                if (no_e4m3)  pub = total;                       // D5 probe: no e4m3 chain
+                else if (pool_outlet)  pub = wbv2::e4m3_vec<32>(total);
+                else if (epi == 1u)      pub = wbv2::e4m3_vec<32>(total);
+                else if (epi == 0u) pub = total;
+                else                pub = esimd::convert<float>(esimd::convert<half>(total)); // epi 4
+                if (contig_store) {   // D7/D8 probes (stop=98/97): the full tail
+                    if (narrow) esimd::block_store<half,32>(TgtH + (size_t)r * N,
+                        esimd::convert<half>(pub), esimd::overaligned_tag<16>{});
+                    else esimd::block_store<float,32>(TgtF + (size_t)r * N, pub,
+                        esimd::overaligned_tag<16>{});            // arithmetic, CONTIG store
+                    continue;
+                }
+                if (narrow) esimd::block_store<half,32>(TgtH + at,
+                    esimd::convert<half>(pub), esimd::overaligned_tag<16>{});
+                else        esimd::block_store<float,32>(TgtF + at, pub,
+                    esimd::overaligned_tag<16>{});
+            }
+        });
+    });
+    }
+    // ---- the original register-tail form (NR_V3_SLM=0) ----
     return q.submit([&](handler& h) {
         h.parallel_for(range<1>((size_t)tr_n), [=](item<1> it) SYCL_ESIMD_KERNEL {
             int tr = (int)it.get_id(0);
@@ -91,6 +251,32 @@ static inline sycl::event gemm_resid_pub(sycl::queue& q, const half* Ap, const h
             }
             esimd::simd<float,32> cv = esimd::block_load<float,32>(
                 cosv, esimd::overaligned_tag<16>{});
+            // section 100 D2 (probe only, tail=false): the RAW store -- every
+            // accumulator row goes straight to TgtF as f32 (the f16v1::gemm shape),
+            // no image read, no FMA, no e4m3. Splits the fused kernel into
+            // GEMM-body vs tail-arithmetic. The engine's stop=87 uses this.
+            if (!tail) {
+                for (int rr = 0; rr < TS; ++rr) {
+                    int r = tr * TS + rr;
+                    if (r >= M) break;
+                    int qh = rr / 8, rl = rr % 8;
+                    esimd::simd<float,32> acc;
+                    if (qh == 0) {
+                        acc.template select<8,1>(0)  = c00.template select<8,1>(rl*8);
+                        acc.template select<8,1>(8)  = c01.template select<8,1>(rl*8);
+                        acc.template select<8,1>(16) = d00.template select<8,1>(rl*8);
+                        acc.template select<8,1>(24) = d01.template select<8,1>(rl*8);
+                    } else {
+                        acc.template select<8,1>(0)  = c10.template select<8,1>(rl*8);
+                        acc.template select<8,1>(8)  = c11.template select<8,1>(rl*8);
+                        acc.template select<8,1>(16) = d10.template select<8,1>(rl*8);
+                        acc.template select<8,1>(24) = d11.template select<8,1>(rl*8);
+                    }
+                    esimd::block_store<float,32>(TgtF + (size_t)r * N, acc,
+                        esimd::overaligned_tag<16>{});
+                }
+                return;
+            }
             // section 100 A2: with a Pool outlet the rows run in the pool's TAP order
             // per pixel -- (UL, LL, UR, LR) for px = 0..3 -- so ((UL+LL)+UR)+LR closes
             // in registers: window_block.comp:523-525's exact chain, each link a plain
@@ -99,6 +285,20 @@ static inline sycl::event gemm_resid_pub(sycl::queue& q, const half* Ap, const h
             // window tr/4 -- every tap lives here, no SLM, no barrier. rr from (px,tap)
             // by pure scalar arithmetic (no arrays: the compiler rejected constant-index
             // register reads once already, the v3 WGT lesson).
+            // section 100 D6: the div-free row map. The six-stop ladder says the 40ms
+            // is neither the image read (stop=88: free) nor the e4m3 chain (stop=89:
+            // free) -- it is the PER-ROW address math: r/64, window/across,
+            // window%across are software integer divisions (~tens of cycles each on
+            // Xe-HPG, no HW int-div), and window/across + window%across run on EVERY
+            // row though window is per-work-item CONSTANT. r = tr*16+rr with rr<16
+            // gives window = tr>>2, token = 16*(tr&3)+rr EXACTLY; the two window/
+            // across ops hoist out (one div + one mod per item). Pure address math:
+            // values and op order untouched (bit-exact by construction; the
+            // WINDOW_BLOCK gate is the judge).
+            const unsigned wbase = (unsigned)tr >> 2;            // = r/64 for every row
+            const unsigned tbase = 16u * ((unsigned)tr & 3u);    // token = tbase + rr
+            const unsigned yband = (wbase / across) * 8u + 2u * ((unsigned)tr & 3u);  // token/8 = 2*(tr&3)+rr>>3
+            const unsigned xband = (wbase % across) * 8u;        // ONE mod per item
             esimd::simd<float,32> pUL, pLL, pUR;
             for (int j = 0; j < TS; ++j) {
                 int rr;
@@ -108,9 +308,9 @@ static inline sycl::event gemm_resid_pub(sycl::queue& q, const half* Ap, const h
                 } else rr = j;
                 int r = tr * TS + rr;
                 if (r >= M) continue;
-                unsigned window = (unsigned)r / 64u, token = (unsigned)r % 64u;
-                unsigned y = (window / across) * 8u + token / 8u;
-                unsigned x = (window % across) * 8u + token % 8u;
+                unsigned token = tbase + (unsigned)rr;           // = r % 64 exactly
+                unsigned y = yband + ((unsigned)rr >> 3);        // token/8 = 2*(tr&3)+rr/8
+                unsigned x = xband + ((unsigned)rr & 7u);        // token%8 = rr&7
                 if (y < top || x < left || y - top >= height || x - left >= width) continue;
                 size_t at = ((size_t)(y - top) * width + (x - left)) * N;
                 int qh = rr / 8, rl = rr % 8;          // tile half (rows 0-7 / 8-15), row in tile
@@ -127,7 +327,8 @@ static inline sycl::event gemm_resid_pub(sycl::queue& q, const half* Ap, const h
                     acc.template select<8,1>(24) = d11.template select<8,1>(rl*8);
                 }
                 esimd::simd<float,32> sk;
-                if (image_half) sk = esimd::convert<float>(esimd::block_load<half,32>(
+                if (skip_image) sk = esimd::simd<float,32>(0.f);   // D4 probe: no image read
+                else if (image_half) sk = esimd::convert<float>(esimd::block_load<half,32>(
                     ImgH + at, esimd::overaligned_tag<16>{}));
                 else            sk = esimd::block_load<float,32>(
                     ImgF + at, esimd::overaligned_tag<16>{});
