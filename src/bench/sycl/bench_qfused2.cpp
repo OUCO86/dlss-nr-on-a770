@@ -13,6 +13,7 @@
 #include <functional>
 #include <algorithm>
 using namespace sycl;
+template<class T> static void scales_w(T* p, unsigned r, float v){ p[r]=v; } // benign: all groups write the SAME value
 namespace esimd = sycl::ext::intel::esimd;
 
 // ---- the two-pass baseline (shipped: rowthread quant + pack_a scatter) ----
@@ -156,17 +157,79 @@ static void one(queue& q, unsigned m, const char* lbl){
     free(src,q);free(pkA,q);free(tA,q);free(tB,q);free(tC,q);free(sA,q);free(sB,q);free(sC,q);
 }
 
+
+// ---- batched-shape probe: WIDE-ROW quant (lda=2048) split into K=256 column GROUPS
+// with shared row-scales (scale_stride=0). Two-pass: quant(M=640,K=2048) -> pack_a_b
+// (8 groups read the int8). Fused: per (group,row) item re-scans the FULL 2048 row for
+// the peak (8x redundant) + writes its 256 slice. Does the redundant peak lose? ----
+static void one_batched(queue& q, unsigned M, unsigned lda, unsigned K, unsigned batch){
+    size_t n=(size_t)M*lda; int Mp=(int)((M+127u)/128u)*128;
+    size_t npk=(size_t)batch*Mp*K;
+    sycl::half* src=malloc_device<sycl::half>(n,q);
+    int8_t* pkA=malloc_device<int8_t>(n,q);
+    int8_t* tA=malloc_device<int8_t>(npk,q);
+    int8_t* tB=malloc_device<int8_t>(npk,q);
+    float* sA=malloc_device<float>(M+128,q);   // k_quant<2048> writes m rows only, but
+    float* sB=malloc_device<float>(M+128,q);   // keep headroom; scales_w guard below
+    std::vector<sycl::half> h(n);
+    std::mt19937 rng(11); std::uniform_real_distribution<float> df(-8.f,8.f);
+    for(size_t i=0;i<n;++i) h[i]=sycl::half(df(rng));
+    q.memcpy(src,h.data(),n*2).wait();
+    q.memset(pkA,0,n); q.memset(tA,0,npk); q.memset(tB,0,npk); q.memset(sA,0,M*4); q.memset(sB,0,M*4); q.wait();
+    auto timeit=[&](std::function<std::vector<event>()> fn){
+        double best=1e9; for(int it=0;it<15;++it){ auto es=fn(); for(auto&e:es)e.wait();
+          double t=0; for(auto&e:es) t+=double(e.get_profiling_info<info::event_profiling::command_end>()-e.get_profiling_info<info::event_profiling::command_start>());
+          best=std::min(best,t/1e6);} return best;};
+    // two-pass: quant wide row + gather_pack_a_b (elementwise int8->tile, batched)
+    double t2=timeit([&]{
+        event e1=q.parallel_for(range(M), k_quant<2048>()(src,pkA,sA,M)); // wide-row quant
+        event e2=q.parallel_for(range((size_t)batch*Mp*K), [=](sycl::item<1> it){
+            const int BM=128,BK=32; int kb_n=K/BK; size_t per=(size_t)(Mp/BM)*kb_n*8*512;
+            size_t gg=(size_t)it.get_id(0)/per, d=(size_t)it.get_id(0)%per;
+            size_t blk=d/512; int off=(int)(d%512); int wi=(int)(blk%8); size_t wk=blk/8;
+            int kb=(int)(wk%(size_t)kb_n), w=(int)(wk/(size_t)kb_n); int row=off/32,k=off%32;
+            int srow=w*BM+wi*16+row;
+            ((int8_t*)tA)[gg*per+d]= srow<(int)M ? pkA[(size_t)srow*lda+gg*((size_t)K)+kb*BK+k] : (int8_t)0; });
+        return std::vector<event>{e1,e2}; });
+    // fused: (group,row) item, re-scan full lda peak + write own K slice into tile
+    double tf=timeit([&]{ return std::vector<event>{q.parallel_for(range((size_t)batch*M), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
+        const int BM=128,BK=32; int kb_n=K/BK; size_t per=(size_t)(Mp/BM)*kb_n*8*512;
+        size_t d=(size_t)it.get_id(0); int gg=(int)(d/M), srow=(int)(d%M);
+        int w=srow/BM, rem=srow%BM, wi=rem/16, row=rem%16; size_t per_blk=((size_t)w*kb_n)*8+wi;
+        esimd::simd<float,32> mx(esimd::simd<float,32>(0.f));
+        for(int kb=0;kb<(int)(lda/32);++kb){ esimd::simd<float,32> reg=esimd::convert<float>(esimd::block_load<sycl::half,32>(src+(size_t)srow*lda+kb*32,esimd::overaligned_tag<16>{})); mx=esimd::max(mx,esimd::abs(reg)); }
+        float peak=esimd::hmax<float,float,32>(mx);
+        float scale=(peak==0.f)?1.f:esimd::div_ieee<float,1>(esimd::simd<float,1>(peak),esimd::simd<float,1>(127.f))[0];
+        scales_w(sB,srow,scale);
+        for(int kb=0;kb<kb_n;++kb){ esimd::simd<float,32> reg=esimd::convert<float>(esimd::block_load<sycl::half,32>(src+(size_t)srow*lda+gg*(size_t)K+kb*BK,esimd::overaligned_tag<16>{}));
+            esimd::simd<float,32> qq=esimd::div_ieee<float,32>(reg,esimd::simd<float,32>(scale));
+            qq=esimd::min(esimd::max(esimd::rnde<float,32>(qq),esimd::simd<float,32>(-127.f)),esimd::simd<float,32>(127.f));
+            esimd::block_store<int8_t,32>(tB+gg*per+(per_blk+(size_t)kb*8)*512+row*32, esimd::convert<int8_t>(esimd::convert<int>(qq)),esimd::overaligned_tag<16>{}); }
+    })}; });
+    std::vector<int8_t> a(npk),b(npk); q.memcpy(a.data(),tA,npk).wait(); q.memcpy(b.data(),tB,npk).wait();
+    std::vector<float> ha(M),hb(M); q.memcpy(ha.data(),sA,M*4).wait(); q.memcpy(hb.data(),sB,M*4).wait();
+    size_t d=0; for(size_t i=0;i<npk;++i) if(a[i]!=b[i])d++;
+    size_t sd=0; for(unsigned i=0;i<M;++i) if(ha[i]!=hb[i])sd++;
+    printf("batched M=%u lda=%u K=%u b=%u | two-pass %7.3f  fused %7.3f (%.2fx) | tile-diff %zu scale-diff %zu %s\n",
+        M,lda,K,batch,t2,tf,t2/tf,d,sd,(d||sd)?"NOT-EXACT":"EXACT");
+    free(src,q);free(pkA,q);free(tA,q);free(tB,q);free(sA,q);free(sB,q);
+}
+
 int main(){
   device dev;
   for(auto&d:device::get_devices(info::device_type::gpu))
     if(d.get_backend()==backend::ext_oneapi_level_zero&&d.get_info<info::device::name>().find("Arc")!=std::string::npos){dev=d;break;}
+  setvbuf(stdout, NULL, _IONBF, 0);
+  fprintf(stderr,"[bench] queue create...\n");
   queue q(dev,property::queue::enable_profiling{});
   // frame-real per-call shapes (the fused families' quants):
-  one<64,1>(q, 32640, "res K64");
+  fprintf(stderr,"[bench] one64\n"); one<64,1>(q, 32640, "res K64");
   one<128,1>(q, 8160, "win K128");
   one<256,1>(q, 2040, "int8 K256");      // the +4.3ms family shapes below
   one<512,1>(q, 640,  "res K512");
   one<2048,4>(q, 640, "res K2048");
   one<4096,8>(q, 192, "qkv K4096");
+  fprintf(stderr,"[bench] one_batched 640/2048\n"); one_batched(q, 640, 2048, 256, 8);
+  fprintf(stderr,"[bench] one_batched 8160/512\n"); one_batched(q, 8160, 512, 128, 4);
   return 0;
 }
