@@ -11,7 +11,7 @@
 #include "gemm_s8_v8_kernel.hpp"
 using namespace sycl;
 
-template<int BMv,int NTv>
+template<int BMv,int NTv,bool SG>
 void run_one(queue& q, int M,int N,int K,int b){
   int ldc=N*b; int Mp=((M+BMv-1)/BMv)*BMv;
   std::mt19937 rng(7); std::uniform_int_distribution<int> da(-127,127);
@@ -30,8 +30,8 @@ void run_one(queue& q, int M,int N,int K,int b){
   s8v9c::pack_a9b<BMv>(q,dA,dAp,M,Mp,K,K);
   s8v9c::pack_b9b(q,dB,dBp,K,N,ldc,K,(size_t)N*K,b);
   q.wait();
-  if(ldc==256) s8v9c::gemm_b_rq9b<256,true,BMv,NTv>(q,dAp,dBp,(sycl::half*)dPk,dSc,dAs,dBs,M,Mp,K,3u).wait();
-  else         s8v9c::gemm_b_rq9b<512,true,BMv,NTv>(q,dAp,dBp,(sycl::half*)dPk,dSc,dAs,dBs,M,Mp,K,3u).wait();
+  if(ldc==256) s8v9c::gemm_b_rq9b<256,true,BMv,NTv,SG>(q,dAp,dBp,(sycl::half*)dPk,dSc,dAs,dBs,M,Mp,K,3u).wait();
+  else         s8v9c::gemm_b_rq9b<512,true,BMv,NTv,SG>(q,dAp,dBp,(sycl::half*)dPk,dSc,dAs,dBs,M,Mp,K,3u).wait();
   std::vector<int8_t> got((size_t)M*ldc); q.memcpy(got.data(),dPk,(size_t)M*ldc).wait();
   std::vector<float> gsc(M); q.memcpy(gsc.data(),dSc,(size_t)M*4).wait();
   std::vector<int8_t> want((size_t)M*ldc); std::vector<float> wsc(M);
@@ -55,14 +55,14 @@ void run_one(queue& q, int M,int N,int K,int b){
   for(int r=0;r<M;++r)if(!(gsc[r]==wsc[r]))sd++;
   double best=1e9;
   for(int it=0;it<7;++it){
-    event e=(ldc==256)?s8v9c::gemm_b_rq9b<256,true,BMv,NTv>(q,dAp,dBp,(sycl::half*)dPk,dSc,dAs,dBs,M,Mp,K,3u)
-                      :s8v9c::gemm_b_rq9b<512,true,BMv,NTv>(q,dAp,dBp,(sycl::half*)dPk,dSc,dAs,dBs,M,Mp,K,3u);
+    event e=(ldc==256)?s8v9c::gemm_b_rq9b<256,true,BMv,NTv,SG>(q,dAp,dBp,(sycl::half*)dPk,dSc,dAs,dBs,M,Mp,K,3u)
+                      :s8v9c::gemm_b_rq9b<512,true,BMv,NTv,SG>(q,dAp,dBp,(sycl::half*)dPk,dSc,dAs,dBs,M,Mp,K,3u);
     e.wait();
     auto s0=e.get_profiling_info<info::event_profiling::command_start>();
     auto t0=e.get_profiling_info<info::event_profiling::command_end>();
     best=std::min(best,(double)(t0-s0)/1e6);}
-  printf("  BM=%-3d NT=%-3d M=%-6d ldc=%-5d: %s %llu %llu  time=%.4f ms (%.0f GF/s)\n",
-    BMv,NTv,M,ldc,(vd==0&&sd==0)?"EXACT":"BAD",
+  printf("  BM=%-3d NT=%-3d SG=%d M=%-6d ldc=%-5d: %s %llu %llu  time=%.4f ms (%.0f GF/s)\n",
+    BMv,NTv,(int)SG,M,ldc,(vd==0&&sd==0)?"EXACT":"BAD",
     (unsigned long long)vd,(unsigned long long)sd,best,2.0*M*ldc*K/1e6/best);
   free(dA,q);free(dB,q);free(dAp,q);free(dBp,q);free(dPk,q);free(dSc,q);free(dAs,q);free(dBs,q);
 }
@@ -72,8 +72,9 @@ int main(){
     if(d.get_backend()==backend::ext_oneapi_level_zero&&d.get_info<info::device::name>().find("Arc")!=std::string::npos){dev=d;break;}
   queue q(dev,property::queue::enable_profiling{});
   printf("senior targets: 32640x128x64b2 -> 0.107ms, 8160x128x128b4 -> 0.071ms (gemm alone)\n");
-  printf("== BM64 NT64 ==\n"); run_one<64,64>(q,32640,128,64,2); run_one<64,64>(q,8160,128,128,4);
-  printf("== BM32 NT64 ==\n"); run_one<32,64>(q,32640,128,64,2); run_one<32,64>(q,8160,128,128,4);
-  printf("== BM32 NT32 ==\n"); run_one<32,32>(q,32640,128,64,2); run_one<32,32>(q,8160,128,128,4);
+  printf("== BM64 NT64 single-buffer (senior KC staging) ==\n"); run_one<64,64,true>(q,32640,128,64,2); run_one<64,64,true>(q,8160,128,128,4);
+  printf("== BM64 NT64 double-buffer (the old form) ==\n"); run_one<64,64,false>(q,32640,128,64,2); run_one<64,64,false>(q,8160,128,128,4);
+  printf("== BM32 NT64 single ==\n"); run_one<32,64,true>(q,32640,128,64,2); run_one<32,64,true>(q,8160,128,128,4);
+  printf("== BM32 NT32 single ==\n"); run_one<32,32,true>(q,32640,128,64,2); run_one<32,32,true>(q,8160,128,128,4);
   return 0;
 }

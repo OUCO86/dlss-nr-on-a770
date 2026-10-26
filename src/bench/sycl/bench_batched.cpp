@@ -22,7 +22,11 @@ int main(){
   queue q(dev, property::queue::enable_profiling{});
   struct Cfg{int M,N,K,b;};
   std::vector<Cfg> cfgs={{2040,128,256,8},{32640,128,64,2},{32640,32,128,2},
-                         {640,64,256,8},{8160,128,128,4},{8160,32,128,4}};
+                         {640,64,256,8},{8160,128,128,4},{8160,32,128,4},
+                         // section 100: the QKV family's REAL gemm shapes (int8,
+                         // channels=128 -> N=3*128=384, K=128, M=8160..130560).
+                         // gemm_b at b=1 == the recorder's s8v8::gemm call.
+                         {8160,384,128,1},{130560,384,128,1}};
   for(auto cf:cfgs){
     int M=cf.M,N=cf.N,K=cf.K,b=cf.b;
     int Mp=((M+127)/128)*128;

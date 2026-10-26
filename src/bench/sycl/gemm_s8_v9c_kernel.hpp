@@ -120,7 +120,7 @@ inline void pack_b9b(queue& q, const int8_t* Braw, int8_t* Bp,
 
 // the fused kernel: C8 = int8 (Mp x ldc, the c buffer reinterpreted), ns = float[Mp]
 // (the a_scale buffer). bs = concatenated float[ldc]. as = float[M] (staged to SLM).
-template <int BN, bool FOLD, int BMv, int NTr>
+template <int BN, bool FOLD, int BMv, int NTr, bool SINGLE = true>
 inline event gemm_b_rq9b(queue& q, const int8_t* Ap, const int8_t* Bp,
                          sycl::half* C8, float* ns,
                          const float* as, const float* bs,
@@ -137,8 +137,17 @@ inline event gemm_b_rq9b(queue& q, const int8_t* Ap, const int8_t* Bp,
     const int WI_COLS = BN / 16;
     const int SLM_A = BM * BK;
     const int SLM_B = BK * BN;
-    const int SLM_B_BASE = 2 * SLM_A;
-    const int ASS = 2 * SLM_A + 2 * SLM_B;
+    // section 100 §99-item-5: KC SINGLE-buffer staging (the senior gemm_staged.comp
+    // :158-159 loop: barrier -> load ONE block -> barrier -> compute). The double
+    // buffer (2*SLM_A + 2*SLM_B) put BN=512 at 36KB+ = 1 WG/SM = the 0.79ms vs the
+    // senior's 0.107 occupancy gap (bench_v9c2). Single buffer: SLM_A + SLM_B =
+    // 2KB + 16KB = 18KB at BN=512 -> 2-3 WG/SM. The cost is one extra barrier per
+    // K step (the load no longer overlaps the compute); the win is 2x the
+    // occupancy. NR_V9C_SINGLE=0 keeps the double buffer for the A/B (the recorder
+    // and the bench pass SINGLE=false).
+    static const bool single = SINGLE;
+    const int SLM_B_BASE = single ? SLM_A : 2 * SLM_A;
+    const int ASS = single ? (SLM_A + SLM_B) : (2 * SLM_A + 2 * SLM_B);
     const int RMAXB = ASS + BM * 4;
     const int SLMTOT = RMAXB + (FOLD ? BM * 4 : 0);
     const int TILES = WI_ROWS * WI_COLS;
@@ -183,6 +192,30 @@ inline event gemm_b_rq9b(queue& q, const int8_t* Ap, const int8_t* Bp,
             #pragma unroll
             for (int t = 0; t < TPT; ++t) { acc[t][0]=0; acc[t][1]=0; acc[t][2]=0; acc[t][3]=0; }
             int kb_n = K / BK;
+            if (single) {
+                // the senior's staged loop (gemm_staged.comp:158-159): barrier ->
+                // load ONE block -> barrier -> compute. dpas operands move GRF->SLM->
+                // GRF; the values are bit-identical either way (the accumulator
+                // sequence per tile is the same), so the gate's OUT BITS EQUAL is the
+                // judge. The operands are dead after the last load_grf of each step,
+                // which is what the top-of-loop barrier enforces.
+                for (int b = 0; b < kb_n; ++b) {
+                    if (b) esimd::barrier();
+                    load_block(0, b);
+                    esimd::barrier();
+                    #pragma unroll
+                    for (int t = 0; t < TPT; ++t) {
+                        int tile = t * NT + lid;
+                        if (tile >= TILES) continue;
+                        int tr = tile / WI_COLS, tc = tile % WI_COLS;
+                        load_grf(0, tr, tc, a0, a1, b0, b1);
+                        acc[t][0] = esimd::xmx::dpas<8, 8, int32_t>(acc[t][0], b0, a0);
+                        acc[t][1] = esimd::xmx::dpas<8, 8, int32_t>(acc[t][1], b1, a0);
+                        acc[t][2] = esimd::xmx::dpas<8, 8, int32_t>(acc[t][2], b0, a1);
+                        acc[t][3] = esimd::xmx::dpas<8, 8, int32_t>(acc[t][3], b1, a1);
+                    }
+                }
+            } else {
             load_block(0, 0);
             esimd::barrier();
             for (int b = 0; b < kb_n; ++b) {
@@ -200,6 +233,7 @@ inline event gemm_b_rq9b(queue& q, const int8_t* Ap, const int8_t* Bp,
                     acc[t][3] = esimd::xmx::dpas<8, 8, int32_t>(acc[t][3], b1, a1);
                 }
                 esimd::barrier();
+            }
             }
             // ---- store phase. FOLD=0: half[r*ldc+n] like gemm_b_pub (the c buffer).
             // FOLD=1: phase A = pub + row absmax atomic-fmax; barrier; phase B = scale +
