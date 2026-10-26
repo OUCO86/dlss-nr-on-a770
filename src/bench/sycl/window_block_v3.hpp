@@ -338,6 +338,19 @@ inline sycl::event launch_v3(
                     DumpKV[(size_t)window*4096u + lid*32u + c] = lh16(KTO + pb16t_dest(lid,c,2u,4u)*2u)[0];
                 return;
             }
+            // section 100 P1 v4-slice judges: RAW-REGION dumps of the three pack
+            // regions (map-agnostic: identical packs => identical raw bytes; v4 may
+            // use a different pack map). stop=10 -> QPO, 11 -> KTO, 12 -> VPO
+            // (6/8/9 are taken by the probs/attended/projected stage dumps).
+            if (stop_stage == 10u || stop_stage == 11u || stop_stage == 12u) {
+                uint reg = (stop_stage == 10u) ? QPO : (stop_stage == 11u) ? KTO : VPO;
+                if (DumpKV) {
+                    half* d = DumpKV + (size_t)window * 4096u;   // same stride as the other stops
+                    for (uint i = 0; i < 2048u; i += 64u)
+                        d[i + lid] = lh16(reg + (i + lid) * 2u)[0];
+                }
+                return;
+            }
 
             // ===== P3: scores = Q.K^T, M=64 N=64 K=32: 16 tiles =====
             for (uint tile = sgid; tile < 16u; tile += 4u) {
