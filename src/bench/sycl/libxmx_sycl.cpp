@@ -169,6 +169,32 @@ static bool qfuse_take(int a, int a_scale, unsigned M, unsigned K, QuantFused& o
     g_quant_pk.erase(it);
     return true;
 }
+// batched variant: the wide-row batched shapes quantize the FULL lda-wide row and the
+// gemm slices it by columns (sa==K per group). Pair when quant-K == lda_e (or == K for
+// the shared-A form sa==0) and scale_stride==0 (row scales shared across groups --
+// every frame case; the census 99c4034).
+static bool qfuse_take_b(int a, int a_scale, unsigned M, unsigned K, unsigned lda_e,
+                         unsigned sa, unsigned scale_stride, size_t my_cmd, QuantFused& out){
+    static bool qfuse_b = getenv("NR_Q_FUSE_B") != nullptr;   // A/B 00:45: end-to-end
+    if (!qfuse_b) return false;                                // NEUTRAL (batched fused
+    if (!qfuse_on() || scale_stride != 0u) return false;       // pack +8ms eats the
+                                                        // quant -12; kept as a probe
+    auto it = g_quant_pk.find(a);
+    if (it == g_quant_pk.end()) return false;
+    // the two frame forms (census 99c4034, guards per the user's reference):
+    //   shared-A:   quant-K == gemm-K == lda, sa==0 (groups read the SAME rows)
+    //   col-slice:  quant-K == lda (full wide row), sa == K (group g reads cols g*K..)
+    const bool shared    = (it->second.K == K && K == lda_e && sa == 0u);
+    const bool colslice  = (it->second.K == lda_e && sa == K);
+    if (!shared && !colslice) return false;
+    if (it->second.sc != a_scale || it->second.M != M) return false;
+    if (my_cmd - it->second.qcmd > 4) return false;   // adjacency sanity: only INIT/BUF
+    out = it->second;                                  // ops may sit in between
+    g_cmds[out.qcmd] = [](){};
+    g_cmd_names[out.qcmd] = "quant(FUSED-pack-b)";
+    g_quant_pk.erase(it);
+    return true;
+}
 // SECTION 99 v9b FOLD pairing (record-time registration, exec-time lookup): the
 // batched recorder, when its v9b condition holds, records its own cmd index under the
 // c buffer id; the ADJACENT quant recorder back-fills (packed,scale) into that slot.
@@ -1802,6 +1828,10 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
         (((flags >> 8) & 0xFu) == 3u) && ((flags & 0x1000u) != 0u) && (K % 32u) == 0u;
     size_t v9b_slot = 0;
     if (v9b_will) { ++v9b_rec_calls; v9b_slot = g_cmds.size(); g_pending_fold_slot = v9b_slot; g_fold_slot.resize(v9b_slot + 1); g_fold_slot[v9b_slot].cbuf = c; }
+    // P2 batched fusion decision at RECORD time (the take no-ops the quant closure):
+    QuantFused qfb;
+    const bool fused_b = !v9b_will && qfuse_take_b(a, a_scale, M, K, lda_, sa, scale_stride, g_cmds.size(), qfb);
+    sycl::half* a16b = fused_b ? (sycl::half*)g_bufs[qfb.src].p : nullptr;
     g_cmds.push_back([=]() {
         const unsigned lda_e = lda ? lda : K, ldb_e = ldb ? ldb : K;
         // R8a shape-merge (section 92): ONE dispatch per stage for the whole op -- the
@@ -1813,7 +1843,8 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
         // one kernel, pack B (weight, cached whole) in one kernel, gemm_b/gemm32_b in ONE
         // launch, publish in one launch. Bounds identical to the gate's aw_b/bw_b.
         int8_t* dAp = (int8_t*)pool_get((size_t)batch * Mp * K);
-        packdev::gather_pack_a_b(*GQ, Araw, dAp, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch);
+        if (fused_b) packdev::pack_a_fused_b(*GQ, a16b, dAp, (float*)ias->second.p, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch);
+        else packdev::gather_pack_a_b(*GQ, Araw, dAp, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch);
         // the whole batched B is one weight: pack once (all groups), cache, reuse.
         WKey wk{ b, (int)N, (int)K, (int)batch };
         auto wc = g_wcache.find(wk);
