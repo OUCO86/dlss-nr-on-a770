@@ -1418,9 +1418,38 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
         // queue: every read kernel is enqueued before the pool_put that recycles its
         // buffer, so cross-pass scratch reuse is safe; one wait at the end of the pass.
         sycl::half* dAp = (sycl::half*)pool_get((size_t)Mp * cin * 2);
-        sycl::half* dH = (sycl::half*)pool_get((size_t)M * hidden * 2);
         packdev::pack_a16(*GQ, Araw, dAp, (int)M, Mp, (int)cin);
         sycl::half* dEp = cached_pack_b_f16(expand, Eraw, (int)cin, (int)hidden);   // weight
+        // P3 (section 100): the expand's published halves ARE the projection's pack_a16
+        // A tile -- (tr,tc) of the expand == (tr,kc=tc) of the projection, same 16x16
+        // geometry, same pub_esimd(3) values, pad rows explicit zero. gemm_pub_pa16
+        // writes the TILE directly: dH (M x hidden halfs, 33MB/call) + the pack_a16
+        // pass (read 33 + write 33) vanish per call. Gate NR_FFN_TILE (default ON;
+        // =0 restores the two-pass dH form).
+        static bool ffntile = !getenv("NR_FFN_TILE") || atoi(getenv("NR_FFN_TILE")) != 0;
+        if (ffntile) {
+            sycl::half* dHp = (sycl::half*)pool_get((size_t)Mp * hidden * 2);
+            f16v1::gemm_pub_pa16(*GQ, dAp, dEp, dHp, (int)M, Mp, (int)hidden, (int)cin, 3u);
+            pool_put(dAp);   // dEp is cache-owned (weight)
+            sycl::half* dPp = cached_pack_b_f16(projection, Praw, (int)hidden, (int)cin);   // weight
+            float* dC2 = (float*)pool_get((size_t)Mp * cin * 4);
+            f16v1::gemm(*GQ, dHp, dPp, dC2, Mp, (int)cin, (int)hidden);
+            pool_put(dHp);
+            GQ->parallel_for(sycl::range((size_t)M * cin), [=](sycl::item<1> it) {
+                size_t i = it.get_id(0);
+                unsigned col = (unsigned)(i % cin);
+                float total = dC2[i];
+                if (residual) {
+                    float sk = half_skip ? (float)((const sycl::half*)skp)[i] : ((const float*)skp)[i];
+                    total = sycl::fma(sk, cp[col], total);
+                }
+                if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
+                else        ((float*)Cout)[i] = qr_publish(epi, total);
+            });
+            pool_put(dC2);   // dPp is cache-owned (weight)
+            return;
+        }
+        sycl::half* dH = (sycl::half*)pool_get((size_t)M * hidden * 2);
         // DERIVED (section 92): fuse publish(3) (gate_activation + e4m3) into the gemm
         // store -- kills the dC1 float scratch + the separate publish pass. pub_esimd(3u)
         // is the same gate+e4m3 chain proven bit-exact by the batched epi3 win.

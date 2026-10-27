@@ -180,6 +180,63 @@ static inline sycl::event gemm_pub(sycl::queue& q, const half* Ap, const half* B
         });
     });
 }
+// gemm_pub_pa16 -- P3 first cut (section 100): gemm_pub whose STORE lands in the
+// f16v1 pack_a16 TILE layout of the published halves, i.e. directly as the NEXT
+// gemm's A operand. The expand's output tile (tr,tc) IS the projection's A block
+// (tr, kc=tc): same 16x16 geometry, and the published half values are exactly
+// what pack_a16 would copy from dH (it is a pure gather of those halves). So the
+// dH buffer (M x hidden halfs) and the separate pack_a16 pass both disappear --
+// per ffn call that is 33MB written + 33MB read + 33MB written + 33MB read + one
+// launch removed (16 calls/frame at M=130560). Bit-exactness: the fragment->tile
+// map below is pack_a16's OWN index math (dest ((tr*kb_n+kc)*2+strip)*128 +
+// il*16 + k, row = tr*16+strip*8+il) applied to the same pub_esimd(3,acc) halves
+// gemm_pub stores row-major; rows >= M get explicit zeros (pack_a16 zero-fills
+// the pad rows -- the pool tile must not carry garbage into the dpas reads).
+static inline sycl::event gemm_pub_pa16(sycl::queue& q, const half* Ap, const half* Bp,
+                                        half* Hp_tile, int M, int Mp, int N, int K,
+                                        unsigned epi) {
+    int tr_n = Mp / TS, tc_n = N / TS, kb_n = K / TS;
+    return q.submit([&](handler& h) {
+        h.parallel_for(range<1>((size_t)tr_n * tc_n), [=](item<1> it) SYCL_ESIMD_KERNEL {
+            int t = (int)it.get_id(0); int tr = t / tc_n, tc = t % tc_n;
+            esimd::simd<float, 64> c00(0.f), c01(0.f), c10(0.f), c11(0.f);
+            for (int kc = 0; kc < kb_n; ++kc) {
+                const half* ab = Ap + ((size_t)(tr * kb_n + kc) * 2) * 128;
+                const half* bb = Bp + ((size_t)(kc * tc_n + tc) * 2) * 128;
+                esimd::simd<half, 128> a0(ab, esimd::overaligned_tag<16>{});
+                esimd::simd<half, 128> a1(ab + 128, esimd::overaligned_tag<16>{});
+                esimd::simd<half, 128> b0(bb, esimd::overaligned_tag<16>{});
+                esimd::simd<half, 128> b1(bb + 128, esimd::overaligned_tag<16>{});
+                c00 = esimd::xmx::dpas<8, 8, float>(c00, b0, a0);
+                c01 = esimd::xmx::dpas<8, 8, float>(c01, b1, a0);
+                c10 = esimd::xmx::dpas<8, 8, float>(c10, b0, a1);
+                c11 = esimd::xmx::dpas<8, 8, float>(c11, b1, a1);
+            }
+            // THIS tile is the projection's A block (tr, kc=tc) in ITS layout:
+            // dest ((tr*kb_n' + kc)*2+strip)*128 with kb_n' = hidden/16 = tc_n
+            // (the output's COLUMN-block count -- NOT the expand's kb_n).
+            half* tile = Hp_tile + (size_t)((tr * tc_n + tc) * 2) * 128;
+            const esimd::simd<half, 8> z8((half)0.f);
+            for (int r = 0; r < 8; ++r) {
+                esimd::simd<half, 8> h00, h01, h10, h11;
+                if ((size_t)(tr * TS + r) < (size_t)M) {
+                    esimd::simd<float, 8> r00 = c00.template select<8, 1>(r * 8);
+                    esimd::simd<float, 8> r01 = c01.template select<8, 1>(r * 8);
+                    for (int e = 0; e < 8; ++e) h00[e] = half(s8v8::pub_esimd(epi, r00.read()[e]));
+                    for (int e = 0; e < 8; ++e) h01[e] = half(s8v8::pub_esimd(epi, r01.read()[e]));
+                } else { h00 = z8; h01 = z8; }
+                if ((size_t)(tr * TS + 8 + r) < (size_t)M) {
+                    esimd::simd<float, 8> r10 = c10.template select<8, 1>(r * 8);
+                    esimd::simd<float, 8> r11 = c11.template select<8, 1>(r * 8);
+                    for (int e = 0; e < 8; ++e) h10[e] = half(s8v8::pub_esimd(epi, r10.read()[e]));
+                    for (int e = 0; e < 8; ++e) h11[e] = half(s8v8::pub_esimd(epi, r11.read()[e]));
+                } else { h10 = z8; h11 = z8; }
+                h00.copy_to(tile + r * 16);        h01.copy_to(tile + r * 16 + 8);
+                h10.copy_to(tile + 128 + r * 16);  h11.copy_to(tile + 128 + r * 16 + 8);
+            }
+        });
+    });
+}
 // gemm_res -- the f16 gemm with a residual fma + publish fused into the store (section 92).
 // ffn_stem pass C: total = fma(skip[i], cos[col], acc); publish(epi). The engine uses
 // sycl::fma (one fused rounding); ESIMD's sk*cc+acc auto-contracts to the same FMA (the
