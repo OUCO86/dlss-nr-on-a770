@@ -28,6 +28,7 @@
 #include "window_block_v4.hpp"
 #include "window_block_v4ph.hpp"
 #include "ffn_fused_kernel.hpp"
+#include "qkv_resident.hpp"
 #include "requant_kernel.hpp"
 #include "gemm_s8_v1_kernel.hpp"
 #include "gemm_s8_v3_kernel.hpp"
@@ -2219,7 +2220,20 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
                 packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)C);
         }
         int8_t* dBp = cached_pack_b_i8(b, Braw, (int)NH, (int)C);   // weight: pack once
-        if (qkvstop < 2) s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)NH, (int)C);
+        // P5 (section 100): the resident QKV epilogue -- deq+butterfly+e4m3+scatter
+        // ON the gemm's SLM-staged accumulator tile; dC (int32 Mp x 3C) AND the
+        // 21ms norm_scatter tail both vanish. NON-VIT + C%64==0 only (the frame:
+        // C=64/128); vit's 16 calls keep the scalar split (different tree).
+        static bool qres_on = getenv("NR_QKV_RES") && atoi(getenv("NR_QKV_RES")) != 0;   // P5 FALSIFIED (11:3x): correct (100%% x2, p5a/p5b) but 1-3ms SLOWER than split (182-185 vs 180-182): the tail is 14ms of BUTTERFLY COMPUTE, not the dC round-trip (0.06ms) -- folding into the gemm moves the cost and serializes it with the dpas loop. Kernel stays in-tree as witness.
+        const bool qres_ok = qres_on && !vit && (C % 64u) == 0u && NH == 3u * C && heads == C / 32u && tokens > 0u;
+        if (qkvstop < 2) {
+            if (qres_ok)
+                qres::gemm_qkv_res(*GQ, dAp, dBp, Q, Kk, V, as, bs, qs, (int)M, Mp, (int)C, (int)NH, (int)heads, (int)tokens);
+            else {
+                s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)NH, (int)C);
+            }
+        }
+        if (qres_ok) goto qkv_done;
         // stage 2: deq + in-place Q/K head norm (the epilogue's order; V deqt only).
         // DERIVED (section 92): the non-vit normalize is the same scalar cosine chain that
         // the 4-lane ESIMD butterfly just made 4.3x faster in window_block; qkv_norm_esimd
@@ -2283,6 +2297,7 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
             if (part == 0u) Q[at] = out; else if (part == 1u) Kk[at] = out; else V[at] = out;
         });
         }   // end else (vit scalar stage2 + stage3)
+        qkv_done:;
         pool_put(dAp); pool_put(dBp); pool_put(dC);
     });
     return 0;
