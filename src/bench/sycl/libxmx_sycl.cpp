@@ -1555,11 +1555,33 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
         // the old path downloaded it and re-uploaded a packed operand (the 256ms).
         // ---- pass B: expand gemm(merged16, expand -> f32), publish(3) -> half hidden ----
         sycl::half* dA2 = (sycl::half*)pool_get((size_t)Mp * 32 * 2);
-        sycl::half* dHid = (sycl::half*)pool_get((size_t)M * 128 * 2);
         packdev::pack_a16(*GQ, dM16, dA2, (int)M, Mp, 32);   // dM16 on device
         sycl::half* dB2 = cached_pack_b_f16(expand, Eraw, 32, 128);   // weight
         // DERIVED (section 92): fuse publish(3) into the gemm store (dC1 was dead after
         // this pass). pass C's residual fma stays split (the gemm_res 13-mismatch lesson).
+        // P3b (section 100): the hidden16 goes STRAIGHT into pass C's A tile
+        // (gemm_pub_pa16, the proven ffn lever): dHid + its pack_a16 pass vanish.
+        static bool ffntile2 = !getenv("NR_FFN_TILE") || atoi(getenv("NR_FFN_TILE")) != 0;
+        if (ffntile2) {
+            sycl::half* dA3 = (sycl::half*)pool_get((size_t)Mp * 128 * 2);
+            f16v1::gemm_pub_pa16(*GQ, dA2, dB2, dA3, (int)M, Mp, 128, 32, 3u);
+            pool_put(dM16); pool_put(dA2);   // dB2 cache-owned
+            float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
+            sycl::half* dB3 = cached_pack_b_f16(projection, Praw, 128, 32);   // weight
+            f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128);
+            pool_put(dA3);
+            GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
+                size_t i = it.get_id(0);
+                unsigned col = (unsigned)(i % 32u);
+                float total = sycl::fma(dMerged[i], cp[col], dC2[i]);     // skip = raw merged f32
+                if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
+                else        ((float*)Cout)[i] = qr_publish(epi, total);
+            });
+            pool_put(dC2);   // dB3 is cache-owned (weight)
+            pool_put(dMerged);
+            return;
+        }
+        sycl::half* dHid = (sycl::half*)pool_get((size_t)M * 128 * 2);
         f16v1::gemm_pub(*GQ, dA2, dB2, dHid, (int)M, Mp, 128, 32, 3u);
         pool_put(dM16); pool_put(dA2);   // dB2 is cache-owned (weight)
         // ---- pass C: projection gemm(hidden, projection -> f32) + raw-merged residual ----
@@ -1645,11 +1667,33 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
         });
         // ---- pass B: expand gemm(hidden16, expand -> f32), publish(3) -> half hidden ----
         sycl::half* dA2 = (sycl::half*)pool_get((size_t)Mp * 32 * 2);
-        sycl::half* dHid = (sycl::half*)pool_get((size_t)M * 128 * 2);
         packdev::pack_a16(*GQ, dH16, dA2, (int)M, Mp, 32);   // dH16 on device
         sycl::half* dB2 = cached_pack_b_f16(expand, Eraw, 32, 128);   // weight
         // DERIVED (section 92): fuse publish(3) into the gemm store (dC1 was dead after
         // this pass). pass A's dS is NOT fused -- pass C re-reads it as the residual skip.
+        // P3b (section 100): hidden16 straight into pass C's A tile (gemm_pub_pa16):
+        // dHid (M x 128 halfs) + its pack_a16 pass vanish. Same gate NR_FFN_TILE.
+        static bool ffntile3 = !getenv("NR_FFN_TILE") || atoi(getenv("NR_FFN_TILE")) != 0;
+        if (ffntile3) {
+            sycl::half* dA3 = (sycl::half*)pool_get((size_t)Mp * 128 * 2);
+            f16v1::gemm_pub_pa16(*GQ, dA2, dB2, dA3, (int)M, Mp, 128, 32, 3u);
+            pool_put(dH16); pool_put(dA2);   // dB2 is cache-owned (weight)
+            float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
+            sycl::half* dB3 = cached_pack_b_f16(projection, Praw, 128, 32);   // weight
+            f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128);
+            pool_put(dA3);
+            GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
+                size_t i = it.get_id(0);
+                unsigned col = (unsigned)(i % 32u);
+                float total = sycl::fma(dS[i], cp[col], dC2[i]);   // skip = RAW f32 stem (device)
+                if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
+                else        ((float*)Cout)[i] = qr_publish(epi, total);
+            });
+            pool_put(dC2);   // dB3 is cache-owned (weight)
+            pool_put(dS);
+            return;
+        }
+        sycl::half* dHid = (sycl::half*)pool_get((size_t)M * 128 * 2);
         f16v1::gemm_pub(*GQ, dA2, dB2, dHid, (int)M, Mp, 128, 32, 3u);
         pool_put(dH16); pool_put(dA2);   // dB2 is cache-owned (weight)
         // ---- pass C: projection gemm(hidden, projection -> f32) + raw-stem residual ----
