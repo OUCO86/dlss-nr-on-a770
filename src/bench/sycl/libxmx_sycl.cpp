@@ -3127,6 +3127,16 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
         // attnV leg: P(64x64) @ V(64x32) -> 64x32. V stored (64 tokens,32 ch) = (K,N).
         if (!wat || smaxplain) packdev::pack_a16_b(*GQ, dProbs, dAp, 64, 64, 64, (int)batches);
         packdev::pack_b16_b(*GQ, V, dBv, 64, 32, (int)batches);
+        // P9 (section 100): attnV + merge_heads FOLDED (gemm_b2_merge): the e4m3
+        // publish lands ON the accumulator and scatters straight into the merged
+        // (windows,64,heads*32) half layout -- dCtx (16.7MB/call f32 write+read)
+        // AND the merge launch both vanish. Same lever as the promoted
+        // gemm_pub_pa16; e4m3 via the bench_pubvec-proven vector form.
+        // Gate NR_WA_MERGE (default ON once the three gates pass). merged=1 only.
+        static bool wam = !getenv("NR_WA_MERGE") || atoi(getenv("NR_WA_MERGE")) != 0;
+        if (wam && merged) {
+            f16v2::gemm_b2_merge(*GQ, dAp, dBv, (sycl::half*)Out, 64, 32, 64, (int)batches, (int)heads);
+        } else {
         if (getenv("NR_F16V1")) f16v1::gemm_b(*GQ, dAp, dBv, dCtx, 64, 32, 64, (int)batches);
         else                    f16v2::gemm_b2<32>(*GQ, dAp, dBv, dCtx, 64, 32, 64, (int)batches);
         if (merged) {
@@ -3142,6 +3152,7 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
         } else {
             ev_sync(GQ->memcpy(Out, dCtx, ctx_elems * 4));
         }
+        }   // P9 fold gate
         pool_put(dScores); pool_put(dProbs); pool_put(dCtx);
         pool_put(dAq); pool_put(dBk); pool_put(dAp); pool_put(dBv);
     });
