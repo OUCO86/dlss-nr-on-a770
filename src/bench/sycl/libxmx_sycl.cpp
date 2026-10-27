@@ -29,6 +29,7 @@
 #include "window_block_v4ph.hpp"
 #include "ffn_fused_kernel.hpp"
 #include "qkv_resident.hpp"
+#include "ffn_chip_kernel.hpp"
 #include "requant_kernel.hpp"
 #include "gemm_s8_v1_kernel.hpp"
 #include "gemm_s8_v3_kernel.hpp"
@@ -1444,23 +1445,28 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
         // pass (read 33 + write 33) vanish per call. Gate NR_FFN_TILE (default ON;
         // =0 restores the two-pass dH form).
         static bool ffntile = !getenv("NR_FFN_TILE") || atoi(getenv("NR_FFN_TILE")) != 0;
-        static bool ffchip = getenv("NR_FFN_CHIP") != nullptr;   // P3c probe gate
-        if (ffntile && ffchip && hidden == 128u && cin == 32u) {
-            // P3c: ONE launch, hidden NEVER leaves the chip (ffn_fused_kernel.hpp).
+        // P3c v3d (section 100): the ffn_fused CHIP kernel -- ONE launch, hidden
+        // NEVER leaves the chip, and it eats the RAW f16 A (pack_a16 vanishes too).
+        // bench_ffnchip: 4.4x vs the promoted tile-chain split, BIT-EXACT. Guards:
+        // cin==32, hidden==128, f32-out (narrow==false, epi==0 -- the captured ffn
+        // flags are exactly this), residual skip half or f32. Escape NR_FFN_CHIP=0.
+        static bool ffchip = !getenv("NR_FFN_CHIP") || atoi(getenv("NR_FFN_CHIP")) != 0;
+        if (ffntile && ffchip && hidden == 128u && cin == 32u && !narrow && epi == 0u) {
             sycl::half* dPp = cached_pack_b_f16(projection, Praw, (int)hidden, (int)cin);
             float* dC2 = (float*)pool_get((size_t)Mp * cin * 4);
-            ffnt::launch_ffn_fused(*GQ, dAp, dEp, dPp, dC2, (int)M, Mp);
-            pool_put(dAp);   // dEp/dPp cache-owned
+            ffnc::launch_ffn_chip(*GQ, Araw, dEp, dPp, dC2, (int)M, Mp);
+            // the residual + publish tail stays SPLIT (the gate's f32-skip 131/8192
+            // caught the in-kernel contracted fma -- sycl::fma is the authority,
+            // section 92's gemm_res lesson, third time proven).
             GQ->parallel_for(sycl::range((size_t)M * cin), [=](sycl::item<1> it) {
-                size_t i = it.get_id(0);
-                unsigned col = (unsigned)(i % cin);
-                float total = dC2[i];
+                size_t i2 = it.get_id(0);
+                unsigned col = (unsigned)(i2 % cin);
+                float total = dC2[i2];
                 if (residual) {
-                    float sk = half_skip ? (float)((const sycl::half*)skp)[i] : ((const float*)skp)[i];
+                    float sk = half_skip ? (float)((const sycl::half*)skp)[i2] : ((const float*)skp)[i2];
                     total = sycl::fma(sk, cp[col], total);
                 }
-                if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
-                else        ((float*)Cout)[i] = qr_publish(epi, total);
+                ((float*)Cout)[i2] = qr_publish(epi, total);
             });
             pool_put(dC2);
             return;
