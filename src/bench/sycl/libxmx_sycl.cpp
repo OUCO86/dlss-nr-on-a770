@@ -1598,14 +1598,38 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
         // fully device-resident (section 92): dM16 stays on device for pass B's pack_a16 --
         // the old path downloaded it and re-uploaded a packed operand (the 256ms).
         // ---- pass B: expand gemm(merged16, expand -> f32), publish(3) -> half hidden ----
-        sycl::half* dA2 = (sycl::half*)pool_get((size_t)Mp * 32 * 2);
-        packdev::pack_a16(*GQ, dM16, dA2, (int)M, Mp, 32);   // dM16 on device
+        // P3f: the chip path eats dM16 RAW -> skip the dA2 pack entirely.
+        static bool mchip_probe = !getenv("NR_FFN_CHIP") || atoi(getenv("NR_FFN_CHIP")) != 0;
+        static bool mtile_probe = !getenv("NR_FFN_TILE") || atoi(getenv("NR_FFN_TILE")) != 0;
+        const bool skip_pack = mchip_probe && mtile_probe && !narrow && epi == 0u;
+        sycl::half* dA2 = skip_pack ? nullptr : (sycl::half*)pool_get((size_t)Mp * 32 * 2);
+        if (!skip_pack) packdev::pack_a16(*GQ, dM16, dA2, (int)M, Mp, 32);   // dM16 on device
         sycl::half* dB2 = cached_pack_b_f16(expand, Eraw, 32, 128);   // weight
         // DERIVED (section 92): fuse publish(3) into the gemm store (dC1 was dead after
         // this pass). pass C's residual fma stays split (the gemm_res 13-mismatch lesson).
         // P3b (section 100): the hidden16 goes STRAIGHT into pass C's A tile
         // (gemm_pub_pa16, the proven ffn lever): dHid + its pack_a16 pass vanish.
         static bool ffntile2 = !getenv("NR_FFN_TILE") || atoi(getenv("NR_FFN_TILE")) != 0;
+        // P3f: the chip kernel on merge's B->C legs (dM16 = the raw merged row-major
+        // M x 32 half = the chip's dA contract; the dA2 pack skips on this path).
+        static bool ffchip2 = !getenv("NR_FFN_CHIP") || atoi(getenv("NR_FFN_CHIP")) != 0;
+        const bool merge_chip = ffntile2 && ffchip2 && !narrow && epi == 0u;
+        if (merge_chip) {
+            sycl::half* dPp2 = cached_pack_b_f16(projection, Praw, 128, 32);
+            float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
+            ffnc::launch_ffn_chip(*GQ, dM16, dB2, dPp2, dC2, (int)M, Mp);
+            pool_put(dM16);   // dA2 was never packed on this path; dB2/dPp2 cache-owned
+            GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
+                size_t i2 = it.get_id(0);
+                unsigned col = (unsigned)(i2 % 32u);
+                float total = sycl::fma(dMerged[i2], cp[col], dC2[i2]);   // raw merged f32 skip
+                if (narrow) ((sycl::half*)Cout)[i2] = sycl::half(qr_publish(epi, total));
+                else        ((float*)Cout)[i2] = qr_publish(epi, total);
+            });
+            pool_put(dC2);
+            pool_put(dMerged);
+            return;
+        }
         if (ffntile2) {
             sycl::half* dA3 = (sycl::half*)pool_get((size_t)Mp * 128 * 2);
             f16v1::gemm_pub_pa16(*GQ, dA2, dB2, dA3, (int)M, Mp, 128, 32, 3u);
