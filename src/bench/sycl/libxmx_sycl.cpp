@@ -1878,7 +1878,7 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
     if (compact && (N != 16u || ldc != 4u || epi || narrow))
         FAILMSG("compact head requires N=16, ldc=4 and plain FP32 output (libxmx.c:2290)");
     const unsigned lda_e = lda ? lda : K, ldb_e = ldb ? ldb : (transposed ? K : N), ldc_e = ldc ? ldc : N;
-    const int Mp = (int)(((M + 15u) / 16u) * 16u);
+    int Mp = (int)(((M + 15u) / 16u) * 16u);   // P12a: re-padded to a 64-multiple on the v2 path below
     g_cmd_names.push_back(__func__);
         flop_note("f16_gemm",M,N,K,batch?batch:1);
     g_cmds.push_back([=]() {
@@ -1888,9 +1888,22 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
         // recorder's host loop turned one big op into `batch` small under-filled gemms.
         // pack-A once (all groups), pack-B once (whole weight, cached), gemm_b once,
         // publish once. Bounds identical to the gate's aw_b/bw_b (section-73 lesson).
-        sycl::half* dAp = (sycl::half*)pool_get(nb * (size_t)Mp * K * 2);
-        float* dC = (float*)pool_get(nb * (size_t)Mp * N * 4);
-        packdev::gather_pack_a16_b(*GQ, Araw, dAp, (int)M, Mp, (int)K, (int)lda_e, sa, oa, (int)nb);
+        // P12a (section 100): the f16 gemm family still ran f16v1::gemm_b (one 16x16
+        // tile per GLOBAL load, 8 FLOP/byte = memory-bound) while the SLM-tiled v2
+        // (4x reuse) was PROMOTED for window_attention in section 99. Same lever,
+        // one variable: v2 needs Mp a multiple of BM=64 -> re-pad Mp here (garbage
+        // pad rows are written but never published: the publish loop bounds r<M).
+        // N%64==0 -> BN=64, else N%32==0 -> BN=32 (the frame's N are 32/64/128/256/
+        // 512/1024). LW = NT = (BM/TS)*(BN/TS) = 8 or 16 (the safe lines). Gate
+        // NR_G_V2 (default ON once the three gates pass; =0 = the v1 escape).
+        static bool gv2 = !getenv("NR_G_V2") || atoi(getenv("NR_G_V2")) != 0;
+        const bool v2_ok = gv2 && (M > 0u) && ((N % 32u) == 0u) && ((K % 16u) == 0u);
+        int Mp2 = v2_ok ? (int)(((M + 63u) / 64u) * 64u) : Mp;
+        sycl::half* dAp = (sycl::half*)pool_get(nb * (size_t)Mp2 * K * 2);
+        float* dC = (float*)pool_get(nb * (size_t)Mp2 * N * 4);
+        static int gst2 = getenv("NR_G_STOP") ? atoi(getenv("NR_G_STOP")) : 0;
+        if (gst2 != 2)   // stop1/stop3 run the pack; stop2 = floor only
+        packdev::gather_pack_a16_b(*GQ, Araw, dAp, (int)M, Mp2, (int)K, (int)lda_e, sa, oa, (int)nb);
         WKey wk{ b, (int)N, (int)K, (int)(nb * 2 + (transposed ? 1 : 0)) };
         auto wc = g_wcache.find(wk);
         sycl::half* dBp;
@@ -1902,7 +1915,25 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
             else            packdev::gather_pack_b16_b(*GQ, Braw, dBp, (int)K, (int)N, (int)ldb_e, sb, ob, (int)nb);
             g_wcache[wk] = dBp;
         }
-        f16v1::gemm_b(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K, (int)nb);
+        static int gst = getenv("NR_G_STOP") ? atoi(getenv("NR_G_STOP")) : 0;   // ladder: 1 = pack only, 2 = floor, 3 = pack+gemm (publish skipped)
+        // P12b (section 100): the gemm family's publish pass (9.4ms on the ladder --
+        // the dC f32 write+read + one launch) folds into the gemm store (gemm_b_pub_f16:
+        // the publish loop's map VERBATIM, vector pub proven, epi2 on the scalar form).
+        // Guards: ldc==N (the frame's every call; the compact N=16/ldc=4 form stays on
+        // the split path), gst==0. Escape NR_G_FOLD=0.
+        static bool gfold = !getenv("NR_G_FOLD") || atoi(getenv("NR_G_FOLD")) != 0;
+        if (gfold && gst == 0 && ldc_e == N && !compact) {
+            f16v1::gemm_b_pub_f16(*GQ, dAp, dBp, Cout, (int)M, Mp2, (int)N, (int)K, (int)nb,
+                                  epi, narrow, oc, sc, ldc_e, lda_e);
+            pool_put(dAp); pool_put(dC);   // dC stays pooled (unused on this path)
+            return;
+        }
+        if (gst != 1 && gst != 2) {
+        if (v2_ok && (N % 64u) == 0u)      f16v2::gemm_b2<64>(*GQ, dAp, dBp, dC, Mp2, (int)N, (int)K, (int)nb);
+        else if (v2_ok)                    f16v2::gemm_b2<32>(*GQ, dAp, dBp, dC, Mp2, (int)N, (int)K, (int)nb);
+        else                               f16v1::gemm_b(*GQ, dAp, dBp, dC, Mp2, (int)N, (int)K, (int)nb);
+        static int gst3 = getenv("NR_G_STOP") ? atoi(getenv("NR_G_STOP")) : 0;   // 3 = skip the publish pass (gemm only): the fold-value probe
+        if (gst3 < 3)
         GQ->parallel_for(sycl::range(nb * (size_t)M * N),
                          [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
@@ -1910,11 +1941,12 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
             unsigned g = (unsigned)(i / mn); size_t rem = i % mn;
             unsigned r = (unsigned)(rem / N), col = (unsigned)(rem % N);
             if (compact && col >= 4u) return;   // the compact head keeps four columns
-            float value = qr_publish(epi, dC[g * (size_t)Mp * N + (size_t)r * N + col]);
+            float value = qr_publish(epi, dC[g * (size_t)Mp2 * N + (size_t)r * N + col]);
             size_t out = oc + g * sc + (size_t)r * ldc_e + col;
             if (narrow) ((sycl::half*)Cout)[out] = sycl::half(value);
             else        ((float*)Cout)[out] = value;
         });
+        }
         pool_put(dAp); pool_put(dC);   // dBp is cache-owned (the whole batched weight)
     });
     return 0;

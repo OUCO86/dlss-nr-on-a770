@@ -189,6 +189,88 @@ static inline sycl::event gemm_b_merge_scale(sycl::queue& q, const half* Ap, con
     });
 }
 
+// gemm_b_pub_f16 (section 100 P12b): the gemm-FAMILY op (xmx_rec_gemm) with the
+// publish pass folded into the gemm store -- the ladder (NR_G_STOP) attributed
+// 9.4ms to the standalone publish over dC (f32 M x N write + read); this kills
+// the dC wire AND the launch. The store map is the publish loop's VERBATIM
+// arithmetic: out = oc + g*sc + r*ldc + col, r<M guard, epi0/1/3/4 through the
+// bench_pubvec-proven vector pub (pub_vec_v8<8>), epi2 through the SCALAR
+// pub_esimd (the -0.0 sign lesson), narrow -> half else f32. CONTIGUOUS fast
+// path when ldc==N (the frame's every call): one 8-wide vector publish per
+// fragment half-row. Compact (N=16,ldc=4) and ldc!=N stay on the split path
+// (recorder guard). v1 geometry (one 16x16 tile per global load) = the shipped
+// form of this family (the v2 swap measured NEUTRAL here: NR_G_V2 stays OFF).
+static inline sycl::event gemm_b_pub_f16(sycl::queue& q, const half* Ap, const half* Bp,
+                                         void* Cout, int M, int Mp, int N, int K, int batches,
+                                         unsigned epi, bool narrow, size_t oc, size_t sc,
+                                         unsigned ldc, unsigned lda_unused) {
+    (void)lda_unused;
+    int tr_n = Mp / TS, tc_n = N / TS, kb_n = K / TS;
+    size_t apb = (size_t)Mp * K, bpb = (size_t)K * N;
+    sycl::half* Oh = (sycl::half*)Cout;
+    float* Of = (float*)Cout;
+    return q.submit([&](handler& h) {
+        h.parallel_for(range<1>((size_t)batches * tr_n * tc_n), [=](item<1> it) SYCL_ESIMD_KERNEL {
+            size_t g = it.get_id(0);
+            int b = (int)(g / ((size_t)tr_n * tc_n)); size_t t0 = g % ((size_t)tr_n * tc_n);
+            const half* Ab = Ap + (size_t)b * apb; const half* Bb = Bp + (size_t)b * bpb;
+            int t = (int)t0; int tr = t / tc_n, tc = t % tc_n;
+            esimd::simd<float, 64> c00(0.f), c01(0.f), c10(0.f), c11(0.f);
+            for (int kc = 0; kc < kb_n; ++kc) {
+                const half* ab = Ab + ((size_t)(tr * kb_n + kc) * 2) * 128;
+                const half* bb = Bb + ((size_t)(kc * tc_n + tc) * 2) * 128;
+                esimd::simd<half, 128> a0(ab, esimd::overaligned_tag<16>{});
+                esimd::simd<half, 128> a1(ab + 128, esimd::overaligned_tag<16>{});
+                esimd::simd<half, 128> b0(bb, esimd::overaligned_tag<16>{});
+                esimd::simd<half, 128> b1(bb + 128, esimd::overaligned_tag<16>{});
+                c00 = esimd::xmx::dpas<8, 8, float>(c00, b0, a0);
+                c01 = esimd::xmx::dpas<8, 8, float>(c01, b1, a0);
+                c10 = esimd::xmx::dpas<8, 8, float>(c10, b0, a1);
+                c11 = esimd::xmx::dpas<8, 8, float>(c11, b1, a1);
+            }
+            const size_t ob = oc + (size_t)b * sc;
+            #pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                esimd::simd<float,8> r00 = c00.template select<8,1>(r*8), r01 = c01.template select<8,1>(r*8);
+                esimd::simd<float,8> r10 = c10.template select<8,1>(r*8), r11 = c11.template select<8,1>(r*8);
+                int row0 = tr * TS + r, row1 = row0 + 8;
+                if (row0 < M) {
+                    if (epi == 2u) {   // gate: the SCALAR proven form (the -0.0 lesson)
+                        size_t base = ob + (size_t)row0 * ldc + (unsigned)tc * TS;
+                        for (int e = 0; e < 8; ++e) {
+                            float v0 = s8v8::pub_esimd(epi, r00.read()[e]), v1 = s8v8::pub_esimd(epi, r01.read()[e]);
+                            if (narrow) { Oh[base + e] = sycl::half(v0); Oh[base + 8 + e] = sycl::half(v1); }
+                            else        { Of[base + e] = v0; Of[base + 8 + e] = v1; }
+                        }
+                    } else {
+                        esimd::simd<float,8> p0 = s8v8::pub_vec_v8<8>(epi, r00), p1 = s8v8::pub_vec_v8<8>(epi, r01);
+                        size_t base = ob + (size_t)row0 * ldc + (unsigned)tc * TS;
+                        if (narrow) { esimd::simd<half,8> h0 = esimd::convert<half>(p0), h1 = esimd::convert<half>(p1);
+                            h0.copy_to(Oh + base); h1.copy_to(Oh + base + 8u); }
+                        else { p0.copy_to(Of + base); p1.copy_to(Of + base + 8u); }
+                    }
+                }
+                if (row1 < M) {
+                    if (epi == 2u) {
+                        size_t base = ob + (size_t)row1 * ldc + (unsigned)tc * TS;
+                        for (int e = 0; e < 8; ++e) {
+                            float v0 = s8v8::pub_esimd(epi, r10.read()[e]), v1 = s8v8::pub_esimd(epi, r11.read()[e]);
+                            if (narrow) { Oh[base + e] = sycl::half(v0); Oh[base + 8 + e] = sycl::half(v1); }
+                            else        { Of[base + e] = v0; Of[base + 8 + e] = v1; }
+                        }
+                    } else {
+                        esimd::simd<float,8> p0 = s8v8::pub_vec_v8<8>(epi, r10), p1 = s8v8::pub_vec_v8<8>(epi, r11);
+                        size_t base = ob + (size_t)row1 * ldc + (unsigned)tc * TS;
+                        if (narrow) { esimd::simd<half,8> h0 = esimd::convert<half>(p0), h1 = esimd::convert<half>(p1);
+                            h0.copy_to(Oh + base); h1.copy_to(Oh + base + 8u); }
+                        else { p0.copy_to(Of + base); p1.copy_to(Of + base + 8u); }
+                    }
+                }
+            }
+        });
+    });
+}
+
 // gemm_pub -- the f16 gemm with the publish fused into the store (section 92, same lever
 // as the int8 gemm_b_pub/gemm_b_res). ffn's pass 1 is gemm(expand) -> dC1 float, then a
 // separate publish(3) pass (gate_activation + e4m3) -> dH half. This writes dH (half)
