@@ -2274,6 +2274,47 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
                 else
                     wbmega::qkv_norm_scatter_esimd(*GQ, dC, Q, Kk, V, as, bs, qs, M, heads, C, NH, tokens);
             }
+        } else if (getenv("NR_QKV_VIT1") && atoi(getenv("NR_QKV_VIT1")) != 0) {
+        // P7 probe: the VIT path merged to ONE pass (the non-vit merge was the
+        // section-92 win; vit kept two passes + dC float-bits write-back). This
+        // form: one item per (row,head): Q/K/V deq + vit_reciprocal tree +
+        // VIT_ROOT/scale + e4m3 + scatter, all in registers -- dC write-back
+        // AND the stage-3 pass vanish. Arithmetic VERBATIM from the two passes
+        // below (qr_half_round/cr_mul/ctree::vit_reciprocal/VIT_ROOT order kept).
+        GQ->parallel_for(sycl::range((size_t)M * heads),
+                         [=](sycl::item<1> it) {
+            size_t i = it.get_id(0);
+            unsigned r = (unsigned)(i / heads), head = (unsigned)(i % heads);
+            float row32[32];
+            for (int c2 = 0; c2 < 32; ++c2) {
+                unsigned n = head * 32u + (unsigned)c2;
+                row32[c2] = qr_half_round(cr_mul(cr_mul((float)dC[(size_t)r * NH + n], as[r]), bs[n]));
+            }
+            float recip = ctree::vit_reciprocal(row32);
+            float sc = qr_half_round(qs[head]);
+            unsigned w = r / tokens, t = r % tokens;
+            size_t at = (((size_t)w * heads + head) * tokens + t) * 32u;
+            for (int c2 = 0; c2 < 32; ++c2) {
+                float val = qr_half_round(cr_mul(row32[c2], recip));
+                val = qr_half_round(cr_mul(val, ctree::VIT_ROOT));
+                val = qr_half_round(cr_mul(val, sc));
+                Q[at + c2] = sycl::half(qr_e4m3(val));
+            }
+            for (int c2 = 0; c2 < 32; ++c2) {
+                unsigned n = C + head * 32u + (unsigned)c2;
+                row32[c2] = qr_half_round(cr_mul(cr_mul((float)dC[(size_t)r * NH + n], as[r]), bs[n]));
+            }
+            float krec = ctree::vit_reciprocal(row32);
+            for (int c2 = 0; c2 < 32; ++c2) {
+                float val = qr_half_round(cr_mul(row32[c2], krec));
+                Kk[at + c2] = sycl::half(qr_e4m3(val));
+            }
+            for (int c2 = 0; c2 < 32; ++c2) {
+                unsigned n = 2u * C + head * 32u + (unsigned)c2;
+                float val = cr_mul(cr_mul((float)dC[(size_t)r * NH + n], as[r]), bs[n]);
+                V[at + c2] = sycl::half(qr_e4m3(val));
+            }
+        });
         } else {
         GQ->parallel_for(sycl::range((size_t)M * heads),
                          [=](sycl::item<1> it) {
