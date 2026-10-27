@@ -131,6 +131,64 @@ static inline sycl::event gemm_b(sycl::queue& q, const half* Ap, const half* Bp,
     });
 }
 
+// gemm_b_merge_scale (section 100 P9-twin): the global_attention attnV leg WITH the
+// merge_heads_scale tail folded into the store. The merge pass computes, per output
+// index (token, c): half(qr_e4m3(half_round(cr_mul(half_round(dCtx[at*32 + c32]),
+// dRecip[at])))) with at = (c/32)*rows + token -- the value dCtx[at*32+c32] IS the
+// accumulator fragment we hold (row = token of the head's block, col = c32). So the
+// store: v -> eh_round -> *recip[row] -> eh_round -> e4m3_vec (proven identical) ->
+// half -> Out[token*CH + head*32 + c32]. dCtx (rows x 32 x heads f32) AND the merge
+// launch both vanish. Guards: N==32 (one tc), Mp==rows (the recorder's Mp=ceil16(rows),
+// rows%16==0 in-frame), narrow-out half. batch b = head (the heads-contiguous layout).
+static inline sycl::event gemm_b_merge_scale(sycl::queue& q, const half* Ap, const half* Bp,
+                                             half* Out, const float* dRecip,
+                                             int Mp, int N, int K, int batches) {
+    int tr_n = Mp / TS, tc_n = N / TS, kb_n = K / TS;
+    size_t apb = (size_t)Mp * K, bpb = (size_t)K * N;
+    const unsigned CH = (unsigned)batches * 32u;
+    return q.submit([&](handler& h) {
+        h.parallel_for(range<1>((size_t)batches * tr_n * tc_n), [=](item<1> it) SYCL_ESIMD_KERNEL {
+            size_t g = it.get_id(0);
+            int b = (int)(g / ((size_t)tr_n * tc_n)); size_t t0 = g % ((size_t)tr_n * tc_n);
+            const half* Ab = Ap + (size_t)b * apb; const half* Bb = Bp + (size_t)b * bpb;
+            int t = (int)t0; int tr = t / tc_n, tc = t % tc_n;
+            esimd::simd<float, 64> c00(0.f), c01(0.f), c10(0.f), c11(0.f);
+            for (int kc = 0; kc < kb_n; ++kc) {
+                const half* ab = Ab + ((size_t)(tr * kb_n + kc) * 2) * 128;
+                const half* bb = Bb + ((size_t)(kc * tc_n + tc) * 2) * 128;
+                esimd::simd<half, 128> a0(ab, esimd::overaligned_tag<16>{});
+                esimd::simd<half, 128> a1(ab + 128, esimd::overaligned_tag<16>{});
+                esimd::simd<half, 128> b0(bb, esimd::overaligned_tag<16>{});
+                esimd::simd<half, 128> b1(bb + 128, esimd::overaligned_tag<16>{});
+                c00 = esimd::xmx::dpas<8, 8, float>(c00, b0, a0);
+                c01 = esimd::xmx::dpas<8, 8, float>(c01, b1, a0);
+                c10 = esimd::xmx::dpas<8, 8, float>(c10, b0, a1);
+                c11 = esimd::xmx::dpas<8, 8, float>(c11, b1, a1);
+            }
+            // (row, col) of the batch's ctx fragment -> the merge's index map
+            for (int r = 0; r < 8; ++r) {
+                int tok0 = tr * TS + r, tok1 = tok0 + 8;
+                float rc0 = dRecip[(size_t)b * Mp + tok0];    // at = head*rows + token (b=head)
+                float rc1 = dRecip[(size_t)b * Mp + tok1];
+                esimd::simd<float,8> r00 = c00.template select<8,1>(r*8), r01 = c01.template select<8,1>(r*8);
+                esimd::simd<float,8> r10 = c10.template select<8,1>(r*8), r11 = c11.template select<8,1>(r*8);
+                auto ms8 = [&](esimd::simd<float,8> v, float rc) SYCL_ESIMD_FUNCTION {
+                    esimd::simd<float,8> hr = esimd::convert<float>(esimd::convert<half>(v));
+                    esimd::simd<float,8> m  = hr * esimd::simd<float,8>(rc);
+                    esimd::simd<float,8> hm = esimd::convert<float>(esimd::convert<half>(m));
+                    return esimd::convert<half>(s8v8::e4m3_vec_v8<8>(hm));
+                };
+                esimd::simd<half,8> o00 = ms8(r00, rc0), o01 = ms8(r01, rc0);
+                esimd::simd<half,8> o10 = ms8(r10, rc1), o11 = ms8(r11, rc1);
+                size_t base0 = (size_t)tok0 * CH + (size_t)b * 32u + tc * TS;
+                size_t base1 = (size_t)tok1 * CH + (size_t)b * 32u + tc * TS;
+                o00.copy_to(Out + base0); o01.copy_to(Out + base0 + 8u);
+                o10.copy_to(Out + base1); o11.copy_to(Out + base1 + 8u);
+            }
+        });
+    });
+}
+
 // gemm_pub -- the f16 gemm with the publish fused into the store (section 92, same lever
 // as the int8 gemm_b_pub/gemm_b_res). ffn's pass 1 is gemm(expand) -> dC1 float, then a
 // separate publish(3) pass (gate_activation + e4m3) -> dH half. This writes dH (half)

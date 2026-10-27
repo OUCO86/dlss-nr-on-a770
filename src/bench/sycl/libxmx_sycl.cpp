@@ -2662,8 +2662,19 @@ int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
             packdev::pack_a16_b(*GQ, dProbs, dAp, (int)rows, Mp, (int)rows, (int)heads);
         }
         packdev::pack_b16_b(*GQ, V, dBv, (int)rows, 32, (int)heads);
-        f16v1::gemm_b(*GQ, dAp, dBv, dCtx, Mp, 32, (int)rows, (int)heads);
+        // P9-twin (section 100): attnV + merge_heads_scale FOLDED (gemm_b_merge_scale):
+        // half_round -> *recip -> half_round -> e4m3 lands ON the accumulator and
+        // scatters straight into the merged (rows, heads*32) half layout -- dCtx
+        // (heads x rows x 32 f32) AND the merge launch both vanish. The recip chain
+        // is the merge pass's EXACT op order (each stage its own ESIMD instruction,
+        // no contraction). Guard: Mp==rows (the recorder pads Mp=ceil16(rows);
+        // in-frame rows%16==0). Escape NR_GA_MERGE=0.
+        static bool gam = getenv("NR_GA_MERGE") && atoi(getenv("NR_GA_MERGE")) != 0;   // P9-twin NEUTRAL in the 3-pair A/B (155-158 vs 156-159): the global_attention family is only ~12ms and its dCtx is small; the fold is correct (100.0000%% x2, p9t1/p9t2) but stays OFF by measurement.
         pool_put(dAq); pool_put(dBk); pool_put(dAp); pool_put(dBv);
+        if (gam && Mp == (int)rows && (rows % 16u) == 0u) {
+            f16v1::gemm_b_merge_scale(*GQ, dAp, dBv, (sycl::half*)M, dRecip, Mp, 32, (int)rows, (int)heads);
+        } else {
+        f16v1::gemm_b(*GQ, dAp, dBv, dCtx, Mp, 32, (int)rows, (int)heads);
         // merge_heads_scale: (1,rows,heads*32) with scale=reciprocal (heads*rows), e4m3, half
         GQ->parallel_for(sycl::range((size_t)rows * CH), [=](sycl::item<1> it) {
             unsigned index = (unsigned)it.get_id(0);
@@ -2672,6 +2683,7 @@ int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
             float value = qr_half_round(cr_mul(qr_half_round(dCtx[at * 32u + (c % 32u)]), dRecip[at]));
             ((sycl::half*)M)[index] = sycl::half(qr_e4m3(value));
         });
+        }   // P9-twin gate
         pool_put(dScores); pool_put(dProbs); pool_put(dRecip); pool_put(dCtx);
     });
     return 0;
