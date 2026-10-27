@@ -406,6 +406,62 @@ static inline void pack_a_fused_b(sycl::queue& q, const sycl::half* A_f16, int8_
         }
     });
 }
+// ---- P4b: the GATHERED window quant folded into the QKV gemm's pack_a ----
+// quant_window's rows are a WINDOW partition of the image: row held maps to
+// (window, token) -> (y,x) in the UNPADDED image (quantize_row_kernel.hpp:52-59
+// VERBATIM); OUTSIDE rows quantize to zeros with scale 1.0 (the shipped guard).
+// The fused form: one item per gemm row r (= the same held index the pk buffer
+// carried); gather the f16 row from the image slot, row-peak, fdiv_rn quantize,
+// scatter into pack_a's BM128/BK32 int8 tile. The pk buffer (M*K int8) and the
+// standalone gather-quant launch both vanish. Arithmetic VERBATIM = bit-exact.
+static inline void pack_a_fused_gather(sycl::queue& q, const sycl::half* A_f16,
+                                       int8_t* Ap, float* scales,
+                                       int M, int Mp, int K,
+                                       unsigned image_h, unsigned image_w,
+                                       unsigned across, unsigned pad) {
+    const int BM = 128, BK = 32;
+    const int kb_n = K / BK;
+    const unsigned top = pad >> 16, left = pad & 0xffffu;
+    q.parallel_for(sycl::range((size_t)Mp), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
+        namespace esimd = sycl::ext::intel::esimd;
+        int srow = (int)it.get_id(0);
+        int w = srow / BM, rem = srow % BM, wi = rem / 16, row = rem % 16;
+        size_t per_blk = ((size_t)w * kb_n) * 8 + wi;
+        // the shipped map (window-major 8x8 token grid)
+        unsigned held = (unsigned)srow;
+        unsigned token = held % 64u, window = held / 64u;
+        int y = (int)((window / across) * 8u + token / 8u) - (int)top;
+        int x = (int)((window % across) * 8u + token % 8u) - (int)left;
+        bool outside = (srow >= M) || y < 0 || x < 0 || y >= (int)image_h || x >= (int)image_w;
+        const sycl::half* arow = A_f16 + ((size_t)(outside ? 0u : (unsigned)y) * image_w
+                                          + (unsigned)(outside ? 0u : (unsigned)x)) * K;
+        esimd::simd<float,32> mx(esimd::simd<float,32>(0.f));
+        if (!outside)
+            for (int kb = 0; kb < kb_n; ++kb){
+                esimd::simd<float,32> reg = esimd::convert<float>(esimd::block_load<sycl::half,32>(
+                    arow + kb*BK, esimd::overaligned_tag<16>{}));
+                mx = esimd::max(mx, esimd::abs(reg));
+            }
+        float peak = esimd::hmax<float,float,32>(mx);
+        const float scale = (peak == 0.f) ? 1.f
+            : esimd::div_ieee<float,1>(esimd::simd<float,1>(peak), esimd::simd<float,1>(127.f))[0];
+        scales[srow] = scale;                    // outside rows: 1.0 (the shipped form)
+        esimd::simd<int8_t,32> z((int8_t)0);
+        for (int kb = 0; kb < kb_n; ++kb){
+            if (outside){
+                esimd::block_store<int8_t,32>(Ap + (per_blk + (size_t)kb*8)*512 + row*32,
+                    z, esimd::overaligned_tag<16>{});
+                continue;
+            }
+            esimd::simd<float,32> reg = esimd::convert<float>(esimd::block_load<sycl::half,32>(
+                arow + kb*BK, esimd::overaligned_tag<16>{}));
+            esimd::simd<float,32> qq = esimd::div_ieee<float,32>(reg, esimd::simd<float,32>(scale));
+            qq = esimd::min(esimd::max(esimd::rnde<float,32>(qq), esimd::simd<float,32>(-127.f)), esimd::simd<float,32>(127.f));
+            esimd::block_store<int8_t,32>(Ap + (per_blk + (size_t)kb*8)*512 + row*32,
+                esimd::convert<int8_t>(esimd::convert<int>(qq)), esimd::overaligned_tag<16>{});
+        }
+    });
+}
 static inline void gather_pack_b_b(sycl::queue& q, const int8_t* Braw, int8_t* Bp,
                                    int N, int K, int ldb, size_t sb, int batch) {
     int nt_n = N / 8, kk_n = K / 32;

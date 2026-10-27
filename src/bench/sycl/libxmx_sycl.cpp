@@ -154,7 +154,8 @@ static std::map<int,int> g_fused_quant;   // quant-source cb -> a_scale buf (new
 // per element = numpy-exact), and writes the packed int8 -- the standalone quant
 // launch AND its pk buffer disappear. bench_qfused: FUSED-PACK tile-diff 0 scale-diff
 // 0 on every frame shape. Gate NR_Q_FUSE (default OFF until the three gates pass).
-struct QuantFused { size_t qcmd; int src; int sc; unsigned M; unsigned K; };
+struct QuantFused { size_t qcmd; int src; int sc; unsigned M; unsigned K;
+    bool gather = false; unsigned image_h = 0, image_w = 0, across = 0, pad = 0; };
 static std::map<int,QuantFused> g_quant_pk;   // pk buf id -> the quant that wrote it
 static bool qfuse_on() { static bool v = !getenv("NR_Q_FUSE") || atoi(getenv("NR_Q_FUSE")) != 0; return v; }
 // called by a gemm recorder: if `a` is a fused-quant pk whose scale buf == this gemm's
@@ -174,6 +175,20 @@ static bool qfuse_take(int a, int a_scale, unsigned M, unsigned K, QuantFused& o
 // gemm slices it by columns (sa==K per group). Pair when quant-K == lda_e (or == K for
 // the shared-A form sa==0) and scale_stride==0 (row scales shared across groups --
 // every frame case; the census 99c4034).
+// P4b: the gather-window pairing (quant_window pk -> the next QKV's A).
+static bool qfuse_take_gather(int a, int a_scale, unsigned M, unsigned C,
+                              size_t my_cmd, QuantFused& out){
+    if (!qfuse_on()) return false;
+    auto it = g_quant_pk.find(a);
+    if (it == g_quant_pk.end() || !it->second.gather) return false;
+    if (it->second.sc != a_scale || it->second.M != M || it->second.K != C) return false;
+    if (my_cmd - it->second.qcmd > 4) return false;
+    out = it->second;
+    g_cmds[out.qcmd] = [](){};
+    g_cmd_names[out.qcmd] = "quant_window(FUSED-pack)";
+    g_quant_pk.erase(it);
+    return true;
+}
 static bool qfuse_take_b(int a, int a_scale, unsigned M, unsigned K, unsigned lda_e,
                          unsigned sa, unsigned scale_stride, size_t my_cmd, QuantFused& out){
     static bool qfuse_b = getenv("NR_Q_FUSE_B") != nullptr;   // A/B 00:45: end-to-end
@@ -2169,6 +2184,15 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
     const bool vit = (flags & 0x2000u) != 0u;
     const unsigned C = channels, NH = 3u * channels;
     const int Mp = l0_ceil_bm(M);
+    // P4b (section 100): a REGISTERED GATHER quant_window feeding this QKV (the
+    // census: all 104 quant_window pks are single-read by exactly the next QKV,
+    // M==qM, C==qK, a_scale==q_scale) -> dissolve its launch; THIS pack reads the
+    // image f16 directly (pack_a_fused_gather: the shipped map + qr arithmetic
+    // VERBATIM, outside rows zero/scale 1.0). Probe gate NR_QW_FUSE (default ON
+    // once the three gates pass).
+    static bool qwf = getenv("NR_QW_FUSE") ? atoi(getenv("NR_QW_FUSE")) != 0 : true;
+    QuantFused qfq;
+    const bool fused_q = qwf && qfuse_take_gather(a, a_scale, M, C, g_cmds.size(), qfq);
     const size_t na = (size_t)Mp * C, nb = (size_t)NH * C;
     g_cmd_names.push_back(__func__);
         flop_note("int8_qkv",M,3u*channels,channels,1);
@@ -2185,7 +2209,15 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
         // epilogue pass so the fold (senior's 0x100000 qkv_epilogue IN the gemm
         // store) targets the right segment.
         static int qkvstop = getenv("NR_QKV_STOP") ? atoi(getenv("NR_QKV_STOP")) : 0;
-        if (qkvstop < 3) packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)C);
+        if (qkvstop < 3) {
+            if (fused_q) {
+                auto itsrc = g_bufs.find(qfq.src);
+                if (itsrc == g_bufs.end()) throw std::runtime_error("qkv fused-gather: image src not live");
+                packdev::pack_a_fused_gather(*GQ, (const sycl::half*)itsrc->second.p, dAp,
+                    (float*)as, (int)M, Mp, (int)C, qfq.image_h, qfq.image_w, qfq.across, qfq.pad);
+            } else
+                packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)C);
+        }
         int8_t* dBp = cached_pack_b_i8(b, Braw, (int)NH, (int)C);   // weight: pack once
         if (qkvstop < 2) s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)NH, (int)C);
         // stage 2: deq + in-place Q/K head norm (the epilogue's order; V deqt only).
@@ -2531,6 +2563,9 @@ int xmx_rec_quant_window(int source, int packed, int scale, unsigned M, unsigned
         qr_launch(*GQ, *GD, qr_kernel(), a, pk, sc, M, K, 0x400000u,
                   height, width, across, pad, nullptr, nullptr);
     });
+    if (qfuse_on())   // P4b: register the GATHERED pk for a downstream QKV take
+        g_quant_pk[packed] = QuantFused{ g_cmds.size()-1, source, scale, M, K,
+                                         true, height, width, across, pad };
     return 0;
 }
 // int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
