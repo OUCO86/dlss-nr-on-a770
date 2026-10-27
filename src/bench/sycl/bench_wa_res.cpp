@@ -45,9 +45,13 @@ namespace esimd = sycl::ext::intel::esimd;
 #define WA_X 0u           // operand double-buffers (stage 1, then stage 3)
 #define WA_Z 8192u        // scores f32 64x64 = 16KB (stage 1 C -> stage 2 reads)
 #define WA_Y 24576u       // probs pack_a16 64x64 half = 8KB (stage 2 -> stage 3)
-#define WA_SLM 32768u
+#define WA_QT 32768u          // P10b: the raw-Q staged tile (2KB)
+#define WA_KT 34816u          // P10b: the raw-K staged tile (2KB)
+#define WA_SLM 36864u
 
-static void one_wa_res(queue& q, unsigned batches, unsigned heads, int stop_stage = 0) {
+static void one_wa_res(queue& q, unsigned batches, unsigned heads, int stop_stage = 0, bool raw_qk = false) {
+    sycl::half* kt_dump = getenv("WA_KTDUMP") ? malloc_device<sycl::half>(2048, q) : nullptr;
+    if (kt_dump) q.memset(kt_dump, 0xEE, 4096);
     const unsigned tokens = 64u, C = 32u;
     const unsigned windows = batches / heads;
     std::mt19937 rng(9); std::uniform_real_distribution<float> df(-4.f, 4.f);
@@ -114,7 +118,82 @@ static void one_wa_res(queue& q, unsigned batches, unsigned heads, int stop_stag
             const int kb_n = 32/BK;             // 2
             const half* Ab = dAq + (size_t)b * 64 * 32;
             const half* Bb = dBk + (size_t)b * 32 * 64;
+            
+            // P10b RAW mode: stage the Q/K dpas tiles from the RAW f16 operands ONCE
+            // per WG. Both packs read row-major (rows,32): the tile elem map
+            // d = ((blk*2+strip)*8+il)*16 + k (blk=(tr,kc)) reduces to row =
+            // tr*16+strip*8+il, col = kc*16+k -- pack_a16_b/pack_b16_t_b VERBATIM.
+            // 16 threads: thread lid = (il=lid/2, kq=lid%2): an 8-half piece each.
+            if (raw_qk) {
+                const half* Qb = dQ + (size_t)b * 64u * 32u;
+                const half* Kb = dK + (size_t)b * 64u * 32u;
+                #pragma unroll
+                for (int blk = 0; blk < 8; ++blk) {          // Q-side blk = tr*2+kc
+                    int trr = blk / 2, kc2 = blk % 2;
+                    #pragma unroll
+                    for (int strip = 0; strip < 2; ++strip) {
+                        // Q: pack_a16_b map (k CONTIGUOUS): tile elem =
+                        // ((tr*2+kc)*2+strip)*128 + il*16 + k : 16 raw halves -> 16 tile halves
+                        uint row  = (uint)(trr * 16 + strip * 8 + (int)(lid / 2u));
+                        uint elem = (uint)(blk * 2 + strip) * 128u + (lid / 2u) * 16u + (lid % 2u) * 8u;
+                        esimd::simd<half,8> vq = esimd::block_load<half,8>(Qb + (size_t)row * 32u + (uint)kc2 * 16u + (lid % 2u) * 8u, esimd::overaligned_tag<16>{});
+                        esimd::slm_block_store(WA_QT + elem * 2u, vq, esimd::overaligned_tag<16>{});
+                        // K: pack_b16_t_b map (k INTERLEAVED kq*2+kpar): tile elem =
+                        // ((kc*tc_n+tc)*2+js)*128 + kq*16 + jl*2 + kpar. blk here = tr*2+kc =
+                        // tc*2+kc SWAPPED vs the pack's kc*8+tc*2 -- the gemm reads block
+                        // (kc,tc) at (kc*tc_n+tc)*2*128: our loop's blk=(tr,kc) with tr=tc
+                        // (square 64x64: tr_n == tc_n == 2? NO: kb_n=2, tc_n=4 for B).
+                        // DO IT PER THE PACK: for (kc,tc,js): thread lid -> jl = lid/2? 16
+                        // threads: jl = lid, js = 0? one strip per pass:
+                        //   load 16 raw halves at row (tc*16+js*8+jl), cols kc*16..+16;
+                        //   for kq 0..7: tile 2-halves at ((kc*4+tc)*2+js)*128 + kq*16 + jl*2 + {0,1}
+                        (void)row; (void)elem;
+                    }
+                }
+                // K gather with the pack_b16_t_b INTERLEAVED map: tile elem =
+                // ((kc*4+tc)*2+js)*128 + kq*16 + jl*2 + kpar <- raw[(tc*16+js*8+jl)*32 +
+                // kc*16 + kq*2+kpar]. thread lid -> (js = lid/8, jl = lid%8).
+                #pragma unroll
+                for (int kc2 = 0; kc2 < 2; ++kc2)
+                #pragma unroll
+                for (int tc2 = 0; tc2 < 4; ++tc2) {
+                    uint js = lid / 8u, jl = lid % 8u;
+                    esimd::simd<half,16> vr = esimd::block_load<half,16>(Kb + (size_t)(tc2 * 16 + js * 8 + jl) * 32u + (uint)kc2 * 16u, esimd::overaligned_tag<16>{});
+                    // scatter: for kq 0..7: two halves -> tile ((kc2*4+tc2)*2+js)*128 + kq*16 + jl*2 + kpar
+                    uint tb = ((uint)(kc2 * 4 + tc2) * 2u + js) * 128u + jl * 2u;
+                    #pragma unroll
+                    for (int kq = 0; kq < 8; ++kq) {
+                        esimd::simd<half,2> piece;
+                        piece[0] = vr[kq * 2]; piece[1] = vr[kq * 2 + 1];
+                        esimd::slm_block_store(WA_KT + (tb + (uint)kq * 16u) * 2u, piece, esimd::overaligned_tag<4>{});
+                    }
+                }
+                esimd::barrier();
+                if (kt_dump && b == 0u) {   // DUMP the whole 2KB K tile to global
+                    #pragma unroll
+                    for (int p2 = 0; p2 < 4; ++p2) {
+                        esimd::simd<half,32> tv = esimd::slm_block_load<half,32>(WA_KT + (uint)(p2 * 512u + lid * 32u) * 2u, esimd::overaligned_tag<16>{});
+                        tv.copy_to(kt_dump + (size_t)(p2 * 16u + lid) * 32u);
+                    }
+                }
+            }
+
             auto load_block = [=](int buf, int kc) SYCL_ESIMD_FUNCTION {
+                if (raw_qk) {   // P10b: SLM->SLM copies of the kc-slice's 4 blocks
+                    // the slice = blocks (tr*2+kc) tr 0..3: each block 256 halfs at
+                    // tile offset ((tr*2+kc)*2)*128? NO: block index = (tr,kc) -> tile
+                    // half-offset ((tr*2+kc)*2+strip)*128: the 4 blocks (strip 0/1 each)
+                    // = 2048 halfs per slice? the slice = 4 tr x 256 halfs = 1024 halfs? BM*BK=64*16=1024 halfs = 2KB: blocks (tr,kc): 4 blocks x 256 halfs. thread lid moves 64 halfs: src = WA_QT + ((tr*2+kc)*2)*128 + (lid%8)*... SIMPLEST: per-thread 64-half pieces: idx t: tr = t/4? Let me: for p in 0..3: each thread copies 64 halfs at tile position of block (p,kc) + (lid*64 within the block's 256? block=256 halfs: 4 threads per block. thread lid: p=lid/4, w=lid%4: src=((p*2+kc)*2)*128 + w*64; dst = buf*SLM_A + (p* (TS*BK*... the gemm's SLM_A layout: block(tr,kc) at (tr*kb_n+kc)*2*128 halfs? from the loop's offA = cur*SLM_A + wi_row*(TS*BK*2): SLM_A stride per tr band = TS*BK=256 halfs: dst elems (tr,kc) at tr*256 + kc*0? The double-buffer holds the WHOLE (BM x BK) for one kc: elems (tr band wi_row) at wi_row*256. dst = buf*SLM_A + tr*256 + w*64.
+                    #pragma unroll
+                    for (int p = 0; p < 4; ++p) {
+                        int tt = (int)(lid / 4u), w = (int)(lid % 4u);
+                        if (tt != p) continue;
+                        esimd::simd<half,64> av = esimd::slm_block_load<half,64>(WA_QT + (uint)(((tt*2+kc)*2)*128 + w*64) * 2u, esimd::overaligned_tag<16>{});
+                        esimd::simd<half,64> bv = esimd::slm_block_load<half,64>(WA_KT + (uint)(((tt*2+kc)*2)*128 + w*64) * 2u, esimd::overaligned_tag<16>{});
+                        esimd::slm_block_store(WA_X + buf * SLM_A + (uint)(tt * 256 + w * 64) * 2u, av, esimd::overaligned_tag<16>{});
+                        esimd::slm_block_store(WA_X + SLM_B_BASE + buf * SLM_B + (uint)(tt * 256 + w * 64) * 2u, bv, esimd::overaligned_tag<16>{});
+                    }
+                } else {
                 #pragma unroll
                 for (int i = 0; i < ACH / 64; ++i) {
                     int la = lid * ACH + i * 64;
@@ -130,6 +209,7 @@ static void one_wa_res(queue& q, unsigned batches, unsigned heads, int stop_stag
                     esimd::simd<half,64> v = esimd::block_load<half,64>(
                         Bb + ((size_t)(kc * 4 + (tcl)) * 2) * 128 + within, esimd::overaligned_tag<16>{});
                     esimd::slm_block_store(WA_X + SLM_B_BASE + buf * SLM_B + lb * 2, v, esimd::overaligned_tag<16>{});
+                }
                 }
             };
             int wi_row = lid / 4, wi_col = lid % 4;
@@ -333,6 +413,17 @@ static void one_wa_res(queue& q, unsigned batches, unsigned heads, int stop_stag
         printf("wa-res BISECT stage3 (attnV raw): diff %zu / %zu %s\n", d3, rb.size(), d3?"NOT-EXACT":"EXACT");
     }
     if (stop_stage == 0) {
+    if (kt_dump) {
+        std::vector<sycl::half> got(2048), want(2048);
+        q.memcpy(got.data(), kt_dump, 4096).wait();
+        q.memcpy(want.data(), dBk, 4096).wait();   // packed batch-0 tile (proven)
+        int d3=0; for (int i2=0;i2<2048;++i2) if (got[i2]!=want[i2]) d3++;
+        printf("WA_KT vs packed dBk[0] (b=0): diff %d / 2048\n", d3);
+        int shown=0;
+        for (int i2=0;i2<2048 && shown<4;++i2) if (got[i2]!=want[i2]) {
+            printf("  elem %d (blk %d within %d): got %.6g want %.6g\n", i2, i2/256, i2%256, (float)got[i2], (float)want[i2]); shown++; }
+        free(kt_dump,q);
+    }
     std::vector<sycl::half> a((size_t)windows*64u*heads*32u), bb((size_t)windows*64u*heads*32u);
     q.memcpy(a.data(), outRef, a.size()*2).wait();
     q.memcpy(bb.data(), outRes, bb.size()*2).wait();
@@ -348,6 +439,7 @@ int main() {
     queue q(device{}, property::queue::enable_profiling{});
     int st = getenv("WA_BISECT") ? atoi(getenv("WA_BISECT")) : 0;
     one_wa_res(q, 1020u, 2u, st);
+    if (getenv("WA_KTDUMP")) one_wa_res(q, 16u, 1u, 0, true);
     one_wa_res(q, 16u, 1u, 0);    // the gate's WB-16x24 shape
     one_wa_res(q, 18u, 2u, 0);    // the gate's WB-20x36-crop shape
     return 0;
