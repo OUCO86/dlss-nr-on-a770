@@ -598,8 +598,19 @@ int xmx_buf_destroy(int id) {
     g_bufs.erase(it); return 0;
 }
 
-int xmx_begin(void) { g_recording = true; g_cmds.clear(); return 0; }
-int xmx_abort(void) { g_recording = false; g_cmds.clear(); return 0; }
+int xmx_begin(void) { g_recording = true; g_cmds.clear();
+    // AUDIT FIX (10-27): the fold registries are RECORD-scoped (qcmd = an index into
+    // g_cmds). A stale entry from a PREVIOUS recording -- scratch/probe recordings, or
+    // a plan switch (768x448 <-> 960x544, different op streams) -- could dissolve the
+    // WRONG closure in the new stream. Same-plan frames re-register identical keys so
+    // this was invisible, but it is a real cross-recording hazard. Clear at both ends.
+    g_quant_pk.clear(); g_fused_quant.clear();
+    g_pending_fold_slot = SIZE_MAX; g_fold_slot.clear();
+    return 0; }
+int xmx_abort(void) { g_recording = false; g_cmds.clear();
+    g_quant_pk.clear(); g_fused_quant.clear();
+    g_pending_fold_slot = SIZE_MAX; g_fold_slot.clear();
+    return 0; }
 
 // int xmx_graph_capture(void) -> id ; int xmx_graph_run(int id) -> passes ; destroy(id)
 // Route (a) step 1 (section 64): the plan says which graph ran "as the number it had
@@ -620,6 +631,8 @@ int xmx_graph_capture(void) {
     if (!g_recording) FAILMSG("not recording");
     g_graphs.push_back(std::move(g_cmds)); g_graph_names.push_back(std::move(g_cmd_names));
     g_cmds.clear();
+    g_quant_pk.clear(); g_fused_quant.clear();          // record-scoped registries die
+    g_pending_fold_slot = SIZE_MAX; g_fold_slot.clear(); // with the stream (10-27 audit)
     g_recording = false;
     return (int)g_graphs.size() - 1;
 }
