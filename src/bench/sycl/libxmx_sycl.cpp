@@ -30,6 +30,7 @@
 #include "ffn_fused_kernel.hpp"
 #include "qkv_resident.hpp"
 #include "ffn_chip_kernel.hpp"
+#include "wa_res_kernel.hpp"
 #include "requant_kernel.hpp"
 #include "gemm_s8_v1_kernel.hpp"
 #include "gemm_s8_v3_kernel.hpp"
@@ -3121,6 +3122,22 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
         // section 99: v2 workgroup-SLM-tiled f16 gemm (v1 = one 16x16 tile per GLOBAL
         // load, 8 FLOP/byte = memory-bound; v2 stages BM=64 x BK=16 blocks in SLM with
         // 4x reuse). Mp=64 is a multiple of BM. NR_F16V1=1 = escape hatch.
+        // P10 (section 100): the whole scores->softmax->attnV->merge MIDDLE of this
+        // chain folds into ONE resident WG-per-batch kernel (wa_res_kernel.hpp;
+        // bench_wa_res 9.2x at the frame shape, EXACT). dScores (16KB/batch f32),
+        // dProbs and dAp (8KB/batch halfs) NEVER touch global; 2 of the 4 middle
+        // launches vanish. The operand packs (dAq/dBk/dBv) stay -- they are the
+        // promoted pack passes. Guards: merged==1, bias present (the frame's every
+        // call has one; the null-bias case keeps the split chain). Escape NR_WA_RES=0.
+        static bool wares = !getenv("NR_WA_RES") || atoi(getenv("NR_WA_RES")) != 0;
+        if (wares && merged && Bp) {
+            packdev::pack_b16_b(*GQ, V, dBv, 64, 32, (int)batches);   // the span below is
+                                                                       // skipped -- pack V FIRST
+            wares::launch_wa_res(*GQ, dAq, dBk, dBv, Bp, (sycl::half*)Out, batches, heads);
+            pool_put(dAq); pool_put(dBk); pool_put(dAp); pool_put(dBv);
+            pool_put(dScores); pool_put(dProbs); pool_put(dCtx);
+            return;
+        }
         if (getenv("NR_F16V1")) f16v1::gemm_b(*GQ, dAq, dBk, dScores, 64, 64, 32, (int)batches);
         else                    f16v2::gemm_b2<64>(*GQ, dAq, dBk, dScores, 64, 64, 32, (int)batches);
         // softmax over (batches*64) rows of 64, with bias (heads,64,64) -- one launch.
