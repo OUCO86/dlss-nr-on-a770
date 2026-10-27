@@ -2019,8 +2019,11 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
         // one kernel, pack B (weight, cached whole) in one kernel, gemm_b/gemm32_b in ONE
         // launch, publish in one launch. Bounds identical to the gate's aw_b/bw_b.
         int8_t* dAp = (int8_t*)pool_get((size_t)batch * Mp * K);
+        static int bstop2 = getenv("NR_B_STOP") ? atoi(getenv("NR_B_STOP")) : 0;
+        if (bstop2 < 2) {
         if (fused_b) packdev::pack_a_fused_b(*GQ, a16b, dAp, (float*)ias->second.p, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch);
         else packdev::gather_pack_a_b(*GQ, Araw, dAp, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch);
+        }
         // the whole batched B is one weight: pack once (all groups), cache, reuse.
         WKey wk{ b, (int)N, (int)K, (int)batch };
         auto wc = g_wcache.find(wk);
@@ -2161,6 +2164,8 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
             // tail -- the 32KB stage costs occupancy there (0.033->0.074, the v9c
             // lesson). NR_PUB_SLM=0 reverts the whole family to gemm_b_pub.
             static bool pubslm = getenv("NR_PUB_SLM") ? atoi(getenv("NR_PUB_SLM")) != 0 : true;
+            static int bstop = getenv("NR_B_STOP") ? atoi(getenv("NR_B_STOP")) : 0;   // section 100 ledger probe (time-only): 1 = pack only, 2 = pack skipped too
+            if (bstop >= 1) { pool_put(dAp); return; }
             if (pubslm && N == 128u)
                 s8v8::gemm_b_pub_slm<false>(*GQ, dAp, dBp, Cout, as, bs, (int)M, Mp, (int)N, (int)K,
                                  (int)batch, sc, ldc_, scale_stride, (sb != 0u) ? N : 0u, narrow, epi);
