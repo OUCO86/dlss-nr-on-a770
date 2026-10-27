@@ -1710,14 +1710,35 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
             dH16[i] = sycl::half(qr_e4m3(dS[i]));
         });
         // ---- pass B: expand gemm(hidden16, expand -> f32), publish(3) -> half hidden ----
-        sycl::half* dA2 = (sycl::half*)pool_get((size_t)Mp * 32 * 2);
-        packdev::pack_a16(*GQ, dH16, dA2, (int)M, Mp, 32);   // dH16 on device
+        // P3e: the chip kernel eats dH16 RAW (row-major M x 32 half = its dA contract),
+        // so the dA2 pack_a16 pass is only needed by the tile-chain fallback -- skip it
+        // entirely on the chip path (one launch + Mp*32*2 scratch gone per stem call).
+        static bool ffntile3 = !getenv("NR_FFN_TILE") || atoi(getenv("NR_FFN_TILE")) != 0;
+        static bool ffchip3 = !getenv("NR_FFN_CHIP") || atoi(getenv("NR_FFN_CHIP")) != 0;
+        const bool stem_chip = ffntile3 && ffchip3 && !narrow && epi == 0u;
+        sycl::half* dA2 = stem_chip ? nullptr : (sycl::half*)pool_get((size_t)Mp * 32 * 2);
+        if (!stem_chip) packdev::pack_a16(*GQ, dH16, dA2, (int)M, Mp, 32);
         sycl::half* dB2 = cached_pack_b_f16(expand, Eraw, 32, 128);   // weight
         // DERIVED (section 92): fuse publish(3) into the gemm store (dC1 was dead after
         // this pass). pass A's dS is NOT fused -- pass C re-reads it as the residual skip.
         // P3b (section 100): hidden16 straight into pass C's A tile (gemm_pub_pa16):
         // dHid (M x 128 halfs) + its pack_a16 pass vanish. Same gate NR_FFN_TILE.
-        static bool ffntile3 = !getenv("NR_FFN_TILE") || atoi(getenv("NR_FFN_TILE")) != 0;
+        if (stem_chip) {
+            sycl::half* dPp3 = cached_pack_b_f16(projection, Praw, 128, 32);
+            float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
+            ffnc::launch_ffn_chip(*GQ, dH16, dB2, dPp3, dC2, (int)M, Mp);
+            pool_put(dH16); pool_put(dA2);   // dB2/dPp3 cache-owned
+            GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
+                size_t i2 = it.get_id(0);
+                unsigned col = (unsigned)(i2 % 32u);
+                float total = sycl::fma(dS[i2], cp[col], dC2[i2]);   // skip = RAW f32 stem
+                if (narrow) ((sycl::half*)Cout)[i2] = sycl::half(qr_publish(epi, total));
+                else        ((float*)Cout)[i2] = qr_publish(epi, total);
+            });
+            pool_put(dC2);
+            pool_put(dS);
+            return;
+        }
         if (ffntile3) {
             sycl::half* dA3 = (sycl::half*)pool_get((size_t)Mp * 128 * 2);
             f16v1::gemm_pub_pa16(*GQ, dA2, dB2, dA3, (int)M, Mp, 128, 32, 3u);
