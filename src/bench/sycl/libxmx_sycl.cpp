@@ -2477,10 +2477,21 @@ int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
         packdev::pack_b16_t_b(*GQ, Kk, dBk, 32, (int)rows, (int)heads);
         f16v1::gemm_b(*GQ, dAq, dBk, dScores, Mp, (int)rows, 32, (int)heads);
         // vit_softmax over heads*rows rows, tokens cols, stride=rows -- one launch.
-        GQ->parallel_for(sycl::range((size_t)heads * rows),
-                         smax::vit_softmax_kernel()(dScores, dProbs, dRecip, heads * rows, tokens, rows));
-        // attnV leg: P(rows x rows) @ V(rows x 32) -> rows x 32. V stored (rows,32)=(K,N).
-        packdev::pack_a16_b(*GQ, dProbs, dAp, (int)rows, Mp, (int)rows, (int)heads);
+        // P4 (section 100): the softmax STORE lands straight in attnV's pack_a16_b
+        // A-tile layout (vit_softmax_tiled -- same values, same lever as P3a's
+        // gemm_pub_pa16): dProbs (heads x rows x rows halfs = the frame's biggest
+        // scratch, 33MB/call at rows=2040) AND the pack_a16_b pass both vanish.
+        // Gate NR_GA_TILE (default ON once the three gates pass; =0 escape hatch).
+        static bool gat = !getenv("NR_GA_TILE") || atoi(getenv("NR_GA_TILE")) != 0;
+        if (gat && (rows % 16u) == 0u && Mp == (int)rows) {
+            GQ->parallel_for(sycl::range((size_t)heads * rows),
+                             smax::vit_softmax_tiled()(dScores, dAp, dRecip, heads * rows, tokens, rows));
+        } else {
+            GQ->parallel_for(sycl::range((size_t)heads * rows),
+                             smax::vit_softmax_kernel()(dScores, dProbs, dRecip, heads * rows, tokens, rows));
+            // attnV leg: P(rows x rows) @ V(rows x 32) -> rows x 32. V stored (rows,32)=(K,N).
+            packdev::pack_a16_b(*GQ, dProbs, dAp, (int)rows, Mp, (int)rows, (int)heads);
+        }
         packdev::pack_b16_b(*GQ, V, dBv, (int)rows, 32, (int)heads);
         f16v1::gemm_b(*GQ, dAp, dBv, dCtx, Mp, 32, (int)rows, (int)heads);
         pool_put(dAq); pool_put(dBk); pool_put(dAp); pool_put(dBv);

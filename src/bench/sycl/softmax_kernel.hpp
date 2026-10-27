@@ -202,4 +202,57 @@ inline auto vit_softmax_kernel() {
         };
     };
 }
+
+// vit_softmax_tiled (section 100 P4): the SAME row/total/reciprocal math and the SAME
+// per-element value qr_e4m3(vit_weight(row[k])) / zero -- but the store lands DIRECTLY
+// in the f16v1 pack_a16_b A-tile layout of the attnV gemm (dest = h*per +
+// ((tr*kb_n+kc)*2+strip)*128 + il*16 + k16, srow = tr*16+strip*8+il), so the dProbs
+// buffer (heads x rows x rows halfs -- the frame's biggest scratch) and the separate
+// pack_a16_b pass both vanish. Same lever as gemm_pub_pa16 (P3a, promoted): pack_a16
+// is a pure gather of exactly these values; rows here are ALWAYS < Mp (the recorder
+// guards rows%16==0 -> Mp==rows), pad COLUMNS (k>=tokens) keep the original's zero.
+inline auto vit_softmax_tiled() {
+    return [](const float* src, sycl::half* Ap, float* recip, unsigned nrows,
+              unsigned tokens, unsigned stride) {
+        return [=](sycl::item<1> it) {
+            unsigned r = (unsigned)it.get_id(0);
+            if (r >= nrows) return;
+            const float* row = src + (size_t)r * stride;
+            unsigned blocks = (tokens + 63u) / 64u;
+            float zero = vit_weight(0.0f), total = 0.0f;
+            for (unsigned b = 0; b < blocks; ++b) {
+                float column[8];
+                for (unsigned c = 0; c < 8u; ++c) {
+                    float pair[4];
+                    for (unsigned j = 0; j < 4u; ++j) {
+                        unsigned k0 = b * 64u + c + 16u * j, k1 = k0 + 8u;
+                        float w0 = k0 < tokens ? vit_weight(row[k0]) : zero;
+                        float w1 = k1 < tokens ? vit_weight(row[k1]) : zero;
+                        pair[j] = ctree::cr_hadd(w0, w1);
+                    }
+                    column[c] = ctree::cr_hadd(ctree::cr_hadd(ctree::cr_hadd(pair[0], pair[1]), pair[2]), pair[3]);
+                }
+                float even = ctree::cr_hadd(ctree::cr_hadd(ctree::cr_hadd(column[0], column[2]), column[4]), column[6]);
+                float odd = ctree::cr_hadd(ctree::cr_hadd(ctree::cr_hadd(column[1], column[3]), column[5]), column[7]);
+                total = ctree::cr_hadd(total, ctree::cr_hadd(even, odd));
+            }
+            unsigned padding = blocks * 64u - tokens;
+            if (padding > 0u) total = ctree::cr_hadd(total, -ctree::cr_hmul(zero, (float)padding));
+            recip[r] = qr_half_round(sycl::ext::intel::math::fdiv_rn(1.0f, total));
+            // tile addressing: head h = r / rows_, row_local srow = r % rows_ where
+            // rows_ = stride (the gemm's M == K == rows; one head's block).
+            unsigned rows_ = stride;
+            unsigned h = r / rows_, srow = r % rows_;
+            unsigned tr = srow / 16u, strip = (srow % 16u) / 8u, il = srow % 8u;
+            unsigned kb_n = stride / 16u;
+            size_t per = (size_t)(stride / 16u) * kb_n * 2u * 128u;   // = Mp*K, Mp=rows
+            sycl::half* Apb = Ap + (size_t)h * per;
+            for (unsigned k = 0; k < stride; ++k) {
+                sycl::half v = sycl::half(k < tokens ? qr_e4m3(vit_weight(row[k])) : 0.0f);
+                unsigned kc = k / 16u, k16 = k % 16u;
+                Apb[((size_t)(tr * kb_n + kc) * 2u + strip) * 128u + il * 16u + k16] = v;
+            }
+        };
+    };
+}
 } // namespace smax
