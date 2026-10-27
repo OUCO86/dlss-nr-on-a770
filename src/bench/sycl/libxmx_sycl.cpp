@@ -1896,7 +1896,7 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
         // N%64==0 -> BN=64, else N%32==0 -> BN=32 (the frame's N are 32/64/128/256/
         // 512/1024). LW = NT = (BM/TS)*(BN/TS) = 8 or 16 (the safe lines). Gate
         // NR_G_V2 (default ON once the three gates pass; =0 = the v1 escape).
-        static bool gv2 = !getenv("NR_G_V2") || atoi(getenv("NR_G_V2")) != 0;
+        static bool gv2 = getenv("NR_G_V2") && atoi(getenv("NR_G_V2")) != 0;   // P12a NEUTRAL (3-pair A/B noise band): the family's N are mostly 32/64; v2's tile reuse pays on the window shapes, not these. OFF by measurement.
         const bool v2_ok = gv2 && (M > 0u) && ((N % 32u) == 0u) && ((K % 16u) == 0u);
         int Mp2 = v2_ok ? (int)(((M + 63u) / 64u) * 64u) : Mp;
         sycl::half* dAp = (sycl::half*)pool_get(nb * (size_t)Mp2 * K * 2);
@@ -1921,7 +1921,7 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
         // the publish loop's map VERBATIM, vector pub proven, epi2 on the scalar form).
         // Guards: ldc==N (the frame's every call; the compact N=16/ldc=4 form stays on
         // the split path), gst==0. Escape NR_G_FOLD=0.
-        static bool gfold = !getenv("NR_G_FOLD") || atoi(getenv("NR_G_FOLD")) != 0;
+        static bool gfold = getenv("NR_G_FOLD") && atoi(getenv("NR_G_FOLD")) != 0;   // P12b NEUTRAL (3-pair A/B mixed at the mean): dC here is 0.5MB/call HOT in L2 -- the fold recovers only the launch + L2-hit reads. OFF by measurement (39 GREEN + end-to-end 100%% x2 gfb1/gfb2 prove correctness; kernel stays in-tree).
         if (gfold && gst == 0 && ldc_e == N && !compact) {
             f16v1::gemm_b_pub_f16(*GQ, dAp, dBp, Cout, (int)M, Mp2, (int)N, (int)K, (int)nb,
                                   epi, narrow, oc, sc, ldc_e, lda_e);
