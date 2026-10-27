@@ -46,6 +46,7 @@
 #include "pre_kernel.hpp"
 #include "post_kernel.hpp"
 #include <cstring>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <set>
@@ -160,6 +161,32 @@ static std::map<int,int> g_fused_quant;   // quant-source cb -> a_scale buf (new
 struct QuantFused { size_t qcmd; int src; int sc; unsigned M; unsigned K;
     bool gather = false; unsigned image_h = 0, image_w = 0, across = 0, pad = 0; };
 static std::map<int,QuantFused> g_quant_pk;   // pk buf id -> the quant that wrote it
+// the P11 recip table: host-built from the reference chain, device-cached once.
+static float* g_dbgbuf = nullptr;   // shared dbg buffer for the vit recip comparison
+static const float* vit_recip_tab() {
+    static float* tab = nullptr;
+    if (!tab) {
+        std::vector<float> h(65536);
+        for (unsigned u = 0; u < 65536u; ++u) {
+            sycl::half hh; unsigned short uu = (unsigned short)u;
+            __builtin_memcpy(&hh, &uu, 2);        // BITS -> half (the earlier sycl::half(u)
+                                                  // VALUE-converted: tab[0x4400] held
+                                                  // 1/sqrt(17408), not 1/sqrt(4) -- the
+                                                  // whole-table poison, gate-caught)
+            float norm = (float)hh;
+            if (!(norm > 0.0f)) { h[u] = 0.0f; continue; }   // NaN/0/inf indices never occur (the floor is applied before the lookup)
+            float r = 1.0f / std::sqrt(norm);                // host IEEE sqrt + correctly-rounded division
+            h[u] = (float)sycl::half(r);                     // qr_half_round
+        }
+        tab = (float*)sycl::malloc_device(65536u * 4u, *GQ);
+        GQ->memcpy(tab, h.data(), 65536u * 4u).wait();
+        if (getenv("NR_VITDBG")) { float chk[4] = {0,0,0,0};
+            GQ->memcpy(chk, (const float*)tab + 0x4400u, 16).wait();
+            printf("[vitdbg] tab=%p host[0x4400]=%.6g dev readback=%.6g %.6g (expect 0.5)\n",
+                   (void*)tab, (double)h[0x4400], (double)chk[0], (double)chk[1]); }
+    }
+    return tab;
+}
 static bool qfuse_on() { static bool v = !getenv("NR_Q_FUSE") || atoi(getenv("NR_Q_FUSE")) != 0; return v; }
 // called by a gemm recorder: if `a` is a fused-quant pk whose scale buf == this gemm's
 // a_scale and whose M,K match, no-op the quant closure and return its info.
@@ -2331,12 +2358,21 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
                 else
                     wbmega::qkv_norm_scatter_esimd(*GQ, dC, Q, Kk, V, as, bs, qs, M, heads, C, NH, tokens);
             }
-        } else if (getenv("NR_QKV_VITES") && atoi(getenv("NR_QKV_VITES")) != 0) {   // P11 NOT promoted: the VIT gate pins 449/196k e4m3 flips (esimd::sqrt APPROXIMATION -- the lane tree itself is host-bisect EXACT 0/200k; f64 sqrt is DEAD in ESIMD). The speed is real (3-6ms) but bit-WRONG -> OFF. A bit-exact port needs IEEE-sqrt emulation (Newton from rsqrt). Witness in-tree.
+        } else if (getenv("NR_QKV_VITES") && atoi(getenv("NR_QKV_VITES")) != 0) {   // P11 NOT promoted: Q-side 449/196k e4m3 flips REMAIN after the table fix (K/V green; the dbg dumps have a 4-lane write race so the micro-cause is not yet pinned -- the table mechanism itself is proven (readback exact, rh0 recip identical)). Default OFF (bit-exactness first). TODO: a clean device-side comparison bench (single-writer slots) to close the 449; the 3-6ms is banked as reachable once pinned.
             // P11 (section 100): the VIT tail on the v1 lane structure (merged
             // single pass, 4 virtual lanes, the vit tree's within-lane E step +
             // the same SLM F cross-step). Gate NR_QKV_VITES (default ON = probe;
             // the GEMM_INT8_QKV gate family includes the 16 vit shapes).
-            wbmega::qkv_norm_scatter_vit_esimd(*GQ, dC, Q, Kk, V, as, bs, qs, M, heads, C, NH, tokens);
+            { float* dbg = nullptr;
+              if (getenv("NR_VITDBG")) { dbg = (float*)sycl::malloc_device((size_t)M * heads * 16u, *GQ);
+                  static float* dbg_prev = nullptr;
+                  if (dbg_prev) sycl::free(dbg_prev, *GQ);
+                  dbg_prev = dbg; }
+              wbmega::qkv_norm_scatter_vit_esimd(*GQ, dC, Q, Kk, V, as, bs, qs, M, heads, C, NH, tokens, vit_recip_tab(), dbg);
+              if (dbg) { std::vector<float> hv((size_t)M * heads * 4u);
+                  GQ->memcpy(hv.data(), dbg, hv.size()*4).wait();
+                  for (unsigned i = 0; i < 8u && i < hv.size()/4u; ++i)
+                      printf("[vitdbg-LANE] rh=%u recipQ=%.9g vq0=%.9g vq1=%.9g hq0=%.6g\n", i, hv[i*16+1], hv[i*16+12], hv[i*16+13], hv[i*16+4]); } }
         } else if (getenv("NR_QKV_VIT1") && atoi(getenv("NR_QKV_VIT1")) != 0) {
         // P7 probe: the VIT path merged to ONE pass (the non-vit merge was the
         // section-92 win; vit kept two passes + dC float-bits write-back). This
@@ -2379,6 +2415,7 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
             }
         });
         } else {
+        float* vdbg = getenv("NR_VITDBG") ? (float*)sycl::malloc_device((size_t)M * heads * 16u, *GQ) : nullptr;
         GQ->parallel_for(sycl::range((size_t)M * heads),
                          [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
@@ -2392,12 +2429,16 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
             }
             float recip = vit ? ctree::vit_reciprocal(row32) : ctree::cosine_reciprocal(row32);
             float sc = qr_half_round(qs[head]);
+            if (vdbg) { vdbg[(size_t)i * 16u + 0u] = 12345.0f;   // marker: scalar path
+                        vdbg[(size_t)i * 16u + 2u] = recip;
+                        for (int q2 = 0; q2 < 8; ++q2) vdbg[(size_t)i * 16u + 4u + q2] = row32[q2 * 4]; }  // hq-parity slots
             for (int c2 = 0; c2 < 32; ++c2) {
                 unsigned n = head * 32u + (unsigned)c2;
                 float h = row32[c2];
                 float val = qr_half_round(cr_mul(h, recip));
                 if (vit) val = qr_half_round(cr_mul(val, ctree::VIT_ROOT));
                 val = qr_half_round(cr_mul(val, sc));
+                if (vdbg && c2 < 2) vdbg[(size_t)i * 16u + 12u + c2] = val;   // the FINAL pre-e4m3 value
                 dC[(size_t)r * NH + n] = sycl::bit_cast<int32_t>(val);
             }
             // K segment (same tree, scale = 1.0 -> the GLSL's part==1 scale path: no mult)
@@ -2430,6 +2471,12 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
             size_t at = (((size_t)w * heads + head) * tokens + t) * 32u + (col % 32u);
             if (part == 0u) Q[at] = out; else if (part == 1u) Kk[at] = out; else V[at] = out;
         });
+        if (vdbg) {
+            std::vector<float> hv((size_t)M * heads * 16u);
+            GQ->memcpy(hv.data(), vdbg, hv.size()*4).wait();
+            for (unsigned i2 = 0; i2 < 8u && i2 < hv.size()/4u; ++i2)
+                printf("[vitdbg-SCALAR] rh=%u recipQ=%.9g recipK=%.9g\n", i2, hv[i2*4+2], hv[i2*4+3]);
+            sycl::free(vdbg, *GQ); }
         }   // end else (vit scalar stage2 + stage3)
         qkv_done:;
         pool_put(dAp); pool_put(dBp); pool_put(dC);

@@ -847,7 +847,7 @@ inline sycl::event qkv_norm_scatter_vit_esimd(sycl::queue& q, const int32_t* dC,
                                   sycl::half* Q, sycl::half* Kk, sycl::half* V,
                                   const float* as, const float* bs, const float* qs,
                                   unsigned M, unsigned heads, unsigned C, unsigned NH,
-                                  unsigned tokens) {
+                                  unsigned tokens, const float* recip_tab, float* dbg = nullptr) {
     unsigned rows = M * heads;
     return q.submit([&](handler& h) {
         h.parallel_for(nd_range<1>(range((size_t)rows / 8u * 32u), range(32u)),
@@ -921,7 +921,20 @@ inline sycl::event qkv_norm_scatter_vit_esimd(sycl::queue& q, const int32_t* dC,
                 // (Newton-refine from rsqrt: 1.5 iterations of y*(1.5-x*y*y) style on
                 // the half-domain norm is enough for correctly-rounded f32). Left OFF;
                 // the kernel below keeps the esqrt form as the speed witness.
-                recip[which] = eh_round(1.0f / esqrt(norm));   // the v1 form (NOT bit-exact for vit boundaries -- see the comment; this is why P11 stays OFF)
+                // P11-FINAL: recip is a function of norm ALONE, and norm is a half value
+                // (every tree step is eh_*, so 65536 bit patterns total). The reference chain
+                // is qr_half_round(fdiv_rn(1, correctly-rounded sqrt)); every ESIMD-native
+                // route kept the SAME 449 e4m3 flips (hw esimd::sqrt is a ~2^-11
+                // approximation; two Newton steps leave 1ulp; Markstein needs a GUARANTEED
+                // FMA and this toolchain does not contract the simd mul+add; f64 in an
+                // ESIMD kernel is DEAD -- submit fails, outputs zero). The HOST-built table
+                // (std::sqrt + IEEE division, then the half round) uploaded once per
+                // process is bit-exact BY CONSTRUCTION. Index = the half bits of norm.
+                { sycl::half nh(norm); unsigned short nb;
+                  __builtin_memcpy(&nb, &nh, 2);            // bit_cast in an ESIMD scalar
+                  recip[which] = recip_tab[(unsigned)nb & 65535u]; }  // context = the all--0.0 poison}
+                if (dbg) { dbg[(size_t)rh*16u + which*2u] = norm; dbg[(size_t)rh*16u + which*2u + 1u] = recip[which];
+                           if (which == 0) for (int q2 = 0; q2 < 8; ++q2) dbg[(size_t)rh*16u + 4u + q2] = hq[q2]; }
             }
             float sc = eh_round(qs[head]);
             unsigned w = r / tokens, t = r % tokens;
