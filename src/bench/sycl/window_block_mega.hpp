@@ -933,17 +933,40 @@ inline sycl::event qkv_norm_scatter_vit_esimd(sycl::queue& q, const int32_t* dC,
                 { sycl::half nh(norm); unsigned short nb;
                   __builtin_memcpy(&nb, &nh, 2);            // bit_cast in an ESIMD scalar
                   recip[which] = recip_tab[(unsigned)nb & 65535u]; }  // context = the all--0.0 poison}
-                if (dbg) { dbg[(size_t)rh*16u + which*2u] = norm; dbg[(size_t)rh*16u + which*2u + 1u] = recip[which];
-                           if (which == 0) for (int q2 = 0; q2 < 8; ++q2) dbg[(size_t)rh*16u + 4u + q2] = hq[q2]; }
+                // P11-CLOSE dbg layout (ONE WRITER PER SLOT): base = (rh*4+l)*32.
+                // +0 normQ, +1 recipQ, +2 normK, +3 recipK, +4..11 hq[0..7],
+                // +12..19 hk[0..7] (lane-DEPENDENT: each lane's own registers,
+                // written only by that lane). STRIDE 32 (not 16): the hk dump
+                // reaches +19 -- a 16-float stride spilled it into the NEXT
+                // lane's norm/recip slots (the 767/768 "norm diff" tell). The
+                // old (rh*16 + which*2 / +4..11) layout had 4 lanes hammering
+                // the same slots -- the race that poisoned the micro-hunt.
+                // dbg buffer: rows*4*32 floats.
+                if (dbg) { size_t db = ((size_t)rh*4u + l)*64u;
+                           dbg[db + which*2u] = norm; dbg[db + which*2u + 1u] = recip[which];
+                           if (which == 1) for (int q2 = 0; q2 < 8; ++q2) { dbg[db + 4u + q2] = hq[q2]; dbg[db + 12u + q2] = hk[q2]; } }
             }
             float sc = eh_round(qs[head]);
             unsigned w = r / tokens, t = r % tokens;
+            // P11-CLOSE ROOT-CAUSE HUNT: the triple-NESTED eh_mul chain was the
+            // only one that flipped (K's single-step eh_mul is green, Q's 3-step
+            // nested = 22 RZ-direction half-ULP diffs). STEPPED form below: t1 =
+            // hq*recip -> half, t2 = t1*VIT_ROOT -> half, t3 = t2*sc -> half --
+            // each an explicit named temp, no nesting. dbg dumps all three
+            // (stride widened to 64: +20..27 t1, +28..35 t2, +36..43 t3) so the
+            // host can pin WHICH step's half conversion the kernel altered.
             for (int g = 0; g < 4; ++g) {
                 uint c2 = g*8u + 2u*l;
                 size_t at = (((size_t)w * heads + head) * tokens + t) * 32u + c2;
+                size_t db = ((size_t)rh*4u + l)*64u;
                 for (int e = 0; e < 2; ++e) {
-                    float vq = eh_mul(eh_mul(eh_mul(hq[2u*g+e], recip[0]), ctree::VIT_ROOT), sc);
-                    Q[at + e] = sycl::half(qr_e4m3_scalar(vq));
+                    float t1 = eh_mul(hq[2u*g+e], recip[0]);
+                    float t2 = eh_mul(t1, ctree::VIT_ROOT);
+                    float t3 = eh_mul(t2, sc);
+                    if (dbg) { dbg[db + 20u + 2u*(uint)g + (uint)e] = t1;
+                               dbg[db + 28u + 2u*(uint)g + (uint)e] = t2;
+                               dbg[db + 36u + 2u*(uint)g + (uint)e] = t3; }
+                    Q[at + e] = sycl::half(qr_e4m3_scalar(t3));
                     Kk[at + e] = sycl::half(qr_e4m3_scalar(eh_mul(hk[2u*g+e], recip[1])));
                     V[at + e] = sycl::half(qr_e4m3_scalar(hv[2u*g+e]));
                 }

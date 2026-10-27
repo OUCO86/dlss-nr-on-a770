@@ -174,8 +174,35 @@ static const float* vit_recip_tab() {
                                                   // 1/sqrt(17408), not 1/sqrt(4) -- the
                                                   // whole-table poison, gate-caught)
             float norm = (float)hh;
-            if (!(norm > 0.0f)) { h[u] = 0.0f; continue; }   // NaN/0/inf indices never occur (the floor is applied before the lookup)
-            float r = 1.0f / std::sqrt(norm);                // host IEEE sqrt + correctly-rounded division
+            // P11-FRAME fix (the frame-0% root cause): the comment "inf indices
+            // never occur" was FALSE for the real frame -- the vit tree sums in
+            // the HALF domain, and frame h values reach |h|~1360 (max|h|^2 =
+            // 1.85e6 > 65504 -> the eh chain OVERFLOWS norm to +inf; 163k/196k
+            // rows of the first vit call land on the inf index). The reference
+            // chain's output there is fdiv_rn(1, sqrt(inf)) = 0; but the bare
+            // host expression 1.0f/std::sqrt(inf) came out NaN through the
+            // vectorized builder (icx's fast path for the inf input) -> the
+            // table HELD NaN at 0x7C00 -> the lane kernel published
+            // e4m3(NaN)=448 on entire rows -> whole-frame 0% match while the
+            // band-3 gate domain (h<=3: norm never inf) stayed green. Explicit
+            // non-finite guard: inf -> 0 (the reference's exact output); NaN
+            // slots unreachable (finite h, positive squares, max-floor).
+            if (!(norm > 0.0f) || !(norm < 3.402823466e+38f)) { h[u] = 0.0f; continue; }
+            // THE FRAME-0% BUILDER BUG (bench_vitframe dbg: kernel recip=-nan(ind)
+            // at the +inf norm index -- frame h~1360 -> half-tree norm overflows to
+            // +inf; 163k/196k rows of the first vit call land there): the fused
+            // expression 1.0f/std::sqrt(norm) gets RECOGNIZED by icx -O2's
+            // vectorizer as an rsqrt pattern, whose approximation returns NaN for
+            // inf input (scalar C++ would give 1/inf = 0 -- the printed host
+            // tab[0x7C00] = -nan(ind) IS the tell). Split with a volatile barrier:
+            // sqrt alone lowers to the correctly-rounded vsqrtps, the division
+            // alone to IEEE vdivps; the 1/sqrt FUSION is what breaks. (Reference
+            // chain at inf: fdiv_rn(1, sqrt(inf)) = 0 -- the guard above already
+            // routes non-finite to 0; the volatile split protects the FINITE
+            // entries from the same rsqrt-approx class of error.)
+            float s = std::sqrt(norm);                       // host IEEE sqrt (vsqrtps, correctly rounded)
+            volatile float vs = s;                           // pattern barrier: no 1/sqrt fusion possible
+            float r = 1.0f / vs;                             // correctly-rounded IEEE division
             h[u] = (float)sycl::half(r);                     // qr_half_round
         }
         tab = (float*)sycl::malloc_device(65536u * 4u, *GQ);
@@ -2390,21 +2417,47 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
                 else
                     wbmega::qkv_norm_scatter_esimd(*GQ, dC, Q, Kk, V, as, bs, qs, M, heads, C, NH, tokens);
             }
-        } else if (getenv("NR_QKV_VITES") && atoi(getenv("NR_QKV_VITES")) != 0) {   // P11 NOT promoted: Q-side 449/196k e4m3 flips REMAIN after the table fix (K/V green; the dbg dumps have a 4-lane write race so the micro-cause is not yet pinned -- the table mechanism itself is proven (readback exact, rh0 recip identical)). Default OFF (bit-exactness first). TODO: a clean device-side comparison bench (single-writer slots) to close the 449; the 3-6ms is banked as reachable once pinned.
+        } else if (!getenv("NR_QKV_VITES") || atoi(getenv("NR_QKV_VITES")) != 0) {   // P11 PROMOTED (this window): the 449-root-cause CLOSED by bench_vitcmp's clean device comparison -- norm/recip/hq were ALL bit-exact vs the scalar reference; the flips were the TRIPLE-NESTED eh_mul(eh_mul(eh_mul(...))) chain being rewritten in-kernel (skipped intermediate half-round, RZ-direction half-ULP). The STEPPED named-temp form (t1=hq*recip, t2=t1*VIT_ROOT, t3=t2*sc) is 0/6144 EXACT in the bench. LESSON (blueprint P1 family): every proven eh chain step needs its OWN named temp adjacent to the use -- nesting is NOT safe in ESIMD, same class as the phi/scope FMA-contraction trap. Default ON, escape NR_QKV_VITES=0.
             // P11 (section 100): the VIT tail on the v1 lane structure (merged
             // single pass, 4 virtual lanes, the vit tree's within-lane E step +
             // the same SLM F cross-step). Gate NR_QKV_VITES (default ON = probe;
             // the GEMM_INT8_QKV gate family includes the 16 vit shapes).
             { float* dbg = nullptr;
-              if (getenv("NR_VITDBG")) { dbg = (float*)sycl::malloc_device((size_t)M * heads * 16u, *GQ);
+              // P11-CLOSE dbg: single-writer layout (rh*4+l)*16 -- needs M*heads*64 floats.
+              if (getenv("NR_VITDBG")) { dbg = (float*)sycl::malloc_device((size_t)M * heads * 4u * 64u, *GQ);
                   static float* dbg_prev = nullptr;
                   if (dbg_prev) sycl::free(dbg_prev, *GQ);
                   dbg_prev = dbg; }
               wbmega::qkv_norm_scatter_vit_esimd(*GQ, dC, Q, Kk, V, as, bs, qs, M, heads, C, NH, tokens, vit_recip_tab(), dbg);
-              if (dbg) { std::vector<float> hv((size_t)M * heads * 4u);
+              // NR_VITDUMP (P11 frame-0%-hunt): the FIRST vit call's full inputs
+              // (dC Mp*NH int32, as, bs, qs) + the lane kernel's outputs (Q/K/V
+              // M*C halfs) to vitdump.bin, for the bench to replay on REAL frame
+              // data. Run with NR_CGRAPH=0 -- the host-vector memcpys here are a
+              // diagnostic path, not graph-safe.
+              if (getenv("NR_VITDUMP")) { static bool vdumped = false;
+                  if (!vdumped) { vdumped = true;
+                      std::vector<int32_t> iC((size_t)Mp*NH);
+                      std::vector<float> ias(M), ibs(NH), iqs(heads);
+                      std::vector<sycl::half> oQ((size_t)M*C), oK((size_t)M*C), oV((size_t)M*C);
+                      GQ->memcpy(iC.data(), dC, iC.size()*4).wait();
+                      GQ->memcpy(ias.data(), as, (size_t)M*4).wait();
+                      GQ->memcpy(ibs.data(), bs, (size_t)NH*4).wait();
+                      GQ->memcpy(iqs.data(), qs, (size_t)heads*4).wait();
+                      GQ->memcpy(oQ.data(), Q, (size_t)M*C*2).wait();
+                      GQ->memcpy(oK.data(), Kk, (size_t)M*C*2).wait();
+                      GQ->memcpy(oV.data(), V, (size_t)M*C*2).wait();
+                      FILE* f = fopen("vitdump.bin", "wb");
+                      unsigned hdr[5] = {M, C, heads, tokens, NH};
+                      fwrite(hdr, 4, 5, f);
+                      fwrite(iC.data(), 4, iC.size(), f); fwrite(ias.data(), 4, M, f);
+                      fwrite(ibs.data(), 4, NH, f); fwrite(iqs.data(), 4, heads, f);
+                      fwrite(oQ.data(), 2, (size_t)M*C, f); fwrite(oK.data(), 2, (size_t)M*C, f);
+                      fwrite(oV.data(), 2, (size_t)M*C, f); fclose(f);
+                      printf("[vitdump] M=%u C=%u heads=%u tokens=%u NH=%u -> vitdump.bin\n", M, C, heads, tokens, NH); } }
+              if (dbg) { std::vector<float> hv((size_t)M * heads * 4u * 64u);
                   GQ->memcpy(hv.data(), dbg, hv.size()*4).wait();
-                  for (unsigned i = 0; i < 8u && i < hv.size()/4u; ++i)
-                      printf("[vitdbg-LANE] rh=%u recipQ=%.9g vq0=%.9g vq1=%.9g hq0=%.6g\n", i, hv[i*16+1], hv[i*16+12], hv[i*16+13], hv[i*16+4]); } }
+                  for (unsigned i = 0; i < 8u && i < M*heads; ++i)
+                      printf("[vitdbg-LANE] rh=%u recipQ=%.9g recipK=%.9g hq0(l0)=%.6g hq0(l1)=%.6g\n", i, hv[(i*4u+0u)*64u+1u], hv[(i*4u+0u)*64u+3u], hv[(i*4u+0u)*64u+4u], hv[(i*4u+1u)*64u+4u]); } }
         } else if (getenv("NR_QKV_VIT1") && atoi(getenv("NR_QKV_VIT1")) != 0) {
         // P7 probe: the VIT path merged to ONE pass (the non-vit merge was the
         // section-92 win; vit kept two passes + dC float-bits write-back). This
