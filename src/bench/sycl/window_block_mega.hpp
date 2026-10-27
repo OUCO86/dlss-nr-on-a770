@@ -827,4 +827,95 @@ inline sycl::event qkv_norm_scatter_v2(sycl::queue& q, const int32_t* dC,
     });
 }
 
+
+// qkv_norm_scatter_vit_esimd (section 100 P11): the VIT tail (16 frame calls, ~10ms
+// of the QKV family) on the v1 lane structure. The scalar two-pass (normalize into
+// dC float-bits + a separate publish/scatter pass) becomes ONE merged pass exactly
+// like the non-vit win (section 92), and the per-row 32-column work splits over 4
+// VIRTUAL LANES like qkv_norm_scatter_esimd -- the column-ownership set {g*8+2l,
+// g*8+2l+1, g 0..3} serves the vit tree directly: lane l holds r[2l], r[2l+1],
+// r[2l+8], r[2l+9] (r[c] = half_round(h[c]^2 + half_round(h[c+16]^2))), E[c] =
+// hadd(r[c], r[c+8]) (c 0..7) is WITHIN-lane, and F[c] = hadd(E[c], E[c+4]) (c
+// 0..3) is the cross-lane SLM step -- same 8-slot staging, same sizes as v1. The
+// tree order is ctree::vit_reciprocal VERBATIM (r16->8->4 pairings, the
+// (F0+F2)+(F1+F3) root, max-floor, half_round(1/ef_div... wait sqrt first)).
+// Publish chain VERBATIM from the scalar vit pass: Q: half_round(h*recip) ->
+// half_round(*VIT_ROOT) -> half_round(*sc) -> e4m3; K: half_round(h*krec) -> e4m3
+// (no VIT_ROOT -- the GLSL's part==1 path); V: e4m3(deq raw, no half_round first).
+inline sycl::event qkv_norm_scatter_vit_esimd(sycl::queue& q, const int32_t* dC,
+                                  sycl::half* Q, sycl::half* Kk, sycl::half* V,
+                                  const float* as, const float* bs, const float* qs,
+                                  unsigned M, unsigned heads, unsigned C, unsigned NH,
+                                  unsigned tokens) {
+    unsigned rows = M * heads;
+    return q.submit([&](handler& h) {
+        h.parallel_for(nd_range<1>(range((size_t)rows / 8u * 32u), range(32u)),
+            [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+            esimd::slm_init<8u * 16u * 4u>();
+            unsigned rh = (unsigned)it.get_group(0) * 8u + (unsigned)it.get_local_id(0) / 4u;
+            unsigned l  = (unsigned)it.get_local_id(0) % 4u;
+            unsigned rl = (unsigned)it.get_local_id(0) / 4u;
+            unsigned r = rh / heads, head = rh % heads;
+            float hq[8], hk[8], hv[8];
+            for (int g = 0; g < 4; ++g) {
+                uint c2 = g*8u + 2u*l;
+                uint nq = head*32u + c2, nk = C + head*32u + c2, nv = 2u*C + head*32u + c2;
+                hq[2u*g]   = eh_round((float)((dC[(size_t)r*NH+nq] * as[r]) * bs[nq]));
+                hq[2u*g+1] = eh_round((float)((dC[(size_t)r*NH+nq+1u] * as[r]) * bs[nq+1u]));
+                hk[2u*g]   = eh_round((float)((dC[(size_t)r*NH+nk] * as[r]) * bs[nk]));
+                hk[2u*g+1] = eh_round((float)((dC[(size_t)r*NH+nk+1u] * as[r]) * bs[nk+1u]));
+                hv[2u*g]   = (float)((dC[(size_t)r*NH+nv] * as[r]) * bs[nv]);
+                hv[2u*g+1] = (float)((dC[(size_t)r*NH+nv+1u] * as[r]) * bs[nv+1u]);
+            }
+            // vit E values per lane: E[2l+p] = hadd(r[2l+p], r[2l+p+8]),
+            // r[c] = hadd(h[c+16]^2, h[c]^2) in the cr_hfma order (the product
+            // h[c]*h[c] exact, add single-rounded -- the §92 contraction-safety note).
+            // the vit tree on v1's lane ownership: lane l holds columns {g*8+2l,
+            // g*8+2l+1} (g 0..3) = hq[2g], hq[2g+1]. E[c] = hadd(r[c], r[c+8]) with
+            // r[c] = hfma(h[c]^2, h[c+16]^2): for c = 2l+p the hq slots are {p, p+4}
+            // (h[c], h[c+16]) and {p+2, p+6} (h[c+8], h[c+24]) -- ALL within-lane.
+            float pe[4], ke[4];
+            for (int p = 0; p < 2; ++p) {
+                float r_lo = eh_hfma(hq[p],   hq[p],   eh_mul(hq[p+4], hq[p+4]));       // r[2l+p]   = h[c]^2 + h[c+16]^2
+                float r_hi = eh_hfma(hq[p+2], hq[p+2], eh_mul(hq[p+6], hq[p+6]));       // r[2l+p+8] = h[c+8]^2 + h[c+24]^2
+                pe[p] = eh_add(r_lo, r_hi);                                             // E[2l+p]
+                float k_lo = eh_hfma(hk[p],   hk[p],   eh_mul(hk[p+4], hk[p+4]));
+                float k_hi = eh_hfma(hk[p+2], hk[p+2], eh_mul(hk[p+6], hk[p+6]));
+                ke[p] = eh_add(k_lo, k_hi);
+            }
+            esimd::simd<float,2> tq; tq[0]=pe[0]; tq[1]=pe[1];
+            esimd::slm_block_store((rl*16u + l*2u) * 4u, tq, esimd::overaligned_tag<16>{});
+            esimd::simd<float,2> tk; tk[0]=ke[0]; tk[1]=ke[1];
+            esimd::slm_block_store((rl*16u + 8u + l*2u) * 4u, tk, esimd::overaligned_tag<16>{});
+            esimd::barrier();
+            float recip[2];
+            for (int which = 0; which < 2; ++which) {
+                uint base = (rl*16u + which*8u) * 4u;
+                esimd::simd<float,8> ev = esimd::slm_block_load<float,8>(base, esimd::overaligned_tag<16>{});
+                // F[c] = hadd(E[c], E[c+4]) (c 0..3); norm = hadd(hadd(F0,F2), hadd(F1,F3))
+                float f0 = eh_add(ev[0], ev[4]);
+                float f1 = eh_add(ev[1], ev[5]);
+                float f2 = eh_add(ev[2], ev[6]);
+                float f3 = eh_add(ev[3], ev[7]);
+                float norm = eh_add(eh_add(f0, f2), eh_add(f1, f3));
+                float floorv = eh_round(ctree::COSINE_NORM_FLOOR);
+                norm = norm > floorv ? norm : floorv;
+                recip[which] = eh_round(wbv2::ef_div(1.0f, esqrt(norm)));   // the smax_esimd-proven division form
+            }
+            float sc = eh_round(qs[head]);
+            unsigned w = r / tokens, t = r % tokens;
+            for (int g = 0; g < 4; ++g) {
+                uint c2 = g*8u + 2u*l;
+                size_t at = (((size_t)w * heads + head) * tokens + t) * 32u + c2;
+                for (int e = 0; e < 2; ++e) {
+                    float vq = eh_mul(eh_mul(eh_mul(hq[2u*g+e], recip[0]), ctree::VIT_ROOT), sc);
+                    Q[at + e] = sycl::half(qr_e4m3_scalar(vq));
+                    Kk[at + e] = sycl::half(qr_e4m3_scalar(eh_mul(hk[2u*g+e], recip[1])));
+                    V[at + e] = sycl::half(qr_e4m3_scalar(hv[2u*g+e]));
+                }
+            }
+        });
+    });
+}
+
 } // namespace wbmega

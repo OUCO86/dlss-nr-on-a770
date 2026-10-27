@@ -2331,6 +2331,12 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
                 else
                     wbmega::qkv_norm_scatter_esimd(*GQ, dC, Q, Kk, V, as, bs, qs, M, heads, C, NH, tokens);
             }
+        } else if (getenv("NR_QKV_VITES") && atoi(getenv("NR_QKV_VITES")) != 0) {   // P11 NEUTRAL (3-pair A/B mixed: +0.5/+2/-0.8 = noise; the vit tail is only 16 small calls). Witness in-tree, default OFF.
+            // P11 (section 100): the VIT tail on the v1 lane structure (merged
+            // single pass, 4 virtual lanes, the vit tree's within-lane E step +
+            // the same SLM F cross-step). Gate NR_QKV_VITES (default ON = probe;
+            // the GEMM_INT8_QKV gate family includes the 16 vit shapes).
+            wbmega::qkv_norm_scatter_vit_esimd(*GQ, dC, Q, Kk, V, as, bs, qs, M, heads, C, NH, tokens);
         } else if (getenv("NR_QKV_VIT1") && atoi(getenv("NR_QKV_VIT1")) != 0) {
         // P7 probe: the VIT path merged to ONE pass (the non-vit merge was the
         // section-92 win; vit kept two passes + dC float-bits write-back). This
