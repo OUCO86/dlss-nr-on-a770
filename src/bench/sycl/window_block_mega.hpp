@@ -757,4 +757,74 @@ inline sycl::event qkv_norm_scatter_esimd(sycl::queue& q, const int32_t* dC,
         });
     });
 }
+
+// qkv_norm_scatter_v2 (section 100 P6): the 21ms tail RESTRUCTURED, not folded
+// (the P5 falsification: the tail is BUTTERFLY COMPUTE, and folding it into the
+// gemm WGs serializes it with the dpas loop). v1's shape -- 4 virtual lanes x
+// strided scalar dC reads (col pairs (j/2)*8+2l+e: 8-byte scatter, poor
+// coalescing) + SLM staging + barrier -- is replaced by ONE ESIMD item per
+// (row,head): the head's 32 columns are a CONTIGUOUS 128B f32 run in dC
+// (row r, cols head*32..), bs slice contiguous, output at = ((w*heads+head)
+// *tokens+t)*32 a contiguous 64B half run. The butterfly is the SAME tree as
+// v1's (pv[2l+p] -> eh_add pairs -> norm/floor/recip, the P5 v2 witness proved
+// this register form bit-exact end-to-end), just fed contiguously. No barrier,
+// no SLM, no strided scalar loads. NON-VIT only (same guard as v1).
+inline sycl::event qkv_norm_scatter_v2(sycl::queue& q, const int32_t* dC,
+                                       sycl::half* Q, sycl::half* Kk, sycl::half* V,
+                                       const float* as, const float* bs, const float* qs,
+                                       unsigned M, unsigned heads, unsigned C, unsigned NH,
+                                       unsigned tokens) {
+    unsigned tasks = M * heads * 3u;      // (row, head, part): part 0=Q 1=K 2=V
+    return q.parallel_for(sycl::range((size_t)tasks), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
+        unsigned rh = (unsigned)it.get_id(0);
+        unsigned part = rh % 3u, head = (rh / 3u) % heads, r = rh / (3u * heads);
+        const float rs = as[r];
+        unsigned col0 = part * C + head * 32u;
+        esimd::simd<float,32> acc = esimd::convert<float>(
+            esimd::block_load<int32_t,32>(dC + (size_t)r * NH + col0, esimd::overaligned_tag<16>{}));
+        esimd::simd<float,32> bsv = esimd::block_load<float,32>(bs + col0, esimd::overaligned_tag<16>{});
+        // deq: (float(c) * as[r]) * bs[n] -- left-to-right, the v1 form (two mul_rn)
+        esimd::simd<float,32> h = (acc * rs) * bsv;
+        unsigned w = r / tokens, t = r % tokens;
+        size_t at = (((size_t)w * heads + head) * tokens + t) * 32u;
+        if (part == 2u) {                       // V: e4m3(deq) only
+            esimd::simd<sycl::half,32> out;
+            for (int i = 0; i < 32; ++i) out[i] = sycl::half(qr_e4m3_scalar(h[i]));
+            out.copy_to(V + at, esimd::overaligned_tag<16>{});
+            return;
+        }
+        float hv[32];
+        for (int i = 0; i < 32; ++i) hv[i] = h[i];
+        float hr[32];
+        for (int i = 0; i < 32; ++i) hr[i] = eh_round(hv[i]);
+        float pv[8];
+        for (int l = 0; l < 4; ++l)
+            for (int p2 = 0; p2 < 2; ++p2) {
+                auto HX = [&](int j) SYCL_ESIMD_FUNCTION { return hr[(j/2)*8 + 2*l + (j%2)]; };
+                pv[2*l + p2] = eh_add(
+                    eh_hfma(HX(2+p2), HX(2+p2), eh_mul(HX(p2),   HX(p2))),
+                    eh_hfma(HX(6+p2), HX(6+p2), eh_mul(HX(4+p2), HX(4+p2))));
+            }
+        float two00 = eh_add(pv[0], pv[4]);
+        float two10 = eh_add(pv[2], pv[6]);
+        float one00 = eh_add(two00, two10);
+        float two01 = eh_add(pv[1], pv[5]);
+        float two11 = eh_add(pv[3], pv[7]);
+        float one01 = eh_add(two01, two11);
+        float norm = eh_add(one00, one01);
+        float floorv = eh_round(ctree::COSINE_NORM_FLOOR);
+        norm = norm > floorv ? norm : floorv;
+        float recip = eh_round(1.0f / esqrt(norm));
+        sycl::half* T = (part == 0u) ? Q : Kk;
+        float sc = (part == 0u) ? eh_round(qs[head]) : 1.0f;
+        esimd::simd<sycl::half,32> out;
+        for (int i = 0; i < 32; ++i) {
+            float value = eh_mul(hr[i], recip);
+            if (part == 0u) value = eh_mul(value, sc);
+            out[i] = sycl::half(qr_e4m3_scalar(value));
+        }
+        out.copy_to(T + at, esimd::overaligned_tag<16>{});
+    });
+}
+
 } // namespace wbmega

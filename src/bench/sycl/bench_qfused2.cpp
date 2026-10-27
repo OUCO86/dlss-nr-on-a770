@@ -279,6 +279,65 @@ static void one_batched_v3(queue& q, unsigned M, unsigned lda, unsigned K, unsig
     free(src,q);free(pkA,q);free(tA,q);free(tC,q);free(sA,q);free(sC,q);
 }
 
+
+// v4 row-item form for batched: item=row; peak scans lda ONCE; then per group g:
+// quantize the g-slice (cols g*K..) and scatter to tile g. Mp items (640 here).
+static void one_batched_v4(queue& q, unsigned M, unsigned lda, unsigned K, unsigned batch){
+    size_t n=(size_t)M*lda; int Mp=(int)((M+127u)/128u)*128;
+    size_t npk=(size_t)batch*Mp*K;
+    sycl::half* src=malloc_device<sycl::half>(n,q);
+    int8_t* pkA=malloc_device<int8_t>(n,q);
+    int8_t* tA=malloc_device<int8_t>(npk,q); int8_t* tD=malloc_device<int8_t>(npk,q);
+    float* sA=malloc_device<float>(M+128,q); float* sD=malloc_device<float>(M+128,q);
+    std::vector<sycl::half> h(n);
+    std::mt19937 rng(11); std::uniform_real_distribution<float> df(-8.f,8.f);
+    for(size_t i=0;i<n;++i) h[i]=sycl::half(df(rng));
+    q.memcpy(src,h.data(),n*2).wait();
+    q.memset(pkA,0,n); q.memset(tA,0,npk); q.memset(tD,0,npk); q.memset(sA,0,(M+128)*4); q.memset(sD,0,(M+128)*4); q.wait();
+    auto timeit=[&](std::function<std::vector<event>()> fn){
+        double best=1e9; for(int it=0;it<15;++it){ auto es=fn(); for(auto&e:es)e.wait();
+          double t=0; for(auto&e:es) t+=double(e.get_profiling_info<info::event_profiling::command_end>()-e.get_profiling_info<info::event_profiling::command_start>());
+          best=std::min(best,t/1e6);} return best;};
+    double t2=timeit([&]{
+        event e1=q.parallel_for(range(M), k_quant<2048>()(src,pkA,sA,M));
+        event e2=q.parallel_for(range((size_t)batch*Mp*K), [=](sycl::item<1> it){
+            const int BM=128,BK=32; int kb_n=K/BK; size_t per=(size_t)(Mp/BM)*kb_n*8*512;
+            size_t gg=(size_t)it.get_id(0)/per, d=(size_t)it.get_id(0)%per;
+            size_t blk=d/512; int off=(int)(d%512); int wi=(int)(blk%8); size_t wk=blk/8;
+            int kb=(int)(wk%(size_t)kb_n), w=(int)(wk/(size_t)kb_n); int row=off/32,k=off%32;
+            int srow=w*BM+wi*16+row;
+            ((int8_t*)tA)[gg*per+d]= srow<(int)M ? pkA[(size_t)srow*lda+gg*((size_t)K)+kb*BK+k] : (int8_t)0; });
+        return std::vector<event>{e1,e2}; });
+    double t4=timeit([&]{ return std::vector<event>{q.parallel_for(range((unsigned)Mp), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
+        const int BM=128,BK=32; int kb_n=K/BK; size_t per=(size_t)(Mp/BM)*kb_n*8*512;
+        int srow=(int)it.get_id(0);
+        int w=srow/BM, rem=srow%BM, wi=rem/16, row=rem%16;
+        size_t per_blk=((size_t)w*kb_n)*8+wi;
+        if (srow>=(int)M){ esimd::simd<int8_t,32> z((int8_t)0);
+            for(int gg=0;gg<(int)batch;++gg) for(int kb=0;kb<kb_n;++kb)
+                esimd::block_store<int8_t,32>((int8_t*)tD+gg*per+(per_blk+(size_t)kb*8)*512+row*32,z,esimd::overaligned_tag<16>{});
+            return; }
+        esimd::simd<float,32> mx(esimd::simd<float,32>(0.f));
+        for(int kb=0;kb<(int)(lda/32);++kb){ esimd::simd<float,32> reg=esimd::convert<float>(esimd::block_load<sycl::half,32>(src+(size_t)srow*lda+kb*32,esimd::overaligned_tag<16>{})); mx=esimd::max(mx,esimd::abs(reg)); }
+        float peak=esimd::hmax<float,float,32>(mx);
+        float scale=(peak==0.f)?1.f:esimd::div_ieee<float,1>(esimd::simd<float,1>(peak),esimd::simd<float,1>(127.f))[0];
+        scales_w(sD,srow,scale);
+        for(int gg=0;gg<(int)batch;++gg){
+            for(int kb=0;kb<kb_n;++kb){
+                esimd::simd<float,32> reg=esimd::convert<float>(esimd::block_load<sycl::half,32>(src+(size_t)srow*lda+gg*(size_t)K+kb*BK,esimd::overaligned_tag<16>{}));
+                esimd::simd<float,32> qq=esimd::div_ieee<float,32>(reg,esimd::simd<float,32>(scale));
+                qq=esimd::min(esimd::max(esimd::rnde<float,32>(qq),esimd::simd<float,32>(-127.f)),esimd::simd<float,32>(127.f));
+                esimd::block_store<int8_t,32>((int8_t*)tD+gg*per+(per_blk+(size_t)kb*8)*512+row*32, esimd::convert<int8_t>(esimd::convert<int>(qq)),esimd::overaligned_tag<16>{}); } }
+    })}; });
+    std::vector<int8_t> a(npk),d2(npk); q.memcpy(a.data(),tA,npk).wait(); q.memcpy(d2.data(),tD,npk).wait();
+    std::vector<float> ha(M),hd(M); q.memcpy(ha.data(),sA,M*4).wait(); q.memcpy(hd.data(),sD,M*4).wait();
+    size_t dd=0; for(size_t i=0;i<npk;++i) if(a[i]!=d2[i])dd++;
+    size_t sd=0; for(unsigned i=0;i<M;++i) if(ha[i]!=hd[i])sd++;
+    printf("batched-v4 row-item M=%u lda=%u K=%u b=%u | two-pass %7.3f  v4 %7.3f (%.2fx) | tile-diff %zu scale-diff %zu %s\n",
+        M,lda,K,batch,t2,t4,t2/t4,dd,sd,(dd||sd)?"NOT-EXACT":"EXACT");
+    free(src,q);free(pkA,q);free(tA,q);free(tD,q);free(sA,q);free(sD,q);
+}
+
 int main(){
   device dev;
   for(auto&d:device::get_devices(info::device_type::gpu))
@@ -294,6 +353,6 @@ int main(){
   one<2048,4>(q, 640, "res K2048");
   one<4096,8>(q, 192, "qkv K4096");
   fprintf(stderr,"[bench] one_batched 640/2048\n"); one_batched(q, 640, 2048, 256, 8);
-  fprintf(stderr,"[bench] one_batched_v3 640/2048\n"); one_batched_v3(q, 640, 2048, 256, 8);
+  fprintf(stderr,"[bench] one_batched_v3 640/2048\n"); one_batched_v3(q, 640, 2048, 256, 8);; fprintf(stderr,"[bench] v4 640/2048\n"); one_batched_v4(q, 640, 2048, 256, 8); fprintf(stderr,"[bench] v4 2040/256\n");   // (2040/256 removed: k_quant<2048> would read an lda=256 buffer with 2048-wide rows = OOB = GPU fault, the black-screen class again)
   return 0;
 }

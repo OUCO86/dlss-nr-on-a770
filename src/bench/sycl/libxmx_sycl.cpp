@@ -2242,8 +2242,38 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
         if (!vit) {
             // DERIVED (section 92): merge stage-2 normalise + stage-3 e4m3/scatter into ONE
             // kernel -- no dC float-bits round-trip, one fewer launch. Non-vit only.
-            if (qkvstop < 1)
-            wbmega::qkv_norm_scatter_esimd(*GQ, dC, Q, Kk, V, as, bs, qs, M, heads, C, NH, tokens);
+            if (qkvstop < 1) {
+                static int qres_v2 = getenv("NR_QKV_RESV2") ? atoi(getenv("NR_QKV_RESV2")) : 0;   // P6 v2 FALSIFIED (ESIMD arrays spill: 186-187 vs 178-180); 3 = v3 scalar-contiguous probe
+                if (qres_v2 == 3)
+                    GQ->parallel_for(sycl::range((size_t)M * heads), [=](sycl::item<1> it) {
+                        unsigned rh = (unsigned)it.get_id(0);
+                        unsigned r = rh / heads, head = rh % heads;
+                        const float rs = as[r];
+                        unsigned col0 = head * 32u;
+                        float hq[32], hk[32], hv[32];
+                        for (int i = 0; i < 32; ++i) {
+                            unsigned n = col0 + (unsigned)i;
+                            hq[i] = wbmega::eh_round((float)((dC[(size_t)r * NH + n] * rs) * bs[n]));
+                            unsigned nk = C + n, nv = 2u * C + n;
+                            hk[i] = wbmega::eh_round((float)((dC[(size_t)r * NH + nk] * rs) * bs[nk]));
+                            hv[i] = (float)((dC[(size_t)r * NH + nv] * rs) * bs[nv]);
+                        }
+                        float rq = ctree::cosine_reciprocal(hq);
+                        float rk = ctree::cosine_reciprocal(hk);
+                        float sc = wbmega::eh_round(qs[head]);
+                        unsigned w = r / tokens, t = r % tokens;
+                        size_t at = (((size_t)w * heads + head) * tokens + t) * 32u;
+                        for (int i = 0; i < 32; ++i) {
+                            Q[at + i] = sycl::half(qr_e4m3_scalar(wbmega::eh_mul(wbmega::eh_mul(hq[i], rq), sc)));
+                            Kk[at + i] = sycl::half(qr_e4m3_scalar(wbmega::eh_mul(hk[i], rk)));
+                            V[at + i] = sycl::half(qr_e4m3_scalar(hv[i]));
+                        }
+                    });
+                else if (qres_v2 == 2)
+                    wbmega::qkv_norm_scatter_v2(*GQ, dC, Q, Kk, V, as, bs, qs, M, heads, C, NH, tokens);
+                else
+                    wbmega::qkv_norm_scatter_esimd(*GQ, dC, Q, Kk, V, as, bs, qs, M, heads, C, NH, tokens);
+            }
         } else {
         GQ->parallel_for(sycl::range((size_t)M * heads),
                          [=](sycl::item<1> it) {
