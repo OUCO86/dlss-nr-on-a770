@@ -45,9 +45,9 @@ namespace esimd = sycl::ext::intel::esimd;
 #define WA_X 0u           // operand double-buffers (stage 1, then stage 3)
 #define WA_Z 8192u        // scores f32 64x64 = 16KB (stage 1 C -> stage 2 reads)
 #define WA_Y 24576u       // probs pack_a16 64x64 half = 8KB (stage 2 -> stage 3)
-#define WA_QT 32768u          // P10b: the raw-Q staged tile (2KB)
-#define WA_KT 34816u          // P10b: the raw-K staged tile (2KB)
-#define WA_SLM 36864u
+#define WA_QT 32768u          // P10b: the raw-Q staged tile (4KB: 8 blocks x 256 halfs)
+#define WA_KT 36864u          // P10b: the raw-K staged tile (4KB) -- the 2KB sizing OVERLAPPED QT (the K gather trashed A blocks (2,*),(3,*) = half the rows wrong, gate-caught)
+#define WA_SLM 40960u         // 8+16+8+4+4 = 40KB (the v4ph 45KB precedent)
 
 static void one_wa_res(queue& q, unsigned batches, unsigned heads, int stop_stage = 0, bool raw_qk = false) {
     sycl::half* kt_dump = getenv("WA_KTDUMP") ? malloc_device<sycl::half>(2048, q) : nullptr;
@@ -189,7 +189,7 @@ static void one_wa_res(queue& q, unsigned batches, unsigned heads, int stop_stag
                         int tt = (int)(lid / 4u), w = (int)(lid % 4u);
                         if (tt != p) continue;
                         esimd::simd<half,64> av = esimd::slm_block_load<half,64>(WA_QT + (uint)(((tt*2+kc)*2)*128 + w*64) * 2u, esimd::overaligned_tag<16>{});
-                        esimd::simd<half,64> bv = esimd::slm_block_load<half,64>(WA_KT + (uint)(((tt*2+kc)*2)*128 + w*64) * 2u, esimd::overaligned_tag<16>{});
+                        esimd::simd<half,64> bv = esimd::slm_block_load<half,64>(WA_KT + (uint)(((kc*4+tt)*2)*128 + w*64) * 2u, esimd::overaligned_tag<16>{});   // FIXED: gather wrote block(kc,tc) at (kc*4+tc)*256; the copy read the A-pattern (tc*2+kc)*256
                         esimd::slm_block_store(WA_X + buf * SLM_A + (uint)(tt * 256 + w * 64) * 2u, av, esimd::overaligned_tag<16>{});
                         esimd::slm_block_store(WA_X + SLM_B_BASE + buf * SLM_B + (uint)(tt * 256 + w * 64) * 2u, bv, esimd::overaligned_tag<16>{});
                     }
@@ -440,6 +440,13 @@ int main() {
     int st = getenv("WA_BISECT") ? atoi(getenv("WA_BISECT")) : 0;
     one_wa_res(q, 1020u, 2u, st);
     if (getenv("WA_KTDUMP")) one_wa_res(q, 16u, 1u, 0, true);
+    if (getenv("WA_RAW")) {
+        one_wa_res(q, 1020u, 2u, 0, true);
+        one_wa_res(q, 16u, 1u, 0, true);
+        one_wa_res(q, 16u, 1u, 1, true);   // STAGE-1 BISECT: RAW scores vs packed dScores
+        one_wa_res(q, 6u, 1u, 0, true);    // THE WB-GATE shapes: 16x24 -> windows 6?
+        one_wa_res(q, 12u, 1u, 0, true);   // 20x36-crop windows; heads=1 (the gate run())
+    }
     one_wa_res(q, 16u, 1u, 0);    // the gate's WB-16x24 shape
     one_wa_res(q, 18u, 2u, 0);    // the gate's WB-20x36-crop shape
     return 0;

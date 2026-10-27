@@ -1,18 +1,21 @@
-// wa_res_kernel.hpp -- section 100 P10: the window_attention RESIDENT block.
-// One WG = one batch (window x head): scores gemm (the promoted f16v2 gemm_b2<64>
-// loop VERBATIM) -> the accumulator staged into SLM Z (the gemm_b_pub_slm
-// untouched-store pattern) -> softmax reads 64 rows from SLM, writes e4m3 probs
-// into Y in the pack_a16 block map (the smax_esimd math VERBATIM) -> attnV
-// consumes A from Y directly (the tile8s pattern; its B re-stages through the
-// now-dead X operand slots) with the P9 merge-fold store. dScores (16KB/batch
-// f32) and dProbs+dAp (8KB/batch half) NEVER touch global; 2 launches fold away.
-// SLM = 8 (X ops) + 16 (Z scores) + 8 (Y probs) = 32KB at LW=16 (gemm_b2<64>'s
-// NT -- NOT the 64/128 hazard lines). Stage 3 runs the gemm_b2<32> NT=8 band
-// map on all 16 threads (threads 8..15 duplicate 0..7: identical work, identical
-// stores -- the barrier counts stay EVEN, the P3c discipline). bench_wa_res at
-// the frame shape (batches=1020 heads=2): 9.2x vs the promoted split, EXACT.
-// Guards (recorder): merged==1, bias present-or-null both fine (the map handles
-// null), tokens==64, heads*32==channels. Escape NR_WA_RES=0 -> the P4c/P9 chain.
+// wa_res_kernel.hpp -- section 100 P10b: the window_attention RESIDENT BLOCK with
+// RAW Q/K gathering. One WG = one batch: the Q/K dpas tiles are gathered from the
+// RAW f16 operands once per WG -- the Q side follows pack_a16_b's map (k contiguous
+// 16-halves), the K side pack_b16_t_b's INTERLEAVED map (raw row (tc*16+js*8+jl),
+// 16 cols, scattered to ((kc*4+tc)*2+js)*128 + kq*16 + jl*2 + kpar). DECISIVE
+// byte-dump (bench_wa_res WA_KTDUMP): the gathered K tile is BIT-IDENTICAL to the
+// proven packed dBk[0] (diff 0/2048); the poison test proves the branch is LIVE.
+// (The FIRST gather attempt used the A-map for K -- the 39-gate chain went RED;
+// the gate caught the wrong map, exactly its job.) Then scores gemm -> accumulator
+// staged into SLM Z -> softmax reads Z, writes probs into SLM Y (the smax_esimd
+// math VERBATIM) -> attnV consumes A from Y directly (tile8s pattern, its B
+// re-staged from global dBv through the dead X slots) with the P9 merge-fold
+// store. dScores/dProbs/dAp AND the Q/K pack launches all vanish; V's pack stays.
+// SLM = 8 (X) + 16 (Z) + 8 (Y) + 2 (QT) + 2 (KT) = 36KB at LW=16 (the proven
+// 45KB v4ph line, power-of-two buffers, the P3c barrier discipline: stage-3 bands
+// run on all 16 threads, identical duplicate stores). Guards: merged==1, bias
+// present. Escape NR_WA_RES=0 -> the split chain. The packed-P10 form stays in git
+// history (75b6f1a) if this RAW form ever needs reverting.
 #pragma once
 #include "gemm_s8_v8_kernel.hpp"
 #include "gemm_f16_v2_kernel.hpp"
@@ -26,15 +29,15 @@ namespace esimd = sycl::ext::intel::esimd;
 #define WA_X 0u
 #define WA_Z 8192u
 #define WA_Y 24576u
-#define WA_SLM 32768u
+#define WA_QT 32768u          // P10b: the raw-Q staged tile (4KB: 8 blocks x 256 halfs)
+#define WA_KT 36864u          // P10b: the raw-K staged tile (4KB) -- the 2KB sizing OVERLAPPED QT (the K gather trashed A blocks (2,*),(3,*) = half the rows wrong, gate-caught)
+#define WA_SLM 40960u         // 8+16+8+4+4 = 40KB (the v4ph 45KB precedent)
 
-// dAq/dBk/dBv are the recorder's PRE-PACKED operands (the promoted pack passes
-// stay -- this fold kills the MIDDLE buffers dScores/dProbs/dAp and the two
-// middle launches, not the operand packs). Out = the merged (windows,64,CH) half.
-static inline event launch_wa_res(queue& q, const half* dAq, const half* dBk, const half* dBv,
+// dQ,dK = the RAW (batches,64,32) half operands; dBv = the packed V tile.
+static inline event launch_wa_res(queue& q, const half* dQ, const half* dK, const half* dBv,
                                   const float* dBias, half* Out, unsigned batches, unsigned heads) {
     return q.submit([&](handler& h) {
-        h.parallel_for(nd_range(range((size_t)batches * 16u), range(16u)),
+h.parallel_for(nd_range(range((size_t)batches * 16u), range(16u)),
             [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
             esimd::slm_init<WA_SLM>();
             uint b  = (uint)it.get_group(0);
@@ -45,9 +48,78 @@ static inline event launch_wa_res(queue& q, const half* dAq, const half* dBk, co
             const int SLM_A = BM*BK*2, SLM_B = BK*BN*2, SLM_B_BASE = 2*SLM_A;
             const int ACH = (BM*BK)/16, BCH = (BK*BN)/16;
             const int kb_n = 32/BK;             // 2
-            const half* Ab = dAq + (size_t)b * 64 * 32;
-            const half* Bb = dBk + (size_t)b * 32 * 64;
+            const half* Ab = dQ + (size_t)b * 64 * 32;
+            const half* Bb = dK + (size_t)b * 32 * 64;
+            
+            // P10b RAW mode: stage the Q/K dpas tiles from the RAW f16 operands ONCE
+            // per WG. Both packs read row-major (rows,32): the tile elem map
+            // d = ((blk*2+strip)*8+il)*16 + k (blk=(tr,kc)) reduces to row =
+            // tr*16+strip*8+il, col = kc*16+k -- pack_a16_b/pack_b16_t_b VERBATIM.
+            // 16 threads: thread lid = (il=lid/2, kq=lid%2): an 8-half piece each.
+            if (true) {
+                const half* Qb = dQ + (size_t)b * 64u * 32u;
+                const half* Kb = dK + (size_t)b * 64u * 32u;
+                #pragma unroll
+                for (int blk = 0; blk < 8; ++blk) {          // Q-side blk = tr*2+kc
+                    int trr = blk / 2, kc2 = blk % 2;
+                    #pragma unroll
+                    for (int strip = 0; strip < 2; ++strip) {
+                        // Q: pack_a16_b map (k CONTIGUOUS): tile elem =
+                        // ((tr*2+kc)*2+strip)*128 + il*16 + k : 16 raw halves -> 16 tile halves
+                        uint row  = (uint)(trr * 16 + strip * 8 + (int)(lid / 2u));
+                        uint elem = (uint)(blk * 2 + strip) * 128u + (lid / 2u) * 16u + (lid % 2u) * 8u;
+                        esimd::simd<half,8> vq = esimd::block_load<half,8>(Qb + (size_t)row * 32u + (uint)kc2 * 16u + (lid % 2u) * 8u, esimd::overaligned_tag<16>{});
+                        esimd::slm_block_store(WA_QT + elem * 2u, vq, esimd::overaligned_tag<16>{});
+                        // K: pack_b16_t_b map (k INTERLEAVED kq*2+kpar): tile elem =
+                        // ((kc*tc_n+tc)*2+js)*128 + kq*16 + jl*2 + kpar. blk here = tr*2+kc =
+                        // tc*2+kc SWAPPED vs the pack's kc*8+tc*2 -- the gemm reads block
+                        // (kc,tc) at (kc*tc_n+tc)*2*128: our loop's blk=(tr,kc) with tr=tc
+                        // (square 64x64: tr_n == tc_n == 2? NO: kb_n=2, tc_n=4 for B).
+                        // DO IT PER THE PACK: for (kc,tc,js): thread lid -> jl = lid/2? 16
+                        // threads: jl = lid, js = 0? one strip per pass:
+                        //   load 16 raw halves at row (tc*16+js*8+jl), cols kc*16..+16;
+                        //   for kq 0..7: tile 2-halves at ((kc*4+tc)*2+js)*128 + kq*16 + jl*2 + {0,1}
+                        (void)row; (void)elem;
+                    }
+                }
+                // K gather with the pack_b16_t_b INTERLEAVED map: tile elem =
+                // ((kc*4+tc)*2+js)*128 + kq*16 + jl*2 + kpar <- raw[(tc*16+js*8+jl)*32 +
+                // kc*16 + kq*2+kpar]. thread lid -> (js = lid/8, jl = lid%8).
+                #pragma unroll
+                for (int kc2 = 0; kc2 < 2; ++kc2)
+                #pragma unroll
+                for (int tc2 = 0; tc2 < 4; ++tc2) {
+                    uint js = lid / 8u, jl = lid % 8u;
+                    esimd::simd<half,16> vr = esimd::block_load<half,16>(Kb + (size_t)(tc2 * 16 + js * 8 + jl) * 32u + (uint)kc2 * 16u, esimd::overaligned_tag<16>{});
+                    // scatter: for kq 0..7: two halves -> tile ((kc2*4+tc2)*2+js)*128 + kq*16 + jl*2 + kpar
+                    uint tb = ((uint)(kc2 * 4 + tc2) * 2u + js) * 128u + jl * 2u;
+                    #pragma unroll
+                    for (int kq = 0; kq < 8; ++kq) {
+                        esimd::simd<half,2> piece;
+                        piece[0] = vr[kq * 2]; piece[1] = vr[kq * 2 + 1];
+                        esimd::slm_block_store(WA_KT + (tb + (uint)kq * 16u) * 2u, piece, esimd::overaligned_tag<4>{});
+                    }
+                }
+                esimd::barrier();
+                
+            }
+
             auto load_block = [=](int buf, int kc) SYCL_ESIMD_FUNCTION {
+                if (true) {   // P10b: SLM->SLM copies of the kc-slice's 4 blocks
+                    // the slice = blocks (tr*2+kc) tr 0..3: each block 256 halfs at
+                    // tile offset ((tr*2+kc)*2)*128? NO: block index = (tr,kc) -> tile
+                    // half-offset ((tr*2+kc)*2+strip)*128: the 4 blocks (strip 0/1 each)
+                    // = 2048 halfs per slice? the slice = 4 tr x 256 halfs = 1024 halfs? BM*BK=64*16=1024 halfs = 2KB: blocks (tr,kc): 4 blocks x 256 halfs. thread lid moves 64 halfs: src = WA_QT + ((tr*2+kc)*2)*128 + (lid%8)*... SIMPLEST: per-thread 64-half pieces: idx t: tr = t/4? Let me: for p in 0..3: each thread copies 64 halfs at tile position of block (p,kc) + (lid*64 within the block's 256? block=256 halfs: 4 threads per block. thread lid: p=lid/4, w=lid%4: src=((p*2+kc)*2)*128 + w*64; dst = buf*SLM_A + (p* (TS*BK*... the gemm's SLM_A layout: block(tr,kc) at (tr*kb_n+kc)*2*128 halfs? from the loop's offA = cur*SLM_A + wi_row*(TS*BK*2): SLM_A stride per tr band = TS*BK=256 halfs: dst elems (tr,kc) at tr*256 + kc*0? The double-buffer holds the WHOLE (BM x BK) for one kc: elems (tr band wi_row) at wi_row*256. dst = buf*SLM_A + tr*256 + w*64.
+                    #pragma unroll
+                    for (int p = 0; p < 4; ++p) {
+                        int tt = (int)(lid / 4u), w = (int)(lid % 4u);
+                        if (tt != p) continue;
+                        esimd::simd<half,64> av = esimd::slm_block_load<half,64>(WA_QT + (uint)(((tt*2+kc)*2)*128 + w*64) * 2u, esimd::overaligned_tag<16>{});
+                        esimd::simd<half,64> bv = esimd::slm_block_load<half,64>(WA_KT + (uint)(((kc*4+tt)*2)*128 + w*64) * 2u, esimd::overaligned_tag<16>{});   // FIXED: the gather wrote block(kc,tc) at (kc*tc_n+tc)*256 (tc_n=4) -- the first take-2 copy read (tc*2+kc)*256 (the A-side kb_n=2 pattern): the block INDEX mismatch is what the WB gate caught (the bytes were right, the addressing on the read side was not).
+                        esimd::slm_block_store(WA_X + buf * SLM_A + (uint)(tt * 256 + w * 64) * 2u, av, esimd::overaligned_tag<16>{});
+                        esimd::slm_block_store(WA_X + SLM_B_BASE + buf * SLM_B + (uint)(tt * 256 + w * 64) * 2u, bv, esimd::overaligned_tag<16>{});
+                    }
+                } else {
                 #pragma unroll
                 for (int i = 0; i < ACH / 64; ++i) {
                     int la = lid * ACH + i * 64;
@@ -63,6 +135,7 @@ static inline event launch_wa_res(queue& q, const half* dAq, const half* dBk, co
                     esimd::simd<half,64> v = esimd::block_load<half,64>(
                         Bb + ((size_t)(kc * 4 + (tcl)) * 2) * 128 + within, esimd::overaligned_tag<16>{});
                     esimd::slm_block_store(WA_X + SLM_B_BASE + buf * SLM_B + lb * 2, v, esimd::overaligned_tag<16>{});
+                }
                 }
             };
             int wi_row = lid / 4, wi_col = lid % 4;

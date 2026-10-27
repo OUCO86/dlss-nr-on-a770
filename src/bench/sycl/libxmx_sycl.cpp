@@ -3183,8 +3183,18 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
         sycl::half* dAp = (sycl::half*)pool_get((size_t)batches * 64u * 64u * 2);
         sycl::half* dBv = (sycl::half*)pool_get((size_t)batches * 64u * 32u * 2);
         // scores leg: Q(64x32) @ K^T(32x64) -> 64x64. K stored (64 tokens,32 ch) = (N,K).
-        packdev::pack_a16_b(*GQ, Q, dAq, 64, 64, 32, (int)batches);
-        packdev::pack_b16_t_b(*GQ, Kk, dBk, 32, 64, (int)batches);
+        // P10b take-2: the resident kernel gathers the Q/K dpas tiles from the RAW
+        // operands itself (the K side's pack_b16_t_b INTERLEAVED map is now byte-dump
+        // PROVEN identical to the packed dBk; take-1 used the A map for K and the
+        // 39-gate chain went RED -- the gate caught it, its job). The two pack
+        // launches vanish on this path; the decision is hoisted ABOVE the packs
+        // (the P9 lesson: never let a gate skip an operand producer it needs).
+        static bool wares = !getenv("NR_WA_RES") || atoi(getenv("NR_WA_RES")) != 0;
+        const bool wa_raw = wares && merged && Bp;
+        if (!wa_raw) {
+            packdev::pack_a16_b(*GQ, Q, dAq, 64, 64, 32, (int)batches);
+            packdev::pack_b16_t_b(*GQ, Kk, dBk, 32, 64, (int)batches);
+        }
         // section 99: v2 workgroup-SLM-tiled f16 gemm (v1 = one 16x16 tile per GLOBAL
         // load, 8 FLOP/byte = memory-bound; v2 stages BM=64 x BK=16 blocks in SLM with
         // 4x reuse). Mp=64 is a multiple of BM. NR_F16V1=1 = escape hatch.
@@ -3195,11 +3205,10 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
         // launches vanish. The operand packs (dAq/dBk/dBv) stay -- they are the
         // promoted pack passes. Guards: merged==1, bias present (the frame's every
         // call has one; the null-bias case keeps the split chain). Escape NR_WA_RES=0.
-        static bool wares = !getenv("NR_WA_RES") || atoi(getenv("NR_WA_RES")) != 0;
-        if (wares && merged && Bp) {
+        if (wa_raw) {
             packdev::pack_b16_b(*GQ, V, dBv, 64, 32, (int)batches);   // the span below is
                                                                        // skipped -- pack V FIRST
-            wares::launch_wa_res(*GQ, dAq, dBk, dBv, Bp, (sycl::half*)Out, batches, heads);
+            wares::launch_wa_res(*GQ, Q, Kk, dBv, Bp, (sycl::half*)Out, batches, heads);
             pool_put(dAq); pool_put(dBk); pool_put(dAp); pool_put(dBv);
             pool_put(dScores); pool_put(dProbs); pool_put(dCtx);
             return;
