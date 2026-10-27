@@ -509,10 +509,27 @@ static int step(replay *r, const struct nr_step *s)
 		r->graph = f_graph_capture();
 		return r->graph < 0 ? -1 : 0;
 
-	case OP_XMX_GRAPH_RUN:
+	case OP_XMX_GRAPH_RUN: {
 		/* The plan says which graph ran, as the number it had that once. This run
-		 * has its own numbers, so what runs is what the last capture handed back. */
-		return f_graph_run(r->graph) < 0 ? -1 : 0;
+		 * has its own numbers, so what runs is what the last capture handed back.
+		 * SECTION 100 per-frame timing (the 4.9fps question): the fused walk is
+		 * the whole NR cost the player waits on; measure it HERE, in the game
+		 * process, every 120 runs (min/median of the window) into the diag log. */
+		static double run_t0; static double run_min, run_med; static int run_n;
+		run_t0 = now_ms();
+		int rc = f_graph_run(r->graph);
+		double dt = now_ms() - run_t0;
+		if (run_n == 0) { run_min = run_med = dt; }
+		else { if (dt < run_min) run_min = dt; if (dt > run_med) run_med = (run_med + dt) / 2.0; }
+		if (run_n < 5)
+			diagf("walk run #%d: %.1f ms\n", run_n, dt);
+		if (++run_n >= 30) {
+			diagf("walk timing: %d runs, min %.1f ms, running-median %.1f ms\n",
+			      run_n, run_min, run_med);
+			run_n = 0;
+		}
+		return rc < 0 ? -1 : 0;
+	}
 
 	case OP_XMX_GRAPH_DESTROY:
 		return f_graph_destroy(r->graph);
@@ -1414,11 +1431,32 @@ unsigned long long nr_net_head_bytes(nr_net *n)
 	return (r && r->head >= 0) ? nr_plan_buffers[r->head].bytes : 0;
 }
 
+static int nr_net_run_inner(replay *r);
 int nr_net_run(nr_net *n)
 {
 	replay *r = (replay *)n;
 	if (!r || r->why || r->features < 0 || r->head < 0)
 		return -1;
+
+	/* SECTION 100 game-side per-frame walk timing (nr_net_run IS the per-frame
+	 * path; the OP_XMX_GRAPH_RUN above only fires during plan recording). The
+	 * 4.9fps question: measure the WHOLE nr_net_run (fused graph run) here. */
+	static double nr_run_med, nr_run_min; static int nr_run_n;
+	double t0 = now_ms();
+	int out = nr_net_run_inner(r);
+	double dt = now_ms() - t0;
+	if (nr_run_n == 0) { nr_run_min = nr_run_med = dt; }
+	else { if (dt < nr_run_min) nr_run_min = dt; if (dt > nr_run_med) nr_run_med = (nr_run_med + dt) / 2.0; }
+	if (nr_run_n < 5) diagf("nr_net_run #%d: %.1f ms\n", nr_run_n, dt);
+	if (++nr_run_n >= 30) {
+		diagf("nr_net_run: %d frames, min %.1f ms, running-median %.1f ms\n",
+		      nr_run_n, nr_run_min, nr_run_med);
+		nr_run_n = 0;
+	}
+	return out;
+}
+static int nr_net_run_inner(replay *r)
+{
 
 	/* The fused path: Pre read the colour where the game wrote it and Post writes
 	 * the answer where the upscaler will read it, so there is nothing to copy in
