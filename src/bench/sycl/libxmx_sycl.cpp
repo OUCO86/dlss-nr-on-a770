@@ -2331,7 +2331,7 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
                 else
                     wbmega::qkv_norm_scatter_esimd(*GQ, dC, Q, Kk, V, as, bs, qs, M, heads, C, NH, tokens);
             }
-        } else if (getenv("NR_QKV_VITES") && atoi(getenv("NR_QKV_VITES")) != 0) {   // P11 NEUTRAL (3-pair A/B mixed: +0.5/+2/-0.8 = noise; the vit tail is only 16 small calls). Witness in-tree, default OFF.
+        } else if (getenv("NR_QKV_VITES") && atoi(getenv("NR_QKV_VITES")) != 0) {   // P11 NOT promoted: the VIT gate pins 449/196k e4m3 flips (esimd::sqrt APPROXIMATION -- the lane tree itself is host-bisect EXACT 0/200k; f64 sqrt is DEAD in ESIMD). The speed is real (3-6ms) but bit-WRONG -> OFF. A bit-exact port needs IEEE-sqrt emulation (Newton from rsqrt). Witness in-tree.
             // P11 (section 100): the VIT tail on the v1 lane structure (merged
             // single pass, 4 virtual lanes, the vit tree's within-lane E step +
             // the same SLM F cross-step). Gate NR_QKV_VITES (default ON = probe;

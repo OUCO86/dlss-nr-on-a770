@@ -19,6 +19,7 @@
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 #include "publish_kernel.hpp"
+#include <cmath>
 #include "cosine_tree_kernel.hpp"
 
 namespace wbmega {
@@ -900,7 +901,27 @@ inline sycl::event qkv_norm_scatter_vit_esimd(sycl::queue& q, const int32_t* dC,
                 float norm = eh_add(eh_add(f0, f2), eh_add(f1, f3));
                 float floorv = eh_round(ctree::COSINE_NORM_FLOOR);
                 norm = norm > floorv ? norm : floorv;
-                recip[which] = eh_round(wbv2::ef_div(1.0f, esqrt(norm)));   // the smax_esimd-proven division form
+                // the ctree::vit_reciprocal reference spelling EXACTLY (the VIT gate
+                // caught the esimd sqrt/div variant: 449/196k one-ULP e4m3 flips --
+                // sycl::sqrt + fdiv_rn are the correctly-rounded forms the golden chain
+                // uses; the non-vit v1 got away with esimd::sqrt because its e4m3
+                // targets never landed on the differing boundaries in the gates).
+                // the reference is fdiv_rn(1/sqrt): an IEEE sqrt + a correctly-rounded
+                // divide. The bare 1.0f/x in an ESIMD kernel lowers to the FAST divide
+                // (the 449/196k VIT-gate flips are exactly that); imf fdiv_rn is banned
+                // in ESIMD contexts -- the pack_device-proven esimd::div_ieee 1-wide
+                // form is the ESIMD-callable correctly-rounded divide. sqrt stays the
+                // v1 esqrt (its gate family is green; the div is the differing stage).
+                // P11 STATUS (honest, gate-caught): the lane tree matches
+                // ctree::vit_reciprocal bit-for-bit in the HOST bisect (bench_vittree
+                // 0/200k), but the VIT gate pins 449/196k e4m3 boundary flips whose
+                // root is esimd::sqrt's APPROXIMATION (div spelling changes leave the
+                // SAME 449; f64 std::sqrt in an ESIMD kernel is DEAD -- submit fails,
+                // outputs zero). A bit-exact vit port needs an IEEE-sqrt emulation
+                // (Newton-refine from rsqrt: 1.5 iterations of y*(1.5-x*y*y) style on
+                // the half-domain norm is enough for correctly-rounded f32). Left OFF;
+                // the kernel below keeps the esqrt form as the speed witness.
+                recip[which] = eh_round(1.0f / esqrt(norm));   // the v1 form (NOT bit-exact for vit boundaries -- see the comment; this is why P11 stays OFF)
             }
             float sc = eh_round(qs[head]);
             unsigned w = r / tokens, t = r % tokens;
