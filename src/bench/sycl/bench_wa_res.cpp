@@ -47,9 +47,10 @@ namespace esimd = sycl::ext::intel::esimd;
 #define WA_Y 24576u       // probs pack_a16 64x64 half = 8KB (stage 2 -> stage 3)
 #define WA_QT 32768u          // P10b: the raw-Q staged tile (4KB: 8 blocks x 256 halfs)
 #define WA_KT 36864u          // P10b: the raw-K staged tile (4KB) -- the 2KB sizing OVERLAPPED QT (the K gather trashed A blocks (2,*),(3,*) = half the rows wrong, gate-caught)
-#define WA_SLM 40960u         // 8+16+8+4+4 = 40KB (the v4ph 45KB precedent)
+#define WA_VT 40960u          // P10c: the raw-V staged tile (4KB: 8 blocks (kc 0..3,tc 0..1) x 256 halfs)
+#define WA_SLM 45056u         // 8+16+8+4+4+4 = 44KB (the v4ph 45KB line)
 
-static void one_wa_res(queue& q, unsigned batches, unsigned heads, int stop_stage = 0, bool raw_qk = false) {
+static void one_wa_res(queue& q, unsigned batches, unsigned heads, int stop_stage = 0, bool raw_qk = false, bool raw_v = false) {
     sycl::half* kt_dump = getenv("WA_KTDUMP") ? malloc_device<sycl::half>(2048, q) : nullptr;
     if (kt_dump) q.memset(kt_dump, 0xEE, 4096);
     const unsigned tokens = 64u, C = 32u;
@@ -174,6 +175,28 @@ static void one_wa_res(queue& q, unsigned batches, unsigned heads, int stop_stag
                     for (int p2 = 0; p2 < 4; ++p2) {
                         esimd::simd<half,32> tv = esimd::slm_block_load<half,32>(WA_KT + (uint)(p2 * 512u + lid * 32u) * 2u, esimd::overaligned_tag<16>{});
                         tv.copy_to(kt_dump + (size_t)(p2 * 16u + lid) * 32u);
+                    }
+                }
+                if (raw_v) {   // P10c V gather (clean): tile blocks bidx =
+                    // (kc*2+tc)*2+js (0..15) -- thread lid = bidx; for kq 0..7 the
+                    // tile's CONTIGUOUS 16-half run at bidx*128 + kq*16 holds elems
+                    // j = jl*2+kpar (0..15): raw row kc*16 + kq*2 + (j%2), col
+                    // tc*16 + js*8 + j/2 -- the pack_b16_b map VERBATIM.
+                    const half* Vb = dV + (size_t)b * 64u * 32u;
+                    uint bidx = lid;
+                    uint kc2 = bidx / 4u, tc2 = (bidx / 2u) % 2u, js = bidx % 2u;
+                    #pragma unroll
+                    for (int kq = 0; kq < 8; ++kq) {
+                        // run[j] = (j even) row kq*2, col j/2 ; (j odd) row kq*2+1,
+                        // col j/2 -- INTERLEAVE of two contiguous 8-half raw rows:
+                        // the scalar 16-load form cost +0.15ms/frame (measured).
+                        esimd::simd<half,16> run;
+                        esimd::simd<half,8> a = esimd::block_load<half,8>(Vb + (size_t)(kc2 * 16u + kq * 2u) * 32u + tc2 * 16u + js * 8u, esimd::overaligned_tag<16>{});
+                        esimd::simd<half,8> b = esimd::block_load<half,8>(Vb + (size_t)(kc2 * 16u + kq * 2u + 1u) * 32u + tc2 * 16u + js * 8u, esimd::overaligned_tag<16>{});
+                        run.select<8,2>(0) = a;   // even lanes: row kq*2
+                        run.select<8,2>(1) = b;   // odd lanes:  row kq*2+1
+                        esimd::slm_block_store(WA_VT + (bidx * 128u + (uint)kq * 16u) * 2u,
+                                               run, esimd::overaligned_tag<16>{});
                     }
                 }
             }
@@ -331,9 +354,15 @@ static void one_wa_res(queue& q, unsigned batches, unsigned heads, int stop_stag
                     for (int i = 0; i < BCH2 / 64; ++i) {
                         int lb = t8 * BCH2 + i * 64;
                         int tcl = lb / 256, within = lb % 256;
+                        if (raw_v) {   // P10c: SLM->SLM copy from the V tile (the
+                            // gather's linear map == the gemm's block addressing)
+                            esimd::simd<half,64> v2 = esimd::slm_block_load<half,64>(WA_VT + (uint)(kc * 512 + lb) * 2u, esimd::overaligned_tag<16>{});   // the kc-slice offset was MISSING (the block map is kc*512 + tcl*256 + within == kc*512 + lb)
+                            esimd::slm_block_store(WA_X + 4096u + buf * SLM_B2 + lb * 2, v2, esimd::overaligned_tag<16>{});
+                        } else {
                         esimd::simd<half,64> v = esimd::block_load<half,64>(
                             Bb2 + ((size_t)(kc * 2 + tcl) * 2) * 128 + within, esimd::overaligned_tag<16>{});
                         esimd::slm_block_store(WA_X + 4096u + buf * SLM_B2 + lb * 2, v, esimd::overaligned_tag<16>{});
+                        }
                     }
                 };
                 esimd::simd<float,64> d00(0.f), d01(0.f), d10(0.f), d11(0.f);
@@ -446,6 +475,12 @@ int main() {
         one_wa_res(q, 16u, 1u, 1, true);   // STAGE-1 BISECT: RAW scores vs packed dScores
         one_wa_res(q, 6u, 1u, 0, true);    // THE WB-GATE shapes: 16x24 -> windows 6?
         one_wa_res(q, 12u, 1u, 0, true);   // 20x36-crop windows; heads=1 (the gate run())
+    }
+    if (getenv("WA_RAWV")) {
+        one_wa_res(q, 1020u, 2u, 0, true, true);
+        one_wa_res(q, 16u, 1u, 0, true, true);
+        one_wa_res(q, 6u, 1u, 0, true, true);
+        one_wa_res(q, 12u, 1u, 0, true, true);
     }
     one_wa_res(q, 16u, 1u, 0);    // the gate's WB-16x24 shape
     one_wa_res(q, 18u, 2u, 0);    // the gate's WB-20x36-crop shape

@@ -3206,9 +3206,11 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
         // promoted pack passes. Guards: merged==1, bias present (the frame's every
         // call has one; the null-bias case keeps the split chain). Escape NR_WA_RES=0.
         if (wa_raw) {
+            static bool rawv2 = !getenv("NR_WA_RAWV") || atoi(getenv("NR_WA_RAWV")) != 0;   // P10c PROMOTED: every A/B pair beats RAW-QK by 0.8-1.2ms (the V pack launch + dBv round-trip gone); escape NR_WA_RAWV=0.
+            if (!rawv2)
             packdev::pack_b16_b(*GQ, V, dBv, 64, 32, (int)batches);   // the span below is
-                                                                       // skipped -- pack V FIRST
-            wares::launch_wa_res(*GQ, Q, Kk, dBv, Bp, (sycl::half*)Out, batches, heads);
+                                                                       // skipped -- pack V FIRST (unless P10c RAW-V)
+            wares::launch_wa_res(*GQ, Q, Kk, V, dBv, Bp, (sycl::half*)Out, batches, heads, rawv2);
             pool_put(dAq); pool_put(dBk); pool_put(dAp); pool_put(dBv);
             pool_put(dScores); pool_put(dProbs); pool_put(dCtx);
             return;
