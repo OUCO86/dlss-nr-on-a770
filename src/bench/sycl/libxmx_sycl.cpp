@@ -2538,9 +2538,13 @@ int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale,
         // device pack (section 92): Araw/Braw are already on device -- pack in place,
         // no download/upload round-trip (same conversion as gemm_int8, packdev gate).
         int8_t* dAp = (int8_t*)pool_get(na);
+        static int rstop = getenv("NR_RES_STOP") ? atoi(getenv("NR_RES_STOP")) : 0;   // section 100 ledger (time-only): 1 = pack only, 2 = no pack either
+        if (rstop < 2) {
         if (fused_r) packdev::pack_a_fused(*GQ, a16r, dAp, (float*)as, (int)M, Mp, (int)K);
         else packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K);
+        }
         int8_t* dBp = cached_pack_b_i8(b, Braw, (int)N, (int)K);   // weight: pack once
+        if (rstop >= 1) { pool_put(dAp); return; }
         // DERIVED (section 92): same lever as batched -- fuse the publish into the gemm
         // store, killing the int32 dC scratch + the separate publish pass. The residual
         // epilogue's sycl::fma(skip,cos,stage) maps to ESIMD's auto-contracted sk*cp+stage
@@ -2642,12 +2646,16 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
         const float* cp  = (const float*)sized(cosine, (size_t)N * 4u, "cosine");
         // device pack (section 92): Araw/Braw already on device -- pack in place.
         int8_t* dAp = (int8_t*)pool_get(na);
+        static int wrstop = getenv("NR_WRES_STOP") ? atoi(getenv("NR_WRES_STOP")) : 0;   // section 100 ledger (time-only)
+        if (wrstop < 2) {
         if (fused_w) {   // P2: the closure captured (fused_w, srcid_w) by value at
             sycl::half* a16w = (sycl::half*)sized(srcid_w, (size_t)M * K * 2u, "A(f16 fused)");
             packdev::pack_a_fused(*GQ, a16w, dAp, (float*)as, (int)M, Mp, (int)K);
         } else
         packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K);
+        }
         int8_t* dBp = cached_pack_b_i8(b, Braw, (int)N, (int)K);   // weight: pack once
+        if (wrstop >= 1) { pool_put(dAp); return; }
         // DERIVED (section 92): same fused-publish lever as int8_residual/batched. The
         // window variant maps the gemm row (window*64+token) to the image slot with the
         // same bounds cull the split pass did, and reads skip at that slot. N%64==0 is a
