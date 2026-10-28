@@ -252,5 +252,8 @@ int main(int argc, char** argv) {
     queue q(device{}, property::queue::enable_profiling{});
     one_ffn_chip(q, 130560u, true);
     one_ffn_chip(q, 130560u, false);
+    one_ffn_chip(q, 261120u, true);
+    one_ffn_chip(q, 522240u, true);   // P8-n: the STEM shape -- is the chip superlinear there?
+    one_ffn_chip(q, 522240u, false);
     return 0;
 }

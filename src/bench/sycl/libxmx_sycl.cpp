@@ -1698,6 +1698,8 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
             dMerged[i] = merged;
             dM16[i] = sycl::half(qr_e4m3(merged));                        // published = GEMM input
         });
+        static int mstop1 = getenv("NR_MERGE_STOP") ? atoi(getenv("NR_MERGE_STOP")) : 0;
+        if (mstop1 == 1) { pool_put(dMerged); pool_put(dM16); return; }   // P8-n ledger: pass A only
         // fully device-resident (section 92): dM16 stays on device for pass B's pack_a16 --
         // the old path downloaded it and re-uploaded a packed operand (the 256ms).
         // ---- pass B: expand gemm(merged16, expand -> f32), publish(3) -> half hidden ----
@@ -1839,6 +1841,8 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
         if (dual) {
             f16v1::gemm_dual_pub(*GQ, dA, dB, dS, dH16, (int)M, Mp, 32, 16);
             pool_put(dA);   // dB is cache-owned (weight)
+            static int sstop1 = getenv("NR_STEM_STOP") ? atoi(getenv("NR_STEM_STOP")) : 0;
+            if (sstop1 == 1) { pool_put(dH16); pool_put(dS); return; }   // P8-n ledger: pass A only
         } else {
         f16v1::gemm(*GQ, dA, dB, dS, Mp, 32, 16);
         pool_put(dA);   // dB is cache-owned (weight)
