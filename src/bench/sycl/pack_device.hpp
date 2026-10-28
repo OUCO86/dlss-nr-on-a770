@@ -172,10 +172,34 @@ static inline void pack_b(sycl::queue& q, const int8_t* B, int8_t* Bp, int N, in
 // pack_a16: A (M x K real rows) -> Ap (Mp x K layout), dest = ((tr*kb_n+kc)*2+strip)*128
 //           + il*16 + k ; src = (tr*TS + strip*8 + il)*K + kc*TS + k. Rows >= M read zero
 //           (the host version zero-pads first -- the guard matches it and stays in-bounds).
+static inline void pack_a16_v(sycl::queue& q, const sycl::half* A, sycl::half* Ap, int M, int Mp, int K) {
+    const int TS = 16;
+    int tr_n = Mp / TS, kb_n = K / TS;
+    size_t n = (size_t)tr_n * kb_n * 2 * 128;   // = Mp*K
+    q.parallel_for(sycl::range(n / 16), [=](sycl::item<1> it) {
+        size_t d = it.get_id(0) * 16;
+        size_t rest = d / 16;
+        int il = (int)(rest % 8); rest /= 8;
+        int strip = (int)(rest % 2); size_t blk = rest / 2;   // blk = tr*kb_n + kc
+        int kc = (int)(blk % (size_t)kb_n); int tr = (int)(blk / (size_t)kb_n);
+        int srow = tr * TS + strip * 8 + il;
+        sycl::vec<unsigned, 8> v(0u);
+        if (srow < M)
+            v = *reinterpret_cast<const sycl::vec<unsigned, 8>*>(
+                A + (size_t)srow * K + (size_t)kc * TS);
+        *reinterpret_cast<sycl::vec<unsigned, 8>*>(Ap + d) = v;
+    });
+}
 static inline void pack_a16(sycl::queue& q, const sycl::half* A, sycl::half* Ap, int M, int Mp, int K) {
     const int TS = 16;
     int tr_n = Mp / TS, kb_n = K / TS;
     size_t n = (size_t)tr_n * kb_n * 2 * 128;  // = Mp*K
+    // P8-d (section 100): the vec form lives in pack_a16_v (called via the
+    // dispatch below; a dest run (fixed il, k=0..15) is 16 CONTIGUOUS halves
+    // (32B) on BOTH sides: dest base = ((tr*kb_n+kc)*2+strip)*128 + il*16
+    // (16-aligned), src = A[srow*K + kc*16] (K%16==0 by the recorder's guard)).
+    static bool v16on = !getenv("NR_PACKA16_VEC") || atoi(getenv("NR_PACKA16_VEC")) != 0;
+    if (v16on && n >= 500000u && (K % 16) == 0) { pack_a16_v(q, A, Ap, M, Mp, K); return; }
     q.parallel_for(sycl::range(n), [=](sycl::item<1> it) {
         size_t d = it.get_id(0);
         int k = (int)(d % 16); size_t rest = d / 16;
@@ -573,6 +597,31 @@ static inline void gather_pack_a16_b(sycl::queue& q, const sycl::half* Araw, syc
     const int TS = 16;
     int tr_n = Mp / TS, kb_n = K / TS;
     size_t per = (size_t)tr_n * kb_n * 2 * 128;      // = Mp*K
+    // P8-d (section 100): the 32B-vector form when oa/sa/lda are all multiples of
+    // 16 halves (the frame: oa=0, sa=0, lda = the row stride of the f16 source --
+    // every f16 activation buffer's row is K*2B with K%16==0). A dest run (fixed
+    // il, k=0..15) is 16 contiguous halves on BOTH sides. NR_GPACK_VEC=0 = escape.
+    static bool gvec = !getenv("NR_GPACK_VEC") || atoi(getenv("NR_GPACK_VEC")) != 0;
+    // threshold: the vec form LOSES on tiny per (bench_packa16_v: 192x512 per=131K
+    // 0.0154 scalar -> 0.0435 vec!), wins big on >= ~0.5M (32640x64 0.0403->0.0291,
+    // 8160x64 0.0212->0.0165). Same 500K-element line as the P8-c pack_a dispatch.
+    if (gvec && per >= 500000u && (lda % 16) == 0 && (sa % 16) == 0 && (oa % 16) == 0) {
+        q.parallel_for(sycl::range((size_t)batch * per / 16), [=](sycl::item<1> it) {
+            size_t d16 = it.get_id(0);
+            size_t gg = d16 / (per / 16); size_t d = (d16 % (per / 16)) * 16;
+            size_t rest = d / 16;
+            int il = (int)(rest % 8); rest /= 8;
+            int strip = (int)(rest % 2); size_t blk = rest / 2;
+            int kc = (int)(blk % (size_t)kb_n); int tr = (int)(blk / (size_t)kb_n);
+            int srow = tr * TS + strip * 8 + il;
+            sycl::vec<unsigned, 8> v(0u);
+            if (srow < M)
+                v = *reinterpret_cast<const sycl::vec<unsigned, 8>*>(
+                    Araw + oa + gg * sa + (size_t)srow * lda + (size_t)kc * TS);
+            *reinterpret_cast<sycl::vec<unsigned, 8>*>(Ap + gg * per + d) = v;
+        });
+        return;
+    }
     q.parallel_for(sycl::range((size_t)batch * per), [=](sycl::item<1> it) {
         size_t gg = it.get_id(0) / per; size_t d = it.get_id(0) % per;
         int k = (int)(d % 16); size_t rest = d / 16;
