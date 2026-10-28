@@ -26,7 +26,7 @@ namespace esimd = sycl::ext::intel::esimd;
 // SLM map: EA (A operand, per-thread 1KB pack_a16 blocks) + HS (hidden stage,
 // per-thread 1KB) = 64KB at LW=32. Weights from GLOBAL (L2-backed).
 #define FFC_EA_OFF 0u
-#define FFC_HS_OFF (32u * 1024u)
+
 #define FFC_SLM_BYTES (64u * 1024u)
 
 // P8-l (section 100): the RESIDUAL-FUSED store. dSkip/cp non-null => the store
@@ -39,19 +39,24 @@ namespace esimd = sycl::ext::intel::esimd;
 // RAW f32 (NO e4m3 boundary -- the P3c plain-ffn 131/8192 lesson was the
 // half-skip + epi!=0 form, which stays on the split chain). Used ONLY by the
 // stem/merge recorder sites (their guards checked there).
+// P8-o: template on LW -- the SLM map scales with the workgroup (EA = LW x 1KB,
+// HS = LW x 1KB): LW=32 -> 64KB (1 WG/SM), LW=16 -> 32KB (2 WG/SM). The occupancy
+// hypothesis for the chip's frame-vs-isolated gap (P8-n: latency chain, NOT the
+// round-trip -- the mega removed 100MB of it and the marginal stayed flat).
+template <int LW>
 static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                                     const half* dPp, float* Cout, int M, int Mp,
                                     const float* dSkip = nullptr, const float* cp = nullptr) {
     const unsigned cin = 32;
     int tiles = Mp / 16;
-    int wgs = (tiles + 31) / 32;
+    int wgs = (tiles + LW - 1) / LW;
     return q.submit([&](handler& h) {
-        h.parallel_for(nd_range(range((size_t)wgs * 32u), range(32u)),
+        h.parallel_for(nd_range(range((size_t)wgs * (unsigned)LW), range((unsigned)LW)),
             [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
-            esimd::slm_init<FFC_SLM_BYTES>();
+            esimd::slm_init<(unsigned)LW * 2048u>();   // EA(LW x 1KB) + HS(LW x 1KB)
             uint wg = (uint)it.get_group(0);
             uint lid = (uint)it.get_local_id(0);
-            int tr = (int)(wg * 32u + lid);
+            int tr = (int)(wg * (unsigned)LW + lid);
             const bool ours = (tr < tiles);   // HANG LESSON (the gate caught it,
                                        // the bench hid it): an early return BEFORE
                                        // esimd::barrier desyncs the WG barrier --
@@ -85,7 +90,7 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                                 // SLM loads (v3b had no SLM A; the removed weight
                                 // barrier also guarded this -- restore it here)
             if (!ours) return;  // SAFE after the barrier
-            uint hs = FFC_HS_OFF + lid * 1024u;   // per-thread 1KB hidden stage (this chunk)
+            uint hs = FFC_EA_OFF + (unsigned)LW * 1024u + lid * 1024u;   // the HS area follows EA (LW-scaled)   // per-thread 1KB hidden stage (this chunk)
             esimd::simd<float,64> p00(0.f), p01(0.f), p10(0.f), p11(0.f);   // out cols 0..15
             esimd::simd<float,64> q00(0.f), q01(0.f), q10(0.f), q11(0.f);   // out cols 16..31
             const esimd::simd<half,8> z8((half)0.f);

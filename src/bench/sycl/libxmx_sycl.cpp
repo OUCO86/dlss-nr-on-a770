@@ -1470,6 +1470,14 @@ int xmx_rec_gemm_int8_fused(int a,int b,int c,int as,int bs,unsigned M,unsigned 
 // (the 67MB intermediates) is exactly what the B1 megakernel removes, after
 // which the wide form pays. NR_FFN_TAILV=0 = escape hatch; epi!=0/narrow stay
 // on the scalar chain (the plain-ffn f32-skip gate lesson is untouched).
+// P8-o: the chip LW=16 variant (32KB SLM = 2 WG/SM) behind NR_CHIP_LW16=1.
+// Isolated it is slightly SLOWER (1.36 vs 1.21 at M=522240, diff 0); the frame
+// A/B tests the occupancy hypothesis (the P8-n verdict said the chip's frame
+// cost is its latency chain at 1 WG/SM -- more resident WGs might hide it).
+#define CHIP_LW_DISPATCH(call32, call16) do { \
+    static bool lw16 = getenv("NR_CHIP_LW16") && atoi(getenv("NR_CHIP_LW16")) != 0; \
+    if (lw16) call16 ; else call32 ; \
+} while(0)
 static inline void ffn_tail_res(sycl::queue& q, const float* dSkip, const float* dC2,
                                 const float* cp, void* Cout, unsigned M,
                                 bool narrow, unsigned epi) {
@@ -1553,7 +1561,7 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
         if (ffntile && ffchip && hidden == 128u && cin == 32u && !narrow && epi == 0u) {
             sycl::half* dPp = cached_pack_b_f16(projection, Praw, (int)hidden, (int)cin);
             float* dC2 = (float*)pool_get((size_t)Mp * cin * 4);
-            ffnc::launch_ffn_chip(*GQ, Araw, dEp, dPp, dC2, (int)M, Mp);
+            CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, Araw, dEp, dPp, dC2, (int)M, Mp), ffnc::launch_ffn_chip<16>(*GQ, Araw, dEp, dPp, dC2, (int)M, Mp));
             // the residual + publish tail stays SPLIT (the gate's f32-skip 131/8192
             // caught the in-kernel contracted fma -- sycl::fma is the authority,
             // section 92's gemm_res lesson, third time proven).
@@ -1727,7 +1735,7 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
         static bool chipres = !getenv("NR_FFN_CHIPRES") || atoi(getenv("NR_FFN_CHIPRES")) != 0;
         if (merge_chip && chipres) {
             sycl::half* dPp2 = cached_pack_b_f16(projection, Praw, 128, 32);
-            ffnc::launch_ffn_chip(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp);
+            CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp), ffnc::launch_ffn_chip<16>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp));
             pool_put(dM16);   // dA2 was never packed on this path; dB2/dPp2 cache-owned
             pool_put(dMerged);
             return;
@@ -1735,7 +1743,7 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
         if (merge_chip) {
             sycl::half* dPp2 = cached_pack_b_f16(projection, Praw, 128, 32);
             float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
-            ffnc::launch_ffn_chip(*GQ, dM16, dB2, dPp2, dC2, (int)M, Mp);
+            ffnc::launch_ffn_chip<32>(*GQ, dM16, dB2, dPp2, dC2, (int)M, Mp);
             pool_put(dM16);   // dA2 was never packed on this path; dB2/dPp2 cache-owned
             ffn_tail_res(*GQ, dMerged, dC2, cp, Cout, M, narrow, epi);
             pool_put(dC2);
@@ -1902,12 +1910,12 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
             sycl::half* dPp3 = cached_pack_b_f16(projection, Praw, 128, 32);
             static bool chipres3 = !getenv("NR_FFN_CHIPRES") || atoi(getenv("NR_FFN_CHIPRES")) != 0;   // P8-l (see the merge site)
             if (chipres3) {
-                ffnc::launch_ffn_chip(*GQ, dH16, dB2, dPp3, (float*)Cout, (int)M, Mp, dS, cp);
+                CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, dH16, dB2, dPp3, (float*)Cout, (int)M, Mp, dS, cp), ffnc::launch_ffn_chip<16>(*GQ, dH16, dB2, dPp3, (float*)Cout, (int)M, Mp, dS, cp));
                 pool_put(dH16); pool_put(dA2); pool_put(dS);   // dC2 never allocated
                 return;
             }
             float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
-            ffnc::launch_ffn_chip(*GQ, dH16, dB2, dPp3, dC2, (int)M, Mp);
+            ffnc::launch_ffn_chip<32>(*GQ, dH16, dB2, dPp3, dC2, (int)M, Mp);
             static int sstop = getenv("NR_STEM_STOP") ? atoi(getenv("NR_STEM_STOP")) : 0;
             if (sstop == 2) { pool_put(dH16); pool_put(dA2); pool_put(dC2); pool_put(dS); return; }  // skip the residual tail
             pool_put(dH16); pool_put(dA2);   // dB2/dPp3 cache-owned
