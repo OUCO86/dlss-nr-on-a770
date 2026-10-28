@@ -111,11 +111,12 @@ simd<float,32> 而非 64×2）、epilogue 无 scr 往返（norm 走 shuffle、e4
 
 ## 四、施工序（v5 修订版，每步独立转正/回滚，三关照旧）
 
-- **v5a（当前刀）QKV epilogue shuffle 化**：bench 里加 launch_v5a，16 lane 每 pass
-  服务 4 行（lane l: row l>>2、channels (l&3)*8..+7），8 通道平方树 + 2 次
-  shuffleXor(2)/(1)（= cosine_recip_vec 同一棵树，逐位恒等有构造性论证）；
-  4 passes 覆盖 16 行。**不动 dpas/map/LW**。验收=JUDGE QPO/KTO/VPO EXACT +
-  QKV 0.474→~0.38-0.42。红了=lane 映射错，当场修，不过夜。
+- **v5a ✅ 已转正（65a1c37，部署 fa0598c8）**：实际打法比设计更简单——不搬
+  shuffleXor 分布，直接把 cosine_recip_vec 的 32 标量 extract 树向量化（4 select +
+  ~11 宽 ops + 2 个 select 蝶形；树同构=位精确论证见代码注释）。靶=相位梯定位的
+  part0 0.278（首条链暴露延迟）vs part1/2 0.046/0.086。帧 A/B 8/10 **+0.77ms**，
+  JUDGE 七区 EXACT + 端到端 100%×2。QKV 没降（0.463 平）但 FULL 1.110→1.088——
+  收益在链重叠度不在段总量，与 fill 探针模型自洽。
 - **v5b** attended/ATO 的 32 宽 reload 点（无 norm 树，只换 load 宽度）——先测再说。
 - **v5c barrier 审计**：v4 现存 7 esimd::barrier + 1 group_barrier，逐个问
   "谁读谁写跨 lane"——blade-2 已证 barrier 是真成本（6→2 = +1.32ms）。
