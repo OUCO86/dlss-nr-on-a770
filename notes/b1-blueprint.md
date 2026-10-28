@@ -34,13 +34,50 @@
 
 ## 二、v5 = 前辈几何（本战役主刀，设计已钉死；几何账已算清）
 
-**v5.1 几何算术（本轮已定，写码照此）**：8 subgroup × 8 行（LW=128，SIMD16）。
-每 part = 8 行×32 列 = 两个 8×16 tile（c00,c01 + 第二 tc）= **4 dpas（v4 是 8）**，
-活跃 acc = 4×simd<float,64> = 16 GRF（安全线内）。scatter 的 (r,c)→pb16t/pb16/sh16
-map 不变（r=全局行 0-63）。**注意：QKV/scores/attnV/outproj 共享 subgroup ownership，
-v5 必须整核同几何——不能只改 QKV 段（ownership 不一致则 scr/操作数域错位，
-7 区 JUDGE 会红但那是半迁移不是 bug）**。这决定 v5 是一次完整重写（~250 行），
-不是增量刀——按 §三 施工序 v5.1→v5.4 分阶段在 bench 里推进。
+**v5 几何账（1c1f437 WIP 已证伪的路线，先记住）**：8×8 行/LW=128 的 naive 移植
+**不划算**——epilogue lane8-15 空转 + 60KB SLM 掉到 1 WG/SM，QPO 0.894 > v4 0.651。
+前辈的 8-subgroup 是 coopmat/SIMD32 的产物，dpas/SIMD16 移植要重设计。**此路封存。**
+
+**★ 对照数修正（本轮精算，覆盖我之前的 6.5x 误账）**：前辈 window_block = 0.62ms/pass
+× 10 pass，每 pass ~2135 window ⇒ **290ns/window**。我们 v4full = 1.11ms/2040w =
+**545ns/window**。真实差距 = **1.9x**（不是 6.5x——我之前把前辈的 per-pass 当
+per-window 除了）。v5 现实目标 = 545→~300（追平前辈），bench FULL 1.11→~0.7，
+帧收益 wblock ~25.9→~16（**约 -10ms**）——仍是本战役最大单块，但预期按 1.9x 校准。
+
+**v5 正式设计（shuffle-epilogue 版，保留 4×16 几何）**：
+精读前辈 200-270 行后确认——**前辈也有 acc→scratch store→reload**（他的
+coopMatStore 到 per-subgroup 1KB scratch + subgroupBarrier），所以"消 scr 往返"
+不是他的武器。他的武器是 **epilogue 的 4-lane×8-channel 分布 + 2 次 shuffleXor**：
+- 我们 v4 的 fat = `cosine_recip_vec`：**每 lane 32 通道标量数组读取**（h[ch]
+  逐元素 extract，~60 个标量 eh_mul/eh_add）+ 每 lane 32-float 宽 reload。
+- 前辈：每 lane 只碰 8 通道（4 lane 分一行），partial[2] + 2 次 shuffleXor(2),(1)
+  完成 4-lane 归约——**代数上与我们 cosine_recip_vec 的 lane^2/lane^1 蝶形同树**
+  （他就是这树的原始定义），所以**逐位恒等有构造性保证**。
+- v5 = 前辈 epilogue 搬到我们 scr 布局：16 lane 每 pass 服务 4 行（lane l:
+  row l>>2, channels (l&3)*8..+7），4 passes 覆盖 16 行。每 lane：4×vec2 load
+  （8 floats）→ 8 通道平方树（eh_hfma×4+eh_mul×4+eh_add×4）→ shuffleXor(lane^2)、
+  shuffleXor(lane^1) 两次 → 得该 lane 的 row recip → mulh/e4m3 8 通道 → scatter。
+  **不动 dpas、不动 SLM map、不动 LW=64**——只换 QKV epilogue 的 lane 分布。
+- 收益账：标量 extract 链（32/lane）→ 8/lane + 2 shuffle；reload 32-float 宽向量
+  → 4×vec2。norm+scatter 0.021→~0.010，reload 侧宽 load 消失（blade-2 的 phase-2
+  变轻）。三个 part 都吃。保守估 QKV 0.474→~0.38，FULL 1.11→~1.0；**若再配合
+  scores 段的同类 epilogue 化（softmax 已是前辈形态，不动）收益有限**。
+- **诚实分级**：v5-shuffle 单独 = bench -0.1ms 级（帧 -1~2ms），**不是** -10ms。
+  到前辈 290ns 的差距大头在**每窗 dpas 指令数本身**（我们 SIMD16 192 dpas +
+  128 scores + 64 attnV + 32 outproj ≈ 416 条 vs 前辈 coopmat 数）与 barrier 数。
+  下一刀真正的大肉候选 = **window_block 的 tc 循环合并**（scores 4tc 与 attnV 2tc
+  的 dpas 链间没有数据依赖的部分重叠）+ **barrier 再砍**（v4 剩 7 个 esimd + 1 group）。
+
+**施工序（v5 修订版）**：
+- v5a：QKV epilogue shuffle 化（bench_v4full 里加 launch_v5a，JUDGE QPO/KTO/VPO
+  必须 EXACT——树同构论证在上，红了就是 lane 映射错）。
+- v5b：若 v5a 兑现，推广到 blade-2 phase-2 的其余 reload 点（attended/ATO 是
+  32 宽但无 norm 树——只换 load 宽度，收益小，先测）。
+- v5c：barrier 审计：v4 现存 7 个 esimd::barrier + 1 group_barrier——逐个问
+  "谁读谁写跨 lane？"能降 subgroup-local 的降、能删的删（blade-2 已证 barrier
+  是真成本）。
+- v5d：若 v5a-c 合计 <3ms 帧收益，**转攻 quant 11.5ms**（§四 B2，前辈 1.64ms
+  的 7x 差距——那才是账面最大单体肉，读者折叠设计见 §四）。
 
 前辈 window_block.comp（531 行，已精读）的形态与我们 v4 的三条结构差：
 
