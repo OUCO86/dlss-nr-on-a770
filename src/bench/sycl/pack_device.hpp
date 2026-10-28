@@ -20,10 +20,40 @@ namespace packdev {
 //         M is the REAL row count, Mp the padded: rows >= M read zero (the host version
 //         copies into a zero-padded buffer first -- the guard matches it AND keeps the
 //         read inside the M*K source).
+// P8-c (section 100): the 128-bit vector form of the CONTIGUOUS pack_a (the same
+// lever as gather_pack_a_b_v; lda==K so the 16-byte run (row, k in {0,16}) is
+// 16-aligned and row-contiguous on BOTH sides -- K%32==0 always (the recorder's
+// own guard)). Used by the residual / window-residual / int8-gemm / qkv-fallback
+// families' pack_a legs.
+static inline void pack_a_v(sycl::queue& q, const int8_t* A, int8_t* Ap, int M, int Mp, int K) {
+    const int BM = 128, BK = 32;
+    int wgr = Mp / BM, kb_n = K / BK;
+    size_t n = (size_t)wgr * kb_n * 8 * 512;
+    q.parallel_for(sycl::range(n / 16), [=](sycl::item<1> it) {
+        size_t d = it.get_id(0) * 16;
+        size_t blk = d / 512; int off = (int)(d % 512);
+        int wi = (int)(blk % 8); size_t wk = blk / 8;
+        int kb = (int)(wk % (size_t)kb_n); int w = (int)(wk / (size_t)kb_n);
+        int row = off / 32;
+        int srow = w * BM + wi * 16 + row;
+        sycl::vec<unsigned, 4> v(0u);
+        if (srow < M)
+            v = *reinterpret_cast<const sycl::vec<unsigned, 4>*>(
+                A + (size_t)srow * K + (size_t)kb * BK + (off % 32));
+        *reinterpret_cast<sycl::vec<unsigned, 4>*>(Ap + d) = v;
+    });
+}
 static inline void pack_a(sycl::queue& q, const int8_t* A, int8_t* Ap, int M, int Mp, int K) {
     const int BM = 128, BK = 32;
     int wgr = Mp / BM, kb_n = K / BK;
     size_t n = (size_t)wgr * kb_n * 8 * 512;   // = Mp*K
+    // P8-c dispatch: the vec16 form wins BIG on the multi-MB packs (bench_packa_v:
+    // 8.4MB 0.164->0.051, 4.2MB 0.076->0.029, 2.3MB 0.046->0.022, 2.1MB 0.043->0.020,
+    // 0.5MB 0.020->0.016) but loses marginally under ~0.4MB (launch-shape noise:
+    // 0.33MB 0.016->0.021). Threshold 500000 elements; NR_PACKA_VEC=0 = escape hatch.
+    static bool pvec = !getenv("NR_PACKA_VEC") || atoi(getenv("NR_PACKA_VEC")) != 0;
+    if (pvec && n >= 500000u && (K % 16) == 0) { static long pv_hits=0; if(getenv("NR_PACKA_STATS")){++pv_hits; if(pv_hits<=12) printf("[packa-vec] M=%d K=%d n=%zu\n", M,K,n);} pack_a_v(q, A, Ap, M, Mp, K); return; }
+    if (pvec && n >= 500000u && (K % 16) == 0 && !getenv("NR_PACKA_STATS")) { pack_a_v(q, A, Ap, M, Mp, K); return; }
     q.parallel_for(sycl::range(n), [=](sycl::item<1> it) {
         size_t d = it.get_id(0);
         size_t blk = d / 512; int off = (int)(d % 512);
