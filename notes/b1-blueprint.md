@@ -297,14 +297,34 @@ host 线并行另案（不碰 GPU 数值，风险最低肉最大）→ B3 视 B2
    游戏 131.9 vs 离线 walk ~112-120 的差 = 持续满载时钟（§7.5 已记 ~12ms 残差，
    暂不追）。
 10. **终版账本（全部实验关闭后的剩余清单，下窗口按此开工）**：
-   - **(iii) B3 = wblock 指令数战（唯一的大肉）**：帧内 wblock 26（small）+16.6
-     （giants）= 42.6ms vs 前辈折算 ~10-13。打法候选按性价比排序：
-     (α) **tc 循环合并**（scores 的 4-tc 与 attnV 的 2-tc 之间、QKV 3-part 的
-         B-operand 复用——指令数减但 barrier 不减，先 bench 对拍）；
-     (β) **SIMD32 dpas 新地形**（前辈 coopmat 8x16 = 我们两条 dpas 合一？
-     `dpas<8,16>` 是否存在=查 esimd xmx 签名，一天实验）；
-     (γ) softmax 的 64 列标量 ef_add 链（2×32 串行 add = 64 步！可向量化但
-         **改变求和顺序=违反参考树**——golden 考古门才允许动，低优先）。
+   - **(iii) B3 = wblock 战（唯一的大肉）**：帧内 wblock 26（small）+16.6
+     （giants）= 42.6ms vs 前辈折算 ~10-13。
+   - **★ (β) 探针已跑并出判决（22:2x，dpas_probe.cpp 已入库）**：esimd
+     `dpas<SD,RC>` 的 static_assert = **RC<=8、SD==8**（XMX 阵列就是 8x8）
+     ⇒ 前辈 coopmat 8x16 在硬件上同样拆两条 dpas，**"dpas 指令数差距"归因
+     作废**（§五 表里"更大 tile/SIMD32 新地形"一行作废，§五"差距主体=每窗
+     dpas 指令数"一句作废）。
+   - **★ 修正后的归因（本轮最有价值的结论）**：差距 = **每 SM 的独立链数**
+     （线程级并行度）。前辈 256 线程/窗 + **16KB SLM**（K/V 各 4KB + 每
+     subgroup 1KB scratch 跨 stage 复用，他注释原文）⇒ >=2 WG/SM = 512+
+     线程/SM；我们 LW=64 + 45KB SLM ⇒ **1 WG/SM = 64 线程/SM**——延迟绑定
+     核（fill 探针）没有链可换。v5-WIP 双输里 60KB=1WG/SM 是主症、idle-lane
+     是表症。
+   - **★ v6 正式设计（前辈几何的 SIMD16 正确移植 = B3 主刀）**：
+     * LW=128 = 8 subgroup x 16 lane x 8 行/subgroup（前辈的行账）；
+     * **epilogue = 前辈的 4-lane x 8-channel 树**：每行 4 lane（lane l:
+       row=sg*8+(l>>2)、ch=(l&3)*8..+7），行归约 2 次 shuffleXor(2)/(1)
+       ——**16 lane 全活**（v5-WIP 的 lane<8 空转正是缺这一步）；树同构
+       位精确论证已在 v5a 入册；
+     * **SLM 预算 16KB**（前辈账）：KTO+VPO 8KB + 每 subgroup 1KB scratch
+       跨 stage 复用（gathered row/projections/logits/weights/attended/
+       projected 轮用同一 KB——前辈原文）；AQO 进 scratch；Q 可留寄存器
+       （前辈把 query 存 regs 给 scores 用！）⇒ **16KB => 2-4 WG/SM**；
+     * dpas 序列与 scatter map 不变（JUDGE 逐区对质）。
+     * 预期：wblock 42.6 -> **15-20**（-22~28ms，walk -> ~85-90）。
+       **这是账本上最后一块大肉，也是追平前辈 wblock 族的正解。**
+   - (α) tc 循环合并 = v6 后的精修；(γ) softmax 64 步标量链（改求和顺序=
+     违反参考树，golden 考古门才允许动）仍然封存。
    - quant 真内嵌 = 2-3ms 残肉高成本，排在 B3 后。
    - **剩余全部加起来 ~15-20ms**（B3 乐观 +10、quant +3、giants +2、GA +2）
      ⇒ 离线地板 ~95-100，游戏侧 ~115。追平前辈 48 需要**算法级改动**（数值
