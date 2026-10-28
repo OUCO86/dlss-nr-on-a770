@@ -1828,6 +1828,18 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
         sycl::half* dH16 = (sycl::half*)pool_get((size_t)M * 32 * 2);
         packdev::pack_a16(*GQ, Fraw, dA, (int)M, Mp, 16);
         sycl::half* dB = cached_pack_b_f16(adapter, Arw, 16, 32);   // weight
+        // P8-m (section 100): DUAL STORE -- the adapter gemm writes the raw f32 dS
+        // AND dH16 = half(e4m3(dS)) in one pass; the separate publish parallel_for
+        // (67MB f32 re-read + 33MB write at M=522240) vanishes. Bit-identical by
+        // the chain: pub_vec_v8(1u) == pub_esimd(1u) (bench_pubvec, section 99)
+        // == qr_e4m3 (the PUBLISH gate). dH16 is bounded by M (the guard matches
+        // the publish loop's range; the chip's A load only reads rows < M).
+        // NR_FFN_DUAL=0 = escape hatch to gemm + the publish loop.
+        static bool dual = !getenv("NR_FFN_DUAL") || atoi(getenv("NR_FFN_DUAL")) != 0;
+        if (dual) {
+            f16v1::gemm_dual_pub(*GQ, dA, dB, dS, dH16, (int)M, Mp, 32, 16);
+            pool_put(dA);   // dB is cache-owned (weight)
+        } else {
         f16v1::gemm(*GQ, dA, dB, dS, Mp, 32, 16);
         pool_put(dA);   // dB is cache-owned (weight)
         // publish = E4M3 only, on device; dH16 stays for pass B's pack_a.
@@ -1835,6 +1847,7 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
             size_t i = it.get_id(0);
             dH16[i] = sycl::half(qr_e4m3(dS[i]));
         });
+        }
         // ---- pass B: expand gemm(hidden16, expand -> f32), publish(3) -> half hidden ----
         // P3e: the chip kernel eats dH16 RAW (row-major M x 32 half = its dA contract),
         // so the dA2 pack_a16 pass is only needed by the tile-chain fallback -- skip it

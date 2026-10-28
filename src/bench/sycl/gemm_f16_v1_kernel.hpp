@@ -279,6 +279,57 @@ static inline sycl::event gemm_b_pub_f16(sycl::queue& q, const half* Ap, const h
 // epi3 win (s8v8::pub_esimd, defined in gemm_s8_v8_kernel.hpp which libxmx_sycl.cpp
 // includes BEFORE this header). M/N/K are TS=16 multiples in the captured ffn, so no
 // row cull is needed, but the r<M guard is kept for safety. FFN gate is the judge.
+// P8-m (section 100): the ffn_stem pass-A DUAL STORE -- the same dpas sequence as
+// gemm() above (bit-identical by construction), but the store writes BOTH the raw
+// f32 C (the residual skip the fused-tail reads) AND H[r][c] = half(e4m3(C[r][c]))
+// in ONE pass, so the separate publish parallel_for (a 67MB f32 re-read + 33MB
+// half write at the stem's M=522240) VANISHES. e4m3 vector = s8v8::pub_vec_v8<8>(1u,·)
+// = the bench_pubvec-proven vector==scalar-identical e4m3 (section 99, epi 1/3
+// over 1M values) -- the publish loop's qr_e4m3 spelling replaced with its proven
+// vector form. The H store guard matches the C store's row bound (rows >= M are
+// written to the padded C but NOT to H -- the publish loop was bounded by M*32).
+static inline sycl::event gemm_dual_pub(sycl::queue& q, const half* Ap, const half* Bp,
+                                        float* C, half* H, int M, int Mp, int N, int K) {
+    int tr_n = Mp / TS, tc_n = N / TS, kb_n = K / TS;
+    return q.submit([&](handler& h) {
+        h.parallel_for(range<1>((size_t)tr_n * tc_n), [=](item<1> it) SYCL_ESIMD_KERNEL {
+            int t = (int)it.get_id(0); int tr = t / tc_n, tc = t % tc_n;
+            esimd::simd<float, 64> c00(0.f), c01(0.f), c10(0.f), c11(0.f);
+            for (int kc = 0; kc < kb_n; ++kc) {
+                const half* ab = Ap + ((size_t)(tr * kb_n + kc) * 2) * 128;
+                const half* bb = Bp + ((size_t)(kc * tc_n + tc) * 2) * 128;
+                esimd::simd<half, 128> a0(ab, esimd::overaligned_tag<16>{});
+                esimd::simd<half, 128> a1(ab + 128, esimd::overaligned_tag<16>{});
+                esimd::simd<half, 128> b0(bb, esimd::overaligned_tag<16>{});
+                esimd::simd<half, 128> b1(bb + 128, esimd::overaligned_tag<16>{});
+                c00 = esimd::xmx::dpas<8, 8, float>(c00, b0, a0);
+                c01 = esimd::xmx::dpas<8, 8, float>(c01, b1, a0);
+                c10 = esimd::xmx::dpas<8, 8, float>(c10, b0, a1);
+                c11 = esimd::xmx::dpas<8, 8, float>(c11, b1, a1);
+            }
+            float* out = C + (size_t)(tr * TS) * N + tc * TS;
+            half* hout = H + (size_t)(tr * TS) * N + tc * TS;
+            #pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                esimd::simd<float, 8> r00 = c00.template select<8, 1>(r * 8);
+                esimd::simd<float, 8> r01 = c01.template select<8, 1>(r * 8);
+                esimd::simd<float, 8> r10 = c10.template select<8, 1>(r * 8);
+                esimd::simd<float, 8> r11 = c11.template select<8, 1>(r * 8);
+                r00.copy_to(out + (size_t)r * N);       r01.copy_to(out + (size_t)r * N + 8);
+                r10.copy_to(out + (size_t)(8 + r) * N); r11.copy_to(out + (size_t)(8 + r) * N + 8);
+                if ((size_t)(tr * TS + r) < (size_t)M) {
+                    esimd::convert<half>(s8v8::pub_vec_v8<8>(1u, r00)).copy_to(hout + (size_t)r * N);
+                    esimd::convert<half>(s8v8::pub_vec_v8<8>(1u, r01)).copy_to(hout + (size_t)r * N + 8);
+                }
+                if ((size_t)(tr * TS + 8 + r) < (size_t)M) {
+                    esimd::convert<half>(s8v8::pub_vec_v8<8>(1u, r10)).copy_to(hout + (size_t)(8 + r) * N);
+                    esimd::convert<half>(s8v8::pub_vec_v8<8>(1u, r11)).copy_to(hout + (size_t)(8 + r) * N + 8);
+                }
+            }
+        });
+    });
+}
+
 static inline sycl::event gemm_pub(sycl::queue& q, const half* Ap, const half* Bp,
                                    half* H, int M, int Mp, int N, int K, unsigned epi) {
     int tr_n = Mp / TS, tc_n = N / TS, kb_n = K / TS;
