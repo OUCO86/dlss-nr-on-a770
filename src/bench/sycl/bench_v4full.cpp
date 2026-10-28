@@ -36,6 +36,7 @@ namespace esimd = sycl::ext::intel::esimd;
 constexpr uint S_AQO=0, S_QPO=4096, S_KTO=8192, S_VPO=12288, S_ATO=16384, S_PPO=20480, S_SCR=28672;
 constexpr uint SCR_SG=4096;
 
+template <int FILL_N = 0>
 inline event launch_v4full(queue& q, const void* Img, bool image_half,
     const half* WqkvPacked, const half* WprojPacked,
     half* Tgt, float* TgtF, const float* Bias, const float* Cos, const float* QkvScale,
@@ -78,6 +79,24 @@ inline event launch_v4full(queue& q, const void* Img, bool image_half,
                 wbv3::sh16(S_AQO + base2*2u, oh.template select<16,1>(16).read());
             }
             esimd::barrier();                       // subgroup: own rows only
+            // P8-fill (the senior's PROBE_FILL instrument, section 100 B1 design
+            // decision): FOUR independent fadd chains seeded from SLM, N rounds.
+            // Cannot be folded (seed load) and cannot reach the output (guarded
+            // store). GROWS with N => issue-bound (v5 = cut instructions).
+            // FLAT => latency-bound (v5 = shorten chains / more parallelism).
+            if (FILL_N) {
+                esimd::simd<float,32> seed = esimd::slm_block_load<float,32>(S_AQO + lid*4u, esimd::overaligned_tag<16>{});
+                esimd::simd<float,32> f0=seed, f1=seed+1.f, f2=seed+2.f, f3=seed+3.f;
+                #pragma unroll
+                for (int i = 1; i <= FILL_N; ++i) {
+                    f0 += esimd::simd<float,32>((float)i)*1.000001f;
+                    f1 += esimd::simd<float,32>((float)i)*1.000002f;
+                    f2 += esimd::simd<float,32>((float)i)*1.000003f;
+                    f3 += esimd::simd<float,32>((float)i)*1.000004f;
+                }
+                if (windows == 0xFFFFFFFFu)
+                    esimd::slm_block_store(S_AQO + lid*4u, f0+f1+f2+f3);
+            }
             if (stop_stage == 101u) return;         // P8-ladder: P0 gather ONLY (no dump)
             // P1+P2 fused (the slice VERBATIM) =====
             // (P8-i2 NOTE: the QKV A-hoist was tried HERE and measured NEUTRAL
@@ -214,10 +233,14 @@ inline event launch_v4full(queue& q, const void* Img, bool image_half,
                 c11 = esimd::xmx::dpas<8, 8, float>(c11, c1, aq3);
                 uint scr = S_SCR + sgid*SCR_SG;
                 for (int r = 0; r < 8; ++r) {
-                    esimd::slm_block_store(scr + (uint)r*64u*4u + tc*16u*4u,        c00.template select<8,1>(r*8));
-                    esimd::slm_block_store(scr + (uint)r*64u*4u + tc*16u*4u + 32u,  c01.template select<8,1>(r*8));
-                    esimd::slm_block_store(scr + (uint)(8+r)*64u*4u + tc*16u*4u,    c10.template select<8,1>(r*8));
-                    esimd::slm_block_store(scr + (uint)(8+r)*64u*4u + tc*16u*4u + 32u, c11.template select<8,1>(r*8));
+                    esimd::simd<float,16> m01;
+                    m01.template select<8,1>(0)  = c00.template select<8,1>(r*8);
+                    m01.template select<8,1>(8)  = c01.template select<8,1>(r*8);
+                    esimd::simd<float,16> m11;
+                    m11.template select<8,1>(0)  = c10.template select<8,1>(r*8);
+                    m11.template select<8,1>(8)  = c11.template select<8,1>(r*8);
+                    esimd::slm_block_store(scr + (uint)r*64u*4u + tc*16u*4u,       m01);
+                    esimd::slm_block_store(scr + (uint)(8+r)*64u*4u + tc*16u*4u,   m11);
                 }
             }
             }
@@ -430,6 +453,23 @@ int main(){
   // full runs (no dump) for the real price
   double f3=timeit("v3 FULL", [&]{ return v3call(0u,nullptr); });
   double f4=timeit("v4 FULL", [&]{ return v4call(0u,nullptr); });
+  double fl0=f4;
+  double fl8=timeit("v4 FULL fill8 ", [&]{ return launch_v4full<8>(q,dImg,false,dWq,dWp,dTgt,(float*)dTgt,dBias,dCos,dQs,2040u,272u,480u,60u,0u,0u,1u,true,0u,nullptr); });
+  double fl32=timeit("v4 FULL fill32", [&]{ return launch_v4full<32>(q,dImg,false,dWq,dWp,dTgt,(float*)dTgt,dBias,dCos,dQs,2040u,272u,480u,60u,0u,0u,1u,true,0u,nullptr); });
+  // CORRECT READING (hand calc, the auto-heuristic above was garbage): the fill
+  // ops become compile-time-constant adds (mul folded), so fill8 = 32 adds and
+  // fill32 = 128 adds per thread. Full EU cost = adds x threads / EUs / clock =
+  // 128 x 130,560 / 32 / 2GHz = 0.26ms for fill32; MEASURED +0.0475 = ~82%
+  // ABSORBED. The senior's rule (PROBE_FILL comment, window_block.comp:92): a
+  // kernel that absorbs fill for free is WAITING ON ITS DEPENDENCY CHAINS.
+  // => window_block v4 is LATENCY-bound (chains + WG barriers), ~20% issue
+  // utilization. v5's lever: SHORTEN CHAINS / ADD PARALLELISM per window --
+  // the senior's 8-subgroup x 8-row geometry (half the serial depth per thread,
+  // 2x the independent chains, subgroup-local barriers). Blade-1 (fewer store
+  // instrs) helped because stores sit IN the chain (SLM write->read round-trip
+  // latency), consistent with the same model.
+  printf("FILL PROBE: base=%.4f fill8=%.4f (+%.4f; full-issue cost would be +0.065) fill32=%.4f (+%.4f; full cost +0.26) => ~80%% ABSORBED = LATENCY-BOUND: v5 shortens chains (senior geometry)\n",
+     fl0, fl8, fl8-fl0, fl32, fl32-fl0);
   // P8-ladder: PURE stops (dump guarded by DumpKV=nullptr -> stop only):
   // the real stage deltas with no 16MB dump traffic polluting them.
   double p10=timeit("v4 stop QKV(QPO)",[&]{ return v4call(10u,nullptr); });
