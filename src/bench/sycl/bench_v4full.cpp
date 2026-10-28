@@ -422,5 +422,27 @@ int main(){
   }
   printf("ladder sums v3=%.3f v4=%.3f | FULL v3=%.3f v4=%.3f ratio=%.2fx => %s\n",
     tv3sum,tv4sum,f3,f4,f3/f4,allok?"EXACT":"BAD");
+
+  // ---- P8-h (section 100): the FRAME-SHAPE ladder (the game-path ledger priced
+  // the window_block family at 31.7ms/16 calls = 1.98/call vs this bench's
+  // synthetic 1.30 at 2040w -- the census says why: the 16 calls are NOT all
+  // 2040w. Plan: {2040w 272x480 a60 pad0}x4 {2135w a61 pad4|4}x2 {2074w a61
+  // pad0|4}x2 {2100w a60 pad4|0}x2 {8160w 544x960 a120 pad0}x2 {8349w a121
+  // pad4|4}x2 -- all on the v4full route (the NR_V2_STOP=65530 ledger covers all
+  // 16). The TWO 8K-window giants are the suspected fat: time every shape. ----
+  printf("--- FRAME-SHAPE ladder (v4 FULL; epi/narrow = the frame's 4352 = epi1|narrow) ---\n");
+  struct S{const char* n;unsigned w,ih,iw,ac,pt,pl;};
+  std::vector<S> shapes={
+    {"2040w 272x480 a60 p0",2040,272,480,60,0,0},
+    {"2135w 272x480 a61 p4|4",2135,272,480,61,4,4},
+    {"2074w 272x480 a61 p0|4",2074,272,480,61,0,4},
+    {"2100w 272x480 a60 p4|0",2100,272,480,60,4,0},
+    {"8160w 544x960 a120 p0",8160,544,960,120,0,0},
+    {"8349w 544x960 a121 p4|4",8349,544,960,121,4,4}};
+  for(auto&sh:shapes){
+    double t=timeit(("v4 "+std::string(sh.n)).c_str(),[&]{
+      return launch_v4full(q,dImg,false,dWq,dWp,dTgt,(float*)dTgt,dBias,dCos,dQs,
+        sh.w,sh.ih,sh.iw,sh.ac,sh.pt,sh.pl,1u,true,0u,nullptr); });
+  }
   return allok?0:1;
 }

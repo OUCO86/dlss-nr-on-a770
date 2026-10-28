@@ -3682,6 +3682,8 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             g_wb_v2++;
             unsigned st = getenv("NR_V2_STOP") ? (unsigned)atoi(getenv("NR_V2_STOP")) : 0u;
             if (st == 65531u || st == 65530u) return;
+            static int phstop = getenv("NR_WB_PH_STOP") ? atoi(getenv("NR_WB_PH_STOP")) : 0;   // P7 floor ledger: the v4ph (pool/head giants) route priced separately
+            if (phstop == 9) return;
             sycl::half* dWq = cached_pack_b_f16(qkv, Wraw, (int)C, (int)NH);
             sycl::half* dWp = cached_pack_b_f16(projection, Praw, (int)C, (int)C);
             sycl::half* dWh = head ? cached_pack_b_f16(pooled, HeadW, (int)C, 16) : nullptr;
@@ -4364,6 +4366,12 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
 // libxmx.c:2471 shape ([c_int]*3 + [c_uint]*2). Appends the proven SYCL kernel.
 int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
     if (!g_recording) FAILMSG("not recording");
+    // NR_Q_STOP=9 (section 100 P7 floor ledger, time-only DIAGNOSTIC -- the frame
+    // output is garbage by design here, same convention as the NR_*_STOP family;
+    // NOT for deployment). The fused-pack quants are already no-ops; this prices
+    // the SURVIVING split quants on the cgraph (game) path.
+    static int qstop = getenv("NR_Q_STOP") ? atoi(getenv("NR_Q_STOP")) : 0;
+    if (qstop == 9) { g_cmd_names.push_back(__func__); g_cmds.push_back([](){}); return 0; }
     if (!M || !K || K % 16u) FAILMSG("quant needs K a multiple of 16");
     auto s = g_bufs.find(source), p = g_bufs.find(packed), c = g_bufs.find(scale);
     if (s == g_bufs.end() || p == g_bufs.end() || c == g_bufs.end()) FAILMSG("bad quant operand");
