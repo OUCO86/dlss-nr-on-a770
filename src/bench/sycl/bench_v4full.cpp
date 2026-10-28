@@ -145,9 +145,33 @@ inline event launch_v4full(queue& q, const void* Img, bool image_half,
             group_barrier(it.get_group());          // KTO/VPO shared for P3/P5
 
             // ===== P3 scores: rows owned, cols 0..63 =====
-            for (uint tc = 0; tc < 4u; ++tc) {
+            // P8-f: the A tile (S_QPO + sgid*1024, kc 0..1) is the SAME across all
+            // four tc blocks -- hoist aq0/aq1 into registers ONCE (2 x simd<half,128>
+            // = 8 GRF regs/thread at LW64; the tile8s A-side was re-read from SLM
+            // 4x). tile8ss's b0/b1 stay SLM loads (each tc's KTO block differs).
+            {
+              uint qb = S_QPO + sgid*1024u;
+              esimd::simd<half,128> aq0 = esimd::slm_block_load<half,128>(qb, esimd::overaligned_tag<16>{});
+              esimd::simd<half,128> aq1 = esimd::slm_block_load<half,128>(qb + 256, esimd::overaligned_tag<16>{});
+              esimd::simd<half,128> aq2 = esimd::slm_block_load<half,128>(qb + 512, esimd::overaligned_tag<16>{});
+              esimd::simd<half,128> aq3 = esimd::slm_block_load<half,128>(qb + 768, esimd::overaligned_tag<16>{});
+              for (uint tc = 0; tc < 4u; ++tc) {
                 esimd::simd<float,64> c00(0.f),c01(0.f),c10(0.f),c11(0.f);
-                wbv3::tile8ss(c00,c01,c10,c11, S_QPO + sgid*1024u, S_KTO + tc*512u, 2, 4);
+                uint bb = S_KTO + tc*512u;
+                // kc=0 (tile8ss: bb step = kc*tc_n*2*256 = kc*2048)
+                esimd::simd<half,128> b0 = esimd::slm_block_load<half,128>(bb, esimd::overaligned_tag<16>{});
+                esimd::simd<half,128> b1 = esimd::slm_block_load<half,128>(bb + 256, esimd::overaligned_tag<16>{});
+                c00 = esimd::xmx::dpas<8, 8, float>(c00, b0, aq0);
+                c01 = esimd::xmx::dpas<8, 8, float>(c01, b1, aq0);
+                c10 = esimd::xmx::dpas<8, 8, float>(c10, b0, aq1);
+                c11 = esimd::xmx::dpas<8, 8, float>(c11, b1, aq1);
+                // kc=1
+                esimd::simd<half,128> c0 = esimd::slm_block_load<half,128>(bb + 2048, esimd::overaligned_tag<16>{});
+                esimd::simd<half,128> c1 = esimd::slm_block_load<half,128>(bb + 2304, esimd::overaligned_tag<16>{});
+                c00 = esimd::xmx::dpas<8, 8, float>(c00, c0, aq2);
+                c01 = esimd::xmx::dpas<8, 8, float>(c01, c1, aq2);
+                c10 = esimd::xmx::dpas<8, 8, float>(c10, c0, aq3);
+                c11 = esimd::xmx::dpas<8, 8, float>(c11, c1, aq3);
                 uint scr = S_SCR + sgid*SCR_SG;
                 for (int r = 0; r < 8; ++r) {
                     esimd::slm_block_store(scr + (uint)r*64u*4u + tc*16u*4u,        c00.template select<8,1>(r*8));
@@ -155,6 +179,7 @@ inline event launch_v4full(queue& q, const void* Img, bool image_half,
                     esimd::slm_block_store(scr + (uint)(8+r)*64u*4u + tc*16u*4u,    c10.template select<8,1>(r*8));
                     esimd::slm_block_store(scr + (uint)(8+r)*64u*4u + tc*16u*4u + 32u, c11.template select<8,1>(r*8));
                 }
+            }
             }
             esimd::barrier();
             if (stop_stage == 5u) {   // scores rows (map-agnostic row dump, v3 stop=5 form)
