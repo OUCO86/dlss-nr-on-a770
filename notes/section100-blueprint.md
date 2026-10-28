@@ -206,7 +206,7 @@ P1-P3 后剩余 GEMM 家族按 width-sweep 目标线逐核修（C2 acc-via-SLM �
 5. ~~地板 27.8 组成拆解~~（**15:0x 已结清，提交 913ca53**：NR_F_STOP/NR_QW_STOP/NR_U_STOP 探针。四族单独价=ffn 16.1 / split quant 11.5（P8-j 后）/ unary 9.4 / quant_window 0.3（P4b 已融合=非靶）；**同删四族只省 22.2 ≠ 单独和 37.3——15ms 被 cgraph 重叠吸收**。军规第 9 条的量化实锤：帧 119.8 是全重叠总账，各族隔离定价会高估可回收量。B1 的真奖品=关键路径上那部分（per-WG elementwise scr 往返=P8-i2/j 两钉所指），不是家族加和。）
 6. 游戏侧 vs 离线残余 ~12ms（持续满载时钟差）——暂不追。
 
-### 7.6 P8-n/o 战线终局（10-28 17:3x，提交 a711fcc + d8824c7）——**帧已进入 GPU 饱和区，快刀时代正式收官**
+### 7.6 P8-n/o 战线（10-28 17:3x，提交 a711fcc + d8824c7）——**审计完成：只剩指令功一条路，B1 是主战役不是可选项**
 
 **实验链**（全部同件 env A/B + 家族边际，第 11/12 条军规的执行）：
 - **P8-n stem mega**（B1 砖1，per-thread SLM 私有 ES/EA/HS 4KB×LW16=64KB，dS/dH16 全程不落 global）：bench diff 0/16.7M EXACT、隔离 +0.15——但**帧 A/B 6/10 mean -0.22、stem 边际 chain 9.5 vs mega 9.8 不降**。默认 OFF（有实测负收益≠"中性无负"），核保留为 opt-in 存证。
@@ -223,6 +223,11 @@ P1-P3 后剩余 GEMM 家族按 width-sweep 目标线逐核修（C2 acc-via-SLM �
 - **P8-p（V-layout 换侧）预检否证**：VPO 换 write-native 存储 ⇒ attnV B 侧从 2×128-half 块读退化为 16×16B 跨行读（8x 指令数）——换侧=换痛，map 代数判死（P8-e"行奇偶"教训的延伸）。蓝图靶②正式关闭。
 - 三 gemm 族 + stem/merge + giants + quant/unary 全部已到**当前算法的指令地板**。
 
-**收官决策点（交用户）**：walk 227→**~115-117**（-110，2x）。剩余两条路：
-- **B1-wblock megakernel**：多窗口工程（~800-1000 行），预期 5-6ms，风险=P8-g 型 spill 已在案。开工需按 §六 仪式 + 本节 ROI 重估。
-- **战役收官**：115ms 已到"当前算法结构+SYCL/ESIMD 移植"的实际地板附近；再往下要算法级改动（碰数值形态=底线区，需 golden 考古）。
+**账本摆正（用户 17:45 点破，此节覆盖我此前的"收官/地板"错误叙事）**：前辈病态 coopmat 链路本 box=48ms（0.050ms/pass），我们 115ms（0.167ms/pass）= **仍慢 2.4x**；蓝图 §二 靶标=10-15ms、"跑不赢他就是丢人"。227→115 是"从慢 4.5x 追到慢 2.4x"，不是到地板。
+
+**逐家族对前辈账（结构差距表，frame-ledger 实测出处）**：
+- window_block 全族：前辈 **6.2ms**/10 pass（7 stage 全 SLM resident）vs 我们 ~30ms/20 call = **4.8x 差距 ← 最大单体靶**
+- quant 全族：前辈 **1.64ms**（折进生产者 store）vs 我们 11.5+0.3 = **~7x 差距**（P2 已折 288/448，剩余 160 个的读者结构是 multi-gemm——前辈靠 megakernel 让它们同 producer）
+- batched 0.6 vs 前辈同级 = 追平（P8-b）；window_attention 7.0 vs ~3 = 接近（P10）；三 gemm 族本体已贴线
+**P8-n/o 否证链的真实含义**：饱和探针立的是"调度/预取/占用/流量四类招全部无效"（帧内无 idle；L2 内流量不花钱）——不是"没空间"。前辈 48ms 证明功可以少 2.4x。成功刀（P8-l/m）与失败刀（P8-n/o）的分界线=**消的是不是真冗余指令**：l/m 消重复 publish/多余缓冲写读（指令功）→ 赢；n/o 消 L2 内往返（不花指令）→ 零。B1 的每一段都必须站在 l/m 一边。
+**下一步（主战役）**：B1 = window_block resident 融合（4.8x 差距追平前辈= -24ms 潜力）+ quant 剩余 11.5ms 的 producer 折叠（借 B1 的 resident 边界）。设计稿按 §六 仪式，先精读前辈 window_block.comp 的 7-stage SLM map + 本节分界线规则。快刀时代结束=审计结束，B1 开始。
