@@ -69,18 +69,41 @@ static inline esimd::simd<float,32> mulh(esimd::simd<float,32> v, float s){
 // cosine_recip on a whole-row simd (the ctree reduce order VERBATIM from
 // wbmega::cosine_recip_esimd; h[i] with constant i is a register extract, so the 8-slot
 // reduce is bit-identical by construction -- only the 32-channel round/e4m3 got vectorized).
+// P8-v5a (B1, THE chain-shortening blade): the SAME tree as cosine_recip_esimd /
+// the scalar body below, VECTOR form (bit-exact by tree-isomorphism, PROVEN:
+// partial[i] indexed i=2*lane+p; lane^2 = index XOR 4 (swap the two 4-blocks);
+// lane^1 = index XOR 2 (swap inside 2-block pairs); norm = one[0]+one[1]; every
+// eh_* is uniform elementwise, and eh_hfma's product is EXACT in f32 (half-
+// rounded operands, 11x11<=24 bits, the section-92 contraction note) so mul+add
+// == fma == the scalar eh_hfma bit-for-bit). WHY: the fill probe (a196d5e) says
+// the kernel is LATENCY-bound, and the QKV split ladder localizes it -- part0
+// (the FIRST epilogue chain in the WG) costs 0.278 while part1/2 (chains that
+// OVERLAP it) cost 0.046/0.086: the exposed chain = 32 scalar h[ch] extracts +
+// the serial eh tree. Vector form: 4 selects + ~11 wide ops, chain depth ~40 ->
+// ~12. No env gate: it is bit-exact (the seven-region JUDGE + end-to-end 100%%
+// are the judges; escape = git revert).
 static inline float cosine_recip_vec(esimd::simd<float,32> h){
-    float partial[4][2];
-    for (int lane=0;lane<4;++lane) for (int p=0;p<2;++p){
-        int ch=lane*2+p;
-        float first  = wbmega::eh_hfma(h[ch+8],  h[ch+8],  wbmega::eh_mul(h[ch],      h[ch]));
-        float second = wbmega::eh_hfma(h[ch+24], h[ch+24], wbmega::eh_mul(h[ch+16],   h[ch+16]));
-        partial[lane][p]=wbmega::eh_add(first,second);
-    }
-    float two[4][2], one[4][2];
-    for (int lane=0;lane<4;++lane) for (int p=0;p<2;++p) two[lane][p]=wbmega::eh_add(partial[lane][p],partial[lane^2][p]);
-    for (int lane=0;lane<4;++lane) for (int p=0;p<2;++p) one[lane][p]=wbmega::eh_add(two[lane][p],two[lane^1][p]);
-    float norm=wbmega::eh_add(one[0][0],one[0][1]);
+    auto x0 = h.template select<8,1>(0);     // ch 0..7   (ch = 2*lane+p)
+    auto x1 = h.template select<8,1>(8);    // ch+8
+    auto x2 = h.template select<8,1>(16);   // ch+16
+    auto x3 = h.template select<8,1>(24);   // ch+24
+    auto sq0 = esimd::convert<float>(esimd::convert<half>(x0*x0));
+    auto f1  = esimd::convert<float>(esimd::convert<half>(x1*x1 + sq0));
+    auto sq2 = esimd::convert<float>(esimd::convert<half>(x2*x2));
+    auto s1  = esimd::convert<float>(esimd::convert<half>(x3*x3 + sq2));
+    esimd::simd<float,8> partial = esimd::convert<float>(esimd::convert<half>(f1 + s1));
+    esimd::simd<float,8> p4;                // xor4 butterfly (lane^2)
+    p4.template select<4,1>(0) = partial.template select<4,1>(4);
+    p4.template select<4,1>(4) = partial.template select<4,1>(0);
+    esimd::simd<float,8> two = esimd::convert<float>(esimd::convert<half>(partial + p4));
+    esimd::simd<float,8> t2;                // xor2 butterfly (lane^1)
+    t2.template select<2,1>(0) = two.template select<2,1>(2);
+    t2.template select<2,1>(2) = two.template select<2,1>(0);
+    t2.template select<2,1>(4) = two.template select<2,1>(6);
+    t2.template select<2,1>(6) = two.template select<2,1>(4);
+    esimd::simd<float,8> one = esimd::convert<float>(esimd::convert<half>(two + t2));
+    auto tv = one.read();                   // converged: lanes 0,1 = one[0][0], one[0][1]
+    float norm=wbmega::eh_add(tv[0],tv[1]);
     float floorv=wbmega::eh_round(ctree::COSINE_NORM_FLOOR);
     norm = norm>floorv?norm:floorv;
     return wbmega::eh_round(1.0f / wbmega::esqrt(norm));
