@@ -222,6 +222,16 @@ host 线并行另案（不碰 GPU 数值，风险最低肉最大）→ B3 视 B2
    - **开工顺序（钉死）**：(a) 先行（行宽=256 完美匹配）→ 三关+帧 A/B →
      然后 (b) 行布局图 → 跨行 scale 设计。预期 (a) = -3~4ms（100.7M 的
      读+写+launch），(b) = -2~3ms。B2 合计 -5~7ms。
+   - **形状对账（21:4x 实测，120/120 全配对）**：quant K == gemm N 全部相等
+     （(2040,256)→(2560,256) x32、(640,512)→(768/960,512) x32、(8160,128)→
+     (8640/9216,128) x24、(32640,64)→(32640-35712,64) x16、(192,1024)→(192,1024)
+     x30）。M 不等 = QUANT_WINDOW 的 gather 行重复（窗口重叠 x16 纵向）——
+     **scale 是按 unique 行算的，重复行 scale 相同** ⇒ 行内 max-abs 只需在
+     gemm 输出行上算一次。**但行宽 N=256 跨 16 个 tc tile（tile8s=16x16），
+     无单 subgroup 行持有** ⇒ 设计两案：(i) gemm 后接一个"行归约+打包"轻 pass
+     （只读 f16 一次，替代 QUANT_WINDOW 的 gather-读+写，省 gather 重复读）；
+     (ii) tc 循环内行 partial-max 寄存器累加 + 末尾行归约（真·内嵌，改 tc 循环
+     结构=大手术）。**先做 (i)（低风险），(ii) 视 (i) 收益再立**。
    - 实现载体：GEMM_INT8_RESIDUAL 已有 fused-pub（gemm_b_pub_f16 家族）——
      在 pub 之外再加 packed-int8 第二 store（dC 行 f32→scale 归约→e4m3→pb16
      直写）。scale 归约=行内 max-abs：tile 的行持有度先查（N=256 宽行跨
