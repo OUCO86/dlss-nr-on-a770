@@ -1826,10 +1826,42 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
         // downloaded Fraw/Arw/Eraw/Praw AND both intermediates to host and re-uploaded
         // packed operands (the 324ms). dS stays the raw f32 stem (pass C's residual).
         sycl::half* dA = (sycl::half*)pool_get((size_t)Mp * 16 * 2);
-        float* dS = (float*)pool_get((size_t)Mp * 32 * 4);
-        sycl::half* dH16 = (sycl::half*)pool_get((size_t)M * 32 * 2);
         packdev::pack_a16(*GQ, Fraw, dA, (int)M, Mp, 16);
         sycl::half* dB = cached_pack_b_f16(adapter, Arw, 16, 32);   // weight
+        // P8-n / B1 brick 1: the STEM MEGAKERNEL -- one launch, the adapter gemm
+        // in-pass, the 16x32 f32 tile + its e4m3 A-map + the hidden stage all in
+        // per-thread SLM (4KB x LW16 = 64KB): dS and dH16 NEVER EXIST in global.
+        // bench_stem_mega: diff 0 / 16.7M EXACT vs the shipped dual+chip-res chain.
+        // Guards: the stem_chip shape conditions (chip path ON, epi 0, !narrow);
+        // dS/dH16 are not even allocated on this path. NR_FFN_MEGA=0 = escape.
+        {
+            // P8-n VERDICT (the 17:2x frame A/B): the mega is bit-exact (43 green +
+            // end-to-end 100%%x2 + bench diff 0/16.7M) but the FRAME is its judge:
+            // A/B 6/10 mean -0.22, and the stem's in-frame marginal did NOT drop
+            // (chain 9.5 vs mega 9.8 per 2 calls) -- the 3.4ms "round-trip penalty"
+            // theory is FALSIFIED: the chain's in-frame cost is NOT the dS/dH16
+            // re-read (the mega removes those buffers entirely and pays the same).
+            // => the stem's frame cost is the kernel's own latency chain at 64KB
+            // SLM (1 WG/SM occupancy) plus the mandatory 67MB f32 Cout write.
+            // DEFAULT OFF (a NEGATIVE mean is not "neutral-without-negative" -- the
+            // user's ruling keeps no-downside changes; this one has a measured
+            // -0.22 downside). The kernel STAYS as B1 brick-1: the SLM tile map,
+            // the constant-offset A-map stores and the bit-exact chain are proven
+            // assets for the window_block megakernel (where the win is the scr
+            // round-trip, a DIFFERENT mechanism). NR_FFN_MEGA=1 = opt-in witness.
+            static bool mega = getenv("NR_FFN_MEGA") && atoi(getenv("NR_FFN_MEGA")) != 0;
+            static bool ffntile3m = !getenv("NR_FFN_TILE") || atoi(getenv("NR_FFN_TILE")) != 0;
+            static bool ffchip3m = !getenv("NR_FFN_CHIP") || atoi(getenv("NR_FFN_CHIP")) != 0;
+            if (mega && ffntile3m && ffchip3m && !narrow && epi == 0u) {
+                sycl::half* dEp3 = cached_pack_b_f16(expand, Eraw, 32, 128);        // weight (cached = idempotent)
+                sycl::half* dPp3 = cached_pack_b_f16(projection, Praw, 128, 32);    // weight
+                ffnc::stem_mega(*GQ, dA, dB, dEp3, dPp3, cp, (float*)Cout, (int)M, Mp);
+                pool_put(dA);   // dB/dEp3/dPp3 cache-owned weights
+                return;
+            }
+        }
+        float* dS = (float*)pool_get((size_t)Mp * 32 * 4);
+        sycl::half* dH16 = (sycl::half*)pool_get((size_t)M * 32 * 2);
         // P8-m (section 100): DUAL STORE -- the adapter gemm writes the raw f32 dS
         // AND dH16 = half(e4m3(dS)) in one pass; the separate publish parallel_for
         // (67MB f32 re-read + 33MB write at M=522240) vanishes. Bit-identical by
