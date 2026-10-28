@@ -4529,7 +4529,11 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
         // fused-memcpy no-ops above)? NR_Q_STATS prints one line per live quant.
         if (getenv("NR_Q_STATS")) { static long qn=0; ++qn;
             if (qn<=100000) printf("[quant-live] #%ld M=%u K=%u src=%d pk=%d\n", qn, M, K, source, packed); }
+        size_t mycmd = g_cmds.size();
         g_cmds.push_back([=]() {
+            // B2 EXECUTION-TIME census: this lambda only runs if the launch was
+            // NOT dissolved by a downstream gemm's qfuse_take. NR_Q_STATS=1.
+            if (getenv("NR_Q_STATS")) printf("[quant-EXEC] M=%u K=%u src=%d pk=%d cmd=%zu\n", M, K, source, packed, mycmd);
             qr_launch_esimd(*GQ, *GD, a, pk, sc, M, K);
         });
         if (qfuse_on())   // register for a downstream gemm to dissolve us (P2 fusion)

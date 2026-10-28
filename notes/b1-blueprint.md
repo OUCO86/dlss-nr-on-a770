@@ -238,6 +238,27 @@ host 线并行另案（不碰 GPU 数值，风险最低肉最大）→ B3 视 B2
      tc_n tile？→ 若是，行持有不成立，改用 blade-2 式两段：store f16 行到
      pk 前的过渡 slab——设计稿第一步=画 N=256 的 tc 切分图）。
 
+## 六.六、B2 实测账（21:4x，覆盖 §六.5 的预估——下窗口按这版开工）
+
+1. **EXEC census（新工具 NR_Q_STATS，执行时打印=真幸存）**：**160 发** real ESIMD
+   quantize（不是初判的 224），形状全表：(640,2048)x32、(8160,512)x24、(32640,256)x16、
+   (2040,256)x32、(192,1024)x16、(8160,128)x24、(32640,64)x16。pk 只有 1305/1312。
+2. **三段定价（NR_Q_STOP=8/9 三态）**：real-ESIMD-kernel = **9.5ms**；fused-memcpy
+   分支 = **0**（P2 的 memcpy 不花钱）；幸存全在 kernel 段。
+3. **★ 地板分解（本轮最重要的一条账）**：160 发流量 = 1107MB → 420GB/s 下地板
+   **2.64ms**；实测 9.5ms ⇒ **6.9ms = launch/延迟开销**（平均 59µs/发 vs 大形状
+   32640x256 的 60µs——小形状全在发射延迟上）。**B2 的肉不是消流量，是消 launch**。
+4. **消费者侧内嵌（take_b / NR_Q_FUSE_B）新账本下重测：3/8、-0.47 = 仍负**
+   （两次独立判决一致，pack_a 内嵌量化的串行代价 > 省下的 launch。此路封存）。
+5. **生产者侧真内嵌（前辈形态）= 唯一未打的 B2 刀**：gemm 的 tc 循环天然按行扫过
+   全部 16 个 16-列 tile ⇒ **行 max-abs 可在 tc 循环里寄存器累加**（partial-max
+   per row），tc 循环尾做 scale + e4m3 打包直写 pk+scale——quant launch 与 f16
+   读（738MB）双双消失。前提核查（下窗口第一步）：batched gemm 的 subgroup
+   ownership 是否一行归一个 subgroup（若列被切走则先改 ownership）。预期
+   -5~6ms（消 6.9ms 开销的大部）。**开工序：(a) 先画 gemm_int8_batched 的
+   tc/行 ownership 图 → (b) bench 原型（JUDGE=pk 逐字节对拍）→ (c) 三关。**
+6. QUANT_WINDOW 幸存 ~1ms（x104 里大部分已被 P4b take 溶解）——不动。
+
 ## 七、交接检查单（新窗口开工先读这些）
 
 1. 本蓝图全文 + 总蓝图 `notes/section100-blueprint.md` §7.5-7.6（★索引行在 7.5 头部）
