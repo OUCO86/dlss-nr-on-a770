@@ -203,5 +203,5 @@ P1-P3 后剩余 GEMM 家族按 width-sweep 目标线逐核修（C2 acc-via-SLM �
 2. V-part scatter（0.181/call）：pb16_dest_kn 行奇偶映射不可 pair-merge；换 V tile 布局牵动 attnV 读侧=大改，暂记。
 3. attnV/outproj hoist：**已否证**（32-reg 区 spill，P8-g/g2 两刀在案）——不要再试整块 hoist；若要试按 ≤16-reg 分半 hoist。
 4. 三 gemm 族（residual/winres/global）本体已 bench 证速；尾巴（publish/scale）已 fused。剩余=width-sweep 逐形状精修（前辈 int8-width-sweep.md 表=红利地图：M 大 N 大才 2-3.5x；Large-GRF 模式=前辈实测否证，不走）。
-5. 地板 27.8 的组成拆解（ffn 三 chip + quant 160 溶解后残余 + unary + 提交）——尚未有逐项账，是 P8 收官前最后一笔账。
+5. ~~地板 27.8 组成拆解~~（**15:0x 已结清，提交 913ca53**：NR_F_STOP/NR_QW_STOP/NR_U_STOP 探针。四族单独价=ffn 16.1 / split quant 11.5（P8-j 后）/ unary 9.4 / quant_window 0.3（P4b 已融合=非靶）；**同删四族只省 22.2 ≠ 单独和 37.3——15ms 被 cgraph 重叠吸收**。军规第 9 条的量化实锤：帧 119.8 是全重叠总账，各族隔离定价会高估可回收量。B1 的真奖品=关键路径上那部分（per-WG elementwise scr 往返=P8-i2/j 两钉所指），不是家族加和。）
 6. 游戏侧 vs 离线残余 ~12ms（持续满载时钟差）——暂不追。
