@@ -169,6 +169,45 @@ v5 的真实意义 = 把"延迟链"论点兑现成钱 + 给 B3 探路（epilogue
 **优先级裁决（写死）：v5a-c 打完（已开工、论证全）→ 立即转 B2 quant（最大倍数）→
 host 线并行另案（不碰 GPU 数值，风险最低肉最大）→ B3 视 B2 后剩余账再立项。**
 
+## 六.五、B2 QUANT 战役 census（21:1x 本轮实测，下窗口开工直接读这里）
+
+**帧账**：quant 家族现存 ESIMD 边际 ~10-11ms（NR_Q_STOP=9 实测 10.0-10.9）；前辈同级 1.64ms = **7x**。
+
+**plan census（walk_plan.py 机制代码 148-270 行精读后修正版，552 个 QUANT 步按 src 最后写者分组）**：
+
+| 组（src ← 写者） | N | 元素量 | 现状 |
+|---|---|---|---|
+| 1267 ← GEMM_INT8_RESIDUAL（ffn 输出） | x120 | 100.7M | 消费者配对存活（见下） |
+| 1277 ← WINDOW_ATTENTION | x104 | 97.5M | 同上 |
+| 1275/1274 ← GEMM_INT8_BATCHED | x72+x40 | 69+234M | **NR_Q_FUSE_B 门 OFF**（历史实测 fused-pack +8ms 吃掉 quant -12 = 净中性，00:45 判决存档） |
+| 1275/1274 ← GEMM | x32+x32 | 17+42M | 配对存活 |
+| GEMM_WINDOW_INT8_RESIDUAL 系（1279-1297） | x~86 | ~75M | 配对存活 |
+| 其余小头 | x~18 | ~20M | — |
+
+**机制要点（写码前必读）**：
+1. `g_quant_pk` 以 **pk 缓冲（1272/1273 共享 scratch）** 为键——登记后**必须**下一个
+   gemm 立刻消费（`qfuse_take` 查 a==pk），否则被后一个 quant 覆盖 = 存活。
+   配对条件：sc/M/K 相等（+batched 的 lda/sa 形、gap<=4）。**16 个 scale-buf 不同的
+   天然两 pass**（census 存档）。
+2. 消费者侧（gemm 的 pack_a 内嵌量化）**已经打完**——P2 全溶解 448/448 的那轮 +
+   batched 变体实测净中性关闭（NR_Q_FUSE_B）。**剩下的 10-11ms 不是配对没做，
+   是配对几何不满足**（写者与读者不相邻 / scale buf 不同 / 多读者）。
+3. **前辈的真打法 = 生产者侧**：quant 折进生产 gemm 的 store epilogue——他的
+   gemm 存 f32 时顺手出 e4m3-packed int8 + row scale（193 个 quantize_row 共 1.64ms）。
+   我们的障碍：row scale = 256 宽行的 max-abs 归约，生产 gemm 的 tile 输出跨
+   subgroup 不持整行 ⇒ 需要"生产 gemm 输出行持有 + 行内归约 + packed store"三合一
+   （= gemm_pub_pa16 家族的自然延伸，但 scale 归约是新地形）。
+4. **候选靶排序（按组 x 元素量）**：(a) 1267←GEMM_INT8_RESIDUAL x120（ffn 三族的
+   输出行=32 宽，quant 行=256 宽 ⇒ **8 个 ffn 输出行拼 1 quant 行**，跨行 scale——
+   先查 ffn Cout 布局与 quant 行对齐）；(b) 1277←WINDOW_ATTENTION x104（attention
+   输出 96 宽行 vs quant 256——同样先对账）；(c) x32 GEMM 小对（2040x256：
+   gemm 输出行=256 宽**正好一行** = 最干净的第一个靶！(2040,256) 的 GEMM dst=1275
+   直接 f16 行→e4m3+scale 内嵌 store）。
+5. **施工第一步（下窗口）**：先做 (c)——GEMM x32（src=1275/1274，(2040,256)/(640,2048)）
+   的生产 gemm store epilogue 加 quant-inline（qr_kernel_rowthread 已证 numpy-exact），
+   JUDGE=quant 输出 pk 逐字节对拍 + 端到端 100%。预期 -2~3ms（17+42M 元素）。
+   (a)(b) 需要跨行 scale 设计，立项前画行布局图。
+
 ## 七、交接检查单（新窗口开工先读这些）
 
 1. 本蓝图全文 + 总蓝图 `notes/section100-blueprint.md` §7.5-7.6（★索引行在 7.5 头部）
