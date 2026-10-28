@@ -18,7 +18,29 @@
    它赢的原因与模型自洽：**SLM store→load 是链上延迟**，减 store=缩短链。
 5. **P8-r 半 store 否证**：字节减半、指令数不变 → 更慢。判决=**只数指令，不数字节**（B1 设计红线）。
 
-## 二、v5 = 前辈几何（本战役主刀，设计已钉死）
+## 一点五、战果（本分支已转正两刀，延迟链论点=已验证盈利）
+
+- **blade-1（P8-q2 合并 store，提交 86647a2）**：acc→SLM 相邻列半行合成一次
+  simd<float,16> store（16→8 指令/part），store 0.056→0.032、QKV 0.563→0.518、
+  FULL 1.232→1.216；帧 A/B 9/10 **+1.41ms**；JUDGE 七区全 EXACT。部署 c84d1d22。
+- **blade-2（P8-blade2 两段式 QKV，提交 077fac5）**：三个 part 的 dpas+store 全做完
+  →**一个** barrier→reload+epilogue+scatter 全做完（6 个 subgroup barrier→2）。
+  scrA/scrB 分 subgroup 的 4KB SCR，scrC 别名 PPO 头（softmax 前死，phase-2 消费完
+  再 barrier 排序）。QKV 0.518→0.474、FULL 1.216→1.111；帧 A/B 9/10 **+1.32ms**；
+  端到端 100%×2。开发中 JUDGE 两次秒级逮 bug（scrB 误叠 4KB ATO 区→6 区 BAD；
+  漏末尾 barrier→VPO dump 竞态 214/8.36M）——安全网价值实证。部署 **8ad560c2**。
+- **分支累计**：walk 117→**~112.5**（-2.7ms）。两刀都砍在 barrier/指令数（延迟链），
+  而消 L2 流量的 mega 死在同一模型下 ⇒ **latency-chain 论点是盈利的，v5 几何继续这条轴**。
+
+## 二、v5 = 前辈几何（本战役主刀，设计已钉死；几何账已算清）
+
+**v5.1 几何算术（本轮已定，写码照此）**：8 subgroup × 8 行（LW=128，SIMD16）。
+每 part = 8 行×32 列 = 两个 8×16 tile（c00,c01 + 第二 tc）= **4 dpas（v4 是 8）**，
+活跃 acc = 4×simd<float,64> = 16 GRF（安全线内）。scatter 的 (r,c)→pb16t/pb16/sh16
+map 不变（r=全局行 0-63）。**注意：QKV/scores/attnV/outproj 共享 subgroup ownership，
+v5 必须整核同几何——不能只改 QKV 段（ownership 不一致则 scr/操作数域错位，
+7 区 JUDGE 会红但那是半迁移不是 bug）**。这决定 v5 是一次完整重写（~250 行），
+不是增量刀——按 §三 施工序 v5.1→v5.4 分阶段在 bench 里推进。
 
 前辈 window_block.comp（531 行，已精读）的形态与我们 v4 的三条结构差：
 
