@@ -3303,7 +3303,12 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
     g_cmd_names.push_back(__func__);
         flop_note("winattn_scores",64u,64u,32u,batches); flop_note("winattn_attnv",64u,32u,64u,batches);
     g_cmds.push_back([=]() {
-        // device pack + batched gemm (section 92): the per-batch host loop (4 sync
+        // NR_WA_STOP=9 (section 100 P7 game-path ledger, time-only DIAGNOSTIC: the
+        // frame output is garbage here by design -- same convention as NR_QKV_STOP
+        // etc.): skip the whole window_attention resident/split chain to price the
+        // family on the cgraph (game) path. NOT for deployment correctness.
+        static int wastop = getenv("NR_WA_STOP") ? atoi(getenv("NR_WA_STOP")) : 0;
+        if (wastop == 9) return;
         // memcpys + 4 malloc/free + 2 launches PER batch, batches up to 2040) was the
         // 34s pathology. Q/K/V are already contiguous per batch on device, so one
         // batched pack + one batched gemm covers every window; the dpas sequence per
