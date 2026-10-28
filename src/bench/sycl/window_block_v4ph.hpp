@@ -109,10 +109,12 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
                     } else {
                         esimd::simd<float,32> kv = wbv3::mulh(hr, recip);
                         esimd::simd<half,32> oh = esimd::convert<half>(wbv3::e4m3_vec<32>(kv));
-                        auto ov = oh.read();
-                        for (uint c = 0; c < 32; ++c)
+                        // P8-e (section 100): the (c,c+1) pair is 4B-adjacent in
+                        // pb16t_dest -> 16 x 2-half stores (bench_v4full KTO judge
+                        // EXACT; VPO stays scalar -- its last bit is the row parity).
+                        for (uint c = 0; c < 32; c += 2)
                             esimd::slm_block_store(S_KTO + wbv3::pb16t_dest(r,c,2u,4u)*2u,
-                                                   esimd::simd<half,1>(ov[c]));
+                                                   oh.template select<2,1>(c));
                     }
                 }
                 esimd::barrier();

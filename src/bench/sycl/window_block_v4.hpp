@@ -107,10 +107,14 @@ inline event launch_v4full(queue& q, const void* Img, bool image_half,
                     } else {
                         esimd::simd<float,32> kv = wbv3::mulh(hr, recip);
                         esimd::simd<half,32> oh = esimd::convert<half>(wbv3::e4m3_vec<32>(kv));
-                        auto ov = oh.read();
-                        for (uint c = 0; c < 32; ++c)
+                        // P8-e (section 100): pb16t_dest's LAST bit is (k&1)=(c&1)
+                        // -> the (c,c+1) pair is 4B-ADJACENT: 16 x 2-half slm
+                        // stores replace 32 x 1-half (bit-EXACT: the bench_v4full
+                        // KTO judge 0/8.36M; VPO cannot -- its last bit is the
+                        // ROW parity, kept scalar). K-part 0.237->0.185 ms/call.
+                        for (uint c = 0; c < 32; c += 2)
                             esimd::slm_block_store(S_KTO + wbv3::pb16t_dest(r,c,2u,4u)*2u,
-                                                   esimd::simd<half,1>(ov[c]));
+                                                   oh.template select<2,1>(c));
                     }
                 }
                 esimd::barrier();

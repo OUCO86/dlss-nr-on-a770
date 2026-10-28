@@ -78,9 +78,11 @@ inline event launch_v4full(queue& q, const void* Img, bool image_half,
                 wbv3::sh16(S_AQO + base2*2u, oh.template select<16,1>(16).read());
             }
             esimd::barrier();                       // subgroup: own rows only
-
-            // ===== P1+P2 fused (the slice VERBATIM) =====
+            if (stop_stage == 101u) return;         // P8-ladder: P0 gather ONLY (no dump)
+            // P1+P2 fused (the slice VERBATIM) =====
             for (uint part = 0; part < 3u; ++part) {
+                if (stop_stage == 102u && part == 1u) return;   // one part's marginal
+                if (stop_stage == 103u && part == 2u) return;   // two parts' marginal
                 uint scr = S_SCR + sgid*SCR_SG;
                 esimd::simd<float,64> c00(0.f),c01(0.f),c10(0.f),c11(0.f);
                 wbv3::tile8s(c00,c01,c10,c11, S_AQO + sgid*1024u,
@@ -105,6 +107,10 @@ inline event launch_v4full(queue& q, const void* Img, bool image_half,
                 if (part == 2u) {
                     esimd::simd<half,32> oh = esimd::convert<half>(wbv3::e4m3_vec<32>(hv));
                     auto ov = oh.read();
+                    // P8-e NOTE: the pair-merge is ILLEGAL for VPO -- pb16_dest_kn's
+                    // last bit is (r&1) (the ROW parity), so consecutive c differ by
+                    // TWO halves, not one. K's pb16t_dest has (c&1) last -> pairs ARE
+                    // adjacent there (the KTO judge went EXACT with 16x2-half).
                     for (uint c = 0; c < 32; ++c)
                         esimd::slm_block_store(S_VPO + wbv3::pb16_dest_kn(r,c,4u,2u)*2u,
                                                esimd::simd<half,1>(ov[c]));
@@ -123,10 +129,9 @@ inline event launch_v4full(queue& q, const void* Img, bool image_half,
                     } else {
                         esimd::simd<float,32> kv = wbv3::mulh(hr, recip);
                         esimd::simd<half,32> oh = esimd::convert<half>(wbv3::e4m3_vec<32>(kv));
-                        auto ov = oh.read();
-                        for (uint c = 0; c < 32; ++c)
+                        for (uint c = 0; c < 32; c += 2)
                             esimd::slm_block_store(S_KTO + wbv3::pb16t_dest(r,c,2u,4u)*2u,
-                                                   esimd::simd<half,1>(ov[c]));
+                                                   oh.template select<2,1>(c));
                     }
                 }
                 esimd::barrier();
@@ -360,6 +365,23 @@ int main(){
   // full runs (no dump) for the real price
   double f3=timeit("v3 FULL", [&]{ return v3call(0u,nullptr); });
   double f4=timeit("v4 FULL", [&]{ return v4call(0u,nullptr); });
+  // P8-ladder: PURE stops (dump guarded by DumpKV=nullptr -> stop only):
+  // the real stage deltas with no 16MB dump traffic polluting them.
+  double p10=timeit("v4 stop QKV(QPO)",[&]{ return v4call(10u,nullptr); });
+  double p101=timeit("v4 stop P0only  ",[&]{ return v4call(101u,nullptr); });
+  double p102=timeit("v4 stop part0   ",[&]{ return v4call(102u,nullptr); });
+  double p103=timeit("v4 stop part01  ",[&]{ return v4call(103u,nullptr); });
+  printf("QKV split: P0=%8.4f | part0(Q)=%8.4f | part1(K)=%8.4f | part2(V)=%8.4f\n",
+         p101, p102-p101, p103-p102, p10-p103);
+  double p12=timeit("v4 stop VPO    ",[&]{ return v4call(12u,nullptr); });
+  double p5 =timeit("v4 stop scores ",[&]{ return v4call(5u,nullptr); });
+  double p6 =timeit("v4 stop probs  ",[&]{ return v4call(6u,nullptr); });
+  double p8 =timeit("v4 stop attend ",[&]{ return v4call(8u,nullptr); });
+  double p9 =timeit("v4 stop project",[&]{ return v4call(9u,nullptr); });
+  printf("PURE-LADDER v4: QKV=%8.4f | +scores=%8.4f | +probs=%8.4f | +attend=%8.4f | +project=%8.4f | FULL=%8.4f\n",
+         p10,p5,p6,p8,p9,f4);
+  printf("  stage deltas: QKV=%8.4f scores=%8.4f softmax=%8.4f attnV=%8.4f outproj+store=%8.4f\n",
+         p10, p5-p10, p6-p5, p8-p6, f4-p8);
   // judge
   std::vector<half> ref(NST*rstride), got(NST*rstride);
   q.memcpy(ref.data(),dRef,ref.size()*2).wait();
