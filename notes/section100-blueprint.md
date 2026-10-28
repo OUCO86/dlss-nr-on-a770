@@ -151,7 +151,7 @@ P1-P3 后剩余 GEMM 家族按 width-sweep 目标线逐核修（C2 acc-via-SLM �
 
 | 家族 | 游戏路径成本 | 状态 |
 |---|---|---|
-| window_block（plain v4full 16 call） | **29.4**（1.84/call） | **头牌靶**：bench 合成域 1.30/call → 真形状/真值域 gap 0.54/call |
+| window_block（plain 路 16 call） | **29.4**（1.84/call） | **头牌靶**：bench 合成域 1.30/call → 真形状/真值域 gap 0.54/call |
 | qkv（120 call） | 15.2 = tail 9.6 + gemm 4.8 + pack 0.8 | gemm/tail 已贴已证线（P5/P6/P7/P11 四试在案）|
 | window_res（104） | 14.6 = gemm 13.7 + pack 0.9 | gemm_b_res 本体 bench 证速；pack 已 fused |
 | global_att（16） | 12.8 = gemms 12.0 + rest 0.8 | gemm 本体已证速；resident 被形状算术否证（重算 scores=翻倍）|
@@ -163,6 +163,15 @@ P1-P3 后剩余 GEMM 家族按 width-sweep 目标线逐核修（C2 acc-via-SLM �
 | **不可约地板** | **27.8** | ffn+quant+unary+提交+pool/head 路（691 闭包 cgraph） |
 
 对照蓝图目标：中期里程碑 ≤24ms、终局 10-15ms。**当前 ~127 = 里程碑未达**；剩余可挖=window_block 29.4 的域 gap + 三 gemm 族尾巴 + 地板 27.8 的逐核精修。理论地板的"7-14ms dispatch 成分"已被 cgraph 压掉大半（ON vs OFF=132 vs 146，省 14ms）。
+
+### 7.2b 精细修正（10-28 13:3x，提交 7367422：NR_WB_PH_STOP + NR_Q_STOP 探针 + bench 帧形状阶梯）
+
+**上面 window_block 行读数已被推翻（探针语义：NR_V2_STOP=65530 同时杀两路——v4full/v4ph 两分支都有该判断；"both"行与"v4"行相等即此故）**。路由普查（flags bit23=POOL/bit24=HEAD）：
+
+- **4 个 giant call = v4ph 路（8160w POOL x2 + 8349w HEAD x2，level-0 全分辨率块，544x960 域）= 19.5ms（4.88/call）**——头牌靶。v4full 在 giant 形状的 bench 参考值 4.89/5.14/call（帧形状阶梯）与 v4ph 帧内边际几乎相等：两路在 giants 上打平，谁都没贴已证线——giants 单 call 4.9ms x4 是纯 GPU 时间，可挖。
+- 16 small = **~10.5ms（0.66/call 有效）**——bench 隔离计时 1.25-1.32/call 但帧内边际 0.66：小 call 是 latency-bound，cgraph 把 bench 成本部分藏进重叠里。**对 latency-bound 核，帧内边际才是真价。**
+- 幸存 split quant（P2 未溶解的 ~160 个）= **12.0ms** = 第二账目。
+- **新账本军规（§7.4 第 9 条）：家族真价=帧内边际（cgraph 重叠后），不是 bench 隔离时间——latency-bound 小核 bench 会虚高、GPU-bound 大核两者相等。定靶前先分类。**
 
 ### 7.3 已结案家族（附 launch 计数证据，不许重挖）
 
@@ -187,7 +196,7 @@ P1-P3 后剩余 GEMM 家族按 width-sweep 目标线逐核修（C2 acc-via-SLM �
 
 ### 7.5 剩余靶图（按 §7.2 账本排序）
 
-1. **window_block 真域定靶（下一刀）**：帧 16 call=1.84/call vs bench 合成 1.30——先给 bench_v4full 喂真帧 image 统计（NR_VITDUMP 同款：录制器 dump 第一帧 Img/权重真值 + 真形状 windows=2040-2135），再拆 gap（值域→dpas 数不变、更可能是 L2/占用或 P0 gather 真 image 尺寸 544×960×32 vs bench 同尺寸……需实测）。
+1. **window_block giants（下一刀，13:3x 定案）**：4 个 v4ph call（8160w POOL + 8349w HEAD）=19.5ms 纯 GPU。v4full 在 giant 形状 4.89/5.14/call 与 v4ph 打平——两条 resident 路都不是 giants 的已证最优；候选=giants 走 **split wide-M 路**（§99 健康形态：rows=windows*64=522k-534k 的宽 gemm，width-sweep 2-3.5x 红利区）对拍 resident。先给 bench_v4full/bench 加 v4ph-giants 与 split-wide-giants 两条的帧形状对拍（判官=stage-dump 位精确），再定。第二靶=**幸存 split quant 12.0ms**：先普查谁没被 P2 溶解（读者计数），能否多读者合并/延迟量化再折。
 2. V-part scatter（0.181/call）：pb16_dest_kn 行奇偶映射不可 pair-merge；换 V tile 布局牵动 attnV 读侧=大改，暂记。
 3. attnV/outproj hoist：**已否证**（32-reg 区 spill，P8-g/g2 两刀在案）——不要再试整块 hoist；若要试按 ≤16-reg 分半 hoist。
 4. 三 gemm 族（residual/winres/global）本体已 bench 证速；尾巴（publish/scale）已 fused。剩余=width-sweep 逐形状精修（前辈 int8-width-sweep.md 表=红利地图：M 大 N 大才 2-3.5x；Large-GRF 模式=前辈实测否证，不走）。
