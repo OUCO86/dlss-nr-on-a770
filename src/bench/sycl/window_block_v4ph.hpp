@@ -66,8 +66,17 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
             esimd::barrier();                       // subgroup: own rows only
 
             // ===== P1+P2 fused (the slice VERBATIM) =====
+            // P8-blade2 (B1, the v4 twin, bench-proven on the v4 copy first): TWO-PHASE QKV
+            // -- phase 1 dpas+merged-stores for all 3 parts into scrA/scrB/scrC
+            // (the subgroup SCR 4KB splits in two; scrC aliases the PPO head,
+            // dead until softmax), ONE barrier, phase 2 reload+epilogue+scatter
+            // with the per-row chain VERBATIM. JUDGEs all seven EXACT on the twin.
+            uint scrA = S_SCR + sgid*SCR_SG;
+            uint scrB = S_SCR + sgid*SCR_SG + 2048u;
+            uint scrC = S_PPO + sgid*2048u;
+            #pragma unroll
             for (uint part = 0; part < 3u; ++part) {
-                uint scr = S_SCR + sgid*SCR_SG;
+                uint scr = (part==0u)? scrA : (part==1u)? scrB : scrC;
                 esimd::simd<float,64> c00(0.f),c01(0.f),c10(0.f),c11(0.f);
                 wbv3::tile8s(c00,c01,c10,c11, S_AQO + sgid*1024u,
                              WqkvPacked + (size_t)(part*2u+0u)*256u, 2, 6);
@@ -93,7 +102,11 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
                     esimd::slm_block_store(scr + (uint)r*32u*4u + 64u,     n01);
                     esimd::slm_block_store(scr + (uint)(8+r)*32u*4u + 64u, n11);
                 }
-                esimd::barrier();
+            }
+            esimd::barrier();
+            #pragma unroll
+            for (uint part = 0; part < 3u; ++part) {
+                uint scr = (part==0u)? scrA : (part==1u)? scrB : scrC;
                 uint r2 = lane, r = sgid*16u + lane;
                 esimd::simd<float,32> hv = esimd::slm_block_load<float,32>(
                     scr + r2*32u*4u, esimd::overaligned_tag<16>{});
@@ -118,16 +131,13 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
                     } else {
                         esimd::simd<float,32> kv = wbv3::mulh(hr, recip);
                         esimd::simd<half,32> oh = esimd::convert<half>(wbv3::e4m3_vec<32>(kv));
-                        // P8-e (section 100): the (c,c+1) pair is 4B-adjacent in
-                        // pb16t_dest -> 16 x 2-half stores (bench_v4full KTO judge
-                        // EXACT; VPO stays scalar -- its last bit is the row parity).
                         for (uint c = 0; c < 32; c += 2)
                             esimd::slm_block_store(S_KTO + wbv3::pb16t_dest(r,c,2u,4u)*2u,
                                                    oh.template select<2,1>(c));
                     }
                 }
-                esimd::barrier();
             }
+            esimd::barrier();
             auto dump_region = [&](uint reg) SYCL_ESIMD_FUNCTION {
                 if (DumpKV) { half* d=DumpKV+(size_t)window*4096u;
                     for (uint i=0;i<2048u;i+=64u) d[i+lid]=wbv3::lh16(reg+(i+lid)*2u)[0]; } };

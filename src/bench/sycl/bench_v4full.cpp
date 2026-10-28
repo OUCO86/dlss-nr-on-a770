@@ -104,40 +104,39 @@ inline event launch_v4full(queue& q, const void* Img, bool image_half,
             // acc->scr round-trip, not the dpas operand loads. Reverted to mirror
             // the shipped v4. The scores hoist (P8-f, 4x128=16-reg class) DID win
             // and lives in the shipped kernel.)
+            // P8-blade2 (B1): PHASE-SPLIT QKV -- the 3 parts get THREE separate
+            // scr slabs (SCR | ATO | PPO-front; both maps are DEAD until P6/P4), so
+            // the per-part store->barrier->reload chains no longer serialize behind
+            // each other: 6 subgroup barriers -> 1 (the barrier before the reload
+            // phase) + the existing end-of-loop one. The per-row op chain is
+            // UNCHANGED -> bit-identical by construction; the seven-region JUDGE is
+            // the safety net. The fill probe (a196d5e) says v4 is LATENCY-bound:
+            // the barriers ARE the chain-coupling between parts.
+            // each part's rows slab = 16 rows x 32 floats = 2KB/subgroup.
+            // scrA/scrB split the subgroup's 4KB SCR slab; scrC takes the PPO
+            // region (8KB = 4x2KB, dead until softmax). ATO stays untouched
+            // (4KB total -- an earlier draft aliased scrB there and the JUDGE
+            // caught the sgid>=1 overflow into scrC: BAD rows, exactly the
+            // safety net doing its job).
+            uint scrA = S_SCR + sgid*SCR_SG;                 // rows 0-15 part0
+            uint scrB = S_SCR + sgid*SCR_SG + 2048u;         // rows 0-15 part1
+            uint scrC = S_PPO + sgid*2048u;                  // rows 0-15 part2
+            // P8-blade2: TWO-PHASE QKV (the fill probe says v4 is latency-bound;
+            // the per-part store->barrier->reload chains serialize behind each
+            // other). Phase 1: dpas + merged stores for ALL THREE parts into
+            // THREE separate scr slabs (no barrier between parts). ONE barrier.
+            // Phase 2: reload + epilogue + scatter for all three (no barrier:
+            // each subgroup re-reads only its own rows; the per-row op CHAIN is
+            // VERBATIM the same -> bit-identical by construction).
+            #pragma unroll
             for (uint part = 0; part < 3u; ++part) {
-                if (stop_stage == 102u && part == 1u) return;   // one part's marginal
-                if (stop_stage == 103u && part == 2u) return;   // two parts' marginal
-                uint scr = S_SCR + sgid*SCR_SG;
+                uint scr = (part==0u)? scrA : (part==1u)? scrB : scrC;
                 esimd::simd<float,64> c00(0.f),c01(0.f),c10(0.f),c11(0.f);
                 wbv3::tile8s(c00,c01,c10,c11, S_AQO + sgid*1024u,
                              WqkvPacked + (size_t)(part*2u+0u)*256u, 2, 6);
                 esimd::simd<float,64> d00(0.f),d01(0.f),d10(0.f),d11(0.f);
                 wbv3::tile8s(d00,d01,d10,d11, S_AQO + sgid*1024u,
                              WqkvPacked + (size_t)(part*2u+1u)*256u, 2, 6);
-                // P8-q micro-ladder (PART 0 only; uniform per-subgroup returns):
-                // 111 = dpas only | 112 = + the 64x f32 scr store | 113 = + the
-                // row reload. MEASURED (2040w): dpas 0.068 | store 0.056 | reload
-                // ~0 (overlaps) | norm+scatter 0.021 => the acc->scr f32 STORE is
-                // 42% of a QKV part. P8-r proved it is INSTRUCTION-bound not byte-
-                // bound (half-store: JUDGE all EXACT -> bit-exactness confirmed,
-                // but SLOWER: +8 convert<half> at the same 8 stores). => the only
-                // way to remove it is the senior's ONE-PASS epilogue: reduce the
-                // row norm across the 4 accumulator lanes by subgroup shuffle and
-                // scatter the e4m3 halves into QPO/KTO/VPO directly -- NO scr row
-                // round-trip. That is B1's window_block target (see blueprint
-                // section 8). The f32 store stays here (the known-good 1.232 FULL)
-                // until v5 lands the shuffle epilogue.
-                if (stop_stage == 111u && part == 0u) return;
-                // P8-q2 MERGED-STORE EXPERIMENT (the decisive one for v5): the
-                // ladder says store=0.056 of part0's 0.133, and P8-r proved it is
-                // INSTRUCTION-count-bound (half-store = same 8 stores = no win).
-                // So: merge the 8 x simd<float,8> per row into 4 x simd<float,16>
-                // (c00+c01 adjacent cols 0-15 of one row = one 16-float line). If
-                // store drops ~2x, the register-path epilogue (v5) is worth it;
-                // if flat, the store is latency-shaped and v5 needs a rethink.
-                // NOTE: the merge changes ONLY the scr layout IF the vector's
-                // lane-distribution matches; the reload must mirror it EXACTLY or
-                // the JUDGEs go red (that is the safety net, doing its job).
                 #pragma unroll
                 for (int r = 0; r < 8; ++r) {
                     esimd::simd<float,16> m01;
@@ -157,19 +156,19 @@ inline event launch_v4full(queue& q, const void* Img, bool image_half,
                     esimd::slm_block_store(scr + (uint)r*32u*4u + 64u,     n01);
                     esimd::slm_block_store(scr + (uint)(8+r)*32u*4u + 64u, n11);
                 }
-                if (stop_stage == 112u && part == 0u) return;
-                esimd::barrier();
+            }
+            esimd::barrier();
+            #pragma unroll
+            for (uint part = 0; part < 3u; ++part) {
+                if (stop_stage == 102u && part == 1u) return;   // one part's epilogue marginal
+                if (stop_stage == 103u && part == 2u) return;   // two parts' marginal
+                uint scr = (part==0u)? scrA : (part==1u)? scrB : scrC;
                 uint r2 = lane, r = sgid*16u + lane;
                 esimd::simd<float,32> hv = esimd::slm_block_load<float,32>(
                     scr + r2*32u*4u, esimd::overaligned_tag<16>{});
-                if (stop_stage == 113u && part == 0u) return;
                 if (part == 2u) {
                     esimd::simd<half,32> oh = esimd::convert<half>(wbv3::e4m3_vec<32>(hv));
                     auto ov = oh.read();
-                    // P8-e NOTE: the pair-merge is ILLEGAL for VPO -- pb16_dest_kn's
-                    // last bit is (r&1) (the ROW parity), so consecutive c differ by
-                    // TWO halves, not one. K's pb16t_dest has (c&1) last -> pairs ARE
-                    // adjacent there (the KTO judge went EXACT with 16x2-half).
                     for (uint c = 0; c < 32; ++c)
                         esimd::slm_block_store(S_VPO + wbv3::pb16_dest_kn(r,c,4u,2u)*2u,
                                                esimd::simd<half,1>(ov[c]));
@@ -193,8 +192,11 @@ inline event launch_v4full(queue& q, const void* Img, bool image_half,
                                                    oh.template select<2,1>(c));
                     }
                 }
-                esimd::barrier();
             }
+            esimd::barrier();   // blade-2 FIX: the original loop's per-part end barrier --
+                                // without it the stop=10/11/12 dumps (and the downstream
+                                // stages) race ahead of other subgroups' scatter (the VPO
+                                // judge caught exactly this: 214/8.36M = a race, not a map)
             auto dump_region = [&](uint reg) SYCL_ESIMD_FUNCTION {
                 if (DumpKV) { half* d=DumpKV+(size_t)window*4096u;
                     for (uint i=0;i<2048u;i+=64u) d[i+lid]=wbv3::lh16(reg+(i+lid)*2u)[0]; } };
@@ -478,12 +480,6 @@ int main(){
   double p103=timeit("v4 stop part01  ",[&]{ return v4call(103u,nullptr); });
   printf("QKV split: P0=%8.4f | part0(Q)=%8.4f | part1(K)=%8.4f | part2(V)=%8.4f\n",
          p101, p102-p101, p103-p102, p10-p103);
-  // P8-q: part0's INTERNAL split (dpas | +store | +reload | +norm/scatter):
-  double s111=timeit("v4 p0 dpas    ",[&]{ return v4call(111u,nullptr); });
-  double s112=timeit("v4 p0 +store  ",[&]{ return v4call(112u,nullptr); });
-  double s113=timeit("v4 p0 +reload ",[&]{ return v4call(113u,nullptr); });
-  printf("part0 internals: dpas=%8.4f | store=%8.4f | reload=%8.4f | norm+scatter=%8.4f\n",
-         s111-p101, s112-s111, s113-s112, p102-s113);
   double p12=timeit("v4 stop VPO    ",[&]{ return v4call(12u,nullptr); });
   double p5 =timeit("v4 stop scores ",[&]{ return v4call(5u,nullptr); });
   double p6 =timeit("v4 stop probs  ",[&]{ return v4call(6u,nullptr); });
