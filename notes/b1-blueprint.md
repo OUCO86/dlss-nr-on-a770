@@ -203,10 +203,30 @@ host 线并行另案（不碰 GPU 数值，风险最低肉最大）→ B3 视 B2
    输出 96 宽行 vs quant 256——同样先对账）；(c) x32 GEMM 小对（2040x256：
    gemm 输出行=256 宽**正好一行** = 最干净的第一个靶！(2040,256) 的 GEMM dst=1275
    直接 f16 行→e4m3+scale 内嵌 store）。
-5. **施工第一步（下窗口）**：先做 (c)——GEMM x32（src=1275/1274，(2040,256)/(640,2048)）
-   的生产 gemm store epilogue 加 quant-inline（qr_kernel_rowthread 已证 numpy-exact），
-   JUDGE=quant 输出 pk 逐字节对拍 + 端到端 100%。预期 -2~3ms（17+42M 元素）。
-   (a)(b) 需要跨行 scale 设计，立项前画行布局图。
+5. **★ 深剖结论（21:3x，覆盖上一条的初判——下窗口直接按这版开工）**：
+   - "shared-scratch 多读者=不能折"的担心**错了**：1267/1277/1275 是 ping-pong
+     scratch——每个写者之后**立刻**跟它的 QUANT（step14 BATCHED 写 1275 → step15
+     QUANT 读 1275）。RESIDUAL x120 写 1267 → x104 QUANT_WINDOW 读。写读严格相邻。
+   - **真靶 = (a) x120 GEMM_INT8_RESIDUAL→QUANT_WINDOW（1267，100.7M）+
+     (b) x104 WINDOW_ATTENTION→QUANT（1277，97.5M）**。初判的 (c) GEMM x32 组
+     实际相邻对只有 x10——降级为小修。
+   - **打法 = 生产者侧内嵌量化**：生产 gemm 的 store epilogue 顺手出
+     e4m3-packed int8 + row scale（qr_kernel_rowthread 已证 numpy-exact）：
+     * (a) 在 GEMM_INT8_RESIDUAL 的 store pass：行宽 K=256（=quant 行宽，
+       一行一 scale，无跨行归约！），acc 行已在 tile 里 → 行内 max-abs +
+       fdiv_rn + e4m3 打包直写 pk(1272) + scale(1273)；f16 输出 1267 **仍要写**
+       （skip 读者），但 QUANT 的 100.7M 读+写整个消失 = 每对省 ~1 pass。
+     * (b) 在 WINDOW_ATTENTION 的 P7 store：行宽 96 vs quant K=256?
+       **先核对 1277 的 quant (M,K)=(2560,256)/(9216,128)——行宽不匹配，
+       需跨行 scale 设计，第二步做**。
+   - **开工顺序（钉死）**：(a) 先行（行宽=256 完美匹配）→ 三关+帧 A/B →
+     然后 (b) 行布局图 → 跨行 scale 设计。预期 (a) = -3~4ms（100.7M 的
+     读+写+launch），(b) = -2~3ms。B2 合计 -5~7ms。
+   - 实现载体：GEMM_INT8_RESIDUAL 已有 fused-pub（gemm_b_pub_f16 家族）——
+     在 pub 之外再加 packed-int8 第二 store（dC 行 f32→scale 归约→e4m3→pb16
+     直写）。scale 归约=行内 max-abs：tile 的行持有度先查（N=256 宽行跨
+     tc_n tile？→ 若是，行持有不成立，改用 blade-2 式两段：store f16 行到
+     pk 前的过渡 slab——设计稿第一步=画 N=256 的 tc 切分图）。
 
 ## 七、交接检查单（新窗口开工先读这些）
 
