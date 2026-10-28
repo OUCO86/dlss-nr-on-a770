@@ -186,6 +186,7 @@ static inline esimd::simd<float,32> lf32(uint off){
 static inline esimd::simd<float,8> lf8(uint off){
     return esimd::slm_block_load<float,8>(off); }
 static inline void sf8(uint off, esimd::simd<float,8> v){ esimd::slm_block_store(off, v); }
+static inline void sf16(uint off, esimd::simd<float,16> v){ esimd::slm_block_store(off, v, esimd::overaligned_tag<16>{}); }
 static inline esimd::simd<half,16> lh16(uint off){
     return esimd::slm_block_load<half,16>(off, esimd::overaligned_tag<16>{}); }
 // the 16x16 dpas tile with SLM A (Ab = byte offset of the A pack block)
@@ -226,11 +227,25 @@ static inline void tile8ss(esimd::simd<float,64>& c00, esimd::simd<float,64>& c0
 static inline void store16s(uint off, int N, esimd::simd<float,64>& c00,
                             esimd::simd<float,64>& c01, esimd::simd<float,64>& c10,
                             esimd::simd<float,64>& c11){
+    // P8-q2 (B1 meat, bench-proven in bench_v4full: store 0.056->0.032, QKV
+    // 0.563->0.518, FULL 1.232->1.216, JUDGE all seven EXACT): adjacent column
+    // halves of one row (c00|c01 = cols 0-15 of the tile) join into ONE
+    // simd<float,16> store -- the row's 32 floats in order are UNCHANGED in
+    // layout, only the instruction count halves (4 stores per row-pair instead
+    // of 8). Every caller's offsets are 64B-aligned (N*4 mult of 64: 32/96/64
+    // verified at all call sites), so the 16-float store is legal everywhere.
+    // (P8-r proved the win is instruction count, not bytes: half-stores were
+    // SLOWER at the same store count.)
+    #pragma unroll
     for (int r = 0; r < 8; ++r) {
-        esimd::simd<float,8> r00=c00.template select<8,1>(r*8), r01=c01.template select<8,1>(r*8);
-        esimd::simd<float,8> r10=c10.template select<8,1>(r*8), r11=c11.template select<8,1>(r*8);
-        sf8(off + (uint)r*N*4u, r00);        sf8(off + (uint)r*N*4u + 32u, r01);
-        sf8(off + (uint)(8+r)*N*4u, r10);    sf8(off + (uint)(8+r)*N*4u + 32u, r11);
+        esimd::simd<float,16> m01;
+        m01.template select<8,1>(0) = c00.template select<8,1>(r*8);
+        m01.template select<8,1>(8) = c01.template select<8,1>(r*8);
+        esimd::simd<float,16> m11;
+        m11.template select<8,1>(0) = c10.template select<8,1>(r*8);
+        m11.template select<8,1>(8) = c11.template select<8,1>(r*8);
+        sf16(off + (uint)r*N*4u, m01);
+        sf16(off + (uint)(8+r)*N*4u, m11);
     }
 }
 // scatter one half row (32 values) to SLM via a dest-fn (r,c)->byte offset

@@ -74,15 +74,24 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
                 esimd::simd<float,64> d00(0.f),d01(0.f),d10(0.f),d11(0.f);
                 wbv3::tile8s(d00,d01,d10,d11, S_AQO + sgid*1024u,
                              WqkvPacked + (size_t)(part*2u+1u)*256u, 2, 6);
+                #pragma unroll
                 for (int r = 0; r < 8; ++r) {
-                    esimd::slm_block_store(scr + (uint)r*32u*4u,           c00.template select<8,1>(r*8));
-                    esimd::slm_block_store(scr + (uint)r*32u*4u + 32u,     c01.template select<8,1>(r*8));
-                    esimd::slm_block_store(scr + (uint)(8+r)*32u*4u,       c10.template select<8,1>(r*8));
-                    esimd::slm_block_store(scr + (uint)(8+r)*32u*4u + 32u, c11.template select<8,1>(r*8));
-                    esimd::slm_block_store(scr + (uint)r*32u*4u + 64u,     d00.template select<8,1>(r*8));
-                    esimd::slm_block_store(scr + (uint)r*32u*4u + 96u,     d01.template select<8,1>(r*8));
-                    esimd::slm_block_store(scr + (uint)(8+r)*32u*4u + 64u, d10.template select<8,1>(r*8));
-                    esimd::slm_block_store(scr + (uint)(8+r)*32u*4u + 96u, d11.template select<8,1>(r*8));
+                    esimd::simd<float,16> m01;
+                    m01.template select<8,1>(0)  = c00.template select<8,1>(r*8);
+                    m01.template select<8,1>(8)  = c01.template select<8,1>(r*8);
+                    esimd::simd<float,16> m11;
+                    m11.template select<8,1>(0)  = c10.template select<8,1>(r*8);
+                    m11.template select<8,1>(8)  = c11.template select<8,1>(r*8);
+                    esimd::simd<float,16> n01;
+                    n01.template select<8,1>(0)  = d00.template select<8,1>(r*8);
+                    n01.template select<8,1>(8)  = d01.template select<8,1>(r*8);
+                    esimd::simd<float,16> n11;
+                    n11.template select<8,1>(0)  = d10.template select<8,1>(r*8);
+                    n11.template select<8,1>(8)  = d11.template select<8,1>(r*8);
+                    esimd::slm_block_store(scr + (uint)r*32u*4u,           m01);
+                    esimd::slm_block_store(scr + (uint)(8+r)*32u*4u,       m11);
+                    esimd::slm_block_store(scr + (uint)r*32u*4u + 64u,     n01);
+                    esimd::slm_block_store(scr + (uint)(8+r)*32u*4u + 64u, n11);
                 }
                 esimd::barrier();
                 uint r2 = lane, r = sgid*16u + lane;
@@ -152,11 +161,16 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
                 c10 = esimd::xmx::dpas<8, 8, float>(c10, c0, aq3);
                 c11 = esimd::xmx::dpas<8, 8, float>(c11, c1, aq3);
                 uint scr = S_SCR + sgid*SCR_SG;
+                #pragma unroll
                 for (int r = 0; r < 8; ++r) {
-                    esimd::slm_block_store(scr + (uint)r*64u*4u + tc*16u*4u,        c00.template select<8,1>(r*8));
-                    esimd::slm_block_store(scr + (uint)r*64u*4u + tc*16u*4u + 32u,  c01.template select<8,1>(r*8));
-                    esimd::slm_block_store(scr + (uint)(8+r)*64u*4u + tc*16u*4u,    c10.template select<8,1>(r*8));
-                    esimd::slm_block_store(scr + (uint)(8+r)*64u*4u + tc*16u*4u + 32u, c11.template select<8,1>(r*8));
+                    esimd::simd<float,16> m01;
+                    m01.template select<8,1>(0)  = c00.template select<8,1>(r*8);
+                    m01.template select<8,1>(8)  = c01.template select<8,1>(r*8);
+                    esimd::simd<float,16> m11;
+                    m11.template select<8,1>(0)  = c10.template select<8,1>(r*8);
+                    m11.template select<8,1>(8)  = c11.template select<8,1>(r*8);
+                    esimd::slm_block_store(scr + (uint)r*64u*4u + tc*16u*4u,       m01);
+                    esimd::slm_block_store(scr + (uint)(8+r)*64u*4u + tc*16u*4u,   m11);
                 }
             }
             }
