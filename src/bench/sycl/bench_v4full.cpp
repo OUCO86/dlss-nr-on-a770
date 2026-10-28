@@ -95,20 +95,55 @@ inline event launch_v4full(queue& q, const void* Img, bool image_half,
                 esimd::simd<float,64> d00(0.f),d01(0.f),d10(0.f),d11(0.f);
                 wbv3::tile8s(d00,d01,d10,d11, S_AQO + sgid*1024u,
                              WqkvPacked + (size_t)(part*2u+1u)*256u, 2, 6);
+                // P8-q micro-ladder (PART 0 only; uniform per-subgroup returns):
+                // 111 = dpas only | 112 = + the 64x f32 scr store | 113 = + the
+                // row reload. MEASURED (2040w): dpas 0.068 | store 0.056 | reload
+                // ~0 (overlaps) | norm+scatter 0.021 => the acc->scr f32 STORE is
+                // 42% of a QKV part. P8-r proved it is INSTRUCTION-bound not byte-
+                // bound (half-store: JUDGE all EXACT -> bit-exactness confirmed,
+                // but SLOWER: +8 convert<half> at the same 8 stores). => the only
+                // way to remove it is the senior's ONE-PASS epilogue: reduce the
+                // row norm across the 4 accumulator lanes by subgroup shuffle and
+                // scatter the e4m3 halves into QPO/KTO/VPO directly -- NO scr row
+                // round-trip. That is B1's window_block target (see blueprint
+                // section 8). The f32 store stays here (the known-good 1.232 FULL)
+                // until v5 lands the shuffle epilogue.
+                if (stop_stage == 111u && part == 0u) return;
+                // P8-q2 MERGED-STORE EXPERIMENT (the decisive one for v5): the
+                // ladder says store=0.056 of part0's 0.133, and P8-r proved it is
+                // INSTRUCTION-count-bound (half-store = same 8 stores = no win).
+                // So: merge the 8 x simd<float,8> per row into 4 x simd<float,16>
+                // (c00+c01 adjacent cols 0-15 of one row = one 16-float line). If
+                // store drops ~2x, the register-path epilogue (v5) is worth it;
+                // if flat, the store is latency-shaped and v5 needs a rethink.
+                // NOTE: the merge changes ONLY the scr layout IF the vector's
+                // lane-distribution matches; the reload must mirror it EXACTLY or
+                // the JUDGEs go red (that is the safety net, doing its job).
+                #pragma unroll
                 for (int r = 0; r < 8; ++r) {
-                    esimd::slm_block_store(scr + (uint)r*32u*4u,           c00.template select<8,1>(r*8));
-                    esimd::slm_block_store(scr + (uint)r*32u*4u + 32u,     c01.template select<8,1>(r*8));
-                    esimd::slm_block_store(scr + (uint)(8+r)*32u*4u,       c10.template select<8,1>(r*8));
-                    esimd::slm_block_store(scr + (uint)(8+r)*32u*4u + 32u, c11.template select<8,1>(r*8));
-                    esimd::slm_block_store(scr + (uint)r*32u*4u + 64u,     d00.template select<8,1>(r*8));
-                    esimd::slm_block_store(scr + (uint)r*32u*4u + 96u,     d01.template select<8,1>(r*8));
-                    esimd::slm_block_store(scr + (uint)(8+r)*32u*4u + 64u, d10.template select<8,1>(r*8));
-                    esimd::slm_block_store(scr + (uint)(8+r)*32u*4u + 96u, d11.template select<8,1>(r*8));
+                    esimd::simd<float,16> m01;
+                    m01.template select<8,1>(0)  = c00.template select<8,1>(r*8);
+                    m01.template select<8,1>(8)  = c01.template select<8,1>(r*8);
+                    esimd::simd<float,16> m11;
+                    m11.template select<8,1>(0)  = c10.template select<8,1>(r*8);
+                    m11.template select<8,1>(8)  = c11.template select<8,1>(r*8);
+                    esimd::simd<float,16> n01;
+                    n01.template select<8,1>(0)  = d00.template select<8,1>(r*8);
+                    n01.template select<8,1>(8)  = d01.template select<8,1>(r*8);
+                    esimd::simd<float,16> n11;
+                    n11.template select<8,1>(0)  = d10.template select<8,1>(r*8);
+                    n11.template select<8,1>(8)  = d11.template select<8,1>(r*8);
+                    esimd::slm_block_store(scr + (uint)r*32u*4u,           m01);
+                    esimd::slm_block_store(scr + (uint)(8+r)*32u*4u,       m11);
+                    esimd::slm_block_store(scr + (uint)r*32u*4u + 64u,     n01);
+                    esimd::slm_block_store(scr + (uint)(8+r)*32u*4u + 64u, n11);
                 }
+                if (stop_stage == 112u && part == 0u) return;
                 esimd::barrier();
                 uint r2 = lane, r = sgid*16u + lane;
                 esimd::simd<float,32> hv = esimd::slm_block_load<float,32>(
                     scr + r2*32u*4u, esimd::overaligned_tag<16>{});
+                if (stop_stage == 113u && part == 0u) return;
                 if (part == 2u) {
                     esimd::simd<half,32> oh = esimd::convert<half>(wbv3::e4m3_vec<32>(hv));
                     auto ov = oh.read();
@@ -403,6 +438,12 @@ int main(){
   double p103=timeit("v4 stop part01  ",[&]{ return v4call(103u,nullptr); });
   printf("QKV split: P0=%8.4f | part0(Q)=%8.4f | part1(K)=%8.4f | part2(V)=%8.4f\n",
          p101, p102-p101, p103-p102, p10-p103);
+  // P8-q: part0's INTERNAL split (dpas | +store | +reload | +norm/scatter):
+  double s111=timeit("v4 p0 dpas    ",[&]{ return v4call(111u,nullptr); });
+  double s112=timeit("v4 p0 +store  ",[&]{ return v4call(112u,nullptr); });
+  double s113=timeit("v4 p0 +reload ",[&]{ return v4call(113u,nullptr); });
+  printf("part0 internals: dpas=%8.4f | store=%8.4f | reload=%8.4f | norm+scatter=%8.4f\n",
+         s111-p101, s112-s111, s113-s112, p102-s113);
   double p12=timeit("v4 stop VPO    ",[&]{ return v4call(12u,nullptr); });
   double p5 =timeit("v4 stop scores ",[&]{ return v4call(5u,nullptr); });
   double p6 =timeit("v4 stop probs  ",[&]{ return v4call(6u,nullptr); });
