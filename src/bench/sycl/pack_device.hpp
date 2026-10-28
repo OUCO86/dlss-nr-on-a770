@@ -489,6 +489,36 @@ static inline void pack_a_fused_gather(sycl::queue& q, const sycl::half* A_f16,
         }
     });
 }
+// P8-b (section 100): the BLOCK-DIAGONAL wide B for the N=32 batched merge.
+// The plan's N=32 calls satisfy sc==N && ldc==N*batch && sa==K && lda==K*batch
+// && sb==N*K && scale_stride==0 -- the groups tile the OUTPUT ROW contiguously
+// (row r: C[r,0..N_w) = group0's N cols then group1's ...), so the whole op is
+// ONE wide gemm (M, K_w=K*batch, N_w=N*batch) whose B is block-diagonal:
+//   B_w[k,n] = Braw[(n/N)*sb + (n%N)*ldb + (k%K)]  if k/K == n/N, else 0.
+// Packed into the SAME per-group tile layout gemm_b/gemm_b_pub_slm consume at
+// (batch=1, N=N_w, K=K_w): one gather over N_w*K_w, cached (the weight).
+// The A side needs nothing new: gather_pack_a_b_v at (K_w, lda=K_w, sa=0,
+// batch=1) -- the wide A row IS the raw row (lda==K_w contiguous).
+static inline void gather_pack_b_diag_b(sycl::queue& q, const int8_t* Braw, int8_t* Bp,
+                                        int N, int K, int ldb, size_t sb, int batch) {
+    const int Nw = N * batch, Kw = K * batch;
+    int nt_n = Nw / 8, kk_n = Kw / 32;
+    size_t per = (size_t)kk_n * nt_n * 64 * 4;       // = Nw*Kw
+    q.parallel_for(sycl::range(per), [=](sycl::item<1> it) {
+        size_t d = it.get_id(0);
+        int j = (int)(d % 4); size_t rest = d / 4;
+        int nl = (int)(rest % 8); rest /= 8;
+        int kq = (int)(rest % 8); rest /= 8;
+        size_t blk = rest;
+        int ntile = (int)(blk % (size_t)nt_n); int kk32 = (int)(blk / (size_t)nt_n);
+        int n = ntile * 8 + nl;
+        int k = kk32 * 32 + kq * 4 + j;
+        // block-diagonal: the group from n and k must agree
+        int g = n / N;
+        Bp[d] = (k / K == g) ? Braw[(size_t)g * sb + (size_t)(n % N) * ldb + (size_t)(k % K)]
+                             : (int8_t)0;
+    });
+}
 static inline void gather_pack_b_b(sycl::queue& q, const int8_t* Braw, int8_t* Bp,
                                    int N, int K, int ldb, size_t sb, int batch) {
     int nt_n = N / 8, kk_n = K / 32;

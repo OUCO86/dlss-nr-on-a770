@@ -2106,6 +2106,44 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
         // launch, publish in one launch. Bounds identical to the gate's aw_b/bw_b.
         int8_t* dAp = (int8_t*)pool_get((size_t)batch * Mp * K);
         static int bstop2 = getenv("NR_B_STOP") ? atoi(getenv("NR_B_STOP")) : 0;
+        // P8-b (section 100): the N=32 batched family is BLOCK-DIAGONAL WIDE-MERGE
+        // legal in the plan (census: sc=N, ldc=N*batch, sa=K, lda=K*batch, sb=N*K,
+        // scale_stride=0, epi1, narrow -- the group A slices are ROW-INTERLEAVED
+        // (lda=Kw, sa=K): the RAW A already IS the wide row; the wide C row is
+        // exactly the ldc layout; the B is block-diagonal; b_scale raw = batch*N
+        // floats concatenated = the wide bs array). ONE wide gemm (M, Nw=N*batch,
+        // Kw=K*batch) at BN=64 with the fused epi1 pub -- bench_n32: byte diff 0
+        // vs the split chain on BOTH frame shapes, 0.511->0.138 / 0.280->0.103
+        // ms/call and 2 launches -> 1. v9b's death (BM=32) does NOT apply: BM
+        // stays 128, only N widens. dAp pool size batch*Mp*K == Mp*Kw exactly.
+        // Guards re-verify the plan form; NR_B_WIDE=0 = escape hatch.
+        static bool wmerge = !getenv("NR_B_WIDE") || atoi(getenv("NR_B_WIDE")) != 0;
+        const bool wide_ok = wmerge && !fused_b && N == 32u && batch >= 2u && (N * batch) <= 128u
+            && sc == N && ldc_ == (unsigned)(N * (size_t)batch) && sa == (size_t)K
+            && lda_e == (unsigned)(K * (size_t)batch) && sb == (size_t)(N * K)
+            && scale_stride == 0u && (epi == 0u || epi == 1u || epi == 4u) && narrow
+            && (K % 32u) == 0u;
+        if (wide_ok) {
+            const unsigned Nw = N * batch, Kw = K * batch;
+            if (bstop2 < 2) {
+                if (getenv("NR_BPACK_TRACE")) printf("[bwide] M=%u Nw=%u Kw=%u\n", M, Nw, Kw);
+                packdev::gather_pack_a_b_v(*GQ, Araw, dAp, (int)M, Mp, (int)Kw, (int)Kw, 0, 1);
+            }
+            if (bstop2 >= 1) { pool_put(dAp); return; }
+            WKey wkW{ b, (int)N, (int)K, 10000 + (int)batch };   // diag-layout cache key
+            auto wcW = g_wcache.find(wkW);
+            int8_t* dBpW;
+            if (wcW != g_wcache.end()) dBpW = (int8_t*)wcW->second;
+            else {
+                dBpW = (int8_t*)sycl::malloc_device((size_t)Nw * Kw, *GQ);
+                packdev::gather_pack_b_diag_b(*GQ, Braw, dBpW, (int)N, (int)K, (int)ldb_e, sb, (int)batch);
+                g_wcache[wkW] = dBpW;
+            }
+            s8v8::gemm_b_pub(*GQ, dAp, dBpW, Cout, as, bs, (int)M, Mp, (int)Nw, (int)Kw,
+                             1, (size_t)0, Nw, 0u, 0u, narrow, epi);
+            pool_put(dAp);
+            return;
+        }
         if (bstop2 < 2) {
         static long bfp = 0, bgp = 0;   // P8 census: fused vs scalar-gather pack_a hits
         if (fused_b) { bfp++; packdev::pack_a_fused_b(*GQ, a16b, dAp, (float*)ias->second.p, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch); }
