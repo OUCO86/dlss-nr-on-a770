@@ -284,6 +284,55 @@ inline auto qr_kernel_rowthread() {
     };
 }
 
+// P8-j (section 100): the WORKGROUP-PER-ROW SINGLE-READ quantize for K>512. The
+// old ESIMD path read the row TWICE (peak pass + quantize pass) and ran 12-28 GB/s
+// at the frame's 640x2048 / 192x1024 / 192x4096 (bench_qesimd: the census-weighted
+// 12.4ms at 84 GB/s vs the rowthread's 190-306). The new form: LW=64 threads own
+// one row, each holds CH16 = K/1024 x simd<half,16> IN REGISTERS (K=1024->1,
+// 2048->2, 4096->4 = 4-16 GRF regs/thread, the safe zone), ONE global read, the
+// row peak = in-thread hmax then a 256B SLM cross-thread max (float max is
+// associative/commutative -> bit-identical to any order, the rowthread precedent),
+// quantize from the registers. bench_qrg: diff 0 AND scale-diff 0 on all five
+// shapes, 3-4x (640x2048 0.206->0.051 = 77 GB/s; 32640x1024 3.56->0.92 = 109).
+// SLM declares EXACTLY 256B (the P8-c bucket rule -- an undersized/odd declaration
+// costs resident workgroups). The frame's K>512 quants are always K%1024==0.
+template <int CH16>
+inline auto qr_kernel_rowgroup() {
+    return [](sycl::half* a_src, sycl::uint2* packed, float* scales, unsigned m, unsigned k) {
+        return [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            namespace esimd = sycl::ext::intel::esimd;
+            esimd::slm_init<256>();
+            constexpr int K = CH16 * 16 * 64;
+            unsigned row = (unsigned)it.get_group(0);
+            unsigned tid = (unsigned)it.get_local_id(0);
+            const size_t base = (size_t)row * K;
+            esimd::simd<sycl::half,16> reg[CH16];
+            esimd::simd<float,16> mx(esimd::simd<float,16>(0.f));
+            #pragma unroll
+            for (int c = 0; c < CH16; ++c) {
+                reg[c] = esimd::block_load<sycl::half,16>(a_src + base + (size_t)(c*64u + tid)*16u,
+                                                          esimd::overaligned_tag<16>{});
+                mx = esimd::max(mx, esimd::abs(esimd::convert<float>(reg[c])));
+            }
+            float local = esimd::hmax<float,float,16>(mx);
+            esimd::slm_block_store(tid * 4u, esimd::simd<float,1>(local), esimd::overaligned_tag<16>{});
+            esimd::barrier();
+            esimd::simd<float,64> all = esimd::slm_block_load<float,64>(0u, esimd::overaligned_tag<16>{});
+            float peak = esimd::hmax<float,float,64>(all);
+            const float scale = (peak == 0.0f) ? 1.0f
+                : esimd::div_ieee<float,1>(esimd::simd<float,1>(peak), esimd::simd<float,1>(127.0f))[0];
+            if (tid == 0u) scales[row] = scale;
+            #pragma unroll
+            for (int c = 0; c < CH16; ++c) {
+                esimd::simd<float,16> f = esimd::convert<float>(reg[c]);
+                esimd::simd<float,16> qq = esimd::div_ieee<float,16>(f, esimd::simd<float,16>(scale));
+                qq = esimd::min(esimd::max(esimd::rnde<float,16>(qq), esimd::simd<float,16>(-127.f)), esimd::simd<float,16>(127.f));
+                esimd::block_store<int8_t,16>((int8_t*)packed + base + (size_t)(c*64u + tid)*16u,
+                    esimd::convert<int8_t>(esimd::convert<int>(qq)), esimd::overaligned_tag<16>{});
+            }
+        };
+    };
+}
 // launcher for the ESIMD variant (plain path). Same over-dispatch rule as qr_launch
 // but per_row is computed from CHUNKS (16-half units), and no local_accessor.
 inline void qr_launch_esimd(sycl::queue& q, sycl::device& dev,
@@ -294,6 +343,15 @@ inline void qr_launch_esimd(sycl::queue& q, sycl::device& dev,
     if (k == 128u) { q.parallel_for(sycl::range(m), qr_kernel_rowthread<128>()(dsrc, dpack, dscale, m, k)); return; }
     if (k == 256u) { q.parallel_for(sycl::range(m), qr_kernel_rowthread<256>()(dsrc, dpack, dscale, m, k)); return; }
     if (k == 512u) { q.parallel_for(sycl::range(m), qr_kernel_rowthread<512>()(dsrc, dpack, dscale, m, k)); return; }
+    // P8-j: K>512 -> the single-read rowgroup form (the double-read ESIMD path
+    // below stays as the NR_QR_RG=0 escape hatch). K%1024==0 required (the frame
+    // census: 1024/2048/4096 only); other K fall through to the old path.
+    static bool rg = !getenv("NR_QR_RG") || atoi(getenv("NR_QR_RG")) != 0;
+    if (rg && k % 1024u == 0u && k <= 4096u) {
+        if (k == 1024u) { q.submit([&](sycl::handler& h){ h.parallel_for(sycl::nd_range<1>(sycl::range(m*64u), sycl::range(64u)), qr_kernel_rowgroup<1>()(dsrc, dpack, dscale, m, k)); }); return; }
+        if (k == 2048u) { q.submit([&](sycl::handler& h){ h.parallel_for(sycl::nd_range<1>(sycl::range(m*64u), sycl::range(64u)), qr_kernel_rowgroup<2>()(dsrc, dpack, dscale, m, k)); }); return; }
+        if (k == 4096u) { q.submit([&](sycl::handler& h){ h.parallel_for(sycl::nd_range<1>(sycl::range(m*64u), sycl::range(64u)), qr_kernel_rowgroup<4>()(dsrc, dpack, dscale, m, k)); }); return; }
+    }
     // LW: §96/bench_v2crash proved the BIG-state v2 ESIMD+barrier kernels HANG at
     // LW>=128 (GRF rule). The quant kernel's state is small (one 32-wide vector), so
     // the rule may not bind here -- NR_QR_LW lets the experiment pick. Default 64.
