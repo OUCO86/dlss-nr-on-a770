@@ -80,6 +80,11 @@ inline event launch_v4full(queue& q, const void* Img, bool image_half,
             esimd::barrier();                       // subgroup: own rows only
             if (stop_stage == 101u) return;         // P8-ladder: P0 gather ONLY (no dump)
             // P1+P2 fused (the slice VERBATIM) =====
+            // (P8-i2 NOTE: the QKV A-hoist was tried HERE and measured NEUTRAL
+            // (0.572->0.572, giants 4.88->4.93) -- the elementwise cost is the
+            // acc->scr round-trip, not the dpas operand loads. Reverted to mirror
+            // the shipped v4. The scores hoist (P8-f, 4x128=16-reg class) DID win
+            // and lives in the shipped kernel.)
             for (uint part = 0; part < 3u; ++part) {
                 if (stop_stage == 102u && part == 1u) return;   // one part's marginal
                 if (stop_stage == 103u && part == 2u) return;   // two parts' marginal

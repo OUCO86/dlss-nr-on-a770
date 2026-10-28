@@ -1456,9 +1456,51 @@ int xmx_rec_gemm_int8_fused(int a,int b,int c,int as,int bs,unsigned M,unsigned 
 // section 85/86): the expand publishes hidden16 on device, we download it, pack it as the
 // projection's A, and the projection adds the residual in its epilogue. The host round-trip
 // is the offline/gate form; folding it is the megakernel stage's job (section 85's note).
+// P8-k (section 100, KEPT per the user's ruling 15:36): the ffn residual tail
+//  total = fma(skip[i], cp[i%32], dC2[i]); publish(epi); write  -- was a
+// per-element SCALAR parallel_for over M*32. The ESIMD row-parallel form: one
+// work-item owns a full 32-channel row = 128B block_load x2 + cp + block_store.
+// MEASURED: NEUTRAL at the frame level (A/B 4/8, mean -0.09 noise band; the
+// NR_STEM_STOP=2 tail cost is 8.87 vec vs 8.81 scalar = WIDTH-INSENSITIVE) --
+// the tail is bound by the 67MBx3 global round-trip (DRAM latency), not by
+// access width. KEPT ANYWAY: strictly better instruction economics, bit-identical
+// (qr_publish(0,.) is the identity, narrow=false, and sk*cv+c2 auto-contracts to
+// ONE fused-rounding FMA in an ESIMD kernel = sycl::fma's single rounding
+// lane-for-lane -- the gemm_b_res golden semantics), zero downside; the mask
+// (the 67MB intermediates) is exactly what the B1 megakernel removes, after
+// which the wide form pays. NR_FFN_TAILV=0 = escape hatch; epi!=0/narrow stay
+// on the scalar chain (the plain-ffn f32-skip gate lesson is untouched).
+static inline void ffn_tail_res(sycl::queue& q, const float* dSkip, const float* dC2,
+                                const float* cp, void* Cout, unsigned M,
+                                bool narrow, unsigned epi) {
+    static bool tv = !getenv("NR_FFN_TAILV") || atoi(getenv("NR_FFN_TAILV")) != 0;
+    if (tv && epi == 0u && !narrow) {
+        float* Cf = (float*)Cout;
+        q.parallel_for(sycl::range(M), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
+            namespace esimd = sycl::ext::intel::esimd;
+            unsigned row = (unsigned)it.get_id(0);
+            size_t base = (size_t)row * 32u;
+            esimd::simd<float,32> sk = esimd::block_load<float,32>(dSkip + base, esimd::overaligned_tag<16>{});
+            esimd::simd<float,32> c2 = esimd::block_load<float,32>(dC2 + base, esimd::overaligned_tag<16>{});
+            esimd::simd<float,32> cv = esimd::block_load<float,32>(cp, esimd::overaligned_tag<16>{});
+            esimd::simd<float,32> total = sk * cv + c2;
+            esimd::block_store<float,32>(Cf + base, total, esimd::overaligned_tag<16>{});
+        });
+        return;
+    }
+    q.parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
+        size_t i = it.get_id(0);
+        unsigned col = (unsigned)(i % 32u);
+        float total = sycl::fma(dSkip[i], cp[col], dC2[i]);
+        if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
+        else        ((float*)Cout)[i] = qr_publish(epi, total);
+    });
+}
 int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine,
                 unsigned M, unsigned cin, unsigned hidden, unsigned groups, unsigned flags) {
     if (!g_recording) FAILMSG("not recording");
+    static int fst = getenv("NR_F_STOP") ? atoi(getenv("NR_F_STOP")) : 0;
+    if (fst == 9) { g_cmd_names.push_back(__func__); g_cmds.push_back([](){}); return 0; }   // P8-k ledger: ffn split pricing (time-only)
     static int fstop = getenv("NR_F_STOP") ? atoi(getenv("NR_F_STOP")) : 0;
     if (fstop == 9) { g_cmd_names.push_back(__func__); g_cmds.push_back([](){}); return 0; }   // P7 floor ledger (time-only)
     if (!M || (M % 16u) || !cin || (cin % 16u) || !hidden || (hidden % 32u))
@@ -1601,6 +1643,8 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
                       int out, int cosine, unsigned height, unsigned width,
                       unsigned source_width, unsigned flags) {
     if (!g_recording) FAILMSG("not recording");
+    static int fst = getenv("NR_FM_STOP") ? atoi(getenv("NR_FM_STOP")) : 0;
+    if (fst == 9) { g_cmd_names.push_back(__func__); g_cmds.push_back([](){}); return 0; }   // P8-k ledger: ffn split pricing (time-only)
     static int fstop = getenv("NR_F_STOP") ? atoi(getenv("NR_F_STOP")) : 0;
     if (fstop == 9) { g_cmd_names.push_back(__func__); g_cmds.push_back([](){}); return 0; }   // P7 floor ledger (time-only)
     const unsigned M = height * width;
@@ -1678,13 +1722,7 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
             float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
             ffnc::launch_ffn_chip(*GQ, dM16, dB2, dPp2, dC2, (int)M, Mp);
             pool_put(dM16);   // dA2 was never packed on this path; dB2/dPp2 cache-owned
-            GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
-                size_t i2 = it.get_id(0);
-                unsigned col = (unsigned)(i2 % 32u);
-                float total = sycl::fma(dMerged[i2], cp[col], dC2[i2]);   // raw merged f32 skip
-                if (narrow) ((sycl::half*)Cout)[i2] = sycl::half(qr_publish(epi, total));
-                else        ((float*)Cout)[i2] = qr_publish(epi, total);
-            });
+            ffn_tail_res(*GQ, dMerged, dC2, cp, Cout, M, narrow, epi);
             pool_put(dC2);
             pool_put(dMerged);
             return;
@@ -1697,13 +1735,7 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
             sycl::half* dB3 = cached_pack_b_f16(projection, Praw, 128, 32);   // weight
             f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128);
             pool_put(dA3);
-            GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
-                size_t i = it.get_id(0);
-                unsigned col = (unsigned)(i % 32u);
-                float total = sycl::fma(dMerged[i], cp[col], dC2[i]);     // skip = raw merged f32
-                if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
-                else        ((float*)Cout)[i] = qr_publish(epi, total);
-            });
+            ffn_tail_res(*GQ, dMerged, dC2, cp, Cout, M, narrow, epi);
             pool_put(dC2);   // dB3 is cache-owned (weight)
             pool_put(dMerged);
             return;
@@ -1718,13 +1750,7 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
         sycl::half* dB3 = cached_pack_b_f16(projection, Praw, 128, 32);   // weight
         f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128);
         pool_put(dHid);
-        GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
-            size_t i = it.get_id(0);
-            unsigned col = (unsigned)(i % 32u);
-            float total = sycl::fma(dMerged[i], cp[col], dC2[i]);     // skip = raw merged f32
-            if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
-            else        ((float*)Cout)[i] = qr_publish(epi, total);
-        });
+        ffn_tail_res(*GQ, dMerged, dC2, cp, Cout, M, narrow, epi);
         pool_put(dA3); pool_put(dC2);   // dB3 is cache-owned (weight)
         pool_put(dMerged);
     });
@@ -1758,6 +1784,8 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
 int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int out,
                      int cosine, unsigned M, unsigned flags) {
     if (!g_recording) FAILMSG("not recording");
+    static int fst = getenv("NR_FS_STOP") ? atoi(getenv("NR_FS_STOP")) : 0;
+    if (fst == 9) { g_cmd_names.push_back(__func__); g_cmds.push_back([](){}); return 0; }   // P8-k ledger: ffn split pricing (time-only)
     static int fstop = getenv("NR_F_STOP") ? atoi(getenv("NR_F_STOP")) : 0;
     if (fstop == 9) { g_cmd_names.push_back(__func__); g_cmds.push_back([](){}); return 0; }   // P7 floor ledger (time-only)
     if (!M || (M % 16u)) FAILMSG("the stem feed-forward needs 16-row blocks (libxmx.c:3195)");
@@ -1812,14 +1840,10 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
             sycl::half* dPp3 = cached_pack_b_f16(projection, Praw, 128, 32);
             float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
             ffnc::launch_ffn_chip(*GQ, dH16, dB2, dPp3, dC2, (int)M, Mp);
+            static int sstop = getenv("NR_STEM_STOP") ? atoi(getenv("NR_STEM_STOP")) : 0;
+            if (sstop == 2) { pool_put(dH16); pool_put(dA2); pool_put(dC2); pool_put(dS); return; }  // skip the residual tail
             pool_put(dH16); pool_put(dA2);   // dB2/dPp3 cache-owned
-            GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
-                size_t i2 = it.get_id(0);
-                unsigned col = (unsigned)(i2 % 32u);
-                float total = sycl::fma(dS[i2], cp[col], dC2[i2]);   // skip = RAW f32 stem
-                if (narrow) ((sycl::half*)Cout)[i2] = sycl::half(qr_publish(epi, total));
-                else        ((float*)Cout)[i2] = qr_publish(epi, total);
-            });
+            ffn_tail_res(*GQ, dS, dC2, cp, Cout, M, narrow, epi);
             pool_put(dC2);
             pool_put(dS);
             return;
@@ -1832,13 +1856,7 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
             sycl::half* dB3 = cached_pack_b_f16(projection, Praw, 128, 32);   // weight
             f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128);
             pool_put(dA3);
-            GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
-                size_t i = it.get_id(0);
-                unsigned col = (unsigned)(i % 32u);
-                float total = sycl::fma(dS[i], cp[col], dC2[i]);   // skip = RAW f32 stem (device)
-                if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
-                else        ((float*)Cout)[i] = qr_publish(epi, total);
-            });
+            ffn_tail_res(*GQ, dS, dC2, cp, Cout, M, narrow, epi);
             pool_put(dC2);   // dB3 is cache-owned (weight)
             pool_put(dS);
             return;
@@ -1859,13 +1877,7 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
         // the isolation instruments that proved this.
         f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128);
         pool_put(dHid);
-        GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
-            size_t i = it.get_id(0);
-            unsigned col = (unsigned)(i % 32u);
-            float total = sycl::fma(dS[i], cp[col], dC2[i]);   // skip = RAW f32 stem (device)
-            if (narrow) ((sycl::half*)Cout)[i] = sycl::half(qr_publish(epi, total));
-            else        ((float*)Cout)[i] = qr_publish(epi, total);
-        });
+        ffn_tail_res(*GQ, dS, dC2, cp, Cout, M, narrow, epi);
         pool_put(dA3); pool_put(dC2);   // dB3 is cache-owned (weight)
         pool_put(dS);
     });
