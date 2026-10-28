@@ -193,10 +193,14 @@ inline event launch_v4full(queue& q, const void* Img, bool image_half,
                     }
                 }
             }
-            esimd::barrier();   // blade-2 FIX: the original loop's per-part end barrier --
-                                // without it the stop=10/11/12 dumps (and the downstream
-                                // stages) race ahead of other subgroups' scatter (the VPO
-                                // judge caught exactly this: 214/8.36M = a race, not a map)
+            // v5c (barrier audit): this end-of-QKV subgroup barrier exists ONLY so
+            // the stop=10/11/12 DUMPS (which read OTHER subgroups' QPO/KTO/VPO
+            // scatter) see complete maps -- the bench instrument's requirement.
+            // The FRAME path (DumpKV==nullptr) is protected by the group_barrier
+            // below (cross-subgroup KTO/VPO for P3/P5), and scrA/B/C phase-2 reads
+            // are subgroup-local. So: barrier iff DumpKV. Blade-2's VPO race was a
+            // DUMP race (214/8.36M) -- exactly this path.
+            if (DumpKV) esimd::barrier();
             auto dump_region = [&](uint reg) SYCL_ESIMD_FUNCTION {
                 if (DumpKV) { half* d=DumpKV+(size_t)window*4096u;
                     for (uint i=0;i<2048u;i+=64u) d[i+lid]=wbv3::lh16(reg+(i+lid)*2u)[0]; } };

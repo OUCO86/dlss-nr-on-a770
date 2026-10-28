@@ -140,7 +140,11 @@ inline event launch_v4full(queue& q, const void* Img, bool image_half,
                     }
                 }
             }
-            esimd::barrier();
+            // v5c: the end-QKV subgroup barrier serves ONLY the stop=10/11/12
+            // DUMP path (cross-subgroup map reads); the frame path's cross-
+            // subgroup sync is the group_barrier below, and scrA/B/C phase-2
+            // reads are subgroup-local. Skip it when not dumping.
+            if (DumpKV) esimd::barrier();
             auto dump_region = [&](uint reg) SYCL_ESIMD_FUNCTION {
                 if (DumpKV) { half* d=DumpKV+(size_t)window*4096u;
                     for (uint i=0;i<2048u;i+=64u) d[i+lid]=wbv3::lh16(reg+(i+lid)*2u)[0]; } };
