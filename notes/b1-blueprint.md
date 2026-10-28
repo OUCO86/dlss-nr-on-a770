@@ -32,7 +32,7 @@
 - **分支累计**：walk 117→**~112.5**（-2.7ms）。两刀都砍在 barrier/指令数（延迟链），
   而消 L2 流量的 mega 死在同一模型下 ⇒ **latency-chain 论点是盈利的，v5 几何继续这条轴**。
 
-## 二、v5 = 前辈几何（本战役主刀，设计已钉死；几何账已算清）
+## 二、v5 正式设计（shuffle-epilogue 版；8×8 naive 已封存见雷#6）
 
 **v5 几何账（1c1f437 WIP 已证伪的路线，先记住）**：8×8 行/LW=128 的 naive 移植
 **不划算**——epilogue lane8-15 空转 + 60KB SLM 掉到 1 WG/SM，QPO 0.894 > v4 0.651。
@@ -100,29 +100,60 @@ simd<float,32> 而非 64×2）、epilogue 无 scr 往返（norm 走 shuffle、e4
 - 前辈的 K/V scatter（他 2 个 u32 store/lane）对应我们的 pb16t/pb16 map——
   **map 不变（JUDGE 锁死），只换谁算哪行**
 
-## 三、施工序（每步独立转正/回滚，三关照旧）
+## 三、前辈数字的正确读法（本轮精算，写死防再错）
 
-- **v5.1 bench 原型**（bench_v4full 里加 launch_v5，7 区 JUDGE 全绿才算成）：
-  先只改 QKV 段到 8×8 行 + shuffle epilogue；scores/softmax/attnV/outproj 暂留 v4 形态
-  （跨段接口=QPO/KTO/VPO map，不动）。预期 QKV 0.518→~0.30。
-- **v5.2 后四段 8 行化**（scores 起，逐段 JUDGE）。预期 FULL 1.216→~0.75。
-- **v5.3 真库接线**（window_block_v5.hpp + 路由 env NR_WB_V5，默认先 OFF 走 A/B），
-  v4ph 同法跟进（giants 走 v5ph）。
-- **v5.4 帧 A/B 转正** + 逃生舱 NR_WB_V5=0 + 部署入账。
-- 回滚纪律：任何一步 JUDGE 红/三关红=当场回滚不过夜（军规⑤）。
+前辈 frame-ledger（`notes/frame-ledger-a770.md`）：row/4 window_block **6.20ms/10 pass**
+= 0.62ms/pass，每 pass ~2135 window（768x448 帧）⇒ **290ns/window**。
+我们 v4full bench = 1.11ms/2040w = **545ns/window** ⇒ 真实差距 **1.9x**。
+（此前"6.5x"是把前辈 per-pass 当 per-window 误除，作废。）
+同口径帧账：前辈 6.2ms/10pass vs 我们 wblock 全族帧内 ~26ms / bench 折算 ~22ms。
+**v5 战役的正确靶 = 545→~300ns/window，帧收益上限 ~8-10ms**——不是 25。
 
-## 四、收益账（诚实区间）
+## 四、施工序（v5 修订版，每步独立转正/回滚，三关照旧）
 
-- bench 线：FULL 1.216→0.75-0.9（v5.2 后）；giants 4.51→~2.8-3.3
-- 帧线：wblock 42.7 → **~25-30**（-13~18ms）→ walk **~100-104**
-- 前辈同级 6.2ms 是 768x448 的 10 pass 账，我们 960x544 的 20 call 同级折算 ~12-15ms
-  ——**v5 打满=追平前辈这一族**；打不满的部分留给 v6（barrier 流水/链再砍）。
+- **v5a（当前刀）QKV epilogue shuffle 化**：bench 里加 launch_v5a，16 lane 每 pass
+  服务 4 行（lane l: row l>>2、channels (l&3)*8..+7），8 通道平方树 + 2 次
+  shuffleXor(2)/(1)（= cosine_recip_vec 同一棵树，逐位恒等有构造性论证）；
+  4 passes 覆盖 16 行。**不动 dpas/map/LW**。验收=JUDGE QPO/KTO/VPO EXACT +
+  QKV 0.474→~0.38-0.42。红了=lane 映射错，当场修，不过夜。
+- **v5b** attended/ATO 的 32 宽 reload 点（无 norm 树，只换 load 宽度）——先测再说。
+- **v5c barrier 审计**：v4 现存 7 esimd::barrier + 1 group_barrier，逐个问
+  "谁读谁写跨 lane"——blade-2 已证 barrier 是真成本（6→2 = +1.32ms）。
+- **v5d 止损条款**：v5a-c 合计帧收益 <3ms ⇒ 转攻 **quant 11.5ms**（§五 B2，
+  前辈 1.64ms，账面最大单体肉）。
+- 真库接线模板（v5a 兑现后）：window_block_v4.hpp 同法改 + NR_WB_V5A 逃生舱 +
+  帧 A/B 十对 + 三关。回滚纪律=军规⑤。
 
-## 五、已排雷清单（v5 不许再进的地雷）
+## 五、收益账（按 1.9x 校准后的诚实区间）
+
+- v5a（shuffle epilogue）：bench FULL 1.11→~1.0；帧 -1~2ms。**单独不是大肉**。
+- v5a+b+c 合计乐观：FULL →~0.85-0.9（545→~420ns）；帧 -4~6ms。
+- **到前辈 290ns 的剩余差距主体 = 每窗 dpas 指令数**（我们 SIMD16 tile 数
+  192+128+64+32 ≈ 416 条 vs 前辈 coopmat 8x16 数更少）——再往下要打
+  tc 循环合并/更大 tile（SIMD32 dpas? = 新地形，未探）。
+- quant B2 线：11.5→~4ms（折叠进生产 gemm 的 epilogue，P2 已证半条路）= 独立 -7ms。
+- **walk 路径**：112.5 →(v5a-c)→ ~106-108 →(B2 quant)→ ~99-101 →(giants split 对拍)→ ~95。
+  追平前辈 48ms 需要 B1+B2+B3 全部兑现 + 游戏侧 host 15ms 那条线（§六 另案）。
+
+## 六、已排雷清单（v5 不许再进的地雷）
 
 1. 半 store / 字节优化（P8-r：指令数才是货币）
 2. 32-reg hoist（P8-g/g2：≤16-reg 预筛线）
 3. mega 式消 L2 内往返（P8-n：边际不降=流量不在关键路径）
-4. 占用/LW 加减 WG（P8-o：边际 9.0 vs 9.0）——**v5 的 LW=128 不是为了占用，是为了链深**，
-   且 SLM 必须 ≤32KB 保住 2 WG/SM（45KB 的旧 map 在 LW=128 会掉到 1 WG/SM——设计已避开）
+4. 占用/LW 加减 WG（P8-o：边际 9.0 vs 9.0）
 5. 动态索引拼装 A-map（P8-e/§7.6：常量偏移 + JUDGE 逐区对质）
+6. **naive 8×8 行移植**（1c1f437 WIP：idle-lane + 60KB=1WG/SM 双输，QPO 0.894>0.651）
+   ——前辈的 8-subgroup 是 coopmat/SIMD32 产物，不能照搬进 dpas/SIMD16
+7. **"消 scr 往返"当 v5 卖点**（精读前辈 200-270 行：他也有 coopMatStore→scratch→
+   reload；他的赢面是 4-lane×8-ch epilogue 分布 + shuffleXor 树）
+8. 6.5x 误账（已修正 1.9x，§三——所有预期按此校准，不许再画 25ms 的饼）
+
+## 七、交接检查单（新窗口开工先读这些）
+
+1. 本蓝图全文 + 总蓝图 `notes/section100-blueprint.md` §7.5-7.6（★索引行在 7.5 头部）
+2. 分支状态：`b1-wblock-resident`（origin），tip=本提交；部署 md5=**8ad560c2**
+   （blade-1+2，游戏画面已验收 OK）；主分支 healthy-chain-resident-opt tip=12fb8f5 之前
+3. bench 验收尺 = bench_v4full（7 区 JUDGE + PURE-LADDER + fill 探针 + part0 微梯）
+4. WIP 封存：src/bench/sycl/bench_v5_WIP.cpp.txt（8×8 naive，勿复活）
+5. 当日流水：E:/WorkBuddy/2026-10-25-22-59-21/.workbuddy/memory/2026-10-28.md（全文精读）
+6. 下一步 = §四 v5a（shuffle epilogue，设计论证已在 §二）
