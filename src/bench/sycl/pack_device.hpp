@@ -356,6 +356,33 @@ static inline void gather_pack_a_b(sycl::queue& q, const int8_t* Araw, int8_t* A
         Ap[gg * per + d] = srow < M ? Araw[gg * sa + (size_t)srow * lda + kb * BK + k] : (int8_t)0;
     });
 }
+// P8-a (section 100, the senior's improve-shared-memory.md "copy the operand bits
+// in 128-bit vectors" lever -- our pack was the byte-scalar spelling): the SAME
+// map, items = 16-byte runs. Legal when lda%16==0 && sa%16==0 (the frame: lda=K
+// (mult 32), sa in {0,128,256}): the tile's run (row, k in {0,16}) is 16-aligned
+// and row-contiguous in BOTH layouts -> one vec<4,32b> load + store.
+// bench_packvec (frame shapes): 0.102->0.023 / 0.078->0.026 / 0.148->0.040 /
+// 0.032->0.017 ms, byte diff 0 / every shape.
+static inline void gather_pack_a_b_v(sycl::queue& q, const int8_t* Araw, int8_t* Ap,
+                                     int M, int Mp, int K, int lda, size_t sa, int batch) {
+    const int BM = 128, BK = 32;
+    int wgr = Mp / BM, kb_n = K / BK;
+    size_t per = (size_t)wgr * kb_n * 8 * 512;
+    q.parallel_for(sycl::range((size_t)batch * per / 16), [=](sycl::item<1> it) {
+        size_t d16 = it.get_id(0);
+        size_t gg = d16 / (per / 16); size_t d = (d16 % (per / 16)) * 16;
+        size_t blk = d / 512; int off = (int)(d % 512);
+        int wi = (int)(blk % 8); size_t wk = blk / 8;
+        int kb = (int)(wk % (size_t)kb_n); int w = (int)(wk / (size_t)kb_n);
+        int row = off / 32;                          // off%32 = k = 0 or 16
+        int srow = w * BM + wi * 16 + row;
+        sycl::vec<unsigned, 4> v(0u);
+        if (srow < M)
+            v = *reinterpret_cast<const sycl::vec<unsigned, 4>*>(
+                Araw + gg * sa + (size_t)srow * lda + (size_t)kb * BK + (off % 32));
+        *reinterpret_cast<sycl::vec<unsigned, 4>*>(Ap + gg * per + d) = v;
+    });
+}
 // ---- batched variant (P2, the bench_qfused2 one_batched probe: fused 3.25x, EXACT):
 // the frame's batched quants that pass the recorder guards have lda == quant-K and
 // sa == 0 (every group reads the SAME activation rows, different weights) and

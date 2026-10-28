@@ -2107,8 +2107,18 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
         int8_t* dAp = (int8_t*)pool_get((size_t)batch * Mp * K);
         static int bstop2 = getenv("NR_B_STOP") ? atoi(getenv("NR_B_STOP")) : 0;
         if (bstop2 < 2) {
-        if (fused_b) packdev::pack_a_fused_b(*GQ, a16b, dAp, (float*)ias->second.p, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch);
-        else packdev::gather_pack_a_b(*GQ, Araw, dAp, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch);
+        static long bfp = 0, bgp = 0;   // P8 census: fused vs scalar-gather pack_a hits
+        if (fused_b) { bfp++; packdev::pack_a_fused_b(*GQ, a16b, dAp, (float*)ias->second.p, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch); }
+        else { bgp++; if (getenv("NR_BPACK_TRACE") && bgp <= 8) printf("[bpack] gather M=%u N=%u K=%u b=%u sa=%u lda=%u\n", M, N, K, batch, (unsigned)sa, lda_e);
+            // P8-a: the 128-bit vector gather when the strides are 16-aligned (the
+            // frame: lda=K mult32, sa in {0,128,256} -- and the operand buffers are
+            // 64B device allocs). NR_BPACK_VEC=0 = escape hatch to the scalar form.
+            static bool bvec = !getenv("NR_BPACK_VEC") || atoi(getenv("NR_BPACK_VEC")) != 0;
+            if (bvec && (lda_e % 16u) == 0u && (sa % 16u) == 0u)
+                packdev::gather_pack_a_b_v(*GQ, Araw, dAp, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch);
+            else
+                packdev::gather_pack_a_b(*GQ, Araw, dAp, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch); }
+        if (getenv("NR_BPACK_STATS")) { static int once=0; if(++once==144) printf("[bpack] fused_hits=%ld gather_hits=%ld\n", bfp, bgp); }
         }
         // the whole batched B is one weight: pack once (all groups), cache, reuse.
         WKey wk{ b, (int)N, (int)K, (int)batch };
