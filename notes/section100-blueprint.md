@@ -1,114 +1,195 @@
-# §100 蓝图：从 214ms 到 <48ms 的全面作战图（2026-10-26）
-
-## 🚩🚩🚩 底线（表头，任何一步不可违背——用户 2026-10-26 明令）
-
-1. **数据链路健康是根本，不可碰。** 破坏链路健康，后面做什么都白搭、之前所有工作全部作废。
-   - **不出现小 M**：GEMM 走宽 M 大 tile（R8a）；batch 进 grid 维，不拆小 dispatch。
-   - **不出现中间量化往返**：int8 直通 + 单一世界；quant 只在 plan 规定处发生；不为省时间引入新量化或放宽 golden 数值标准（rcp-form 这类数值形态改动必须先过 numpy golden 考古，过不了就死）。
-   - **不出现额外开销**：CPU 不碰像素路径、无 host pack/download、无多余 launch、无多余 buffer 往返。
-   - **每步三关**：39 门 GREEN + 端到端 recorded walk 100.0000% 0 mismatch（vs bk 基线）+ 确定性两遍 100%。任何一关红=当场回滚，不过夜。
-2. **照搬的是思路，不是代码。** 前辈的 coopmat/Vulkan 具体实现不能直接搬进 SYCL/ESIMD；可搬的是**结构**（resident、fold、SLM staging、acc-via-SLM）。
-3. **每步流程**：先查参考（文件:行）→ 解释参照是什么+打算怎么做 → 动手 → bench 判 → 三关 → 自查违规（小M/中间量化/额外开销/CPU）→ 提交推送 → 用户验收。
+# A770 NR 引擎 §100 作战蓝图（2026-10-26 版，2026-10-28 12:5x 修订）
+> 用途：每个新窗口开工前先读这份。它是账本、路线图和军规的三合一。
+> **⚡ 2026-10-28 修订要点：先看 §七（最新游戏路径账本 + 部署链 + 新增军规补条 + 剩余靶图）。
+> §一/§三/§五 的旧数字已被 §七 取代（walk 214→~120-128；sync 账本口径作废，以游戏路径账本为准）。**
 
 ---
 
-## 一、主因（已找到，证据钉死）
+## 🚩🚩🚩 底线（军规，任何一步不可违背）
 
-**不是 GEMM 算术慢，不是 pass 数量多——是每个 pass 的"实现方式"把中间数据甩进 global 再读回来。**
+**数据链路健康是根本。破坏了它，做什么都白搭，之前所有工作全部作废。这是不可碰的底线。**
 
-对照（同工具、同 plan、同 691/723 个 pass）：
+1. **不出现小 M**：GEMM 必须宽 M 大 tile（R8a）；batch 进 grid 维，绝不拆成一堆小 dispatch。
+2. **不出现中间量化往返**：全程 int8 直通 + 单一世界；quant 只在 plan 规定处发生；不为省时间放宽任何数值标准（改数值形态必须先过 numpy golden 考古，过不了就地死刑）。
+3. **不出现额外开销**：CPU 不碰像素路径；无 host pack/download；无多余 launch；无多余 buffer 往返；不为绕路新增搬运。
+4. **照搬的是思路，不是代码**：前辈 coopmat/Vulkan 的实现不能直接搬进 SYCL/ESIMD；可搬的是结构（resident、fold、SLM staging、acc-via-SLM、epilogue-on-accumulator）。
+5. **每步三关**：39 独立门 GREEN → 端到端 recorded walk 100.0000% 0 mismatch（vs bk 基线）+ 确定性两遍 100% → 同热交替 A/B 计时。任何一关红 = 当场回滚，不过夜。否证也要落盘（否证是资产）。
+6. **每步流程**：先查参考（文件:行）→ 写明"学到什么、因此改了什么设计" → 先立门再写码 → 动手 → 三关 → 自查违规（小M?中间量化?额外开销?CPU牵扯?）→ 提交推送 → 部署 md5 入账 → 游戏验收画面。
 
-| | 前辈 coopmat 引擎 | 我的引擎（E1 后） |
+---
+
+## 一、现状与主因（证据链，全部实测）
+
+**当前**：引擎 walk 214ms（E1 修复后）；游戏内前辈病态 coopmat 链路 = 49ms。同工具同 plan 对照：
+
+| | 前辈 coopmat 引擎 | 我的引擎 |
 |---|---|---|
-| 设备时间 | 36.41ms（frame-ledger）/ 48ms（本 box replay 实测） | 214ms |
-| pass 数 | 723 | 691（几乎一样！） |
+| pass 数 | 723 | 691（几乎一样） |
+| 设备时间 | 36.4ms（frame-ledger）/ 48ms（本 box） | 214ms |
 | **每 pass 均价** | **0.050ms** | **0.31ms（6.2x）** |
 
-前辈 frame-ledger 的家族账（36.41ms 全账）：
-```
-gemm  13.94ms/198pass(0.070)  row  9.54/70(0.136)  tiled 8.50/130(0.065)  unary 4.45/325(0.014)
-其中：row/4 = window_block 整块 0.62ms/个×10 = 6.2ms（一个 pass 装下整个 block 的全部 7 个 stage，中间值全留片上）
-      unary/12 = quantize_row 193 pass 共 1.64ms（quant 折进生产者 store，独立 pass 只 0.009ms）
-```
-我的 sync 家族账（303ms 串行口径 / 214ms 异步）：
-```
-window_block 42.8 | window_attention 32.8 | qkv 32.5 | batched 31.1 | quant 29.2
-residual 22.5 | ffn 19.2 | gemm-f16 18.8 | wb-window-res 17.4 | quant_window 15.1
-global_attn 11.2 | ffn_merge 10.8 | ffn_stem 10.4 | unary 4.9 | gemm_int8 4.6
-```
-**同一个 plan op，前辈实现=片上 resident，我的实现=多 pass split**——这就是 6x 的全部来源。
-（leg3 的 40ms hand-off 之谜也是同一件事的局部表现：split 实现里 writer→reader 经 33MB global 的代价；resident 实现里那个 hand-off 根本不存在。）
+**主因不是算术，是拓扑**：前辈每个 op 是**片上 resident**（中间值不出芯片）；我是 **split 多 pass**（中间值经 global 往返）。同一 block 前辈一个 pass 6.2ms/10 个做完（window_block.comp：7 个 stage 全在 SLM，Q/K/V/scores/probs/ctx 从不进 global）；我把同一个 block 拆成 5 个家族 ≈130ms。他的 quant 折进生产者 store，193 个 quantize_row 共 1.64ms；我的独立 quant 家族 44.3ms。"leg3 40ms hand-off 之谜"就是这件事的局部：resident 里那个 global hand-off 根本不存在。
 
-## 二、为什么当初的 split 不算"挖坑"，但现在必须转（诚实账）
+**split 的历史价值**（诚实账）：它是逐 op 位精确对质的脚手架——39 门 + 端到端 100% 的健康链路就是这么建起来的。现在脚手架功成，必须转 resident。前辈的 resident 不违反大宽标准（片上 SLM 里的 GEMM，不是 global 小 M dispatch）——**健康链路和 resident 是可以兼得的，而且兼得才是这套架构的本意**。
 
-- split 是**逐 op 位精确对质的脚手架**：每个 op 拆成可独立验证的腿，才有 39 门+端到端 100% 的今天。这个价值是真实的。
-- resident 尝试过四次，每次都被硬约束挡回：v2（M=64 小 tile 违规）、FULL_MEGA/RESIDENT_WB（ESIMD 多 subgroup 崩）、v3（45KB SLM 方案 opt-in 已 bit-exact，没转正）。
-- **前辈的 window_block.comp 本身就是 per-window resident（64 token 一 workgroup）**——它不违反 R8a，因为 stage GEMM 在片上 SLM 里做，不是 global dispatch。转 resident 与链路健康标准不冲突，前提=照 v3 的已证机制走。
+---
 
-## 三、作战序列（按 家族账本大小 × 前辈对应实现 排，每刀独立提交独立三关）
+## 二、理论地板（为什么目标必须远低于 49ms）
 
-### P1 window_block 内部机制 resident 化（账本 42.8+wb-window-res 17.4+quant_window 15.1+qkv 尾巴 20.8+attention 往返，整链 sync 口径 160.6ms → 前辈对应 ~12ms）
+960x544 帧的硬数据量（前辈 notes 里的字节账）：
+- 权重 int8：~55MB/帧 → 5.5TB/s 下 0.01ms 级，L2 常驻后每 pass 摊销 <0.05ms
+- 全帧 GEMM FLOPs：~400 GFLOP → A770 dpas int8 峰值 ~110 TOPS 打五折（宽 M 实际可达区）= **~7ms**
+- 全帧数据搬运（resident 化后只剩输入输出）：~150MB → 5TB/s = **~0.03ms**；保守按 400GB/s 有效 = 0.4ms
+- 前辈 723 pass 若全融合理想形态：dispatch 开销 ~0.01-0.02ms/个 = 7-14ms（这是 coopmat 引擎 36ms 的成分之一，megakernel 化能压掉大半）
 
-**★ 核心算子不动原则（用户 10-26 13:08 明令，实测背书）**：P1 修的是【中间数据住哪 + stage 数据流纪律】这个**内部机制**，不是计算核心。账本已证明我们的核心是健康的：QKV 宽 GEMM 本体 5.7ms/30call（0.09-0.56ms/个=前辈区）；前辈 coopmat 在 A770 只有 24.8 TOPS 上限，我们的 dpas 宽 tile 是他的 3-4x——**他的核心不是 A770 最优，他的价值只在数据流组织**。v3/v4 的计算继续用已证的 dpas tile8/store16（f16v1 逐字，39 门绿）+ 大宽数据。
+**结论：健康链路 + 全程 resident + int8 直通 + 宽 M 的理论地板 ≈ 10-15ms。** 前辈 48ms 是病态数据 + coopmat 在 A770 上只有 24.8 TOPS 上限的产物——他的链路是"数据病态但思路健康"。我们数据健康、算法用 A770 原生最优（dpas 宽 tile + SLM staging + fold），**跑不赢他就是丢人**。
 
-**前辈 workgroup 形状实测否证（10-26 15:25）**：他的 256 线程/WG（8×32 coopmat）在 ESIMD 下直接 HANG——bench_v2crash mode=0 nd(2040×256) 无返回（90s 掐断；§96 旧账 LW>=128 ESIMD+barrier hangs，LW=64×2040 windows 是验证过的安全区）。**不搬他的形状，只搬他的 stage 纪律**：每阶段 scratch 复用（他每 subgroup 仅 1KB）、权重一次进 SLM 常驻（他的实测教训 1.6ms of 7.1ms）、双层 barrier（subgroup 内自 barrier、跨行才 group barrier）、K 转置 ColumnMajor 读法。
+## 三、目标
 
-- 首刀已否证（a36c9dc）：wbv3 直接转正失败——46.1 vs 42.9（每对 split 赢）。根因=v3 的 stage 机制糙：45KB 别名区、7 阶段全组 barrier、每阶段只 4 个 SIMD16 subgroup 并行度。**resident 思路没错（前辈 0.62ms/call 证），v3 的实现没执行到位。**
-- P1 正确做法：对 v3 做 **stage 级 bisect**（NR_V2_STOP 已有）找出 5.7ms/call 里哪段最肥 → 按前辈纪律逐段修（scratch 复用、SLM 常驻权重、barrier 分层），算子保持 dpas 宽 tile。每修一段跑一次 NR_WB_V3 同热 A/B，转正判据=家族账 window_block 42.9 → 目标 <15ms（不必到前辈 6.2——我们的 tile 更大，合理预期 3-4ms/call 级）。
-- 目标：window_block 家族 42.8→~10-15ms 起步，**预期 -30~50ms**（含 wb-window-res/quant_window/qkv 尾巴/attention 往返被吸收）。
+- **中期里程碑**（P1-P7 走完）：**≤ 24ms**（前辈的 2x）
+- **终局**（P8 逐核精修后）：**10-15ms**（前辈的 3-5x，逼近理论地板）
+- 每个 P 的单项预期写死在下表，做完对账，不达预期就归因重排。
 
-### P2 quant 家族折进生产者（29.2+15.1=44.3ms → 前辈 1.64ms）
-- 参照：gemm_staged_int8.comp 的 store 出口直接出 int8+scale；quantize_row.comp 只剩非 GEMM 生产者。
-- 我的现成机制：v9b fold（g_fused_quant + no-op quant）已证 bit-exact；E1 已把 v9b 的错默认修掉。缺的是**给每个生产者 GEMM 配 fold store**（batched 已有 rq9b 路；residual/f16 家族还没有）。
-- 目标：**预期 -30~40ms**。
+---
 
-### P3 ffn 家族转 ffn_fused 结构（19.2+10.8+10.4=40.4ms → 前辈 gemm/31 5.53ms）
-- 参照：ffn_fused.comp——"hidden layer kept on chip"：expand GEMM 的 publish 出口直接进 SLM 当 projection 的操作数，252MB×2 的 hidden 往返消失。一个 subgroup 带 16 行过两个 GEMM，32 hidden 列一批。
-- 我的现成件：gemm_b_pub/res 的 fold store、SLM staging。做法=在 ffn recorder 里做一个 fused-expand-projection 核（或两核共享 SLM——受 launch 边界限制，选前辈的单核双 GEMM 形态）。
-- 目标：**预期 -25~30ms**。
+## 四、作战序列（P1→P8）
 
-### P4 window_attention 转单 pass（32.8ms → 前辈 row/3 3.0ms）
-- 参照：window_attention.comp / Codex phase42 移植（improve-fusions.md：QK^T+softmax+PV 一趟，scores 和 probs 两次 memory 往返删掉）。
-- 我的现成件：smax_esimd、packdev、gemm_b 全绿。
-- 目标：**预期 -20~25ms**。
+> **状态速览（10-28）**：P1✅ P2✅ P3✅ P4✅ P5✅（QKV 尾巴=P6/P7/P11 战线收官）P6 例行验收✅（用户三次游戏确认）P7✅（=§7.2 游戏路径账本）P8 进行中（P8-a/b/d/e/f 转正、P8-c 普查中性、P8-g/g2 否证在案）。**当前 ~127ms，中期里程碑 ≤24ms 未达——剩余靶见 §7.5。**
 
-### P5 qkv epilogue 折进 GEMM store（32.5 中尾巴 20.8ms）
-- 参照：gemm_staged_int8 0x100000 位（BN=32=head 对齐，norm 蝶形在 SLM stage 上做）。
-- 蓝本 op 序列：qkv_norm_scatter_esimd（已绿）逐字，数据源 dC→SLM。
-- 注意：P1 若把 QKV 吸进 resident block，P5 自动被覆盖——**所以 P5 排在 P1 后，可能直接消失**。
-- 目标：-15~20ms（若 P1 没吃掉）。
+### P1 window_block op 转 resident —— 预期 -100ms 级（不是 -40）
+账本上这条链的总和：window_block 42.8 + wb-window-res 17.4 + quant_window 15.1 + qkv 32.5 + window_attention 32.8 = **160.6ms（sync 口径）** → 前辈对应 row/4 6.2 + row/3 3.0 + gemm 里 qkv 份额 ≈ **12ms**。
 
-### P6 已折家族的几何精修（batched 31.1 / residual 22.5 / gemm-f16 18.8）
-- 参照：width-sweep 目标线（0.071/0.107/0.172ms 级）+ KC 单缓冲（v9c2 已测：单/双同速，v9c 的病根不在 SLM 大小——这条先记档不追）+ acc-via-SLM（C2 已接 N=128 族）。
-- 目标：-20~30ms。
+**★ 核心算子不动原则（用户 10-26 13:08 明令，实测背书——写在 P1 头上防误读）**：
+"转 resident"修的是【中间数据住哪 + stage 数据流纪律】这个**内部机制**，不是计算核心，更不是重新设计核心。账本已证明核心是健康的、就是 A770 最优：QKV 宽 GEMM 本体只花 5.7ms/30call（0.09-0.56ms/个=前辈 width-sweep 目标区）；前辈的 coopmat 算子在 A770 只有 24.8 TOPS 硬上限，我们的 dpas 宽 tile 是他的 3-4 倍——**他的核心恰恰不是 A770 最优，值得学的只有他的数据流组织**。v3/v4 的计算继续用已证的 dpas tile8/store16（f16v1 逐字，39 门绿）算大宽数据。
 
-### P7 收尾：global_attention(11.2)/unary(4.9)/ffn_stem/merge 残余
-- 逐个对照前辈对应 pass 账，能折则折。目标：-10~15ms。
+**前辈 workgroup 形状实测否证（10-26 15:25，c0_256 实验）**：他的 256 线程/WG（8×32 subgroup coopmat 形状）在 ESIMD 下**直接 HANG**——bench_v2crash mode=0 nd(2040×256) 打印 launch 行后 90s 无返回被掐（§96 旧账：LW>=128 ESIMD+barrier HANGS；LW=64×2040 windows 是验证过的安全区）。**他的形状搬不过来也不该搬**（那是 coopmat 专用配型）。可搬的是他的 **stage 纪律**：每 subgroup 1KB scratch 逐阶段复用（不是 45KB 大别名区）、权重一次进 SLM 常驻（他实测教训 "read from memory by row... 1.6ms of 7.1"）、双层 barrier（subgroup 内自己 barrier、跨行才 group barrier）、K 转置 ColumnMajor 读。
 
-## 四、总账（诚实预期，2026-10-26 用户点破后修正）
+**P1 首刀实测（10-26，提交 a36c9dc）：wbv3 直接转正失败，否证入账。**
+- 同热 A/B：split 222.7-223.9 vs NR_WB_V3 226.4-229.2（每对 split 赢）；sync 家族 window_block 42.9→46.1。
+- **根因=v3 的 stage 机制执行得糙**（45KB 别名区浪费 occupancy、7 阶段全组 barrier、每阶段并行度低），不是 resident 思路错——前辈 0.62ms/call 证明 resident 本身可以很快。
+- **P1 正确做法=v3 的 stage 级 bisect + 按前辈纪律修机制**：先用 NR_V2_STOP 找出 5.7ms/call 里最肥的阶段 → 逐段修（scratch 复用缩 SLM、SLM 常驻权重、barrier 分层），**算子保持 dpas 宽 tile 不动**。每修一段跑 NR_WB_V3 同热 A/B；转正判据=家族账 window_block 42.9 → 先 <15ms（我们的 tile 比前辈大，合理目标 1-1.5ms/call，不必到他的 0.62——那是 coopmat 8x16 tile 的产物）。
+- 判据不变：opt-in → stage-dump 对质 → 三关（39 门 + 端到端 100.0000% + 确定性两遍）→ 同热 A/B → 转正。
+- 目标：window_block 家族 42.9→~10-15ms 起步，整链（含 wb-window-res 17.4 + quant_window 15.1 + qkv 尾巴 20.8 + attention 往返 32.8 被吸收）**预期 -80~120ms**。
 
-**理论地板 ≈ 10-15ms**（全帧 GEMM FLOPs ~400GFLOP 在 dpas 宽 tile 实际可达区 ~7ms + resident 化后搬运 <1ms + dispatch 开销压到最小）。前辈 48ms 是"数据病态 + coopmat 在 A770 只有 24.8 TOPS 上限"的产物。健康链路 + A770 原生最优算法**必须**大幅跑赢他——只能到 55-70ms 等于承认这套架构白建。
+**✅ P1 DONE（10-26 21:5x，三形态全部 resident）**：plain（v4, 2.12x）+ pool（v4ph fold）+ head（v4ph 片上 GEMM）全部转正。window_block op = ONE kernel（QKV+norm+scores+softmax+PV+outproj+residual+publish+pool-fold+head-GEMM）。leg4 独立 GEMM、dOut16 往返、dA4/dB4/dH4 pool buffers、Stage 缓冲全部消失。walk 227→~204（本链累计 -23ms）。
+**破案记录（教训级）**：pool/head 的"神秘 1-ULP"= **FMA 收缩对 scope/phi 结构敏感**——操作数 load 预初始化+分支重赋值会把 `a*b+c` 拆成两次舍入（muladd），load 与表达式直线相邻才缩成单条 HW FMA。witness 链（dump sk/cosv/acc → numpy fma-vs-muladd 重构）一次定位；修复=表达式移进 if(inimg){} 直线块（前辈 :433-436 同形）。修后 total 0/16.7M、两 head 门直接全绿。**写新核的军规补一条：ESIMD 里每个已证数值表达式必须保持"load 紧邻表达式、无 phi"的形态。**
+- 部署链：c0fcc750 → 11c55383（pool）→ b17d55eb（head）。逃生舱 NR_WB_V4_NO_POOL=1 / NR_WB_V4_NO_HEAD=1 / NR_WB_V3=1 / NR_WB_SPLIT=1。
 
-- 中期里程碑（P1-P3 走完）：**≤ 24ms**（前辈 2x）
-- 终局（P8 逐核精修）：**10-15ms**（前辈 3-5x，逼近地板）
-- P1 的真实杠杆 = 整条 block 链 160.6ms（sync 口径）→ 前辈对应 ~12ms 量级，不是先前写的 -35~50。
+### P2 quant 折进生产者 store —— 预期 -35ms
+44.3ms → 前辈 1.64ms 量级。参照 gemm_staged_int8.comp store 出口直出 int8+scale；我的现成件=v9b fold（已证 bit-exact）+ g_fused_quant no-op 机制。给每个生产者 GEMM（batched/residual/f16）配 fold store。
 
-**顺序原则：P1 先打**——resident 化 window_block 一刀吃掉账本里最纠缠的一坨（leg3 hand-off、wb-window-res、quant_window、qkv 尾巴、attention 往返全在其中）。
+**✅ P2 DONE（10-27 凌晨，实际 -16ms 级，未达 -35 全额=归因入 P7）**：打法与蓝图预设不同且有据——v9b 式"折进 GEMM 生产者 store"被 §99 历史否证（宽合并慢 16ms），改用**消费者侧溶解**（用户"别合并 kernel，消灭它"方向）：pack_a_fused 把 quant 算术 VERBATIM 融进 gemm 的 pack 读路径（读 f16→行内峰值→量化→直写 dpas tile+scales），int8(48)+residual(136)+window(104)=288/448 call 溶解转正（NR_Q_FUSE 默认开，=0 逃生舱）。sync 账本 quant 29.6→13.1。bench_p2quant 否证"除法瓶颈"（DIV/RECIP/PURE 全 446GB/s=带宽贴顶）；NR_QUANT_SKIP 钉死 552 call 帧内真实代价 21ms。batched(144) 融合 bench 3.25x 赢但端到端严格 A/B 五对=中性→探针 OFF（NR_Q_FUSE_B）不硬转正——"不为融合而融合"（用户语）；"8x 冗余是元凶"亦否证（v3 零冗余 0.071 慢于冗余版 0.058：L1 兜底+ILP）。quant_window(104/16ms) 消费者=QKV 语义不匹配，不硬接。**链路审计（10-27 早）**：四雷排查修 1 真雷——fold 注册表 record-scoped 但 xmx_begin/abort/graph_capture 不清空（跨录制/换 plan 会 no-op 错闭包，v9b recycled-buffer 同族坑）→ c94872f 修，部署 md5=**0c3b1edf**。军规补账：单家族账本 delta 不能当判据（挪账假象），判据=同热端到端 A/B。
 
-## 五、每刀验收清单（贴墙）
+### P3 ffn 家族转 ffn_fused 结构 —— 预期 -30ms
+40.4ms → 前辈 5.5ms。参照 ffn_fused.comp："hidden layer kept on chip"——expand 的 publish 在 accumulator 上做、经 SLM 直接喂 projection，252MBx2 的 hidden 往返消失；一个 subgroup 带 16 行过两个 GEMM。
 
-1. 参照原文（文件:行）读全，写明"学到什么、因此改了什么设计"。
-2. 先门后码：给该 op 加/用既有独立门，期望值先钉。
-3. 改完：39 门 → 端到端 walk 两遍 → 同热 A/B → 自查（小M?中间量化?额外开销?CPU?）→ 提交推送 → 部署 md5 入账 → 用户游戏验收。
-4. 任何一关红：git revert，当场落盘失败原因（否证也是资产）。
+**🔨 P3 进行中（10-27 早）**：
+- **P3a ✅（0291bd7）**：gemm_pub_pa16——expand 的门控输出**直接写 projection 的 pack_a16 A-tile**（(tr,tc)==(tr,kc=tc) 同 16x16 几何、同 pub_esimd(3) 值、pad 行显式零）。dH(33MB/call)+pack_a16 趟消失。门逮住块步长 bug（expand kb_n vs projection tc_n）。三关全过，A/B 每对赢 2-3ms。
+- **P3b ✅（e276b10）**：同杠杆接 stem+merge（B→C 腿同构；residual 腿维持 split——gemm_res 1-ULP 教训）。ffn 三族 20 call/帧 全 tile 链。39 绿、端到端 100%×2、A/B 每对赢 4-5ms。部署 md5=**9ef11353**。walk 227→~190（-38ms）。
+- **P3c ⏳（下一刀，蓝图正主）**：真 ffn_fused——hidden 跨两 GEMM **片上驻留**（subgroup 16 行、32 列 chunk、expand acc→SLM→projection 操作数；ffn_fused.comp:11-16 前辈原图 + 我们 v4ph head 路已证"acc→SLM pack→tile8s 第二 GEMM"同型机制）。收益=再消 tile 缓冲的 write+read（~66MB/call×20）+ 一 launch。风险=大核重写，先立门（gate_ffn 三族的 within-one 锚点现成）。
+- 军规自查（P3a/b）：无小 M（tile 链全 16x16 宽块）、无新增量化往返（tile 直写=消往返）、无 CPU 牵扯、launch 净减。✅
 
-### P1 stage-ladder CORRECTED (10-26 15:40, family-total clean口径)
-floor(split 42 calls)=20.1 | v3-full family=46.6 -> **v3 8 plain calls = 26.5ms = 1.3ms/call** (NOT 5.7 -- a36c9dc's mean was stage-dump-contaminated; correction recorded). Per-stage (dump-contaminated but shape-telling): P0 0.5 / P1 0.9 / P2 0.8 / P3 0.6 / P4-P7 0.3 ms/call -- cost EVENLY spread over tiny stages = BARRIER+OCCUPANCY bound, not arithmetic. v3 SLM=65536B = 1 WG/EU, only 2 real subgroups/WG -> latency unhiding. Senior: 16KB + 8 subgroups = 4 WG/EU.
-**v4 design (operator UNTOUCHED = dpas tile8/store16)**: kill the f32 DCQ slab (24KB) by the senior's row-block-in-registers structure (subgroup owns 8 rows; its QKV outputs normalize IN the computing subgroup; K/V to 4KB packs; 1KB scratch per subgroup reused per stage); stage weights into SLM once (his measured lesson). SLM target <=24KB -> 2-3 WG/EU. First step = bench_v4slice: P0+P1+P2 only, dump-compare vs v3 stop=3 (bit-exact), time it. Barrier discipline: subgroup-local where rows are local; group barrier only at pack handoffs (P0->P1, P2->P3, P4->P5, P5->P6).
+### P4 剩余 attention/独立 pass 归户 —— 预期 -10ms
+global_attention 11.2 + unary 4.9 等，逐个对照前辈对应 pass 账（row/5 0.042ms/个）。
 
-### P1 pool/head attempt (10-26 17:40, REVERTED to 8aec17d; attempt source on disk: work/patch_v4ph_framefail_1026.txt)
-- if constexpr<PH> FIXED the gate-level plain/f32out regression (runtime-bool branches shift the plain outlet's codegen). PH=true: 39 gates GREEN incl. BOTH pool gates (fold tap order ((UL+LL)+UR)+LR VERBATIM senior :522-527 == the split dStage pass; target always-half per the scalar chain).
-- HEAD open item: gate WB-16x24-head-halfimage 8/24576 slots ~2e-4 = ULP-level (mapping row-checked vs leg4; crop-head floatimage GREEN, halfimage red).
-- THE DEEP FACT: the PH binary with NR_WB_V4_NO_POOL=1 (pool+head back on A2, plain on v4<false>) shows the SAME 12 frame diffs on 1301 (3 pixels x 4 cols) as full-PH -- while the 8aec17d binary (plain v4<runtime-bool form>, pool/head A2) shows 0. Same routing, different binary -> the 12-diff trigger is a CODEGEN shift the template instantiation causes for the plain outlet, NOT the pool/head outlets' math.
-- NEXT WINDOW: start from 8aec17d (deployed c0fcc750; family window_block 42.8->32.8, frame 100%% x2). Apply work/patch_v4ph_framefail_1026.txt, then bisect the 12 diffs: (a) PH=true but pool/head outlets EMPTY -> if 12 diffs persist, it is pure codegen; (b) compare v4<false> vs 8aec17d kernel SASS/ISA counts; (c) suspect the head outlet's hbase=scr+2048 region touching the SCR lifetime map (fold writes total at scr+r2*128 for ALL rows incl. rows 8..15 = hbase's area -- the pool outlet STORES raw total then reads rows 2j/2j+1 -- hbase only used by head, fine -- but the <true> instantiation's register pressure spills into the plain outlet).
-- Also: the user's game check on c0fcc750 -- picture OK, fps not visibly up (-10ms of ~220 = under perception). The next VISIBLE lever per the sync ledger is P2 quant-fold (44.3ms family) + P4 attention round-trips (32.8), not more P1 micro-drift.
+**✅ P4a/P4b/P4c DONE（10-27 早，游戏侧对拍结案）**：
+- P4a（eecead1）：global_attention vit_softmax store 直写 attnV A-tile（dProbs 67MB/call + pack 趟双消），A/B 赢 1-2ms。
+- P4b（def106a）：**104/104 quant_window gather-quant 全溶解进 QKV pack_a_fused_gather**（P2"语义不匹配"是读错——普查钉死单读者+索引同构）。A/B 每对赢 8-10ms=本窗口最大单刀。
+- P4c（3e230a2）：window_attention smax_esimd store 直写 tile（又消 dProbs 33MB/帧）。A/B 赢 1.5-3ms。
+- **游戏侧每帧 harness（e010377，nr_net_run 30 帧一报进 work/nr_net.log）**：对拍 OFF(P1-era)=215 vs ON=197 → **-18ms 在玩家侧兑现**（离线 -21 吻合）；OptiScaler bridge 账本 work=197/wait+fence<2ms → NR=202ms 帧的 97%。教训入册：插桩前先确认每帧路径（第一版插错在 record 期）。
+- 部署：**fdc8b483**=当前 ON 件（游戏加载位）；对照 work/libxmx_p1era.dll(44bc1b64)。逃生舱：NR_Q_FUSE / NR_QW_FUSE / NR_FFN_TILE / NR_GA_TILE / NR_WA_TILE（全 =0 关）。
+
+### P5 = QKV resident epilogue（下一窗口开工，靶 21.3ms 尾巴）
+QKV 内部账（NR_QKV_STOP 阶梯）：pack 5.9 + GEMM 5.5（健康）+ **norm_scatter 尾巴 21.3**（dC int32 Mp×3C×4=25MB/call 写+读 + 标量蝴蝶核低效）。前辈正解=qkv_epilogue.glsl（已精读）：**BN=32 head-aligned 列块 + 归一在 stage 就地做 + 绝不加额外 SLM 分配**（前辈原注释：一个 64 元素 recip 数组把 stage 2KB 顶到 4KB、WG 驻留减半、代价 23ms——SLM 按 2 的幂分配）。军规①合规论证：v9b 败在窄 **M**(BM=32)，P5 保 BM=128 宽 M、只把 QKV 一族的 N 切成 32 对齐 head 块——width-sweep 先例支持窄 N 合法。实现路径二选一：(a) s8v8::gemm 加 BN=32 变体+acc-via-SLM stage 内 butterfly（gemm_b_pub_slm 机制现成）；(b) 先修 norm_scatter 核本身（向量化/coalesced），再折进 gemm。先立门（GEMM_INT8_QKV 门现成）再写码。工具链：nr_net.dll 重编用手动 cl（见 10-27 流水备忘）。
+
+### P5 batched/residual/gemm-f16 几何精修 —— 预期 -20ms
+P1-P3 后剩余 GEMM 家族按 width-sweep 目标线逐核修（C2 acc-via-SLM 已接 N=128 族；v9c 单/双缓冲否证已记档）。
+
+### P6 游戏侧对质 + 帧时间验收（每刀之后例行）
+
+### P7 数字对账与重排（做完 P1-P5 重拉账本，未达预期项归因）
+
+### P8 终局精修 —— 目标 10-15ms
+逐核对前辈 width-sweep + occupancy/GRF 调优（improve-large-grf.md、improve-shared-memory.md 的前辈踩坑账直接复用）。
+
+---
+
+## 五、当前已入账（§100 窗口，全部已推送）
+
+| 提交 | 内容 | 效果 |
+|---|---|---|
+| 1061ebc/a28f274/d9906c0 | 门先行 + pool/head 接融合腿 + 2x2 pool 折进核 | -3~4ms |
+| d72a1a6/5ae45e4 | C1/C2 batched acc-via-SLM（N=128 族） | 单核 -7~24% |
+| 32790d9~1ada6e1 | D 探针链（8 轮）：leg3 40ms 机制事实矩阵 | 否证存证 |
+| 50f67eb | **E1：v9b 暗坑（代码默认与笔记结论相反）** | **-13ms（227→214）** |
+| 1742239 | QKV 内部三档账本（GEMM 5.7 健康 / dC 尾巴 20.8） | 靶子钉死 |
+
+已部署：work/libxmx.dll md5=**9da723f3**（游戏画面已验收 OK）。回退=swap_engine.bat revert。
+
+## 六、新窗口开工仪式（照此执行）
+
+1. 精读本文件 + `notes/a770-native-architecture.md` 最新节 + `.workbuddy/memory/` 最近两天流水（全文，不许跳读）。
+2. 从 P1 的"先查参考"开始：读 window_block.comp 全文 + wbv3 现状 + §99 的 v2/mega 失败记录（为什么败、约束是什么）。
+3. 写设计（学到什么/改什么）→ 用户点头 → 开工。
+4. 每刀三关 + 自查 + 提交推送 + 部署对质。
+
+---
+
+## 七、2026-10-28 修订：游戏路径账本（P7 口径）+ 收官盘面 + 军规补条 ★★★ 新窗口先读这节
+
+### 7.1 当前盘面
+
+- **walk 227 → ~120-128ms**（§100 战役累计 **-100~107ms**）。游戏侧已验收（用户 10-28 两次确认画面 OK、帧数提升）。
+- 部署链尾（游戏加载位 `work/libxmx.dll`）：
+  - 当前件 md5=**883bd207**（=0e16d72 构建，含 NR_WA_STOP 探针，默认关行为不变）
+  - 功能件序列：5cc20f24(P3收官) → 7b58778c(P10) → 0835db5(P10b) → ed5a3bc(P10c) → 5ac705ed(P11探针) → 91c313d5(**P11 转正**) → 0b0727a5(**P8-a**) → 83b7c020(**P8-b**) → a892c77d(**P8-c/d**) → e4f08183(**P8-e**) → 1ddf4ed9(**P8-f**) → 0e16d72(**P7 账本探针**)
+- 逃生舱全清单（默认全 ON，=0 关）：NR_Q_FUSE / NR_QW_FUSE / NR_FFN_TILE / NR_FFN_CHIP / NR_GA_TILE / NR_WA_TILE / NR_WA_RES / NR_WA_RAWV / NR_QKV_VITES / NR_B_WIDE / NR_BPACK_VEC / NR_PACKA_VEC / NR_PACKA16_VEC / NR_GPACK_VEC。
+
+### 7.2 游戏路径家族账本（cgraph ON 直测，帧 baseline ~129ms，两遍均值）
+
+**这是唯一可信的账本口径。** sync 口径（NR_RUN_TIMING 逐闭包 GQ->wait()）把流水线串行化，floor 虚高到 ~107——游戏真路径 floor=**27.8**。
+
+| 家族 | 游戏路径成本 | 状态 |
+|---|---|---|
+| window_block（plain v4full 16 call） | **29.4**（1.84/call） | **头牌靶**：bench 合成域 1.30/call → 真形状/真值域 gap 0.54/call |
+| qkv（120 call） | 15.2 = tail 9.6 + gemm 4.8 + pack 0.8 | gemm/tail 已贴已证线（P5/P6/P7/P11 四试在案）|
+| window_res（104） | 14.6 = gemm 13.7 + pack 0.9 | gemm_b_res 本体 bench 证速；pack 已 fused |
+| global_att（16） | 12.8 = gemms 12.0 + rest 0.8 | gemm 本体已证速；resident 被形状算术否证（重算 scores=翻倍）|
+| residual（136） | 10.6 = gemm 9.3 + pack 1.3 | 同上结案形态 |
+| window_attention（104） | **7.0**（每 call 1 resident launch 全 RAW） | P10/P10b/P10c 完全兑现 |
+| batched（144） | **0.6** | **P8-b 宽合并吃光**（sync 曾虚报 64.5！） |
+| ffn 三族 chip | ~6-8 | P3 收官（chip 单核） |
+| quant/unary | ~17（sync 口径）→ 游戏路径含在 floor 27.8 内 | P2/P4b 已溶解 288/448 |
+| **不可约地板** | **27.8** | ffn+quant+unary+提交+pool/head 路（691 闭包 cgraph） |
+
+对照蓝图目标：中期里程碑 ≤24ms、终局 10-15ms。**当前 ~127 = 里程碑未达**；剩余可挖=window_block 29.4 的域 gap + 三 gemm 族尾巴 + 地板 27.8 的逐核精修。理论地板的"7-14ms dispatch 成分"已被 cgraph 压掉大半（ON vs OFF=132 vs 146，省 14ms）。
+
+### 7.3 已结案家族（附 launch 计数证据，不许重挖）
+
+- **qkv 家族**：P5（resident epilogue 慢 1-3ms）/P6（v2/v3 尾巴重构全败，v1 近最优）/P7（vit 两段合一中性）/P11（vit lane 核**转正**：449 真凶=嵌套 eh_mul 被核内改写→STEPPED 命名临时量；帧 0% 真凶=host 建表 rsqrt 融合污染 inf 槽→非有限守卫+volatile 屏障）。终账 15.2。
+- **batched**：P8-b **宽合并转正**（block-diagonal 精确合并，零 padding，40/40 命中）；v9b 幽灵正名（死因=BM=32 几何，宽思路本身对）。终账 0.6。
+- **window_attention**：P9（attnV+merge 折叠）→P10（整块 resident）→P10b（Q/K RAW gather）→P10c（V RAW gather）=每 call 1 launch 全 RAW。终账 7.0。
+- **residual 两族**：pack-fold 被形状算术否决（K 大 N/BN 冗余读净亏）；gemm_b_res 已 fused；本体 bench 证速。终账 25.2。
+- **gemm_f16**：P12a（v1→v2）/P12b（publish-fold）双中性（N 小 dC 热 L2）；P8-d（A 腿向量化）**转正**。
+- **global_attention**：resident 需重算 scores=翻倍 gemm，净亏 ~5x，形状算术结案。
+- **window_block 内部 stage 账（bench_v4full 纯停点，2040w）**：QKV 0.567（P0 0.058/Q 0.141/K 0.185/V 0.181）+ scores 0.265（P8-f hoist 后）+ softmax 0.058 + attnV 0.177 + outproj+store 0.19 ≈ FULL 1.255。
+
+### 7.4 军规补条（本窗口新增，全部入册）
+
+1. **ESIMD 已证数值链每一步必须有独立命名临时量、紧邻使用**——嵌套表达式=编译器改写风险区（P11-449 案：eh_mul 三重嵌套被改写跳中间 half-round）。与 phi/scope FMA 收缩同族。
+2. **host 建表/构造循环同样在编译器改写危险区**——向量化 rsqrt 融合毁掉非有限输入槽（P11 帧 0% 案）。数值构造件：volatile 屏障拆步 + 非有限显式守卫。
+3. **门域必须对照真实帧域审计**（band-3 门全绿照样全帧崩；vit norm 在帧域 as=3.53 下溢出 inf，163k/196k 行）。端到端对质不可省。
+4. **结案汇报必须附 launch 计数证据**；**bench 空 launch 自查**（wg=0 的"EXACT"行=没测——bench_batched N=32 案、RAW 调用行被编辑吞案，共四逮 bench 自欺）。
+5. **bench 副本核的胜负不能外推到真库核**（P8-g/g2 否证：hoist 在 bench 赢、真核 32-reg 区 spill 帧输）。寄存器当量预筛：simd<half,128>=4 GRF regs/lane@SIMD16；≤16 regs 区（P8-f 赢）、32 regs 区（P8-g 输）。帧 A/B 用真库两 dll 才是裁判。
+6. **每步重读当步构建输出**（0 GREEN+EXIT=1=什么都没测——旧 dll 假结论家族三次）。提交声明的门状态必须在同次编辑对照代码验证。
+7. **单家族 sync 账 delta 不能当判据**（挪账假象）；**亚 ms 级 stage 改动用纯停点 bench 阶梯 + 单族 sync 账定案**（帧总时噪声=20 族抖动之和）；**家族/帧级判据一律用 cgraph ON 游戏路径账本**。
+8. 军规原五条（小 M / 中间量化往返 / 额外开销 / 照搬思路不照搬代码 / 三关）不变。
+
+### 7.5 剩余靶图（按 §7.2 账本排序）
+
+1. **window_block 真域定靶（下一刀）**：帧 16 call=1.84/call vs bench 合成 1.30——先给 bench_v4full 喂真帧 image 统计（NR_VITDUMP 同款：录制器 dump 第一帧 Img/权重真值 + 真形状 windows=2040-2135），再拆 gap（值域→dpas 数不变、更可能是 L2/占用或 P0 gather 真 image 尺寸 544×960×32 vs bench 同尺寸……需实测）。
+2. V-part scatter（0.181/call）：pb16_dest_kn 行奇偶映射不可 pair-merge；换 V tile 布局牵动 attnV 读侧=大改，暂记。
+3. attnV/outproj hoist：**已否证**（32-reg 区 spill，P8-g/g2 两刀在案）——不要再试整块 hoist；若要试按 ≤16-reg 分半 hoist。
+4. 三 gemm 族（residual/winres/global）本体已 bench 证速；尾巴（publish/scale）已 fused。剩余=width-sweep 逐形状精修（前辈 int8-width-sweep.md 表=红利地图：M 大 N 大才 2-3.5x；Large-GRF 模式=前辈实测否证，不走）。
+5. 地板 27.8 的组成拆解（ffn 三 chip + quant 160 溶解后残余 + unary + 提交）——尚未有逐项账，是 P8 收官前最后一笔账。
+6. 游戏侧 vs 离线残余 ~12ms（持续满载时钟差）——暂不追。
