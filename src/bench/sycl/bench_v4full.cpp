@@ -444,5 +444,44 @@ int main(){
       return launch_v4full(q,dImg,false,dWq,dWp,dTgt,(float*)dTgt,dBias,dCos,dQs,
         sh.w,sh.ih,sh.iw,sh.ac,sh.pt,sh.pl,1u,true,0u,nullptr); });
   }
+  // ---- P8-h giant STAGE ladder (pure stops, no dumps): where does the 4.89ms go?
+  printf("--- 8160w GIANT stage ladder ---\n");
+  {
+    auto G=[&](unsigned st){ return launch_v4full(q,dImg,false,dWq,dWp,dTgt,(float*)dTgt,dBias,dCos,dQs,
+        8160u,544u,960u,120u,0u,0u,1u,true,st,nullptr); };
+    double p0=timeit("g stop P0only  ",[&]{ return G(101u); });
+    double qkv=timeit("g stop QKV     ",[&]{ return G(10u); });
+    double sco=timeit("g stop scores  ",[&]{ return G(5u); });
+    double prb=timeit("g stop probs   ",[&]{ return G(6u); });
+    double att=timeit("g stop attend  ",[&]{ return G(8u); });
+    double prj=timeit("g stop project ",[&]{ return G(9u); });
+    double full=timeit("g stop FULL    ",[&]{ return G(0u); });
+    printf("GIANT deltas: P0=%.3f QKV=%.3f scores=%.3f softmax=%.3f attnV=%.3f outproj=%.3f store=%.3f\n",
+           p0, qkv-p0, sco-qkv, prb-sco, att-prb, prj-att, full-prj);
+    // P8-h probe A: is the giant's per-WG time a TAIL/occupancy artifact? 8160 WG
+    // = 51 SM x 160/wave x 1.003 waves -- the 0.003 tail = 5 dead SMs for a full
+    // wave. Run the SAME 8160 windows as 2 x 4080 (the recorder's giant calls are
+    // single launches; this probe splits the grid artificially by launching with
+    // half the windows twice -- output-correctness irrelevant here, timing only).
+    double half1=timeit("g 2x4080w first ",[&]{ return launch_v4full(q,dImg,false,dWq,dWp,dTgt,(float*)dTgt,dBias,dCos,dQs,
+        4080u,544u,960u,120u,0u,0u,1u,true,0u,nullptr); });
+    double half2=timeit("g 2x4080w second",[&]{ return launch_v4full(q,dImg,false,dWq,dWp,dTgt,(float*)dTgt,dBias,dCos,dQs,
+        4080u,544u,960u,120u,0u,0u,1u,true,0u,nullptr); });
+    printf("2x4080 = %.3f vs 1x8160 = %.3f  -> tail effect %s\n", half1+half2, full,
+           (half1+half2 < full*0.95) ? "REAL (split wins)" : "none/linear");
+    // P8-h probe C (the DECISIVE one): per-WG time parity -- smalls 1.25/2040 =
+    // 0.61us/WG, giants 4.88/8160 = 0.60us/WG: NO giant-specific inefficiency; the
+    // 19.5ms = 4x data at the family's per-WG cost. So the lever is the per-WG
+    // ELEMENTWISE chain (XMX util = 5.4GFLOP/(4.88ms x 131T) = 0.8%: the dpas
+    // engine is idle 99% of the time). Localize inside QKV (the 2.115 fat):
+    // micro-stops 102 (after part0=Q) / 103 (after part1=K) at the giant shape.
+    double g102=timeit("g stop after Q",[&]{ return G(102u); });
+    double g103=timeit("g stop after K",[&]{ return G(103u); });
+    printf("GIANT QKV parts: P0=%.3f Q=%.3f K=%.3f V=%.3f (V has NO cosine_recip)\n",
+           p0, g102-p0, g103-g102, qkv-g103);
+    // probe B: P0 gather overlap dedup -- the giant rows have across=120 == vw/8=120
+    // = NO horizontal overlap between windows in a row; vertical overlap x16.
+    // P0 alone is 0.219 of 4.88 -> the dedup ceiling on P0 is TINY. Skip.
+  }
   return allok?0:1;
 }
