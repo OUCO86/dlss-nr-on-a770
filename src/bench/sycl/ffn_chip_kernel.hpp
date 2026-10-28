@@ -29,8 +29,19 @@ namespace esimd = sycl::ext::intel::esimd;
 #define FFC_HS_OFF (32u * 1024u)
 #define FFC_SLM_BYTES (64u * 1024u)
 
+// P8-l (section 100): the RESIDUAL-FUSED store. dSkip/cp non-null => the store
+// loop computes Cout = fma(skip, cos, acc) IN THE SAME PASS and the separate
+// residual tail (ffn_tail_res) plus the dC2 scratch (67MB write + 67MB read per
+// stem call, the L2-thrash the cgraph ledger priced at ~8.8ms/frame) VANISH.
+// Bit-exactness: the tail's sycl::fma(sk,cv,c2) and here the auto-contracted
+// sk*cv+acc are the SAME single-fused-rounding FMA per lane (the gemm_b_res
+// golden semantics, section 92); epi=0 publish is the identity and the skip is
+// RAW f32 (NO e4m3 boundary -- the P3c plain-ffn 131/8192 lesson was the
+// half-skip + epi!=0 form, which stays on the split chain). Used ONLY by the
+// stem/merge recorder sites (their guards checked there).
 static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
-                                    const half* dPp, float* Cout, int M, int Mp) {
+                                    const half* dPp, float* Cout, int M, int Mp,
+                                    const float* dSkip = nullptr, const float* cp = nullptr) {
     const unsigned cin = 32;
     int tiles = Mp / 16;
     int wgs = (tiles + 31) / 32;
@@ -147,7 +158,18 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                 if (tr * 16 + r < M) {
                     esimd::simd<float,8> f0 = p00.template select<8,1>(r*8), f1 = p01.template select<8,1>(r*8);
                     esimd::simd<float,8> g0 = q00.template select<8,1>(r*8), g1 = q01.template select<8,1>(r*8);
-
+                    if (dSkip) {   // P8-l: Cout = fma(skip, cos, acc), same single-rounding FMA as the tail
+                        size_t rb = outb + (size_t)r * cin;
+                        esimd::simd<float,8> k0 = esimd::block_load<float,8>(dSkip + rb + 0, esimd::overaligned_tag<16>{});
+                        esimd::simd<float,8> k1 = esimd::block_load<float,8>(dSkip + rb + 8, esimd::overaligned_tag<16>{});
+                        esimd::simd<float,8> k2 = esimd::block_load<float,8>(dSkip + rb + 16, esimd::overaligned_tag<16>{});
+                        esimd::simd<float,8> k3 = esimd::block_load<float,8>(dSkip + rb + 24, esimd::overaligned_tag<16>{});
+                        esimd::simd<float,8> w0 = esimd::block_load<float,8>(cp + 0, esimd::overaligned_tag<16>{});
+                        esimd::simd<float,8> w1 = esimd::block_load<float,8>(cp + 8, esimd::overaligned_tag<16>{});
+                        esimd::simd<float,8> w2 = esimd::block_load<float,8>(cp + 16, esimd::overaligned_tag<16>{});
+                        esimd::simd<float,8> w3 = esimd::block_load<float,8>(cp + 24, esimd::overaligned_tag<16>{});
+                        f0 = k0 * w0 + f0;  f1 = k1 * w1 + f1;  g0 = k2 * w2 + g0;  g1 = k3 * w3 + g1;
+                    }
                     f0.copy_to(Cout + outb + (size_t)r * cin + 0);
                     f1.copy_to(Cout + outb + (size_t)r * cin + 8);
                     g0.copy_to(Cout + outb + (size_t)r * cin + 16);
@@ -156,7 +178,18 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                 if (tr * 16 + 8 + r < M) {
                     esimd::simd<float,8> f0 = p10.template select<8,1>(r*8), f1 = p11.template select<8,1>(r*8);
                     esimd::simd<float,8> g0 = q10.template select<8,1>(r*8), g1 = q11.template select<8,1>(r*8);
-
+                    if (dSkip) {
+                        size_t rb = outb + (size_t)(8+r) * cin;
+                        esimd::simd<float,8> k0 = esimd::block_load<float,8>(dSkip + rb + 0, esimd::overaligned_tag<16>{});
+                        esimd::simd<float,8> k1 = esimd::block_load<float,8>(dSkip + rb + 8, esimd::overaligned_tag<16>{});
+                        esimd::simd<float,8> k2 = esimd::block_load<float,8>(dSkip + rb + 16, esimd::overaligned_tag<16>{});
+                        esimd::simd<float,8> k3 = esimd::block_load<float,8>(dSkip + rb + 24, esimd::overaligned_tag<16>{});
+                        esimd::simd<float,8> w0 = esimd::block_load<float,8>(cp + 0, esimd::overaligned_tag<16>{});
+                        esimd::simd<float,8> w1 = esimd::block_load<float,8>(cp + 8, esimd::overaligned_tag<16>{});
+                        esimd::simd<float,8> w2 = esimd::block_load<float,8>(cp + 16, esimd::overaligned_tag<16>{});
+                        esimd::simd<float,8> w3 = esimd::block_load<float,8>(cp + 24, esimd::overaligned_tag<16>{});
+                        f0 = k0 * w0 + f0;  f1 = k1 * w1 + f1;  g0 = k2 * w2 + g0;  g1 = k3 * w3 + g1;
+                    }
                     f0.copy_to(Cout + outb + (size_t)(8+r) * cin + 0);
                     f1.copy_to(Cout + outb + (size_t)(8+r) * cin + 8);
                     g0.copy_to(Cout + outb + (size_t)(8+r) * cin + 16);

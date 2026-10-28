@@ -1717,6 +1717,19 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
         // M x 32 half = the chip's dA contract; the dA2 pack skips on this path).
         static bool ffchip2 = !getenv("NR_FFN_CHIP") || atoi(getenv("NR_FFN_CHIP")) != 0;
         const bool merge_chip = ffntile2 && ffchip2 && !narrow && epi == 0u;
+        // P8-l: the residual-fused chip store -- dC2 (Mp*32 f32 = 67MB at M=522240)
+        // NEVER touches global; the separate ffn_tail_res pass vanishes. Guards:
+        // epi==0 && !narrow (already merge_chip), f32 skip (dMerged) -- the P3c
+        // half-skip/epi!=0 lesson zone stays on the split chain. NR_FFN_CHIPRES=0 =
+        // escape hatch to the (already-vectorized, P8-k) tail form.
+        static bool chipres = !getenv("NR_FFN_CHIPRES") || atoi(getenv("NR_FFN_CHIPRES")) != 0;
+        if (merge_chip && chipres) {
+            sycl::half* dPp2 = cached_pack_b_f16(projection, Praw, 128, 32);
+            ffnc::launch_ffn_chip(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp);
+            pool_put(dM16);   // dA2 was never packed on this path; dB2/dPp2 cache-owned
+            pool_put(dMerged);
+            return;
+        }
         if (merge_chip) {
             sycl::half* dPp2 = cached_pack_b_f16(projection, Praw, 128, 32);
             float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
@@ -1838,6 +1851,12 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
         // dHid (M x 128 halfs) + its pack_a16 pass vanish. Same gate NR_FFN_TILE.
         if (stem_chip) {
             sycl::half* dPp3 = cached_pack_b_f16(projection, Praw, 128, 32);
+            static bool chipres3 = !getenv("NR_FFN_CHIPRES") || atoi(getenv("NR_FFN_CHIPRES")) != 0;   // P8-l (see the merge site)
+            if (chipres3) {
+                ffnc::launch_ffn_chip(*GQ, dH16, dB2, dPp3, (float*)Cout, (int)M, Mp, dS, cp);
+                pool_put(dH16); pool_put(dA2); pool_put(dS);   // dC2 never allocated
+                return;
+            }
             float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
             ffnc::launch_ffn_chip(*GQ, dH16, dB2, dPp3, dC2, (int)M, Mp);
             static int sstop = getenv("NR_STEM_STOP") ? atoi(getenv("NR_STEM_STOP")) : 0;
