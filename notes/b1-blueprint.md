@@ -258,6 +258,28 @@ host 线并行另案（不碰 GPU 数值，风险最低肉最大）→ B3 视 B2
    -5~6ms（消 6.9ms 开销的大部）。**开工序：(a) 先画 gemm_int8_batched 的
    tc/行 ownership 图 → (b) bench 原型（JUDGE=pk 逐字节对拍）→ (c) 三关。**
 6. QUANT_WINDOW 幸存 ~1ms（x104 里大部分已被 P4b take 溶解）——不动。
+7. **★ B2 kernel-形态收割完毕（21:5x，bench_qr/qr2/qr3 三连，诚实账）**：
+   - 稳态三态（去 JIT）：full=120.5 / s8=111.5 / s9=112.1 ⇒ **kernel-time 9.05ms，
+     launch-scheduling ≈ 0（-0.58=噪声）**——"消 launch"论点被**否证**（图执行器
+     把 160 个小发射藏得很好）。
+   - 隔离 sum-of-shapes = 5.26ms（202 GB/s 平均）；帧内 9.05 ⇒ 3.74ms = L2 竞争
+     价（rule-11 的缓存交互，不是 kernel 形态问题）。
+   - 形态扫描（RG<LW,CH16> 全家族 + LW=128）：640x2048 "WIN" 经**对拍裁决 bench
+     撤销**（warm-up 假象：shipped 0.036-0.040 vs mine 0.036-0.045，pk/scale
+     diff=0 证同形）；LW=128 无赢（0.044 vs 0.043）。**rowthread/rowgroup64
+     就是当前地板形态**。
+   - **B2 剩余唯一未打刀 = 生产者侧真内嵌（§六.5-5 的跨-WG 行归约问题）**：
+     N=256 行跨 4 个 WG（BN=64），行 max-abs 需要 SLM slab 二次扫或跨 WG 全局
+     归约——两种都把"quant 读 f16"变成"gemm 写 f16 + gemm 读回 f16"，字节不变
+     只省一 launch（已证≈0 开销）⇒ **按当前形态账，真内嵌收益上限 = 隔离
+     5.26 - 内嵌后 ~3 = 仅 -2ms 级，且要动 5 个 gemm 族的 store epilogue**。
+   - **B2 判决（写死）：quant 家族从"7x 最大肉"降级为"~2-3ms 残肉 + 高手术
+     成本"。账本重排：剩余大肉 = (i) giants-split-wide 对拍（§六 P8-h 计划里
+     从未执行的那条：4 个 v4ph call 16.6ms vs split wide-M 路——§99 宽 gemm
+     2-3.5x 红利区，未对拍）；(ii) wblock 帧内 26+16.6 的 B3 指令数战（SIMD32
+     新地形）；(iii) host/提交线（前辈账 15.4ms 不在设备，从未动过）。
+     **下窗口开工序：(i) 先行（纯对拍实验，一天内出判决）→ (iii) 并行另案
+     → (ii) 视剩余预算立项。**
 
 ## 七、交接检查单（新窗口开工先读这些）
 
