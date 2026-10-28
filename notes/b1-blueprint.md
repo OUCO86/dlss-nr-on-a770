@@ -323,6 +323,29 @@ host 线并行另案（不碰 GPU 数值，风险最低肉最大）→ B3 视 B2
      * dpas 序列与 scatter map 不变（JUDGE 逐区对质）。
      * 预期：wblock 42.6 -> **15-20**（-22~28ms，walk -> ~85-90）。
        **这是账本上最后一块大肉，也是追平前辈 wblock 族的正解。**
+   - **★ v6 的两条实测警告（本轮新收，开工前必读）**：
+     (W1) **占用轴单变量证据偏弱**：v4occ 探针（未入库，方法=SCR 别名进
+         操作数区把 SLM 45KB 压到 28KB，数据有 race 但计时有效）测得
+         1.161 -> 1.130 = **仅 -2.6%%**。"2 WG/SM"单独不是那个数量级的
+         杠杆。v6 的收益必须来自 **几何+scratch+并行度三件套同时改**，
+         不是 SLM 缩小本身。若 v6 只做 SLM 压缩 = 预期内 -3%% 级。
+     (W2) **8 行几何的 dpas 半载陷阱（v5-WIP 慢的真正机制，本轮推导）**：
+         tile8h 在 SIMD16 下 dpas<8,8> 的 16 lane 只装 8 行 ⇒ **一半
+         XMX message 是 padding**，dpas 有效吞吐减半——这就是 v5-WIP
+         QPO 0.894 > v4 0.651 的主因（不是 SLM！60KB=1WG/SM 但 v5-WIP
+         128 线程/SM 反而比 v4 64 线程/SM 慢：半载 dpas + idle lanes
+         两宗罪）。v6 的 8 行几何**必须解决 dpas 满载**：
+         * 方案 A（推荐先试）：**两个 subgroup 拼一个 16 行 tile**——
+           KTO 的 pack 本来就是 (js0,js1)=两个 8 行 strip 拼 16 行块，
+           scores/attnV 的 B 侧天然满；A 侧让 sg 偶数号算 rows0-7、
+           奇数号算 rows8-15，dpas 的 a0/a1 分别来自两个 subgroup 的
+           scratch（SLM 读，跨 subgroup）——tile 满载但多一跳 SLM；
+         * 方案 B：QKV/outproj 保持 16 行 tile（v4 原样），**只把
+           epilogue 改 4-lane 树 + scratch 复用压 SLM**——几何不动、
+           无半载风险，收益=e4m3 树向量化(v5a 已吃)+barrier 减+占用
+           微升。预期只有 -3~8%%。方案 B 是安全垫，A 是主刀。
+         * 下窗口第一步 = 用 bench 对拍 A/B 两案的 QKV 段（JUDGE 逐区），
+           再定全核走哪案。
    - (α) tc 循环合并 = v6 后的精修；(γ) softmax 64 步标量链（改求和顺序=
      违反参考树，golden 考古门才允许动）仍然封存。
    - quant 真内嵌 = 2-3ms 残肉高成本，排在 B3 后。
@@ -337,6 +360,8 @@ host 线并行另案（不碰 GPU 数值，风险最低肉最大）→ B3 视 B2
 2. 分支状态：`b1-wblock-resident`（origin），tip=本提交；部署 md5=**8ad560c2**
    （blade-1+2，游戏画面已验收 OK）；主分支 healthy-chain-resident-opt tip=12fb8f5 之前
 3. bench 验收尺 = bench_v4full（7 区 JUDGE + PURE-LADDER + fill 探针 + part0 微梯）
-4. WIP 封存：src/bench/sycl/bench_v5_WIP.cpp.txt（8×8 naive，勿复活）
+4. WIP 封存：src/bench/sycl/bench_v5_WIP.cpp.txt（8×8 naive，勿复活——
+   它的失败机制已在 §六.6-10 W2 推导清楚：dpas 半载+idle lanes）
+4b. v6 开工必读 = §六.6-10 的 v6 设计 + 两条警告 W1/W2 + 方案 A/B 对拍第一步
 5. 当日流水：E:/WorkBuddy/2026-10-25-22-59-21/.workbuddy/memory/2026-10-28.md（全文精读）
 6. 下一步 = §四 v5a（shuffle epilogue，设计论证已在 §二）
