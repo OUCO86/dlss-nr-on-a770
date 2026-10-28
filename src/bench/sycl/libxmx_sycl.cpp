@@ -1459,6 +1459,8 @@ int xmx_rec_gemm_int8_fused(int a,int b,int c,int as,int bs,unsigned M,unsigned 
 int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine,
                 unsigned M, unsigned cin, unsigned hidden, unsigned groups, unsigned flags) {
     if (!g_recording) FAILMSG("not recording");
+    static int fstop = getenv("NR_F_STOP") ? atoi(getenv("NR_F_STOP")) : 0;
+    if (fstop == 9) { g_cmd_names.push_back(__func__); g_cmds.push_back([](){}); return 0; }   // P7 floor ledger (time-only)
     if (!M || (M % 16u) || !cin || (cin % 16u) || !hidden || (hidden % 32u))
         FAILMSG("ffn needs M%%16, cin%%16, hidden%%32 (libxmx.c:3118)");
     if (flags & ~0x41f00u) FAILMSG("ffn takes an epilogue, a half output and a half skip only");
@@ -1599,6 +1601,8 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
                       int out, int cosine, unsigned height, unsigned width,
                       unsigned source_width, unsigned flags) {
     if (!g_recording) FAILMSG("not recording");
+    static int fstop = getenv("NR_F_STOP") ? atoi(getenv("NR_F_STOP")) : 0;
+    if (fstop == 9) { g_cmd_names.push_back(__func__); g_cmds.push_back([](){}); return 0; }   // P7 floor ledger (time-only)
     const unsigned M = height * width;
     if (!M || (M % 16u) || (height % 2u) || (width % 2u) || source_width < width / 2u)
         FAILMSG("the merged feed-forward needs an even extent in 16-row blocks (libxmx.c:3161)");
@@ -1754,6 +1758,8 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
 int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int out,
                      int cosine, unsigned M, unsigned flags) {
     if (!g_recording) FAILMSG("not recording");
+    static int fstop = getenv("NR_F_STOP") ? atoi(getenv("NR_F_STOP")) : 0;
+    if (fstop == 9) { g_cmd_names.push_back(__func__); g_cmds.push_back([](){}); return 0; }   // P7 floor ledger (time-only)
     if (!M || (M % 16u)) FAILMSG("the stem feed-forward needs 16-row blocks (libxmx.c:3195)");
     if (flags & ~0x1f00u) FAILMSG("the stem feed-forward takes an epilogue and a half output only");
     auto ift = g_bufs.find(features), iad = g_bufs.find(adapter), iex = g_bufs.find(expand),
@@ -2900,6 +2906,8 @@ int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
 int xmx_rec_quant_window(int source, int packed, int scale, unsigned M, unsigned K,
                          unsigned height, unsigned width, unsigned across, unsigned pad) {
     if (!g_recording) FAILMSG("not recording");
+    static int qwstop = getenv("NR_QW_STOP") ? atoi(getenv("NR_QW_STOP")) : 0;
+    if (qwstop == 9) { g_cmd_names.push_back(__func__); g_cmds.push_back([](){}); return 0; }
     if (!M || !K || (K % 64u)) FAILMSG("a gathered quantiser needs K a multiple of 64");
     if (!across || !height || !width) FAILMSG("a gathered quantiser needs the image extent and windows per row");
     auto s = g_bufs.find(source), p2 = g_bufs.find(packed), c = g_bufs.find(scale);
@@ -2932,6 +2940,8 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
                   unsigned channels, float p0, unsigned batch, unsigned sa,
                   unsigned sb, unsigned sc, unsigned k) {
     if (!g_recording) FAILMSG("not recording");
+    static int ustop = getenv("NR_U_STOP") ? atoi(getenv("NR_U_STOP")) : 0;
+    if (ustop == 9) { g_cmd_names.push_back(__func__); g_cmds.push_back([](){}); return 0; }
     const unsigned flags = kind;                 // the plan's arg0 IS the flags word
     const unsigned sub = flags & 0xFFu;
     auto ia = g_bufs.find(a), ic = g_bufs.find(c);
@@ -3113,6 +3123,8 @@ int xmx_rec_unary2(unsigned kind, int a, int b, int c, int d, int second, unsign
                    unsigned channels, float p0, unsigned batch, unsigned sa,
                    unsigned sb, unsigned sc, unsigned k) {
     if (!g_recording) FAILMSG("not recording");
+    static int ustop = getenv("NR_U_STOP") ? atoi(getenv("NR_U_STOP")) : 0;
+    if (ustop == 9) { g_cmd_names.push_back(__func__); g_cmds.push_back([](){}); return 0; }
     const unsigned flags = kind;
     const unsigned sub = flags & 0xFFu;
     if (sub != 21u) FAILMSG("unary2: only UPSAMPLE_ADD(21) is in the captured graph (section 87)");
@@ -4405,9 +4417,14 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
             g_pending_fold_slot = SIZE_MAX;   // adjacent but NOT in-place: cancel the
                                               // pending fold, this pair keeps the split chain
     }
+    // P8-i ledger split (section 100): NR_Q_STOP=8 skips the REAL ESIMD quantize
+    // kernels only; =9 skips everything (memcpy no-ops too). The 0/8/9 triple
+    // prices the two halves of the surviving-quant 12.0ms line.
+    static int qstop8 = getenv("NR_Q_STOP") ? atoi(getenv("NR_Q_STOP")) : 0;
     auto fq = g_fused_quant.find(source);
     if (fq != g_fused_quant.end()) {   // section 99: the producer already wrote int8 + new_scale
         int asbuf = fq->second;
+        if (qstop8 == 9) { g_cmds.push_back([](){}); return 0; }   // (the entry guard already did 9; belt: skip the memcpy too)
         g_cmds.push_back([=]() {
             GQ->memcpy(pk, (const int8_t*)a, (size_t)M * K);          // device int8 copy
             if (asbuf != scale)                                       // scales landed in a_scale's buf
@@ -4419,6 +4436,11 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
     // 100.0000% + walk 463->351ms). NR_QR_PLAIN=1 = escape hatch to the old kernel.
     static bool qrplain = getenv("NR_QR_PLAIN") != nullptr;
     if (!qrplain && (K % 16u) == 0u) {
+        if (qstop8 == 8) { g_cmd_names.push_back(__func__); g_cmds.push_back([](){}); return 0; }  // P8-i ledger: skip the REAL quantize kernel
+        // P8 census (section 100): who are the SURVIVING real quantizes (not the
+        // fused-memcpy no-ops above)? NR_Q_STATS prints one line per live quant.
+        if (getenv("NR_Q_STATS")) { static long qn=0; ++qn;
+            if (qn<=100000) printf("[quant-live] #%ld M=%u K=%u src=%d pk=%d\n", qn, M, K, source, packed); }
         g_cmds.push_back([=]() {
             qr_launch_esimd(*GQ, *GD, a, pk, sc, M, K);
         });
@@ -4570,6 +4592,8 @@ int xmx_submit(void) {
 // nr_model (test_resident.py:65). count is in elements; kernel works in float4.
 int xmx_rec_unary32(int source, int dst, unsigned count, unsigned epilogue) {
     if (!g_recording) FAILMSG("not recording");
+    static int ustop = getenv("NR_U_STOP") ? atoi(getenv("NR_U_STOP")) : 0;
+    if (ustop == 9) { g_cmd_names.push_back(__func__); g_cmds.push_back([](){}); return 0; }
     if (!count || (count & 3u)) FAILMSG("unary32 count must be a multiple of 4");
     auto s = g_bufs.find(source), d = g_bufs.find(dst);
     if (s == g_bufs.end() || d == g_bufs.end()) FAILMSG("bad unary operand");
@@ -4592,6 +4616,8 @@ int xmx_rec_unary32(int source, int dst, unsigned count, unsigned epilogue) {
 int xmx_rec_unary_i8(int source, int scale, int dst, unsigned count, unsigned cols,
                      unsigned epilogue) {
     if (!g_recording) FAILMSG("not recording");
+    static int ustop = getenv("NR_U_STOP") ? atoi(getenv("NR_U_STOP")) : 0;
+    if (ustop == 9) { g_cmd_names.push_back(__func__); g_cmds.push_back([](){}); return 0; }
     if (!count || !cols || (count % cols)) FAILMSG("unary_i8 needs count a multiple of cols");
     auto s = g_bufs.find(source), c = g_bufs.find(scale), d = g_bufs.find(dst);
     if (s == g_bufs.end() || c == g_bufs.end() || d == g_bufs.end()) FAILMSG("bad unary_i8 operand");
