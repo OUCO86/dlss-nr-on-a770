@@ -205,3 +205,24 @@ P1-P3 后剩余 GEMM 家族按 width-sweep 目标线逐核修（C2 acc-via-SLM �
 4. 三 gemm 族（residual/winres/global）本体已 bench 证速；尾巴（publish/scale）已 fused。剩余=width-sweep 逐形状精修（前辈 int8-width-sweep.md 表=红利地图：M 大 N 大才 2-3.5x；Large-GRF 模式=前辈实测否证，不走）。
 5. ~~地板 27.8 组成拆解~~（**15:0x 已结清，提交 913ca53**：NR_F_STOP/NR_QW_STOP/NR_U_STOP 探针。四族单独价=ffn 16.1 / split quant 11.5（P8-j 后）/ unary 9.4 / quant_window 0.3（P4b 已融合=非靶）；**同删四族只省 22.2 ≠ 单独和 37.3——15ms 被 cgraph 重叠吸收**。军规第 9 条的量化实锤：帧 119.8 是全重叠总账，各族隔离定价会高估可回收量。B1 的真奖品=关键路径上那部分（per-WG elementwise scr 往返=P8-i2/j 两钉所指），不是家族加和。）
 6. 游戏侧 vs 离线残余 ~12ms（持续满载时钟差）——暂不追。
+
+### 7.6 P8-n/o 战线终局（10-28 17:3x，提交 a711fcc + d8824c7）——**帧已进入 GPU 饱和区，快刀时代正式收官**
+
+**实验链**（全部同件 env A/B + 家族边际，第 11/12 条军规的执行）：
+- **P8-n stem mega**（B1 砖1，per-thread SLM 私有 ES/EA/HS 4KB×LW16=64KB，dS/dH16 全程不落 global）：bench diff 0/16.7M EXACT、隔离 +0.15——但**帧 A/B 6/10 mean -0.22、stem 边际 chain 9.5 vs mega 9.8 不降**。默认 OFF（有实测负收益≠"中性无负"），核保留为 opt-in 存证。
+- **P8-o 占用**（chip 模板化 LW=16=2WG/SM，diff 0）：帧 A/B 5/10、**边际 9.0 vs 9.0 纹丝不动**。
+- **P8-o 时钟**（900-rep 持续循环）：1.83→2.00（1.1x 热漂移）≠ 2.4x 帧内差。
+- **P8-o 饱和探针（决定性）**：双进程并发各自 238.9ms = solo 115.3 的 **2.07x**，重复稳定 ⇒ **帧内 GPU 无空闲**，overlap/预取/调度类优化全部判死。
+
+**统一解释**（取代旧叙事）：帧=GPU 吞吐总量账。隔离 bench 快 2.4x 的原因是 L2 独占+boost 微突发，不是"有空隙可藏"。stem 的 100MB 中间量**本来就在 L2 里**（写完即读），消掉它=消 L2 内流量=零收益——mega 判死的原因。async 预取（16:57 参考方案）被饱和探针直接枪毙。
+
+**军规第 12 条（入册）**：内存消除类改动，隔离 bench 赢必须用**家族边际**确认——边际不降=消掉的流量从不在关键路径上。
+
+**剩余账本的真实形态**（指令功视角）：
+- 帧内唯一杠杆=**减少指令功**，且只在指令真冗余处。window_block per-WG 0.60µs 的构成：dpas ~130 条（XMX 0.8%）+ SLM 搬运 ~380 条 + elementwise（norm/e4m3/cosine/scatter）~1500 条——e4m3/cosine **已是向量化必需数学**，B1 融合只消 SLM+barrier ≈ 15-20% wblock = **5-6ms**（不是旧叙事的 15+）。
+- **P8-p（V-layout 换侧）预检否证**：VPO 换 write-native 存储 ⇒ attnV B 侧从 2×128-half 块读退化为 16×16B 跨行读（8x 指令数）——换侧=换痛，map 代数判死（P8-e"行奇偶"教训的延伸）。蓝图靶②正式关闭。
+- 三 gemm 族 + stem/merge + giants + quant/unary 全部已到**当前算法的指令地板**。
+
+**收官决策点（交用户）**：walk 227→**~115-117**（-110，2x）。剩余两条路：
+- **B1-wblock megakernel**：多窗口工程（~800-1000 行），预期 5-6ms，风险=P8-g 型 spill 已在案。开工需按 §六 仪式 + 本节 ROI 重估。
+- **战役收官**：115ms 已到"当前算法结构+SYCL/ESIMD 移植"的实际地板附近；再往下要算法级改动（碰数值形态=底线区，需 golden 考古）。
