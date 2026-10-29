@@ -614,6 +614,10 @@ bench 尺 A/B **5/5 W，FULL 1.112→1.093 -1.9%**）。但**帧 A/B 5 对 vs 52
 ⇒ **诚实结论（写给下一个窗口，也是给用户的直话）**：单 kernel 指令削减在帧级被摊薄
 （wblock 42ms ÷ ~55 call = -0.02ms/call 清不出噪声）。**112→20 不可能靠 blade 级微脂，
 必须打 launch 塌缩。blade-3 保留是为 B5 重写时这些 store 已经是最优形态，不返工。**
+⚠ 用词校准（军规自查轮点破，防与 §六.6-7 打架）："launch 塌缩" = 消 kernel 之间的
+**global 中间量往返**（P1 判词主因），**不是**消发射开销——cgraph 下纯发射开销实测≈0
+（§六.6-7：160 个小 quant 发射藏得很好，9.05ms 里 launch-scheduling≈0）。
+两个概念混着卖就是画饼，任何窗口引用这句话前先分清是哪个。
 
 **spill 天花板的架构结论（11:5x，重要）**：resident 修完所有标量数组后 spill 仍 2400B≠0，
 因为剩余 4 处是 `jm::joint_matrix<...layout::dynamic> acc[4]/context[4]/projected[4]`
