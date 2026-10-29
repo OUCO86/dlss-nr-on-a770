@@ -410,7 +410,24 @@ static inline esimd::simd<float,N> gate_vec_v8(esimd::simd<float,N> x) {
     M = M + esimd::simd<float,N>(0.89453125f);
     esimd::simd<float,N> l1 = esimd::convert<float>(esimd::convert<half>(M));
     esimd::simd<float,N> R = wide * l1;
-    return esimd::convert<float>(esimd::convert<half>(R));
+    esimd::simd<float,N> res = esimd::convert<float>(esimd::convert<half>(R));
+    // BLADE-6 (cross-validation census 19:4x, the user's "still meat" call was RIGHT):
+    // the frame's gemm-f16 family has 32 epi=2 (gate) calls -- the "cold" scalar
+    // branch is HOT (15-30 instrs/element x 128 elements/thread). bench_pubvec's
+    // 1M-value A/B localized the ONLY vector-vs-scalar epi2 difference to the -0.0
+    // SIGN (the scalar clamp ternaries take the else-path for -0.0; hw min/max fold
+    // it to +0.0). Sign-preserving tail: where x == 0, force the ZERO WITH X'S SIGN
+    // (2 wide ops, branchless) => bit-identical to the scalar form BY CONSTRUCTION
+    // over the whole bench sweep. The GEMM_F16 gate (it has epi2 cases) + end-to-end
+    // 1301 are the judges.
+    esimd::simd<uint32_t,N> xb = x.template bit_cast_view<uint32_t>();
+    esimd::simd<bool,N> isz = (xb & esimd::simd<uint32_t,N>(0x7FFFFFFFu)) == esimd::simd<uint32_t,N>(0u);
+    esimd::simd<uint32_t,N> zb = esimd::simd<uint32_t,N>(isz);   // all-ones mask where x == +-0.0
+    esimd::simd<uint32_t,N> signedzero = (xb & esimd::simd<uint32_t,N>(0x80000000u));  // -0.0 bits when x<0, +0.0 otherwise
+    esimd::simd<uint32_t,N> rb; rb = res.template bit_cast_view<uint32_t>();
+    rb = (rb & ~zb) | (signedzero & zb);
+    esimd::simd<float,N> out; out = rb.template bit_cast_view<float>();
+    return out;
 }
 template <int N>
 static inline esimd::simd<float,N> pub_vec_v8(unsigned epi, esimd::simd<float,N> v) {

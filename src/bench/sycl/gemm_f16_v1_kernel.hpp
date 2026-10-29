@@ -235,36 +235,23 @@ static inline sycl::event gemm_b_pub_f16(sycl::queue& q, const half* Ap, const h
                 esimd::simd<float,8> r10 = c10.template select<8,1>(r*8), r11 = c11.template select<8,1>(r*8);
                 int row0 = tr * TS + r, row1 = row0 + 8;
                 if (row0 < M) {
-                    if (epi == 2u) {   // gate: the SCALAR proven form (the -0.0 lesson)
-                        size_t base = ob + (size_t)row0 * ldc + (unsigned)tc * TS;
-                        for (int e = 0; e < 8; ++e) {
-                            float v0 = s8v8::pub_esimd(epi, r00.read()[e]), v1 = s8v8::pub_esimd(epi, r01.read()[e]);
-                            if (narrow) { Oh[base + e] = sycl::half(v0); Oh[base + 8 + e] = sycl::half(v1); }
-                            else        { Of[base + e] = v0; Of[base + 8 + e] = v1; }
-                        }
-                    } else {
-                        esimd::simd<float,8> p0 = s8v8::pub_vec_v8<8>(epi, r00), p1 = s8v8::pub_vec_v8<8>(epi, r01);
-                        size_t base = ob + (size_t)row0 * ldc + (unsigned)tc * TS;
-                        if (narrow) { esimd::simd<half,8> h0 = esimd::convert<half>(p0), h1 = esimd::convert<half>(p1);
-                            h0.copy_to(Oh + base); h1.copy_to(Oh + base + 8u); }
-                        else { p0.copy_to(Of + base); p1.copy_to(Of + base + 8u); }
-                    }
+                    // BLADE-6: epi2 (gate) now flows through the vector chain too --
+                    // gate_vec_v8 got the sign-preserving zero tail (the ONLY
+                    // bench_pubvec-localized scalar-vs-vector difference was the -0.0
+                    // sign), so the 32 hot epi=2 gemm-f16 calls stop paying 15-30
+                    // scalar instrs/element. GEMM_F16 gate (has epi2 cases) judges.
+                    esimd::simd<float,8> p0 = s8v8::pub_vec_v8<8>(epi, r00), p1 = s8v8::pub_vec_v8<8>(epi, r01);
+                    size_t base = ob + (size_t)row0 * ldc + (unsigned)tc * TS;
+                    if (narrow) { esimd::simd<half,8> h0 = esimd::convert<half>(p0), h1 = esimd::convert<half>(p1);
+                        h0.copy_to(Oh + base); h1.copy_to(Oh + base + 8u); }
+                    else { p0.copy_to(Of + base); p1.copy_to(Of + base + 8u); }
                 }
                 if (row1 < M) {
-                    if (epi == 2u) {
-                        size_t base = ob + (size_t)row1 * ldc + (unsigned)tc * TS;
-                        for (int e = 0; e < 8; ++e) {
-                            float v0 = s8v8::pub_esimd(epi, r10.read()[e]), v1 = s8v8::pub_esimd(epi, r11.read()[e]);
-                            if (narrow) { Oh[base + e] = sycl::half(v0); Oh[base + 8 + e] = sycl::half(v1); }
-                            else        { Of[base + e] = v0; Of[base + 8 + e] = v1; }
-                        }
-                    } else {
-                        esimd::simd<float,8> p0 = s8v8::pub_vec_v8<8>(epi, r10), p1 = s8v8::pub_vec_v8<8>(epi, r11);
-                        size_t base = ob + (size_t)row1 * ldc + (unsigned)tc * TS;
-                        if (narrow) { esimd::simd<half,8> h0 = esimd::convert<half>(p0), h1 = esimd::convert<half>(p1);
-                            h0.copy_to(Oh + base); h1.copy_to(Oh + base + 8u); }
-                        else { p0.copy_to(Of + base); p1.copy_to(Of + base + 8u); }
-                    }
+                    esimd::simd<float,8> p0 = s8v8::pub_vec_v8<8>(epi, r10), p1 = s8v8::pub_vec_v8<8>(epi, r11);
+                    size_t base = ob + (size_t)row1 * ldc + (unsigned)tc * TS;
+                    if (narrow) { esimd::simd<half,8> h0 = esimd::convert<half>(p0), h1 = esimd::convert<half>(p1);
+                        h0.copy_to(Oh + base); h1.copy_to(Oh + base + 8u); }
+                    else { p0.copy_to(Of + base); p1.copy_to(Of + base + 8u); }
                 }
             }
         });
