@@ -678,8 +678,7 @@ mega 的剩余 scratch（2304B）**全是可修的标量数组**（wf[64]/proj[3
 - 军规⑤判据在 B5 上的具体化：融合刀的判据 = **家族边际**（§7.4 第 12 条：隔离 bench 赢
   必须边际确认；cgraph 重叠吸收 15ms 的实锤在 §7.5-5）——每刀先跑 NR_Q_STOP=8/9 式
   停点探针定边际，再帧 A/B 十对。
-- 部署链当前位：**a3efdf6c**（B5-1..4 dC 全歼，walk 112.5→~103-106；回退位 libxmx_b3.dll=ec147ecb、libxmx_v5c.dll=52f2a0c4）（blade-3，游戏画面验收=下次开机用户确认；回退=libxmx_v5c.dll
-  即 52f2a0c4 在 oneapi/ 原位）。
+- 部署链当前位：**a3efdf6c**（B5-1..4 dC 全歼，walk 112.5→~103-106；游戏画面验收=下次开机用户确认；回退=libxmx_b3.dll=ec147ecb 或 libxmx_v5c.dll=52f2a0c4，均在 oneapi/ 原位）。
 
 ## 七、交接检查单（新窗口开工先读这些）
 
