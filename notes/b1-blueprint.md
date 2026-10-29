@@ -767,3 +767,43 @@ pack_a_fused_gather（**gather** 1270→dAp）。两者映射不同 ⇒ **dAp �
 - pad≠0 的 78 层 = 最大难点：out-of-bound 行 wres 现在 continue 跳过不写 1270，
   融合核里这些行必须**照 gather-pack 语义写零行+scale 1.0**（不是跳过）——
   这是当年 131/8192 同族坑，开工第一件事就是门里放 pad 层（416×236 那 12 层）。
+
+## 六.十二、层链全解剖（17:4x，plan 序列 2586-2661 逐 call 实读——B5-5 的最后一块拼图）
+
+**每层真实链（N=64 窗口层，plan 原文 dump）**：
+```
+quant(1277→1272)  ─┐ 被 wres 的 take 溶解（pack_a_fused 读 1277）
+wres(1272→1270)    │ 6 发真 launch：wres/batched/batched/residual/qkv/wa
+quant(1270→1272)  ─┤ 被 batched1 溶解                        + 6 发 pack 腿
+batched→1274       │                                        = 每层 12 发
+quant(1274→1272)  ─┤ 被 batched2 溶解
+batched→1275       │
+quant(1275→1272)  ─┤ 被 residual 溶解
+residual(skip=1270)→1267
+quant_window(1267→1272) ─┐ 被 qkv 的 gather-pack 溶解
+qkv→1274/1275/1276       │
+wa→1277 ─────────────────┘
+```
+**dC/quant 层已全歼**（448 quant 里 288 溶解 + 160 = pyramid 输入不可消）。
+**剩下的最后一层结构 = 每层 6 条 pack 腿**（pack_a_fused：读 f16 平面→行峰→量化→
+tiled 写，一条独立 launch ~0.02-0.05ms；全帧 pack 腿合计 ≈ 8-12ms sync）。
+
+**为什么 pack 腿不能顺手折进 gemm（两面墙，今天实证的）**：
+1. **行峰跨 WG 冗余墙**：gemm 的 A 行被 N/64 个 wg_col 重复读；行峰要整行
+   （K=2048=4KB/线程）⇒ 每个消费者重算一遍峰 = take_b 三连判死的根。
+   前辈解法 = **生产者直写 tiled int8 + scale**（峰只算一次，生产者持有整行）。
+2. **生产者直写的覆盖面墙**（逐边界核过）：
+   - wres(N=64)→batched1：行完整在 WG、行序 window*64+token == pack_a 的 srow
+     （无 gather）⇒ **可折**，但只覆盖 16/104 发（N=128/256/512 的行跨 2-8 个
+     wg_col = 撞墙 1）；
+   - residual→qkv：residual 出行 32640（510 窗）vs qkv 需 35712（558 窗，pad 金字塔
+     扩窗）= 行集不同 + gather remap ⇒ **不可直写**（quant_window 的 gather 就是为它存在）；
+   - wa→quant→wres：wa 的 Out 行 = window-major，wres 的 pack 消费它 K=64 ⇒ 可折
+     （行完整），但 wa 的 BN=32 尾部分片跨 2 个 wg ⇒ 撞墙 1 变体。
+
+**B5-5 终裁决（写死）**：pack 腿的完全消亡 = **前辈每层一核**（wres+qkv+wa 一个
+resident WG，中间量全在 SLM，无平面无 pack）——这是 B5-5b，一个 ~400-600 行的
+新核工程，门=bench_layer_fused 逐字节对拍 split 链（先放 pad 层=131/8192 同族坑）。
+**今天不硬开**：解剖已完整、设计已钉死（§六.十一+十二），下窗口直接从
+"gate first, then 400 lines" 起步。在会话尾端盲写大核 = 制造下一次证伪，
+比不写更贵。
