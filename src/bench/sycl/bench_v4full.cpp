@@ -139,22 +139,23 @@ inline event launch_v4full(queue& q, const void* Img, bool image_half,
                              WqkvPacked + (size_t)(part*2u+1u)*256u, 2, 6);
                 #pragma unroll
                 for (int r = 0; r < 8; ++r) {
-                    esimd::simd<float,16> m01;
-                    m01.template select<8,1>(0)  = c00.template select<8,1>(r*8);
-                    m01.template select<8,1>(8)  = c01.template select<8,1>(r*8);
-                    esimd::simd<float,16> m11;
-                    m11.template select<8,1>(0)  = c10.template select<8,1>(r*8);
-                    m11.template select<8,1>(8)  = c11.template select<8,1>(r*8);
-                    esimd::simd<float,16> n01;
-                    n01.template select<8,1>(0)  = d00.template select<8,1>(r*8);
-                    n01.template select<8,1>(8)  = d01.template select<8,1>(r*8);
-                    esimd::simd<float,16> n11;
-                    n11.template select<8,1>(0)  = d10.template select<8,1>(r*8);
-                    n11.template select<8,1>(8)  = d11.template select<8,1>(r*8);
-                    esimd::slm_block_store(scr + (uint)r*32u*4u,           m01);
-                    esimd::slm_block_store(scr + (uint)(8+r)*32u*4u,       m11);
-                    esimd::slm_block_store(scr + (uint)r*32u*4u + 64u,     n01);
-                    esimd::slm_block_store(scr + (uint)(8+r)*32u*4u + 64u, n11);
+                    // BLADE-3 (ISA ledger 1, 2026-10-29): the gap-map counted 32 SLM stores
+                    // per QKV part, ALL store.slm.d64x8t; m01@row*128B and n01@row*128B+64B
+                    // are the LEFT/RIGHT halves of the SAME 32-float row -> merge into ONE
+                    // 32-wide store (d64x16t). 96->48 stores per call. Addresses, values and
+                    // the select SOURCE ORDER per element are unchanged -> bit-identical.
+                    esimd::simd<float,32> mrow;
+                    mrow.template select<8,1>(0)  = c00.template select<8,1>(r*8);
+                    mrow.template select<8,1>(8)  = c01.template select<8,1>(r*8);
+                    mrow.template select<8,1>(16) = d00.template select<8,1>(r*8);
+                    mrow.template select<8,1>(24) = d01.template select<8,1>(r*8);
+                    esimd::simd<float,32> nrow;
+                    nrow.template select<8,1>(0)  = c10.template select<8,1>(r*8);
+                    nrow.template select<8,1>(8)  = c11.template select<8,1>(r*8);
+                    nrow.template select<8,1>(16) = d10.template select<8,1>(r*8);
+                    nrow.template select<8,1>(24) = d11.template select<8,1>(r*8);
+                    esimd::slm_block_store(scr + (uint)r*32u*4u,      mrow);
+                    esimd::slm_block_store(scr + (uint)(8+r)*32u*4u,  nrow);
                 }
             }
             esimd::barrier();
