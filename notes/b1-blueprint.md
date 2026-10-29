@@ -362,6 +362,14 @@ host 线并行另案（不碰 GPU 数值，风险最低肉最大）→ B3 视 B2
            打平 v4，不是 -22ms**。若下窗口非要打几何牌，先 bench_v6 里
            给 epilogue 换 4-lane 树（~80 行改动，JUDGE 现成）再跑同一
            giants 对照——一小时出判决，不许先写真库。
+     (W2d) **★ W2c 的牌也基本死（09:5x 原语检查）**：SYCL ESIMD
+         **没有 subgroupShuffleXor 原语**（全 esimd 头 grep 零命中）——
+         前辈的 4-lane 树靠 Vulkan subgroupShuffleXor，我们这栈要模拟
+         只能 SLM 中转（部分和写 scratch 再读回）= **又一次 scr 往返，
+         与消 idle-lane 的目的自相矛盾**。v5a 的 select-树（整行在
+         单 lane 向量内完成归约）恰恰就是这个缺失原语的 SIMD16
+         等价物——它已经吃了。**前辈 epilogue 武器在语法层不可移植**
+         盖章。几何线死透：不要再打。
      (W3=新钉) **v6 的正确构成**（= v5-WIP 几何 + v4 的教训全叠上）：
          * LW=128、8 subgroup x 8 行（dpas 满条，W2 否证后此几何无障碍）；
          * **blade-2 两段式** QKV（phase1 三 part dpas+store 全做、1 barrier、
