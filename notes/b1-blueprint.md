@@ -807,3 +807,26 @@ resident WG，中间量全在 SLM，无平面无 pack）——这是 B5-5b，一
 **今天不硬开**：解剖已完整、设计已钉死（§六.十一+十二），下窗口直接从
 "gate first, then 400 lines" 起步。在会话尾端盲写大核 = 制造下一次证伪，
 比不写更贵。
+
+## 六.十三、BLADE-4 密度刀（18:3x-18:5x，用户"代码本身还有很多要改"点破后当轮落地）
+
+**用户的判词是对的**：结构刀（B5-1..4）之外，density 账本（dpas 0.1-0.7%）指的就是
+**代码质量**。最大的一坨：residual 两族（帧内最大家族，sync 46ms）的 fused store
+把 pub 链写成 **256 次/线程的标量 pub_esimd 调用**（gate+e4m3 每次 15-30 条指令
+≈ 5000 条 epilogue 指令 vs 8-32 条 dpas）——而 bench_pubvec 已证的向量孪生 pub_vec_v8
+就在同一个文件里没人用（section-92 时代的保守遗留）。
+**刀**：fma 表达式逐元素原样保留（尊重 "别向量化 res 的 fma" 警告——simd 版
+sk*c+f 降成 muladd=两次舍入=帧 0%），只向量化 PUB 步（epi!=2 守卫，帧 res flags
+0x41100→epi1 在已证位精确集内；epi2 留标量 -0.0 路）。四站点 gemm_b_res x2 +
+gemm_b_res_window x2；gemm_pub/pa16 标量循环同加守卫（逃生舱一致性）。
+**三关**：1250 ok 全绿（GEMM_INT8_RESIDUAL/WINDOW_INT8_RESIDUAL/f16-residual 独立
+numpy 判官）+ 端到端 1301 EXACT x2 + 确定性 0 + **帧 A/B 3/3：107→85 = -22ms**。
+**walk 战役总账：227 → 112.5 →（dC 全歼 -10.4）→（blade-4 -22）= ~85**。
+三族删除上限复测 24.7→**12.4**（blade-4 把三族 12ms 标量税直接消掉，剩下的是
+计算本体——融合也不再省）。部署位 work/libxmx.dll = **0b0075e1**（游戏验收=下次开机）。
+**教训入册（军规⑬候补）**：普查账本里"密度异常"= 代码质量异常，每个 0.x% 的家族
+都要按"这个 epilogue 是不是标量循环"过一遍——下一个同类靶：f16v1 gemm_b 族
+（9214 指令/9 dpas，movish 4320——先数标量 pub 循环占比再开刀）；batched 族
+gemm_b_pub 已用 pub_vec_v8 但 density 仍 0.3-0.6% = 靶在 pack/load_block 的
+select/join 群，不是 pub。softmax 的 64 步顺序 ef_add = golden 序不可向量化
+（位精确红线），别再打它主意。
