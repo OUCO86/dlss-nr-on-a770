@@ -537,12 +537,19 @@ B2 已数过（9.05ms，优先级低）。
 **账本 4（per-pass 计时）**：GIANT 梯已存在（bench_v4full 的 stop 梯 + QKV parts：
 P0=0.22 Q=1.24 K=0.19 V=0.17，scores=1.41 attnV=0.62 outproj=0.53 store=0.43）。
 
-**下一步（按账本证据排序，写死）**：
+**下一步（按账本证据排序，写死）** [13:5x 帧 A/B 更新——(1)(2)(3) 全部判死，别再接着修]：
 (1) 修 launch_resident 的 spill（数组→命名 temp/标量链），对照 spill_size 归零 + JUDGE；
 (2) 修好后 resident 核上热（撤 NR_RESIDENT_WB 门），用 703-SLM-load 供数结构 vs v4full 的
     54+156 对比，决定 B5 各层融合核的 SLM 布局规范；
 (3) 再进 B5-1（QKV tail 折叠——注意 P5 证伪 nuance：tail 是 14ms butterfly 计算，
     折叠必须连带把 butterfly 也 ESIMD 化且不与 dpas 循环串行）。
+**★13:5x 判决（nr_replay_now 帧尺，同 dll ec147ecb）**：(2)=657ms、launch_full=575ms、
+NR_QKV_RESV2=2（连续 ESIMD tail）=126.6 vs v1 113.2 —— **三条门后路线全部帧死，
+spill 清零救不了几何**。B5 唯一正确形态 = **在 v4full 自己的宽-M 几何上做跨家族融合**：
+(a) quant 折进生产 gemm 的 store epilogue（B2 线，跨 kernel 的 global 中间量消除=
+P1 判决原文支持的"另一回合"，不是 P8-n 的 resident 内部往返）；
+(b) qkv tail 的 butterfly 用 v5a 式 4-lane 向量树（P6 v2 的"连续 item"形态已两次帧死，
+别再碰）；(c) blade-3 已把 v4full 的 QKV staging 定型（48×d64x16t），B5 重写直接复用。
 
 ### 6.8-首刀（11:5x，工具链打通当轮直接开挖的溢出修复，已验证）
 
