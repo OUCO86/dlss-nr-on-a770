@@ -1560,6 +1560,18 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
         static bool ffchip = !getenv("NR_FFN_CHIP") || atoi(getenv("NR_FFN_CHIP")) != 0;
         if (ffntile && ffchip && hidden == 128u && cin == 32u && !narrow && epi == 0u) {
             sycl::half* dPp = cached_pack_b_f16(projection, Praw, (int)hidden, (int)cin);
+            // B5-3 (2026-10-29, the user's "eliminate every dC round-trip"): the
+            // residual + publish tail FOLDS into the chip store (P8-l mechanism, now
+            // with the section-75 straight-line FMA shape fix -- the 131/8192 gate red
+            // was the phi-reassignment muladd lowering, see ffn_chip_kernel.hpp).
+            // dC2 NEVER EXISTS on this path; epi==0 && !narrow is the guard here so
+            // qr_publish is the identity and the fold matches the tail by construction.
+            static bool chipres_m = !getenv("NR_FFN_CHIPRES") || atoi(getenv("NR_FFN_CHIPRES")) != 0;
+            if (chipres_m) {
+                CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, Araw, dEp, dPp, (float*)Cout, (int)M, Mp, skp, cp, half_skip),
+                                 ffnc::launch_ffn_chip<16>(*GQ, Araw, dEp, dPp, (float*)Cout, (int)M, Mp, skp, cp, half_skip));
+                return;
+            }
             float* dC2 = (float*)pool_get((size_t)Mp * cin * 4);
             CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, Araw, dEp, dPp, dC2, (int)M, Mp), ffnc::launch_ffn_chip<16>(*GQ, Araw, dEp, dPp, dC2, (int)M, Mp));
             // the residual + publish tail stays SPLIT (the gate's f32-skip 131/8192
