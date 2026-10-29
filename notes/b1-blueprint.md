@@ -296,7 +296,38 @@ host 线并行另案（不碰 GPU 数值，风险最低肉最大）→ B3 视 B2
    **host 线无肉，此线关闭。** (ii) 的"并行另案"取消。
    游戏 131.9 vs 离线 walk ~112-120 的差 = 持续满载时钟（§7.5 已记 ~12ms 残差，
    暂不追）。
-10. **终版账本（全部实验关闭后的剩余清单，下窗口按此开工）**：
+10. **★★ 历史线重定义 + “诚实墙”撤回（10:38 用户点破，写死不再犯）**：
+   **项目真实历史**：起点 = uzbekunknown/dlss-nr-on-intel 移植（本地
+   src/dlss5nr-b580 就是这一脉的存档）→ 优化到 ~59ms → 判定“整体不适合
+   A770、上限无肉” → **推翻重写 = 现在的大宽数据链路全新核心，
+   目标从出发就是 20ms 以内**。当前新核心战役才打到 112ms（峰值 170 起步）
+   = 第一波家族手术完成，**距目标还差 5.6x —— 谁也没权利说“没肉/墙”**。
+   - 我上午写的“纯工程收割尽头 ~95-100、架构差不是懒惰差” **撤回**：
+     它锚错了对象（拿"追前辈/追 B580"当锚，而锚应是 20ms 设定）。
+   - **“架构差”的真含义用户赋能了**：B580 式小 program 几何确实不适合
+     A770（这是推翻它的理由）；宽-M 是正确架构。但 **112→20 的差不是
+     家族内精修，是整帧融合级别的活**：前辈/前人的 P1 判决原文——
+     "中间量 round-trip global = 6.2x 的主因；resident 一刀枢死整个结，
+     ~160ms → ~12ms"。v4full 只把 window_block 内部 7 stage 变 resident；
+     **帧的其余 670 发还是 split**（qkv tail 的 dC global 往返、winres、
+     residual、quant、unary…）。lmxxf-3080 反过来的数字也印证这一点：
+     全帧只有 **82 launch**（FB00-06 每层一个融合核，producer 直接喂
+     consumer 的 matrix fragment，QKV_FUSE/T=2 复用/plane 生命周期）。
+     我们 691 vs 82 ⇒ **launch 结构差 = 5.6x 的主要来源之一**，这不是
+     “B580 目标数”问题，是“方法”问题：**把层内链融进一个 wide-M resident 核**。
+   - **新战役 B5 = 整帧层内 resident 融合（目标锚 20ms）**，施工顺序按
+     “链最短、机制现成”排：
+     * **B5-1 = QKV tail 折叠**：qkv 家族旧账 27.6 = pack 1.4 + wide gemm 5.7
+       + **dC 往返尾 20.8**（1742239 字段；P7 cgraph 口径 tail 9.6）。
+       wide-M gemm 写 int32 dC → qkv_norm_scatter_esimd 读回→norm→pack。
+       托 = 把 norm+pack 折进 gemm store epilogue（gemm_b_pub 家族机制现成，
+       BN=64 tile 内 32 通道 head 边界对齐→行内 norm 可算）。预期 -6~9ms。
+     * B5-2 = winres + 其 quant 同级融合；B5-3 = residual 链；B5-4 = C32 层
+       （wblock 输出→down→下一层）；B5-5 = ViT 层；每层一个 resident 核。
+     * 铁律不变：毀先于建（每层开工前先拉该层的 stage 微梯定位）；三关+帧 A/B；
+       P8-n 教训只适用 resident 内部往返，跨 kernel 的 global 中间量消除
+       是另一回合（P1 判决原文支持），仍以帧 A/B 为裁判。
+   - 上一条"终版账本"的“接受 ~112 为终点”选项同时作废。
    - **(iii) B3 = wblock 战（唯一的大肉）**：帧内 wblock 26（small）+16.6
      （giants）= 42.6ms vs 前辈折算 ~10-13。
    - **★ (β) 探针已跑并出判决（22:2x，dpas_probe.cpp 已入库）**：esimd
