@@ -707,3 +707,24 @@ mega 的剩余 scratch（2304B）**全是可修的标量数组**（wf[64]/proj[3
    (3) B2 残肉（生产者内嵌 -2ms 上限）排最后，动 5 个 gemm 族 epilogue 的成本高，
        等 (1)(2) 出账后再裁决。
    ~~接受 ~112 为终点~~（永久作废，用户 10-28 判决 + §六.九 硬件账双重死刑）。
+
+## 六.十、B5-5 解剖图（17:3x 普查，下窗口直接开工用——今天的 dC 全歼已游戏验收）
+
+**幸存结构税最后一层 = pack 腿 + 接力 plane**（dC 已死，别再找它）。实测+普查钉死：
+- 三族同删上限（NR_WB_STOP=0 NR_WA_STOP=9 NR_WRES_STOP=2 交错三对）= **-24.7ms**
+  （sync 加和 58.8 的 42% 被 cgraph 吸收——军规⑫再实锤）。其中纯 gemm/softmax 计算
+  ~15ms 融合消不掉；**真结构可回收 ≈ 7-10ms** = pack 腿 + launch 塌缩 + plane 往返。
+- qkv 内部分段（NR_QKV_STOP 三态）：pack 腿 ≈ **6ms**（stop1-stop2），gemm+tail ≈ 7.5。
+- take_b（消费者内嵌 quant）在新结构下重测仍 **-14ms**（124-127 vs 110-113）——
+  **三连判死，永久封存，任何窗口勿再试**（pack_a 内嵌量化的串行代价是根，与 cgraph 无关）。
+- 幸存 160 发 quant 的 src=1307/1295/1280/1282/1292/1298/1271/1303 = **游戏导入的
+  图像金字塔平面**（plan 里无 recorder 写者）——它们不是往返税，是输入本身，消不掉。
+
+**B5-5 的正确刀形（已解剖，含一个陷阱）**：
+wres 的 pack 腿 = pack_a_fused（**行主序** 1270→dAp），qkv 的 pack 腿 =
+pack_a_fused_gather（**gather** 1270→dAp）。两者映射不同 ⇒ **dAp 不能直接复用**
+（我差点按"结果复用"接线——映射对不上就是帧 0%，停手了）。正解两选一：
+(a) wres epilogue 直出 gather-tiled int8+scales（qres 同款 SLM dead-operand 行归约，
+    ~90 行 kernel + fold-slot 接线）——消 qkv 的 120 发 gather pack（-6ms 级）；
+(b) 前辈真形 = 每层一个核（wres+qkv+wa 三合一），pack 腿整体不存在——大工程，
+    建议先 (a) 后 (b)，(a) 的 gather-tiled store 机制就是 (b) 的积木。
