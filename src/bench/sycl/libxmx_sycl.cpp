@@ -2062,7 +2062,13 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
         // the fold REMOVES the dC write + read + the publish launch). compact (2 calls,
         // N=16/ldc=4 head form) stays split -- its dC is 8KB, allocated lazily below.
         static bool gfold = !getenv("NR_G_FOLD") || atoi(getenv("NR_G_FOLD")) != 0;
-        if (gfold && gst == 0 && ldc_e == N && !compact) {
+        // BLADE-5 (2026-10-29 census): the old guard `ldc_e == N` excluded the 96
+        // batched-shape calls (ldc=1024/2088960 != N=32/...) -- but gemm_b_pub_f16
+        // ALREADY indexes its store with ldc (base = ob + row*ldc + tc*TS, the
+        // publish pass's map VERBATIM). G_STOP=3 priced the stranded publish tail
+        // at 14ms/frame. Guard relaxed to !compact (the compact head keeps its own
+        // column-cull semantics); the kernel is the same code path.
+        if (gfold && gst == 0 && !compact) {
             f16v1::gemm_b_pub_f16(*GQ, dAp, dBp, Cout, (int)M, Mp2, (int)N, (int)K, (int)nb,
                                   epi, narrow, oc, sc, ldc_e, lda_e);
             pool_put(dAp);   // dC never existed on this path
