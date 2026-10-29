@@ -131,22 +131,181 @@ inline sycl::event launch_resident(
                     }
                     // normalize: lane local owns row local (all 8 lanes active). Write DIRECTLY
                     // to the dedicated stash (never overlaps the still-live weights or scratch).
-                    float hv[32];
-                    for (int c = 0; c < 32; ++c) hv[c] = f32[scratch + local*32u + c];
+                    // SPILL FIX (ISA ledger 2, 2026-10-29): this hv[32] array escaped its
+                    // element indexing -> private_size=1792B (=32*4*8) + scratch 8192B/thread +
+                    // 311 scratch msgs in the GEN asm. 32 named scalars (rv0..rv31; NOT hvN --
+                    // the outer half* h16 SLM pointer would be shadowed) + the GENERATED
+                    // named-arg twin of the golden's tree (cosine_reciprocal_32, kdis/gen_cr32.py;
+                    // identical operation ORDER). K's scale==1.0f multiply is bit-neutral:
+                    // cr_hmul(half-representable x, 1.0f) == x exactly.
+                    float rv0 = f32[scratch + local*32u + 0u], rv1 = f32[scratch + local*32u + 1u], rv2 = f32[scratch + local*32u + 2u], rv3 = f32[scratch + local*32u + 3u], rv4 = f32[scratch + local*32u + 4u], rv5 = f32[scratch + local*32u + 5u], rv6 = f32[scratch + local*32u + 6u], rv7 = f32[scratch + local*32u + 7u], rv8 = f32[scratch + local*32u + 8u], rv9 = f32[scratch + local*32u + 9u], rv10 = f32[scratch + local*32u + 10u], rv11 = f32[scratch + local*32u + 11u], rv12 = f32[scratch + local*32u + 12u], rv13 = f32[scratch + local*32u + 13u], rv14 = f32[scratch + local*32u + 14u], rv15 = f32[scratch + local*32u + 15u], rv16 = f32[scratch + local*32u + 16u], rv17 = f32[scratch + local*32u + 17u], rv18 = f32[scratch + local*32u + 18u], rv19 = f32[scratch + local*32u + 19u], rv20 = f32[scratch + local*32u + 20u], rv21 = f32[scratch + local*32u + 21u], rv22 = f32[scratch + local*32u + 22u], rv23 = f32[scratch + local*32u + 23u], rv24 = f32[scratch + local*32u + 24u], rv25 = f32[scratch + local*32u + 25u], rv26 = f32[scratch + local*32u + 26u], rv27 = f32[scratch + local*32u + 27u], rv28 = f32[scratch + local*32u + 28u], rv29 = f32[scratch + local*32u + 29u], rv30 = f32[scratch + local*32u + 30u], rv31 = f32[scratch + local*32u + 31u];
                     half* dst = (part == 0u) ? (h16 + QSTASH + 256u*sub + local*32u)
                             : (part == 1u) ? (h16 + KSTASH + (row + local) * 32u)
                             : (h16 + VSTASH + (row + local) * 32u);
                     if (part < 2u) {
-                        for (int c = 0; c < 32; ++c) hv[c] = qr_half_round(hv[c]);
-                        float recip = ctree::cosine_reciprocal(hv);   // the golden's exact chain
+                        rv0 = qr_half_round(rv0);
+                        rv1 = qr_half_round(rv1);
+                        rv2 = qr_half_round(rv2);
+                        rv3 = qr_half_round(rv3);
+                        rv4 = qr_half_round(rv4);
+                        rv5 = qr_half_round(rv5);
+                        rv6 = qr_half_round(rv6);
+                        rv7 = qr_half_round(rv7);
+                        rv8 = qr_half_round(rv8);
+                        rv9 = qr_half_round(rv9);
+                        rv10 = qr_half_round(rv10);
+                        rv11 = qr_half_round(rv11);
+                        rv12 = qr_half_round(rv12);
+                        rv13 = qr_half_round(rv13);
+                        rv14 = qr_half_round(rv14);
+                        rv15 = qr_half_round(rv15);
+                        rv16 = qr_half_round(rv16);
+                        rv17 = qr_half_round(rv17);
+                        rv18 = qr_half_round(rv18);
+                        rv19 = qr_half_round(rv19);
+                        rv20 = qr_half_round(rv20);
+                        rv21 = qr_half_round(rv21);
+                        rv22 = qr_half_round(rv22);
+                        rv23 = qr_half_round(rv23);
+                        rv24 = qr_half_round(rv24);
+                        rv25 = qr_half_round(rv25);
+                        rv26 = qr_half_round(rv26);
+                        rv27 = qr_half_round(rv27);
+                        rv28 = qr_half_round(rv28);
+                        rv29 = qr_half_round(rv29);
+                        rv30 = qr_half_round(rv30);
+                        rv31 = qr_half_round(rv31);
+                        float recip = ctree::cosine_reciprocal_32(rv0, rv1, rv2, rv3, rv4, rv5, rv6, rv7, rv8, rv9, rv10, rv11, rv12, rv13, rv14, rv15, rv16, rv17, rv18, rv19, rv20, rv21, rv22, rv23, rv24, rv25, rv26, rv27, rv28, rv29, rv30, rv31);
                         float scale = part == 0u ? qr_half_round(QkvScale[0]) : 1.0f;
-                        for (int c = 0; c < 32; ++c) {
-                            float value = ctree::cr_hmul(hv[c], recip);
-                            if (part == 0u) value = ctree::cr_hmul(value, scale);
-                            dst[c] = half(qr_e4m3(value));
-                        }
+                        float v0 = ctree::cr_hmul(rv0, recip);
+                        if (part == 0u) v0 = ctree::cr_hmul(v0, scale);
+                        dst[0] = half(qr_e4m3(v0));
+                        float v1 = ctree::cr_hmul(rv1, recip);
+                        if (part == 0u) v1 = ctree::cr_hmul(v1, scale);
+                        dst[1] = half(qr_e4m3(v1));
+                        float v2 = ctree::cr_hmul(rv2, recip);
+                        if (part == 0u) v2 = ctree::cr_hmul(v2, scale);
+                        dst[2] = half(qr_e4m3(v2));
+                        float v3 = ctree::cr_hmul(rv3, recip);
+                        if (part == 0u) v3 = ctree::cr_hmul(v3, scale);
+                        dst[3] = half(qr_e4m3(v3));
+                        float v4 = ctree::cr_hmul(rv4, recip);
+                        if (part == 0u) v4 = ctree::cr_hmul(v4, scale);
+                        dst[4] = half(qr_e4m3(v4));
+                        float v5 = ctree::cr_hmul(rv5, recip);
+                        if (part == 0u) v5 = ctree::cr_hmul(v5, scale);
+                        dst[5] = half(qr_e4m3(v5));
+                        float v6 = ctree::cr_hmul(rv6, recip);
+                        if (part == 0u) v6 = ctree::cr_hmul(v6, scale);
+                        dst[6] = half(qr_e4m3(v6));
+                        float v7 = ctree::cr_hmul(rv7, recip);
+                        if (part == 0u) v7 = ctree::cr_hmul(v7, scale);
+                        dst[7] = half(qr_e4m3(v7));
+                        float v8 = ctree::cr_hmul(rv8, recip);
+                        if (part == 0u) v8 = ctree::cr_hmul(v8, scale);
+                        dst[8] = half(qr_e4m3(v8));
+                        float v9 = ctree::cr_hmul(rv9, recip);
+                        if (part == 0u) v9 = ctree::cr_hmul(v9, scale);
+                        dst[9] = half(qr_e4m3(v9));
+                        float v10 = ctree::cr_hmul(rv10, recip);
+                        if (part == 0u) v10 = ctree::cr_hmul(v10, scale);
+                        dst[10] = half(qr_e4m3(v10));
+                        float v11 = ctree::cr_hmul(rv11, recip);
+                        if (part == 0u) v11 = ctree::cr_hmul(v11, scale);
+                        dst[11] = half(qr_e4m3(v11));
+                        float v12 = ctree::cr_hmul(rv12, recip);
+                        if (part == 0u) v12 = ctree::cr_hmul(v12, scale);
+                        dst[12] = half(qr_e4m3(v12));
+                        float v13 = ctree::cr_hmul(rv13, recip);
+                        if (part == 0u) v13 = ctree::cr_hmul(v13, scale);
+                        dst[13] = half(qr_e4m3(v13));
+                        float v14 = ctree::cr_hmul(rv14, recip);
+                        if (part == 0u) v14 = ctree::cr_hmul(v14, scale);
+                        dst[14] = half(qr_e4m3(v14));
+                        float v15 = ctree::cr_hmul(rv15, recip);
+                        if (part == 0u) v15 = ctree::cr_hmul(v15, scale);
+                        dst[15] = half(qr_e4m3(v15));
+                        float v16 = ctree::cr_hmul(rv16, recip);
+                        if (part == 0u) v16 = ctree::cr_hmul(v16, scale);
+                        dst[16] = half(qr_e4m3(v16));
+                        float v17 = ctree::cr_hmul(rv17, recip);
+                        if (part == 0u) v17 = ctree::cr_hmul(v17, scale);
+                        dst[17] = half(qr_e4m3(v17));
+                        float v18 = ctree::cr_hmul(rv18, recip);
+                        if (part == 0u) v18 = ctree::cr_hmul(v18, scale);
+                        dst[18] = half(qr_e4m3(v18));
+                        float v19 = ctree::cr_hmul(rv19, recip);
+                        if (part == 0u) v19 = ctree::cr_hmul(v19, scale);
+                        dst[19] = half(qr_e4m3(v19));
+                        float v20 = ctree::cr_hmul(rv20, recip);
+                        if (part == 0u) v20 = ctree::cr_hmul(v20, scale);
+                        dst[20] = half(qr_e4m3(v20));
+                        float v21 = ctree::cr_hmul(rv21, recip);
+                        if (part == 0u) v21 = ctree::cr_hmul(v21, scale);
+                        dst[21] = half(qr_e4m3(v21));
+                        float v22 = ctree::cr_hmul(rv22, recip);
+                        if (part == 0u) v22 = ctree::cr_hmul(v22, scale);
+                        dst[22] = half(qr_e4m3(v22));
+                        float v23 = ctree::cr_hmul(rv23, recip);
+                        if (part == 0u) v23 = ctree::cr_hmul(v23, scale);
+                        dst[23] = half(qr_e4m3(v23));
+                        float v24 = ctree::cr_hmul(rv24, recip);
+                        if (part == 0u) v24 = ctree::cr_hmul(v24, scale);
+                        dst[24] = half(qr_e4m3(v24));
+                        float v25 = ctree::cr_hmul(rv25, recip);
+                        if (part == 0u) v25 = ctree::cr_hmul(v25, scale);
+                        dst[25] = half(qr_e4m3(v25));
+                        float v26 = ctree::cr_hmul(rv26, recip);
+                        if (part == 0u) v26 = ctree::cr_hmul(v26, scale);
+                        dst[26] = half(qr_e4m3(v26));
+                        float v27 = ctree::cr_hmul(rv27, recip);
+                        if (part == 0u) v27 = ctree::cr_hmul(v27, scale);
+                        dst[27] = half(qr_e4m3(v27));
+                        float v28 = ctree::cr_hmul(rv28, recip);
+                        if (part == 0u) v28 = ctree::cr_hmul(v28, scale);
+                        dst[28] = half(qr_e4m3(v28));
+                        float v29 = ctree::cr_hmul(rv29, recip);
+                        if (part == 0u) v29 = ctree::cr_hmul(v29, scale);
+                        dst[29] = half(qr_e4m3(v29));
+                        float v30 = ctree::cr_hmul(rv30, recip);
+                        if (part == 0u) v30 = ctree::cr_hmul(v30, scale);
+                        dst[30] = half(qr_e4m3(v30));
+                        float v31 = ctree::cr_hmul(rv31, recip);
+                        if (part == 0u) v31 = ctree::cr_hmul(v31, scale);
+                        dst[31] = half(qr_e4m3(v31));
                     } else {
-                        for (int c = 0; c < 32; ++c) dst[c] = half(qr_e4m3(hv[c]));
+                        dst[0] = half(qr_e4m3(rv0));
+                        dst[1] = half(qr_e4m3(rv1));
+                        dst[2] = half(qr_e4m3(rv2));
+                        dst[3] = half(qr_e4m3(rv3));
+                        dst[4] = half(qr_e4m3(rv4));
+                        dst[5] = half(qr_e4m3(rv5));
+                        dst[6] = half(qr_e4m3(rv6));
+                        dst[7] = half(qr_e4m3(rv7));
+                        dst[8] = half(qr_e4m3(rv8));
+                        dst[9] = half(qr_e4m3(rv9));
+                        dst[10] = half(qr_e4m3(rv10));
+                        dst[11] = half(qr_e4m3(rv11));
+                        dst[12] = half(qr_e4m3(rv12));
+                        dst[13] = half(qr_e4m3(rv13));
+                        dst[14] = half(qr_e4m3(rv14));
+                        dst[15] = half(qr_e4m3(rv15));
+                        dst[16] = half(qr_e4m3(rv16));
+                        dst[17] = half(qr_e4m3(rv17));
+                        dst[18] = half(qr_e4m3(rv18));
+                        dst[19] = half(qr_e4m3(rv19));
+                        dst[20] = half(qr_e4m3(rv20));
+                        dst[21] = half(qr_e4m3(rv21));
+                        dst[22] = half(qr_e4m3(rv22));
+                        dst[23] = half(qr_e4m3(rv23));
+                        dst[24] = half(qr_e4m3(rv24));
+                        dst[25] = half(qr_e4m3(rv25));
+                        dst[26] = half(qr_e4m3(rv26));
+                        dst[27] = half(qr_e4m3(rv27));
+                        dst[28] = half(qr_e4m3(rv28));
+                        dst[29] = half(qr_e4m3(rv29));
+                        dst[30] = half(qr_e4m3(rv30));
+                        dst[31] = half(qr_e4m3(rv31));
                     }
                     group_barrier(it.get_group());           // stash halves visible
                 }

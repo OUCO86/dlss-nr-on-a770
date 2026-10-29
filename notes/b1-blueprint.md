@@ -544,6 +544,45 @@ P0=0.22 Q=1.24 K=0.19 V=0.17，scores=1.41 attnV=0.62 outproj=0.53 store=0.43）
 (3) 再进 B5-1（QKV tail 折叠——注意 P5 证伪 nuance：tail 是 14ms butterfly 计算，
     折叠必须连带把 butterfly 也 ESIMD 化且不与 dpas 循环串行）。
 
+### 6.8-首刀（11:5x，工具链打通当轮直接开挖的溢出修复，已验证）
+
+**手法**：lmxxf 的"解除寄存器紧箍咒"在我们栈上的对应物 = **消掉逃逸的局部数组**
+（数组被动态下标取地址 → 编译器放 private/scratch → 每条访问 = 一条 scratch 消息）。
+- `cosine_tree_kernel.hpp`：新增 GENERATED `cosine_reciprocal_32(rv0..rv31)`（kdis/gen_cr32.py
+  从原树逐 op 生成，**op 顺序与 golden 完全一致**）。
+- `window_block_resident.hpp`：stage-3 的 `float hv[32]` → 32 个命名标量 rv0..rv31
+  （★不能叫 hvN/hN——外层 `half* h16` SLM 指针会被 h16 遮蔽，踩过一次编译错）。
+  K 的 scale==1.0f 乘法位中性（cr_hmul(half 可表示 x, 1.0f) == x）。
+- `window_block_mega.hpp`：launch_full stage-3 同款（h[32]+partial/two/one 数组群）→
+  `cosine_recip_esimd_32` 命名孪生 + rv 标量。★mega 体内还有**更多**逃逸数组
+  （stage 计 h[32]×2、wf[64]、proj[32]、hq/hk/hv[8]、pv[8]、hv[32]/hr[32]）——只修了
+  stage-3 一处，scratch 仍 2304B。**B5 前要把 mega 全部数组清干净**（逐个同款手法）。
+
+**指标回路（固化）**：`icx ... -fsycl-targets=spir64_gen -Xs "-device dg2" <src> -o kdis/x.exe`
+→ `kdis/spillcheck.py x.exe <outdir>` 打印每 kernel 的 grf/simd/slm/spill_size/private_size/
+scratchB/scratchInstr。resident 核基线→首刀：**spill 4544→2400、private 1792→1536、
+scratch 8192B→4096B、scratch 消息 311→266**。未归零——剩余源=其余逃逸数组
+（`cosine_reciprocal(hv)` 已修，但 stage-5/7 的 probs 循环还有标量形态，weights_pair_u32
+的调用点也可能；下窗口继续数）。
+**★Windows MAX_PATH 坑**：ocloc disasm 的 .text.<mangled>.asm 文件名 ~170 字符，
+深层目录（kdis/dep_dis_N/）下**静默不生成**（rc=0 但目录里只有 sections.txt）——
+必须 dump 到短路径（如 /tmp/w1）。dep_dis_* 当初能成是因为路径恰好没超。
+
+**验证**：mega_aot2.exe（修复后）7 区 JUDGE 全 EXACT、v4full FULL 1.086ms（vs 基线 1.082，
+噪声带内）——两处修复对热路径零扰动、对 resident/mega 数值恒等（op 顺序不变）。
+编译门=GREEN（bench_wbres_compile + bench_v4full 双双 AOT 编过）。
+★尚未做：resident 核端到端 100%×2（它本来就没上热，等 spill 归零后再走三关转正流程）。
+
+**spill 天花板的架构结论（11:5x，重要）**：resident 修完所有标量数组后 spill 仍 2400B≠0，
+因为剩余 4 处是 `jm::joint_matrix<...layout::dynamic> acc[4]/context[4]/projected[4]`
+——**coopmat 动态布局碎片是结构性 spill，编译器无法 SROA**（j 虽是编译期循环，但
+joint_matrix 类型本身的存储就是 register-tile，数组化后 IGC 落 private）。
+⇒ **coopmat 血统（wbres）天生带 spill 地板；ESIMD 血统（wbmega/v4full 手写 dpas）没有这个地板**。
+这再次印证 §6.7-勘误：B5 融合核必须走 **ESIMD wide-M**（v4full 的 dpas 几何），不是 coopmat。
+mega 的剩余 scratch（2304B）**全是可修的标量数组**（wf[64]/proj[32]/hq,hk,hv[8]/pv[8]/hv[32]/hr[32]
+——见 window_block_mega.hpp stage 计），逐个同款命名标量手法可归零。**B5 开工第一子任务
+= 把 mega 全部标量数组清干净、scratch→0**，这是 resident 融合上热的先决条件。
+
 ## 七、交接检查单（新窗口开工先读这些）
 
 1. 本蓝图全文 + 总蓝图 `notes/section100-blueprint.md` §7.5-7.6（★索引行在 7.5 头部）

@@ -50,6 +50,16 @@ static inline float cosine_reciprocal(const float* h) {
     return qr_half_round(sycl::ext::intel::math::fdiv_rn(1.0f, sycl::sqrt(norm)));
 }
 
+// cosine_reciprocal_32 -- GENERATED (kdis/gen_cr32.py) from the exact tree of
+// cosine_reciprocal above: same operation ORDER, 32 named params, no array inside.
+// Lets the caller keep its row in SSA registers (kill hv[32] -> private/scratch spill).
+static inline float cosine_reciprocal_32(float h0, float h1, float h2, float h3, float h4, float h5, float h6, float h7, float h8, float h9, float h10, float h11, float h12, float h13, float h14, float h15, float h16, float h17, float h18, float h19, float h20, float h21, float h22, float h23, float h24, float h25, float h26, float h27, float h28, float h29, float h30, float h31) {
+    float one00 = cr_hadd(cr_hadd(cr_hadd(cr_hfma(h8,h8,cr_hmul(h0,h0)), cr_hfma(h24,h24,cr_hmul(h16,h16))), cr_hadd(cr_hfma(h12,h12,cr_hmul(h4,h4)), cr_hfma(h28,h28,cr_hmul(h20,h20)))), cr_hadd(cr_hadd(cr_hfma(h10,h10,cr_hmul(h2,h2)), cr_hfma(h26,h26,cr_hmul(h18,h18))), cr_hadd(cr_hfma(h14,h14,cr_hmul(h6,h6)), cr_hfma(h30,h30,cr_hmul(h22,h22)))));
+    float one01 = cr_hadd(cr_hadd(cr_hadd(cr_hfma(h9,h9,cr_hmul(h1,h1)), cr_hfma(h25,h25,cr_hmul(h17,h17))), cr_hadd(cr_hfma(h13,h13,cr_hmul(h5,h5)), cr_hfma(h29,h29,cr_hmul(h21,h21)))), cr_hadd(cr_hadd(cr_hfma(h11,h11,cr_hmul(h3,h3)), cr_hfma(h27,h27,cr_hmul(h19,h19))), cr_hadd(cr_hfma(h15,h15,cr_hmul(h7,h7)), cr_hfma(h31,h31,cr_hmul(h23,h23)))));
+    float norm = sycl::max(cr_hadd(one00, one01), qr_half_round(COSINE_NORM_FLOOR));
+    return qr_half_round(sycl::ext::intel::math::fdiv_rn(1.0f, sycl::sqrt(norm)));
+}
+
 // cosine_tree.glsl:47-54, the ViT variant (opendlss_reference), verbatim.
 static inline float vit_reciprocal(const float* h) {
     float r[16];
