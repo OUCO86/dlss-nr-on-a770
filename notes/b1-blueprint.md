@@ -329,23 +329,34 @@ host 线并行另案（不碰 GPU 数值，风险最低肉最大）→ B3 视 B2
          1.161 -> 1.130 = **仅 -2.6%%**。"2 WG/SM"单独不是那个数量级的
          杠杆。v6 的收益必须来自 **几何+scratch+并行度三件套同时改**，
          不是 SLM 缩小本身。若 v6 只做 SLM 压缩 = 预期内 -3%% 级。
-     (W2) **8 行几何的 dpas 半载陷阱（v5-WIP 慢的真正机制，本轮推导）**：
-         tile8h 在 SIMD16 下 dpas<8,8> 的 16 lane 只装 8 行 ⇒ **一半
-         XMX message 是 padding**，dpas 有效吞吐减半——这就是 v5-WIP
-         QPO 0.894 > v4 0.651 的主因（不是 SLM！60KB=1WG/SM 但 v5-WIP
-         128 线程/SM 反而比 v4 64 线程/SM 慢：半载 dpas + idle lanes
-         两宗罪）。v6 的 8 行几何**必须解决 dpas 满载**：
-         * 方案 A（推荐先试）：**两个 subgroup 拼一个 16 行 tile**——
-           KTO 的 pack 本来就是 (js0,js1)=两个 8 行 strip 拼 16 行块，
-           scores/attnV 的 B 侧天然满；A 侧让 sg 偶数号算 rows0-7、
-           奇数号算 rows8-15，dpas 的 a0/a1 分别来自两个 subgroup 的
-           scratch（SLM 读，跨 subgroup）——tile 满载但多一跳 SLM；
-         * 方案 B：QKV/outproj 保持 16 行 tile（v4 原样），**只把
-           epilogue 改 4-lane 树 + scratch 复用压 SLM**——几何不动、
-           无半载风险，收益=e4m3 树向量化(v5a 已吃)+barrier 减+占用
-           微升。预期只有 -3~8%%。方案 B 是安全垫，A 是主刀。
-         * 下窗口第一步 = 用 bench 对拍 A/B 两案的 QKV 段（JUDGE 逐区），
-           再定全核走哪案。
+     (W2) **⚠ 已被 09:05 复核否证（写得太快，自纠）**：当时推测"8 行 tile 在
+         SIMD16 下 dpas 半载（一半 message 是 padding）"。复核 esimd dpas.hpp
+         + 我们自己的 tile8s：`dpas<SD=8,RC=8>` 的 A 操作数=128 half=
+         **恰好 8 行 x 16K**（a0 一个 16 行块=两条 dpas：a0=rows0-7、
+         a1=rows8-15）。v5-WIP 的 tile8h 载的也是同样的 128-half 满条
+         ⇒ **dpas 半载不存在**；"方案 A（两 subgroup 拼 16 行 tile）"
+         解决的是不存在的问题，作废。
+     (W2') **v5-WIP 慢的真因（复核后重钉，这次有代码证据）**：
+         ① **barrier 结构**：v5-WIP 的 QKV 是旧式 per-part store->barrier->
+           reload->barrier = **6 个 subgroup barrier**；v4 经 blade-2 只剩 2 个。
+           fill 探针说延迟绑定 ⇒ barrier 差 4 个就是主罪（blade-2 实测 6->2
+           = +1.32ms 的外推）。
+         ② **epilogue idle-lane**（lane<8 半退休）——4-lane 树正是解药。
+         ③ 60KB SLM 在 128KB 桶下仍 2 WG/SM（60x2=120<=128），**不是**主症。
+     (W3=新钉) **v6 的正确构成**（= v5-WIP 几何 + v4 的教训全叠上）：
+         * LW=128、8 subgroup x 8 行（dpas 满条，W2 否证后此几何无障碍）；
+         * **blade-2 两段式** QKV（phase1 三 part dpas+store 全做、1 barrier、
+           phase2 reload+epilogue+scatter 全做）；
+         * **epilogue = 前辈 4-lane x 8-ch 树**（shuffleXor(2)/(1)，16 lane
+           全活；树同构=v5a 已入册；每 lane 4x vec2 load、8 通道 mulh/e4m3、
+           K/Q 8x2-half scatter、V 8x1-half——store 总量与 v4 每窗相同）；
+         * 后段（scores/softmax/attnV/outproj/P7）v5-WIP 已移植过且单跑
+           probe 全 OK——softmax 的 lane<8 idle 同理解药（64 列 = 8 lane x
+           8 列? softmax 树=标量 ef_add 链不可动序，但行可以在 lane 间分）；
+         * SLM: 前辈 16KB 预算（scratch 跨 stage 复用 + Q 留寄存器）= 二阶段
+           优化，v6.1 先保 60KB 能跑对再压。
+         **下窗口第一步（改）= 直接建 v6.1：v5-WIP 核 + 两段式 + 4-lane 树，
+         JUDGE QPO/KTO/VPO 对拍 v4 dump。方案 A/B 对拍作废（A 已死）。**
    - (α) tc 循环合并 = v6 后的精修；(γ) softmax 64 步标量链（改求和顺序=
      违反参考树，golden 考古门才允许动）仍然封存。
    - quant 真内嵌 = 2-3ms 残肉高成本，排在 B3 后。
