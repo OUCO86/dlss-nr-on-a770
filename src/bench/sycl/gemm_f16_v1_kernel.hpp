@@ -408,6 +408,31 @@ static inline sycl::event gemm_pub_pa16(sycl::queue& q, const half* Ap, const ha
             // (the output's COLUMN-block count -- NOT the expand's kb_n).
             half* tile = Hp_tile + (size_t)((tr * tc_n + tc) * 2) * 128;
             const esimd::simd<half, 8> z8((half)0.f);
+            // BLADE-4 (ISA density ledger, 2026-10-29): the scalar pub_esimd loops here
+            // (256 calls x ~20 instr = ~5000 instr/WG vs 8 dpas) were the dpas-density
+            // killers the census counted (gemm_pub_pa16/gemm_pub = 2035/1359 static
+            // instrs at 0.1-0.3% density). Vector twin = pub_vec_v8 (bench_pubvec
+            // 1M-value scalar-vs-vec IDENTICAL for epi 0/1/3/4; epi2 keeps the SCALAR
+            // -0.0-sign path, the gemm_b_pub_f16 guard VERBATIM).
+            if (epi != 2u) {
+                for (int r = 0; r < 8; ++r) {
+                    esimd::simd<half, 8> h00, h01, h10, h11;
+                    if ((size_t)(tr * TS + r) < (size_t)M) {
+                        esimd::simd<float, 8> r00 = c00.template select<8, 1>(r * 8);
+                        esimd::simd<float, 8> r01 = c01.template select<8, 1>(r * 8);
+                        h00 = esimd::convert<half>(s8v8::pub_vec_v8<8>(epi, r00));
+                        h01 = esimd::convert<half>(s8v8::pub_vec_v8<8>(epi, r01));
+                    } else { h00 = z8; h01 = z8; }
+                    if ((size_t)(tr * TS + 8 + r) < (size_t)M) {
+                        esimd::simd<float, 8> r10 = c10.template select<8, 1>(r * 8);
+                        esimd::simd<float, 8> r11 = c11.template select<8, 1>(r * 8);
+                        h10 = esimd::convert<half>(s8v8::pub_vec_v8<8>(epi, r10));
+                        h11 = esimd::convert<half>(s8v8::pub_vec_v8<8>(epi, r11));
+                    } else { h10 = z8; h11 = z8; }
+                    h00.copy_to(tile + r * 16);        h01.copy_to(tile + r * 16 + 8);
+                    h10.copy_to(tile + 128 + r * 16);  h11.copy_to(tile + 128 + r * 16 + 8);
+                }
+            } else
             for (int r = 0; r < 8; ++r) {
                 esimd::simd<half, 8> h00, h01, h10, h11;
                 if ((size_t)(tr * TS + r) < (size_t)M) {

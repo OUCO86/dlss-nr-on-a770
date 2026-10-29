@@ -740,10 +740,25 @@ static inline sycl::event gemm_b_res(sycl::queue& q, const int8_t* Ap, const int
                         esimd::simd<float,16> sf = esimd::block_load<float,16>((const float*)skip + (size_t)rr0*N + gc, esimd::overaligned_tag<16>{});
                         sk0 = sf.template select<8,1>(0); sk1 = sf.template select<8,1>(8);
                     }
-                    // fma: sk*cos + stage (one fused rounding, matches sycl::fma)
+                    // fma: sk*cos + stage (one fused rounding, matches sycl::fma).
+                    // BLADE-4 (ISA density ledger 2026-10-29): the pub chain here ran
+                    // 128 SCALAR pub_esimd calls/thread (~1800 instrs) vs 8 dpas = the
+                    // 0.1% density the census counted. The fma expression stays
+                    // ELEMENTWISE byte-identical (the "do NOT vectorize res's fma"
+                    // warning: a simd sk*c+f lowers as muladd = two roundings, frame 0%);
+                    // only the PUB step is vectorized via pub_vec_v8 (bench_pubvec: epi
+                    // 0/1/3/4 scalar-vs-vec IDENTICAL over 1M values; the frame's res
+                    // flags 0x41100 -> epi=1; epi==2 keeps the scalar -0.0 path).
                     esimd::simd<float, 16> pub;
-                    for (int e = 0; e < 8; ++e) pub[e] = pub_esimd(epi, sk0[e]*ccl[e] + f0.read()[e]);
-                    for (int e = 0; e < 8; ++e) pub[8+e] = pub_esimd(epi, sk1[e]*cch[e] + f1.read()[e]);
+                    if (epi != 2u) {
+                        esimd::simd<float,8> t0, t1;
+                        for (int e = 0; e < 8; ++e) { t0[e] = sk0[e]*ccl[e] + f0.read()[e]; t1[e] = sk1[e]*cch[e] + f1.read()[e]; }
+                        pub.template select<8,1>(0) = pub_vec_v8<8>(epi, t0);
+                        pub.template select<8,1>(8) = pub_vec_v8<8>(epi, t1);
+                    } else {
+                        for (int e = 0; e < 8; ++e) pub[e] = pub_esimd(epi, sk0[e]*ccl[e] + f0.read()[e]);
+                        for (int e = 0; e < 8; ++e) pub[8+e] = pub_esimd(epi, sk1[e]*cch[e] + f1.read()[e]);
+                    }
                     size_t out = (size_t)rr0 * N + gc;
                     if (narrow) esimd::convert<half>(pub).copy_to((half*)Cout + out);
                     else        pub.copy_to((float*)Cout + out);
@@ -761,8 +776,15 @@ static inline sycl::event gemm_b_res(sycl::queue& q, const int8_t* Ap, const int
                         sk0 = sf.template select<8,1>(0); sk1 = sf.template select<8,1>(8);
                     }
                     esimd::simd<float, 16> pub;
-                    for (int e = 0; e < 8; ++e) pub[e] = pub_esimd(epi, sk0[e]*ccl[e] + g0.read()[e]);
-                    for (int e = 0; e < 8; ++e) pub[8+e] = pub_esimd(epi, sk1[e]*cch[e] + g1.read()[e]);
+                    if (epi != 2u) {
+                        esimd::simd<float,8> t0, t1;
+                        for (int e = 0; e < 8; ++e) { t0[e] = sk0[e]*ccl[e] + g0.read()[e]; t1[e] = sk1[e]*cch[e] + g1.read()[e]; }
+                        pub.template select<8,1>(0) = pub_vec_v8<8>(epi, t0);
+                        pub.template select<8,1>(8) = pub_vec_v8<8>(epi, t1);
+                    } else {
+                        for (int e = 0; e < 8; ++e) pub[e] = pub_esimd(epi, sk0[e]*ccl[e] + g0.read()[e]);
+                        for (int e = 0; e < 8; ++e) pub[8+e] = pub_esimd(epi, sk1[e]*cch[e] + g1.read()[e]);
+                    }
                     size_t out = (size_t)rr1 * N + gc;
                     if (narrow) esimd::convert<half>(pub).copy_to((half*)Cout + out);
                     else        pub.copy_to((float*)Cout + out);
@@ -852,8 +874,15 @@ static inline sycl::event gemm_b_res_window(sycl::queue& q, const int8_t* Ap, co
                         sk0 = sf.template select<8,1>(0); sk1 = sf.template select<8,1>(8);
                     }
                     esimd::simd<float, 16> pub;
+                    if (epi != 2u) {   // BLADE-4: same fma text, vectorized pub chain (epi1 proven)
+                        esimd::simd<float,8> t0, t1;
+                        for (int e = 0; e < 8; ++e) { t0[e] = sk0[e]*ccl[e] + f0.read()[e]; t1[e] = sk1[e]*cch[e] + f1.read()[e]; }
+                        pub.template select<8,1>(0) = pub_vec_v8<8>(epi, t0);
+                        pub.template select<8,1>(8) = pub_vec_v8<8>(epi, t1);
+                    } else {
                     for (int e = 0; e < 8; ++e) pub[e] = pub_esimd(epi, sk0[e]*ccl[e] + f0.read()[e]);
                     for (int e = 0; e < 8; ++e) pub[8+e] = pub_esimd(epi, sk1[e]*cch[e] + f1.read()[e]);
+                    }
                     if (in) { if (narrow) esimd::convert<half>(pub).copy_to((half*)Cout + out);
                               else        pub.copy_to((float*)Cout + out); }
                 }
@@ -874,8 +903,15 @@ static inline sycl::event gemm_b_res_window(sycl::queue& q, const int8_t* Ap, co
                         sk0 = sf.template select<8,1>(0); sk1 = sf.template select<8,1>(8);
                     }
                     esimd::simd<float, 16> pub;
+                    if (epi != 2u) {   // BLADE-4 (window variant, second row): same rule
+                        esimd::simd<float,8> t0, t1;
+                        for (int e = 0; e < 8; ++e) { t0[e] = sk0[e]*ccl[e] + g0.read()[e]; t1[e] = sk1[e]*cch[e] + g1.read()[e]; }
+                        pub.template select<8,1>(0) = pub_vec_v8<8>(epi, t0);
+                        pub.template select<8,1>(8) = pub_vec_v8<8>(epi, t1);
+                    } else {
                     for (int e = 0; e < 8; ++e) pub[e] = pub_esimd(epi, sk0[e]*ccl[e] + g0.read()[e]);
                     for (int e = 0; e < 8; ++e) pub[8+e] = pub_esimd(epi, sk1[e]*cch[e] + g1.read()[e]);
+                    }
                     if (in) { if (narrow) esimd::convert<half>(pub).copy_to((half*)Cout + out);
                               else        pub.copy_to((float*)Cout + out); }
                 }
