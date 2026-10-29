@@ -2487,7 +2487,10 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
     g_cmds.push_back([=]() {
         // device pack (section 92): Araw/Braw already on device -- pack in place.
         int8_t* dAp = (int8_t*)pool_get(na);
-        int32_t* dC = (int32_t*)pool_get((size_t)Mp * NH * 4);
+        // B5-1: on the folded QKV path dC NEVER EXISTS (no pool_get at all -- the
+        // user's "no new extra cost": not even a pool slot); the split escape
+        // (NR_QKV_RES=0) allocates it as before.
+        int32_t* dC = nullptr;
         // section 100 QKV-internal ledger (NR_QKV_STOP=N, launch-guard form, time
         // ledger only -- the frame is garbage here by design): 1 = skip norm_scatter
         // (pack+gemm only), 2 = skip gemm too (pack only), 3 = skip pack too (floor).
@@ -2509,12 +2512,22 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
         // ON the gemm's SLM-staged accumulator tile; dC (int32 Mp x 3C) AND the
         // 21ms norm_scatter tail both vanish. NON-VIT + C%64==0 only (the frame:
         // C=64/128); vit's 16 calls keep the scalar split (different tree).
-        static bool qres_on = getenv("NR_QKV_RES") && atoi(getenv("NR_QKV_RES")) != 0;   // P5 FALSIFIED (11:3x): correct (100%% x2, p5a/p5b) but 1-3ms SLOWER than split (182-185 vs 180-182): the tail is 14ms of BUTTERFLY COMPUTE, not the dC round-trip (0.06ms) -- folding into the gemm moves the cost and serializes it with the dpas loop. Kernel stays in-tree as witness.
-        const bool qres_ok = qres_on && !vit && (C % 64u) == 0u && NH == 3u * C && heads == C / 32u && tokens > 0u;
+        // B5-1 FINAL (2026-10-29, the user's 'eliminate the 114 dC round-trips,
+        // NO EXCEPTIONS'): the fold is now the DEFAULT and covers BOTH trees --
+        // non-vit runs the PROMOTED v5a vector chain (cosine_recip_vec/mulh/
+        // e4m3_vec, the exact shape the green v4full QKV phase-2 runs), vit runs
+        // the tree-isomorphic vit_recip_vec + the P11 host recip tab. The P5
+        // falsification was about the SCALAR butterfly (14ms compute) and the
+        // dpas-serialization; both roots are answered (v5a vector chain + the
+        // kernel's phase-split shape: all dpas staged, ONE barrier, then tails).
+        // dC is NOT ALLOCATED on this path at all. Escape NR_QKV_RES=0 = split.
+        static bool qres_on = !getenv("NR_QKV_RES") || atoi(getenv("NR_QKV_RES")) != 0;
+        const bool qres_ok = qres_on && (C % 64u) == 0u && NH == 3u * C && heads == C / 32u && tokens > 0u;
         if (qkvstop < 2) {
             if (qres_ok)
-                qres::gemm_qkv_res(*GQ, dAp, dBp, Q, Kk, V, as, bs, qs, (int)M, Mp, (int)C, (int)NH, (int)heads, (int)tokens);
+                qres::gemm_qkv_res(*GQ, dAp, dBp, Q, Kk, V, as, bs, qs, (int)M, Mp, (int)C, (int)NH, (int)heads, (int)tokens, vit, vit_recip_tab());
             else {
+                dC = (int32_t*)pool_get((size_t)Mp * NH * 4);   // split path ONLY
                 s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)NH, (int)C);
             }
         }
@@ -2706,7 +2719,8 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
             sycl::free(vdbg, *GQ); }
         }   // end else (vit scalar stage2 + stage3)
         qkv_done:;
-        pool_put(dAp); pool_put(dBp); pool_put(dC);
+        if (!qres_ok) dC = (int32_t*)nullptr;   // (kept for the split path below)
+        pool_put(dAp); pool_put(dBp); if (dC) pool_put(dC);
     });
     return 0;
 }

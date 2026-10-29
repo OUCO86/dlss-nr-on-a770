@@ -19,15 +19,59 @@
 #pragma once
 #include "gemm_s8_v8_kernel.hpp"
 #include "window_block_mega.hpp"   // wbmega::eh_* / esqrt / qr_e4m3_scalar family
+#include "window_block_v3.hpp"     // wbv3::cosine_recip_vec (v5a) / e4m3_vec / mulh
 
 namespace qres {
 using namespace sycl;
 namespace esimd = sycl::ext::intel::esimd;
 
+// vit norm tree, VECTOR twin of ctree::vit_reciprocal over a contiguous 32-col row
+// (the ownership the P5 tail already has). Tree-isomorphism proof (same class as
+// v5a's cosine_recip_vec): x0..x3 = h[0..7]/h[8..15]/h[16..23]/h[24..31];
+//   r_lo8[c] = (float)(half)(x0*x0 + (float)(half)(x2*x2)) = r[c]   (c 0..7)
+//   r_hi8[c] = same with x1/x3                                        = r[c+8]
+//   E8[c] = hadd(r_lo8,r_hi8) = hadd(r[c],r[c+8]) (c 0..7) -- the products are
+//   EXACT in f32 (11x11<=24 bits, the section-92 contraction note), so cr_hfma's
+//   mul+add == one add == this form bit-for-bit.
+//   F = E8 + xor4(E8): lanes 0..3 = hadd(E[c],E[c+4]) = F[c] (c 0..3).
+//   F2 = F + xor2(F): lanes 0,1 = F0+F2, F1+F3.  norm = eh_add(lane0,lane1).
+// recip = the P11 host-built table (std::sqrt+IEEE div+half-round, bit-exact by
+// construction) indexed by the half bits of norm -- SAME tab the green
+// qkv_norm_scatter_vit_esimd uses. No esqrt/div in-kernel (the 449-flip lesson).
+static inline float vit_recip_vec(esimd::simd<float,32> h, const float* tab) {
+    auto x0 = h.template select<8,1>(0);
+    auto x1 = h.template select<8,1>(8);
+    auto x2 = h.template select<8,1>(16);
+    auto x3 = h.template select<8,1>(24);
+    auto a0 = esimd::convert<float>(esimd::convert<half>(x2*x2));
+    auto rlo = esimd::convert<float>(esimd::convert<half>(x0*x0 + a0));
+    auto a1 = esimd::convert<float>(esimd::convert<half>(x3*x3));
+    auto rhi = esimd::convert<float>(esimd::convert<half>(x1*x1 + a1));
+    auto E8 = esimd::convert<float>(esimd::convert<half>(rlo + rhi));
+    esimd::simd<float,8> e4;
+    e4.template select<4,1>(0) = E8.template select<4,1>(4);
+    e4.template select<4,1>(4) = E8.template select<4,1>(0);
+    auto Ep = esimd::convert<float>(esimd::convert<half>(E8 + e4));   // lanes 0..3 = F
+    esimd::simd<float,8> f2;
+    f2.template select<2,1>(0) = Ep.template select<2,1>(2);
+    f2.template select<2,1>(2) = Ep.template select<2,1>(0);
+    f2.template select<2,1>(4) = Ep.template select<2,1>(6);
+    f2.template select<2,1>(6) = Ep.template select<2,1>(4);
+    auto F = esimd::convert<float>(esimd::convert<half>(Ep + f2));
+    auto fv = F.read();
+    float norm = wbmega::eh_add(fv[0], fv[1]);
+    float floorv = wbmega::eh_round(ctree::COSINE_NORM_FLOOR);
+    norm = norm > floorv ? norm : floorv;
+    { sycl::half nh(norm); unsigned short nb;
+      __builtin_memcpy(&nb, &nh, 2);
+      return tab[(unsigned)nb & 65535u]; }
+}
+
 static inline sycl::event gemm_qkv_res(sycl::queue& q, const int8_t* Ap, const int8_t* Bp,
                                        half* Q, half* Kk, half* V,
                                        const float* as, const float* bs, const float* qs,
-                                       int M, int Mp, int C, int NH, int heads, int tokens) {
+                                       int M, int Mp, int C, int NH, int heads, int tokens,
+                                       bool vit = false, const float* recip_tab = nullptr) {
     using namespace s8v8;   // BM BN BK NT SLM_*
     const int wg = (Mp / BM) * (NH / BN);
     return q.submit([&](handler& h) {
@@ -88,9 +132,16 @@ static inline sycl::event gemm_qkv_res(sycl::queue& q, const int8_t* Ap, const i
                 esimd::slm_block_store<float,16>((uint32_t)((wi_row*16 + 8 + r) * BN + wi_col*16) * 4u, f1, esimd::overaligned_tag<16>{});
             }
             esimd::barrier();
-            // ---- head tail v2: one thread = one (row, head) = 32 cols (the v1
-            // row-wide h[64]+hr[32] live set spilled the GRF -- A/B showed no win;
-            // halving it: 256 (row,head) tasks / 32 threads = 8 each). ----
+            // ---- head tail v3 (B5-1 FINAL BLADE, 2026-10-29): the P5 witness ran the
+            // tail as the 32-SCALAR butterfly (the v1 esimd body transplanted) -- that
+            // is what cost 14ms and made P5 "1-3ms slower than split". The tail now
+            // uses the PROMOTED v5a vector forms (cosine_recip_vec + mulh + e4m3_vec,
+            // the exact shape the green v4full QKV phase-2 runs) and for vit the
+            // tree-isomorphic vit_recip_vec above + the P11 host recip tab. dC NEVER
+            // EXISTS on this path. Chain depth ~40 -> ~12; the exposed-chain fill-probe
+            // argument (v5a) plus blade-2's phase-split (all dpas before the epilogue --
+            // this kernel already has that shape: the whole tile stages, ONE barrier,
+            // then tails) answer the P5 "serializes with the dpas loop" root cause. ----
             const int part = (wg_col * BN) / C;                 // C==64==BN: 0=Q 1=K 2=V
             const unsigned head0 = (unsigned)((wg_col * BN) % C) / 32u;
             for (int k = 0; k < BM * 2 / NT; ++k) {
@@ -100,43 +151,29 @@ static inline sycl::event gemm_qkv_res(sycl::queue& q, const int8_t* Ap, const i
                 if (r >= M) continue;
                 esimd::simd<float,32> seg = esimd::slm_block_load<float,32>(
                     (uint32_t)(row * BN + hpart * 32) * 4u, esimd::overaligned_tag<16>{});
-                float h[32];
-                for (int i = 0; i < 32; ++i) h[i] = seg[i];
                 unsigned head = head0 + (unsigned)hpart;
                 unsigned w = (unsigned)r / (unsigned)tokens, t = (unsigned)r % (unsigned)tokens;
                 size_t at = (((size_t)w * heads + head) * tokens + t) * 32u;
                 if (part == 2) {                     // V: deq-only, e4m3 (no round first)
-                    for (int i = 0; i < 32; ++i)
-                        V[at + i] = sycl::half(qr_e4m3_scalar(h[i]));
+                    esimd::simd<half,32> ov = esimd::convert<half>(wbv3::e4m3_vec<32>(seg));
+                    ov.copy_to(V + at, esimd::overaligned_tag<16>{});
                     continue;
                 }
-                float hr[32];
-                for (int i = 0; i < 32; ++i) hr[i] = wbmega::eh_round(h[i]);
-                float pv[8];
-                for (int l = 0; l < 4; ++l)
-                    for (int p2 = 0; p2 < 2; ++p2) {
-                        auto HX = [&](int j) { return hr[(j/2)*8 + 2*l + (j%2)]; };
-                        pv[2*l + p2] = wbmega::eh_add(
-                            wbmega::eh_hfma(HX(2+p2), HX(2+p2), wbmega::eh_mul(HX(p2),   HX(p2))),
-                            wbmega::eh_hfma(HX(6+p2), HX(6+p2), wbmega::eh_mul(HX(4+p2), HX(4+p2))));
-                    }
-                float two00 = wbmega::eh_add(pv[0], pv[4]);
-                float two10 = wbmega::eh_add(pv[2], pv[6]);
-                float one00 = wbmega::eh_add(two00, two10);
-                float two01 = wbmega::eh_add(pv[1], pv[5]);
-                float two11 = wbmega::eh_add(pv[3], pv[7]);
-                float one01 = wbmega::eh_add(two01, two11);
-                float norm = wbmega::eh_add(one00, one01);
-                float floorv = wbmega::eh_round(ctree::COSINE_NORM_FLOOR);
-                norm = norm > floorv ? norm : floorv;
-                float recip = wbmega::eh_round(1.0f / wbmega::esqrt(norm));
+                esimd::simd<float,32> hr = esimd::convert<float>(esimd::convert<half>(seg));
+                float recip = vit ? vit_recip_vec(hr, recip_tab) : wbv3::cosine_recip_vec(hr);
                 half* T = (part == 0) ? Q : Kk;
-                float sc = (part == 0) ? wbmega::eh_round(qs[head]) : 1.0f;
-                for (int i = 0; i < 32; ++i) {
-                    float value = wbmega::eh_mul(hr[i], recip);
-                    if (part == 0) value = wbmega::eh_mul(value, sc);
-                    T[at + i] = sycl::half(qr_e4m3_scalar(value));
+                esimd::simd<half,32> oh;
+                if (part == 0) {
+                    float sc = wbmega::eh_round(qs[head]);
+                    // P11 stepped chain (t1/t2/t3 each its OWN named wide temp -- the
+                    // nesting-rewrite lesson, applied at simd width): non-vit skips VIT_ROOT.
+                    esimd::simd<float,32> t1 = wbv3::mulh(hr, recip);
+                    esimd::simd<float,32> t2 = vit ? wbv3::mulh(t1, ctree::VIT_ROOT) : t1;
+                    oh = esimd::convert<half>(wbv3::e4m3_vec<32>(wbv3::mulh(t2, sc)));
+                } else {
+                    oh = esimd::convert<half>(wbv3::e4m3_vec<32>(wbv3::mulh(hr, recip)));
                 }
+                oh.copy_to(T + at, esimd::overaligned_tag<16>{});
             }
         });
     });
