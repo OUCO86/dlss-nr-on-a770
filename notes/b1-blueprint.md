@@ -573,6 +573,23 @@ scratch 8192B→4096B、scratch 消息 311→266**。未归零——剩余源=�
 编译门=GREEN（bench_wbres_compile + bench_v4full 双双 AOT 编过）。
 ★尚未做：resident 核端到端 100%×2（它本来就没上热，等 spill 归零后再走三关转正流程）。
 
+**13:0x 帧 A/B 判决（nr_replay_now.exe 同 dll 三路由，覆盖上面的"上热"计划）**：
+默认 v4full=**113.8ms**；NR_FULL_MEGA=1（launch_full，scratch 已归零）=**~575ms**；
+NR_RESIDENT_WB=1（coopmat resident，spill 修半）=**~657ms**。
+⇒ **两个门后核即使清零溢出仍慢 5-6x——它们输在几何（section 92-94 一代巨型单窗 WG 核），
+不是 spill。"修好再上热"路线作废；B5 融合必须在 v4full 宽-M 几何上重写，不复活旧核。**
+溢出修复本身保留（launch_full scratch 2304→0 已提交 bc774a2，作为 ESIMD 手法库+样板，
+将来 B5 重写直接复用这套 named-scalar/VAL-重载/sc8 分 pass 技术）。
+⚠ getenv 坑：`NR_FULL_MEGA=`（空串）在 C 里是真——做 off 对照必须 unset。
+⚠ walk 计时器正身 = `oneapi/nr_replay_now.exe <dll路径>`（打印 run0..3 ms / 691 passes）。
+walk_plan.py 的 sigs 断言是 json(31 压缩表) vs .c(55 全枚举) 索引错位，已红，不要用它测速。
+
+**v4full 热路径微结构（asm 直数，下一刀的靶）**：102 条 dpas 里 **90/101 对背靠背（间隙 0 条）**
+——dpas 主循环已紧，XMX 发射间隙不是问题；成本集中在**少数巨型 epilogue 间隙**
+（36/50 条 SLM 指令的 QKV/scores staging 段，mean 17.5 条/dpas 全被这几个大间隙拉高）。
+⇒ 攻击面 = epilogue staging 的 SLM 往返与 mov 群（QKV 段 1.61ms、scores 段 1.41ms 的
+giants 微梯已定位），不是 dpas 载重本身。
+
 **spill 天花板的架构结论（11:5x，重要）**：resident 修完所有标量数组后 spill 仍 2400B≠0，
 因为剩余 4 处是 `jm::joint_matrix<...layout::dynamic> acc[4]/context[4]/projected[4]`
 ——**coopmat 动态布局碎片是结构性 spill，编译器无法 SROA**（j 虽是编译期循环，但
