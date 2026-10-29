@@ -82,21 +82,35 @@ static inline event launch_wa_res(queue& q, const half* dQ, const half* dK, cons
                 }
                 // K gather with the pack_b16_t_b INTERLEAVED map: tile elem =
                 // ((kc*4+tc)*2+js)*128 + kq*16 + jl*2 + kpar <- raw[(tc*16+js*8+jl)*32 +
-                // kc*16 + kq*2+kpar]. thread lid -> (js = lid/8, jl = lid%8).
-                #pragma unroll
-                for (int kc2 = 0; kc2 < 2; ++kc2)
-                #pragma unroll
-                for (int tc2 = 0; tc2 < 4; ++tc2) {
-                    uint js = lid / 8u, jl = lid % 8u;
-                    esimd::simd<half,16> vr = esimd::block_load<half,16>(Kb + (size_t)(tc2 * 16 + js * 8 + jl) * 32u + (uint)kc2 * 16u, esimd::overaligned_tag<16>{});
-                    // scatter: for kq 0..7: two halves -> tile ((kc2*4+tc2)*2+js)*128 + kq*16 + jl*2 + kpar
-                    uint tb = ((uint)(kc2 * 4 + tc2) * 2u + js) * 128u + jl * 2u;
+                // kc*16 + kq*2+kpar].
+                // BLADE-7 (supply audit 20:1x, the supply list the user's memo pushed
+                // us to run): the OLD form wrote the tile with 1024 TWO-HALF SLM stores
+                // per WG (4-byte messages -- the worst supply pattern in the whole
+                // chain, counted 75 narrow send.slm in the AOT asm). New form: ONE
+                // thread owns one 128-half tile BLOCK bidx=(kc*4+tc)*2+js: it loads the
+                // block's 8 raw rows (8 x 32B overaligned global loads, rows shared
+                // across the kc pair = L1) and assembles the 128-half block IN
+                // REGISTERS (select-to-select copies = register shuffles, the free
+                // strided-mov encoding), then ONE 256B slm_block_store. Values and
+                // addresses are IDENTICAL to the old form by construction (same elem
+                // map, just different message shape). WINDOW_ATTENTION gate + 1301 judge.
+                {
+                    uint bidx = lid;                       // 16 threads = 16 blocks
+                    uint kc2 = bidx / 8u, tc2 = (bidx / 2u) % 4u, js = bidx % 2u;
+                    esimd::simd<half,16> rows[8];
                     #pragma unroll
-                    for (int kq = 0; kq < 8; ++kq) {
-                        esimd::simd<half,2> piece;
-                        piece[0] = vr[kq * 2]; piece[1] = vr[kq * 2 + 1];
-                        esimd::slm_block_store(WA_KT + (tb + (uint)kq * 16u) * 2u, piece, esimd::overaligned_tag<4>{});
-                    }
+                    for (int jl = 0; jl < 8; ++jl)
+                        rows[jl] = esimd::block_load<half,16>(
+                            Kb + (size_t)(tc2 * 16 + js * 8 + jl) * 32u + kc2 * 16u,
+                            esimd::overaligned_tag<16>{});
+                    esimd::simd<half,128> blk;
+                    #pragma unroll
+                    for (int kq = 0; kq < 8; ++kq)
+                        #pragma unroll
+                        for (int jl = 0; jl < 8; ++jl)
+                            blk.template select<2,1>(kq * 16 + jl * 2) =
+                                rows[jl].template select<2,1>(kq * 2);
+                    esimd::slm_block_store(WA_KT + bidx * 128u * 2u, blk, esimd::overaligned_tag<16>{});
                 }
                 esimd::barrier();
                 
