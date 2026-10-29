@@ -496,6 +496,54 @@ A770=Alchemist 老代 XMX，供数/fragment 布局与矩阵指令行为不同）
    账本再下刀"方法找我们自己的冗余功**——这才是 B4 的正解。
 
 
+## 六.八、★★ ISA 工具链已打通 + 四大账本落地（11:2x-11:4x，用户点死"先给我打通"）
+
+**打通配方（AOT 路线，JIT-dump 在 Windows 驱动上不落盘，别再试）**：
+1. `icx //fsycl -fsycl-targets=spir64_gen -Xs "-device dg2" ... //Fe:xxx.dll //LD libxmx_sycl.cpp //link //DEF:...`
+   —— ★gen 管线只在**链接 exe/dll 时**跑；`-c` 编 .o 时 `-Xs` 被 clang-cl 报 "argument unused"、
+   .o 里只有 LLVM bitcode（`BC\xc0\xde` 包装）没有 zebin。上次 AOT 失败根因=`-out` 应为 `-dump`、
+   且节区提取长度要含节头表（`shoff+shent*shnum`，我先前漏了 3 字节截断 → "Out of bounds section headers"）。
+2. 提取：python 扫 PE 里 `\x7fELF` + e_machine==0xCD（EM_INTELGPU）→ 按节表算全长写 `dep_N.bin`。
+3. `ocloc disasm -file dep_N.bin -dump <dir> -device dg2` → 每个 kernel 一个 `.text.<mangled>.asm`
+   （点开头，glob `*.asm` 匹配不到，脚本要用 listdir）+ `.ze_info`（YAML 资源清单）+ `.spv`。
+4. 验证：`bench_aot.exe`（spir64_gen/dg2 构建）在 GPU 上跑 7 区 JUDGE 全 EXACT，
+   1.082ms vs JIT 1.080ms —— AOT 与 JIT 同码同速，账本可信。
+   产物与脚本全在 `src/bench/sycl/kdis/`：`ledgers_20261029.txt`（指令账本）、
+   `spill_ledger_20261029.txt`（溢出账本）、`census.py`/`spill_ledger.py`/`movkind.py`/`parse_zeinfo.py`。
+
+**账本 1（洗牌/搬运，lmxxf 的 SHFL 类比）**：GEN 的 `mov r8.0<1>:ud r3.0<0;1,0>:ud` 形态里
+`<n;stride,...>` 是**操作数级跨 lane 重排——免费、不花指令**。v4full 实测：movish=981/2568 条
+（mov 899 + sel 51 + join 31）；launch_resident 实测 strided-mov=3512、arith 带 strided-src=15681
+（cmp 3919 / and 3222 / add 2178...）——**这些"洗牌"在 GEN 上本来就是零成本编码**，
+不存在 SASS SHFL 那种独立指令。⇒ lmxxf 手法(a)"偶奇 K16 零洗牌"在我们栈上的对应物
+= **消掉真实花指令的搬运**：`sel`(51)+`join`(31)+**SLM 往返 store/load**（v4full: slmST=156/slmLD=54；
+resident: slmLD=703!!）。**头号搬运靶 = resident 核的 703 次 SLM load**（它 simd=8，
+每条是 8-lane 消息；dpas 只有 51 条却配 703 次 SLM 读 = 供数结构问题）。
+
+**账本 2（寄存器溢出，lmxxf 的 maxnreg/LDL 类比）**：ze_info 有官方字段 **`spill_size`**。
+全链 402 kernel 中 17 个带 spill/private/scratch。★判决级发现：
+**`wbres::launch_resident`（B5 旗舰 resident 融合核，NR_RESIDENT_WB 门后）
+spill=4544B + private=1792B + scratch=8192B/thread，且 asm 里实打实 311 条 scratch 读写消息**
+——它就是 P6 qkv_norm_scatter_v2 "ESIMD arrays spill" 同一个病：**局部数组被 SLM/scratch 化**。
+其余：qkv gemm 热核 private=7680B（SIMD16，无 scratch 消息=编译器放 SLM/寄存器）、
+stem_mega/ffn_chip scratch=1024-1312B。⇒ lmxxf 手法(b) 的对应物 = **把 resident 核里的
+simd 局部数组改成命名标量/temp 链**（我们 P11 教训同款：named temp adjacent to use）。
+**这是 B5-1 开工前的先决修复**——不修它，resident 核永远被 4.5KB spill 拖死。
+
+**账本 3（e4m3/SWAR 密度）**：resident 2119 个 `:hf`（half）操作数触点、rnde 只有 10——
+fp16 链本身已是 packed 形态；SWAR 成对转换机会在 scalar 量化路径（qr_e4m3_scalar），
+B2 已数过（9.05ms，优先级低）。
+
+**账本 4（per-pass 计时）**：GIANT 梯已存在（bench_v4full 的 stop 梯 + QKV parts：
+P0=0.22 Q=1.24 K=0.19 V=0.17，scores=1.41 attnV=0.62 outproj=0.53 store=0.43）。
+
+**下一步（按账本证据排序，写死）**：
+(1) 修 launch_resident 的 spill（数组→命名 temp/标量链），对照 spill_size 归零 + JUDGE；
+(2) 修好后 resident 核上热（撤 NR_RESIDENT_WB 门），用 703-SLM-load 供数结构 vs v4full 的
+    54+156 对比，决定 B5 各层融合核的 SLM 布局规范；
+(3) 再进 B5-1（QKV tail 折叠——注意 P5 证伪 nuance：tail 是 14ms butterfly 计算，
+    折叠必须连带把 butterfly 也 ESIMD 化且不与 dpas 循环串行）。
+
 ## 七、交接检查单（新窗口开工先读这些）
 
 1. 本蓝图全文 + 总蓝图 `notes/section100-blueprint.md` §7.5-7.6（★索引行在 7.5 头部）

@@ -1,0 +1,21 @@
+total kernels: 402; with spill/private/scratch: 17
+kernel                          grf simd   slmB  spillB  privB   scrB bar dpas
+sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZZ21xmx_rec_gemm_int8_qkvENKUlvE_clEvEUlS4_E_E::E  128   16      -       -   7680      -   - -
+wbres15launch_residentERN4sycl3_V15queueEPKvbPKNS1_6detail9half_impl4halfESA_PvPKfSD_SD_jjjjjjjbjPS8_ENKUlRNS1_7handlerEE_clESG_EUlNS1_7nd_itemILi1EEEE::_  128    8      -    4544   1792   8192   1 true
+sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZZN5ctree21cosine_norm_i8_kernelEvENKUlPKfPaPfjjS7_jE_clES7_S8_S9_jjS7_jEUlS4_E_E::E  128   16      -       -   5632      -   - -
+sycl3_V14itemILi1ELb1EEEE::_    128    8      -       -   3072      -   - -
+sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZZN5ctree18cosine_norm_kernelEvENKUlPKfPfjjS7_jE_clES7_S8_jjS7_jEUlS4_E_E::E  128    8      -       -   1280      -   - -
+sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZZ21xmx_rec_gemm_int8_qkvENKUlvE_clEvEUlS4_E1_E::E  128    8      -       -   1024      -   - -
+sycl3_V14itemILi1ELb1EEEE1::_   128    8      -       -   1024      -   - -
+ctree18cosine_norm_kernelEvENKUlPKfPfjjS1_jE_clES1_S2_jjS1_jEUlN4sycl3_V14itemILi1ELb1EEEE::_  128    8      -       -   1024      -   - -
+ctree21cosine_norm_i8_kernelEvENKUlPKfPaPfjjS1_jE_clES1_S2_S3_jjS1_jEUlN4sycl3_V14itemILi1ELb1EEEE::_  128    8      -       -   1024      -   - -
+sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZZ23xmx_rec_gemm_qkv_windowENKUlvE_clEvEUlS4_E_E::E  128    8      -       -    768      -   - -
+sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN7prepassL10pre_kernelENS5_7PreArgsEEUlS4_E_E::E  128    8      -       -    608      -   - -
+sycl3_V14itemILi1ELb1EEEE::_    128    8      -       -    512      -   - -
+sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZZN5f16v3L14gemm_resid_pubERNS0_5queueEPKNS1_9half_impl4halfESB_SB_PKfbSD_PS9_PfbiiijjjjjjSF_bSE_bbibENKUlRNS0_7handlerEE0_clESH_EUlS4_E_E::E  128    1      -       -      -    512   - true
+wbmega11launch_fullERN4sycl3_V15queueEPKvbPKNS1_6detail9half_impl4halfESA_PS8_PfPKfSE_SE_jjjjjjjbjSB_ENKUlRNS1_7handlerEE_clESG_EUlNS1_7nd_itemILi1EEEE::_  128    1  31744       -      -   2304   1 true
+ffncL9stem_megaERN4sycl3_V15queueEPKNS1_6detail9half_impl4halfES8_S8_S8_PKfPfiiENKUlRNS1_7handlerEE_clESD_EUlNS1_7nd_itemILi1EEEE::_  128    1  65536       -      -   1024   1 true
+ffncL15launch_ffn_chipILi16EEEN4sycl3_V15eventERNS2_5queueEPKNS2_6detail9half_impl4halfESA_SA_PfiiPKfSD_ENKUlRNS2_7handlerEE_clESF_EUlNS2_7nd_itemILi1EEEE::_  128    1  32768       -      -   1312   1 true
+ffncL15launch_ffn_chipILi32EEEN4sycl3_V15eventERNS2_5queueEPKNS2_6detail9half_impl4halfESA_SA_PfiiPKfSD_ENKUlRNS2_7handlerEE_clESF_EUlNS2_7nd_itemILi1EEEE::_  128    1  65536       -      -   1312   1 true
+
+=== biggest 15 kernels (instr count from earlier) ===
