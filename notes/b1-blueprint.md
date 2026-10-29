@@ -349,7 +349,19 @@ host 线并行另案（不碰 GPU 数值，风险最低肉最大）→ B3 视 B2
          （a0/a1 两条满 128-half 消息）；窗口只有 64 行 ⇒ 每窗最多 4 subgroup
          =v4 的 4x16 就是 **SIMD16 栈上的唯一满载几何**。前辈的 8x8 行是
          SIMD8x32lane（8 行 x 4 lane 的 A 消息满载）的产物，**不可移植**。
-         ⇒ v4 几何=已是最优适配；v6/v5 线**全线关闭**（雷 #6 定案）。
+         ⇒ v4 几何=已是最优适配；v6/v5 线**关闭**（雷 #6 定案）。
+     (W2c) **★ 诚实的残余卡（未打的最后一张几何牌，EV 明码标价）**：
+         giants 测的 v6 带 **idle-lane 浪费**（epilogue lane8-15 空转——SIMD16
+         指令照发 16 条 lane，半退休=elementwise 发射功 x2）。真 v6.1（4-lane
+         树全 16 lane 活）没测过。但两个理由说它 EV 低：
+         ① 补 idle-lane 只消掉 ~1.6x 里的一宗罪，**另一宗=B-操作数
+           (weights) 被 8 个 subgroup 重复载 = 2x SLM 读**（tile8h 每 sg 都
+           载全套 B；v4 4 sg 只载一半的量）——这是 8-sg 几何的结构性代价；
+         ② fill 探针说延迟余量已由 2 WG/SM 提供（80%% 吸收），链深减半的
+           红利早被 v4 吃到。两罪消一罪 + 结构代价仍在 ⇒ **v6.1 大概率
+           打平 v4，不是 -22ms**。若下窗口非要打几何牌，先 bench_v6 里
+           给 epilogue 换 4-lane 树（~80 行改动，JUDGE 现成）再跑同一
+           giants 对照——一小时出判决，不许先写真库。
      (W3=新钉) **v6 的正确构成**（= v5-WIP 几何 + v4 的教训全叠上）：
          * LW=128、8 subgroup x 8 行（dpas 满条，W2 否证后此几何无障碍）；
          * **blade-2 两段式** QKV（phase1 三 part dpas+store 全做、1 barrier、
@@ -382,4 +394,8 @@ host 线并行另案（不碰 GPU 数值，风险最低肉最大）→ B3 视 B2
    它的失败机制已在 §六.6-10 W2 推导清楚：dpas 半载+idle lanes）
 4b. v6 开工必读 = §六.6-10 的 v6 设计 + 两条警告 W1/W2 + 方案 A/B 对拍第一步
 5. 当日流水：E:/WorkBuddy/2026-10-25-22-59-21/.workbuddy/memory/2026-10-28.md（全文精读）
-6. 下一步 = §四 v5a（shuffle epilogue，设计论证已在 §二）
+6. 下一步（09:3x 定案）= **v5/v6 几何线已关**（W2''/W2c giants 1.60x 判决）。
+   剩余选项按 EV 排序：(1) v6.1 4-lane 树一小时快判（低 EV，见 W2c）；
+   (2) wblock 微脂（V-scatter 跨 lane 配对=transpose 问题、softmax 链=golden 门）；
+   (3) 接受 ~112 为 dpas/SYCL 栈的当前终点（前辈 48-62 是 coopmat/Vulkan 栈的
+   产物——**架构差不是懒惰差**，§六.6-10 诚实墙）。用户裁决点=要不要打 (1)。
