@@ -31,6 +31,7 @@
 #include "qkv_resident.hpp"
 #include "ffn_chip_kernel.hpp"
 #include "wa_res_kernel.hpp"
+#include "lfw_res_kernel.hpp"
 #include "requant_kernel.hpp"
 #include "gemm_s8_v1_kernel.hpp"
 #include "gemm_s8_v3_kernel.hpp"
@@ -215,6 +216,28 @@ static const float* vit_recip_tab() {
     return tab;
 }
 static bool qfuse_on() { static bool v = !getenv("NR_Q_FUSE") || atoi(getenv("NR_Q_FUSE")) != 0; return v; }
+
+// B5-5b SLICE 1 (lfw = layer-fused qkv+window-attention): the qkv recorder (guard:
+// non-vit, C==64, heads==2, tokens==64, M%64==0) stashes its packed operands in a
+// process-static scratch and marks the stash; the NEXT window_attention recorder
+// (same q/k/v buffer ids, merged, bias) consumes it with ONE lfw::launch_lfw kernel
+// (qkv gemm + v5a tail + attention stages, planes 1274/75/76 never exist). If the
+// pairing never completes, the stash is simply overwritten (no leak, no launch).
+struct LfwStash {
+    bool valid = false;        // set by a guarded qkv record
+    bool confirmed = false;    // set when the NEXT wa record pairs with it
+    int q = -1, k = -1, v = -1;   // the qkv TARGET buffer ids (wa's q/k/v must match)
+    int a = -1, b = -1;           // qkv operand ids (b = weight for cached_pack_b_i8)
+    const float *as = nullptr, *bs = nullptr, *qs = nullptr;   // qkv scale pointers
+    const int8_t* Araw = nullptr; // qkv raw A (the non-fused pack form)
+    const int8_t* Braw = nullptr; // qkv raw weight (the cache-fill pack_b at run time)
+    bool fq = false; QuantFused qfq;   // the fused gather-pack form (image source)
+    unsigned M = 0, Mp = 0, C = 64u, heads = 2u, tokens = 64u;
+    size_t qcmd = 0;
+};
+static LfwStash g_lfw;
+static int8_t* lfw_scratch_a = nullptr;   // device: max Mp*C int8 (~2.3MB, 4MB cap)
+static bool lfw_on() { static bool v = getenv("NR_LFW_FUSE") != nullptr && atoi(getenv("NR_LFW_FUSE")) != 0; return v; }   // B5-5b SLICE1: bench_lfw 8/8 EXACT + walk 1301 EXACT, but FRAME A/B 3/4 slightly NEG (+0.5: 510 WG x NT16 serializes qkv+attn per WG vs the split chain's 768+1020 WG parallelism). NOT promoted; slice 2 = per-(window,head) WG at BN=32 (1020 WGs, disjoint plane slices) -- analysis banked in 6.15. Probe: NR_LFW_FUSE=1.
 // called by a gemm recorder: if `a` is a fused-quant pk whose scale buf == this gemm's
 // a_scale and whose M,K match, no-op the quant closure and return its info.
 static bool qfuse_take(int a, int a_scale, unsigned M, unsigned K, QuantFused& out){
@@ -2510,6 +2533,21 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
         flop_note("int8_qkv",M,3u*channels,channels,1);
         if (getenv("NR_SHAPE_DUMP")) { static long qv=0,qnv=0; if(flags&0x2000u) qv++; else qnv++;
             std::printf("[qkv-vit] vit=%ld nonvit=%ld (running)\n", qv, qnv); }
+    // B5-5b SLICE 1 (lfw, record-time pairing like the P2 take mechanism): a guarded
+    // qkv STASHES its record info; if the NEXT window_attention (same q/k/v ids,
+    // merged, bias, batches == M/64*heads) consumes it, the qkv closure is REPLACED
+    // by a no-op and the wa closure runs pack + lfw::launch_lfw as ONE kernel --
+    // planes 1274/1275/1276 and the wa launch AND the qkv gemm/tail launches all
+    // dissolve into one resident launch. Unpaired stashes are harmless (the qkv
+    // closure runs as-is).
+    const bool lfw_guard = lfw_on() && !vit && C == 64u && heads == 2u && tokens == 64u && (M % 64u) == 0u
+        && !(getenv("NR_QKV_STOP") && atoi(getenv("NR_QKV_STOP")) != 0);
+    size_t myqcmd = g_cmds.size();
+    if (lfw_guard) { g_lfw = LfwStash{}; g_lfw.valid = true; g_lfw.q = q; g_lfw.k = k; g_lfw.v = v;
+        g_lfw.a = a; g_lfw.b = b; g_lfw.as = as; g_lfw.bs = bs; g_lfw.qs = qs;
+        g_lfw.Araw = Araw; g_lfw.Braw = Braw; g_lfw.fq = fused_q; g_lfw.qfq = qfq;
+        g_lfw.M = M; g_lfw.Mp = Mp; g_lfw.C = C; g_lfw.heads = heads; g_lfw.tokens = tokens; g_lfw.qcmd = myqcmd;
+        if (getenv("NR_LFW_DBG")) std::printf("[lfw] guard STASH q=%d k=%d v=%d M=%u\n", q, k, v, M); }
     g_cmds.push_back([=]() {
         // device pack (section 92): Araw/Braw already on device -- pack in place.
         int8_t* dAp = (int8_t*)pool_get(na);
@@ -3449,6 +3487,45 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
     const size_t ctx_elems = (size_t)batches * 64u * 32u;  // attnV context
     g_cmd_names.push_back(__func__);
         flop_note("winattn_scores",64u,64u,32u,batches); flop_note("winattn_attnv",64u,32u,64u,batches);
+    // B5-5b SLICE 1 pairing (P2 take mechanism, record-time): a STASHED guarded qkv
+    // whose target ids == this wa's q/k/v ids, same heads, windows*64 == qkv M, bias
+    // present, adjacency (<=4 cmd gap: init records sit between) -> the qkv closure
+    // no-ops and THIS closure becomes pack + ONE lfw::launch_lfw (qkv gemm + v5a
+    // tail + attention stages resident; planes 1274/75/76 never exist, the wa
+    // operand gathers and both gemm launches collapse into one kernel).
+    size_t mywacmd = g_cmds.size();
+    const bool lfw_pair = lfw_on() && g_lfw.valid && !g_lfw.confirmed &&
+        q == g_lfw.q && k == g_lfw.k && v == g_lfw.v && heads == g_lfw.heads &&
+        64u == g_lfw.tokens && windows * 64u == g_lfw.M && Bp != nullptr &&
+        (mywacmd - g_lfw.qcmd) <= 4 &&
+        !(getenv("NR_WA_STOP") && atoi(getenv("NR_WA_STOP")) != 0);
+    if (lfw_pair) {
+        if (getenv("NR_LFW_DBG")) std::printf("[lfw] PAIRED windows=%u M=%u qcmd=%zu wacmd=%zu\n", windows, g_lfw.M, g_lfw.qcmd, mywacmd);
+        g_lfw.confirmed = true;
+        g_cmds[g_lfw.qcmd] = [](){};
+        g_cmd_names[g_lfw.qcmd] = "int8_qkv(LFW-fused)";
+        LfwStash S = g_lfw;
+        const size_t na = (size_t)S.Mp * S.C;
+        sycl::half* OutH = (sycl::half*)Out;
+        const float* biasp = Bp;
+        g_cmds.push_back([=]() {
+            int8_t* dAp = (int8_t*)pool_get(na);
+            if (S.fq) {
+                auto itsrc = g_bufs.find(S.qfq.src);
+                if (itsrc == g_bufs.end()) throw std::runtime_error("lfw fused-gather: image src not live");
+                packdev::pack_a_fused_gather(*GQ, (const sycl::half*)itsrc->second.p, dAp,
+                    (float*)S.as, (int)S.M, (int)S.Mp, (int)S.C, S.qfq.image_h, S.qfq.image_w, S.qfq.across, S.qfq.pad);
+            } else
+                packdev::pack_a(*GQ, S.Araw, dAp, (int)S.M, (int)S.Mp, (int)S.C);
+            // the qkv closure no-ops under the pair, so the weight-cache fill moves
+            // HERE (Braw from the stash; cached_pack_b_i8 packs once, reuses after).
+            int8_t* dBp = cached_pack_b_i8(S.b, S.Braw, (int)(3u * S.C), (int)S.C);
+            lfw::launch_lfw(*GQ, dAp, dBp, OutH, S.as, S.bs, S.qs, biasp, windows,
+                            (sycl::half*)Q, (sycl::half*)Kk, (sycl::half*)V);
+            pool_put(dAp);
+        });
+        return 0;
+    }
     g_cmds.push_back([=]() {
         // NR_WA_STOP=9 (section 100 P7 game-path ledger, time-only DIAGNOSTIC: the
         // frame output is garbage here by design -- same convention as NR_QKV_STOP

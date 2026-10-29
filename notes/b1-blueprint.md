@@ -839,3 +839,34 @@ select/join 群，不是 pub。softmax 的 64 步顺序 ef_add = golden 序不�
 **我们 76.9 的差距比之前算的更大、更没有硬件借口**——用户判词"弹药相同硬件占优还输"
 在笔记本 3080 事实下更强成立。这把 B5-5b + 供数寻址战从"追平"抬到"应当碾压"，
 优先级再上调。已入流水。
+
+## 六.十五、B5-5b SLICE 1（lfw=qkv+wa 每窗口一核）：已建通、仪器全绿、帧账负、退回探针（21:5x-22:2x）
+
+**用户的批评成立**：我写 lfw 核时凭 qres/wa_res 源码镜像推几何，没先读归档
+（refs/a770-skill + notes/dpas-resident-findings.md）。归档里两条直接命中：
+① §96 探针矩阵（plain kernel 里 SLM-fed dpas 静默归零；ESIMD nd_range + global
+scratch + group_barrier 才安全——我的核是 SYCL_ESIMD_KERNEL+slm_init，属已证安全类）；
+② **wa_res 头注释里就写着"WA_KT 2KB sizing OVERLAPPED QT = 半行错，gate 抓的"**
+——我犯的正是同族坑。教训：写新核前先把归档 notes 的坑名单过一遍（已在做，这次没做够）。
+
+**做了什么**：lfw_res_kernel.hpp（qkv gemm BM64/NT16 + v5a tail + blade-7 宽消息
+tile gather + wa_res stages1-3 全在一个 WG=一 window）+ recorder P2 式配对
+（stash→confirm→qkv 闭包 no-op→wa 闭包跑 pack+launch_lfw）+ **bench_lfw.cpp 仪器**
+（对照=qres 出 planes + wa_res 消费——wa_res 转正同款纪律）。
+**调试完全靠仪器**：首跑 planes 全 EXACT（NT16 新几何对）、Out head-1 全错 →
+一眼定位 SLM 区尺寸（每 tile 区要 2×4KB=8KB，我照 wa_res 的 4KB 抄——它的 WG 只
+装一头，我的装两头）→ 修 QT/KT/VT=32768/40960/49152、SLMB=57344（56KB，还在
+64KB 桶=v4full/wa_res 同桶不损驻留）→ **bench_lfw 8/8 EXACT（两帧形状 planes+Out）**
++ 全门绿 + walk 1301 EXACT。
+
+**帧判决（诚实）**：交错 A/B 4 对 = 3 负 1 正（+0.5 均值，带内偏负）。根因=
+**WG 并行度**：融合核 510-558 个 WG 串行走 qkv+attention 全链 vs split 链
+768(qkv)+1020(wa) 个 WG 的 GPU 级并行——cgraph 下 split 的两核还能互相重叠。
+**SLICE 1 不转正**（默认 OFF，NR_LFW_FUSE=1 探针保留，代码在树里是已证仪器资产）。
+
+**SLICE 2 定案（下刀形已想清）**：WG=一 (window,head) batch（1020-1116 WG，并行度
+与 split 持平），qkv gemm 只算该 head 的 BN=32 列带（dpas 半宽=损失 1/2 tile 效率，
+但 plane 写只写自己 head 的 slice=与 wa_res 的 batch 语义天然对齐），tail 用 v5a 树
+（32 列正好=一棵）。预期：并行度不再输 split，省下的=1 launch + QK plane 的
+gather 重读（1274/75 只在 fused 内存在；1276 V-plane 保留给下游 batched2 读=半消）。
+bench_lfw 仪器已就位（改 reference 链即可对拍），pad 层雷不变。
