@@ -2021,7 +2021,7 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
         const bool v2_ok = gv2 && (M > 0u) && ((N % 32u) == 0u) && ((K % 16u) == 0u);
         int Mp2 = v2_ok ? (int)(((M + 63u) / 64u) * 64u) : Mp;
         sycl::half* dAp = (sycl::half*)pool_get(nb * (size_t)Mp2 * K * 2);
-        float* dC = (float*)pool_get(nb * (size_t)Mp2 * N * 4);
+        float* dC = nullptr;   // B5-2: allocated ONLY on the split escape path now
         static int gst2 = getenv("NR_G_STOP") ? atoi(getenv("NR_G_STOP")) : 0;
         if (gst2 != 2)   // stop1/stop3 run the pack; stop2 = floor only
         packdev::gather_pack_a16_b(*GQ, Araw, dAp, (int)M, Mp2, (int)K, (int)lda_e, sa, oa, (int)nb);
@@ -2042,13 +2042,21 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
         // the publish loop's map VERBATIM, vector pub proven, epi2 on the scalar form).
         // Guards: ldc==N (the frame's every call; the compact N=16/ldc=4 form stays on
         // the split path), gst==0. Escape NR_G_FOLD=0.
-        static bool gfold = getenv("NR_G_FOLD") && atoi(getenv("NR_G_FOLD")) != 0;   // P12b NEUTRAL (3-pair A/B mixed at the mean): dC here is 0.5MB/call HOT in L2 -- the fold recovers only the launch + L2-hit reads. OFF by measurement (39 GREEN + end-to-end 100%% x2 gfb1/gfb2 prove correctness; kernel stays in-tree).
+        // B5-2 (2026-10-29, the user's "eliminate the dC round-trip, no exceptions"):
+        // the fold is now the DEFAULT -- the P12b "NEUTRAL" verdict was measured against
+        // the OLD frame (and the frame ledger now says this family is the biggest
+        // remaining round-trip payer at 84 calls); the round-trip itself is what the
+        // order targets. dC is NOT ALLOCATED on the fold path at all (zero new cost:
+        // the fold REMOVES the dC write + read + the publish launch). compact (2 calls,
+        // N=16/ldc=4 head form) stays split -- its dC is 8KB, allocated lazily below.
+        static bool gfold = !getenv("NR_G_FOLD") || atoi(getenv("NR_G_FOLD")) != 0;
         if (gfold && gst == 0 && ldc_e == N && !compact) {
             f16v1::gemm_b_pub_f16(*GQ, dAp, dBp, Cout, (int)M, Mp2, (int)N, (int)K, (int)nb,
                                   epi, narrow, oc, sc, ldc_e, lda_e);
-            pool_put(dAp); pool_put(dC);   // dC stays pooled (unused on this path)
+            pool_put(dAp);   // dC never existed on this path
             return;
         }
+        if (!dC) dC = (float*)pool_get(nb * (size_t)Mp2 * N * 4);   // split/compact path only
         if (gst != 1 && gst != 2) {
         if (v2_ok && (N % 64u) == 0u)      f16v2::gemm_b2<64>(*GQ, dAp, dBp, dC, Mp2, (int)N, (int)K, (int)nb);
         else if (v2_ok)                    f16v2::gemm_b2<32>(*GQ, dAp, dBp, dC, Mp2, (int)N, (int)K, (int)nb);
