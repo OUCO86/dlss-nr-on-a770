@@ -2957,9 +2957,9 @@ int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
     g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         float* dScores = (float*)pool_get(sc * 4);
-        sycl::half* dProbs = (sycl::half*)pool_get(sc * 2);
+        sycl::half* dProbs = nullptr;   // B5-4: split-escape only (allocated below)
         float* dRecip = (float*)pool_get((size_t)heads * rows * 4);
-        float* dCtx = (float*)pool_get(cx * 4);
+        // B5-4: dCtx moved to the split branch below (never allocated on the fold path).
         const int Mp = (int)(((rows + 15u) / 16u) * 16u);   // rows%16==0 (guard) => Mp==rows
         // batched device pack + batched gemm (section 92): Q/Kk/V are contiguous per head
         // on device (h*rows*32), dScores at h*rows*rows, dCtx at h*rows*32 -- the same
@@ -2984,6 +2984,7 @@ int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
             GQ->parallel_for(sycl::range((size_t)heads * rows),
                              smax::vit_softmax_tiled()(dScores, dAp, dRecip, heads * rows, tokens, rows));
         } else {
+            dProbs = (sycl::half*)pool_get(sc * 2);   // split escape only
             GQ->parallel_for(sycl::range((size_t)heads * rows),
                              smax::vit_softmax_kernel()(dScores, dProbs, dRecip, heads * rows, tokens, rows));
             // attnV leg: P(rows x rows) @ V(rows x 32) -> rows x 32. V stored (rows,32)=(K,N).
@@ -2997,11 +2998,17 @@ int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
         // is the merge pass's EXACT op order (each stage its own ESIMD instruction,
         // no contraction). Guard: Mp==rows (the recorder pads Mp=ceil16(rows);
         // in-frame rows%16==0). Escape NR_GA_MERGE=0.
-        static bool gam = getenv("NR_GA_MERGE") && atoi(getenv("NR_GA_MERGE")) != 0;   // P9-twin NEUTRAL in the 3-pair A/B (155-158 vs 156-159): the global_attention family is only ~12ms and its dCtx is small; the fold is correct (100.0000%% x2, p9t1/p9t2) but stays OFF by measurement.
+        // B5-4 (2026-10-29, the user's "eliminate EVERY dC round-trip"): the fold is
+        // now the DEFAULT. The P9-twin "NEUTRAL" was a timing call on the old frame;
+        // the order is structural -- dCtx's write+read must not exist. dCtx is NOT
+        // ALLOCATED on the fold path (zero new buffers, one launch fewer).
+        static bool gam = !getenv("NR_GA_MERGE") || atoi(getenv("NR_GA_MERGE")) != 0;
+        float* dCtx = nullptr;
         pool_put(dAq); pool_put(dBk); pool_put(dAp); pool_put(dBv);
         if (gam && Mp == (int)rows && (rows % 16u) == 0u) {
             f16v1::gemm_b_merge_scale(*GQ, dAp, dBv, (sycl::half*)M, dRecip, Mp, 32, (int)rows, (int)heads);
         } else {
+        dCtx = (float*)pool_get(cx * 4);   // split path only
         f16v1::gemm_b(*GQ, dAp, dBv, dCtx, Mp, 32, (int)rows, (int)heads);
         // merge_heads_scale: (1,rows,heads*32) with scale=reciprocal (heads*rows), e4m3, half
         GQ->parallel_for(sycl::range((size_t)rows * CH), [=](sycl::item<1> it) {
@@ -3012,7 +3019,7 @@ int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
             ((sycl::half*)M)[index] = sycl::half(qr_e4m3(value));
         });
         }   // P9-twin gate
-        pool_put(dScores); pool_put(dProbs); pool_put(dRecip); pool_put(dCtx);
+        pool_put(dScores); pool_put(dProbs); pool_put(dRecip); if (dCtx) pool_put(dCtx);
     });
     return 0;
 }
