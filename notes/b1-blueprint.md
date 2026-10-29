@@ -661,18 +661,46 @@ mega 的剩余 scratch（2304B）**全是可修的标量数组**（wf[64]/proj[3
 - ⚠ 旧模型修正：§一 锁的"~400GF fp16"是**我们核的实测吞吐**，不是硬件峰值；
   峰值=137TF（XMX FP16）。两数并存不矛盾，引用时注明是哪个。
 
+**链路健康自查（军规⑥要求，14:0x，防 B5 走歪——用户点名"别改着改着变不健康链路"）**：
+- 结构证据：blade-3 后 nr_replay_now 仍是 **691 passes**（与基线逐 pass 同构），
+  端到端 1301 字节全等 ⇒ 只改了热核内部 store 宽度，**没动任何拓扑**。
+- **B5 用词澄清（钉死，下窗口不许再歧义）**：B5 的 "resident 融合" = 军规④前辈判词原文的
+  "片上 SLM staging、中间量不出 global、quant 折进生产者 store"——**几何必须是 v4full 的
+  宽-M ESIMD（LW=64 全载 tile8s/tile8ss，军规①）**。coopmat 血统的三个核（wbres/wbmega/
+  launch_full）已帧 A/B 判死（657/575/127ms），**任何窗口不得以"resident"名义复活它们**。
+- 军规②红线再抄一遍：B5-1 把 quant/norm 折进 gemm epilogue 时，**数值形态必须 VERBATIM
+  现路**（qr_e4m3 链、sum 顺序、eh 步各自命名 temp——P11 教训）；要改形态先过 numpy golden
+  考古，过不了就地死刑。
+- 军规⑤判据在 B5 上的具体化：融合刀的判据 = **家族边际**（§7.4 第 12 条：隔离 bench 赢
+  必须边际确认；cgraph 重叠吸收 15ms 的实锤在 §7.5-5）——每刀先跑 NR_Q_STOP=8/9 式
+  停点探针定边际，再帧 A/B 十对。
+- 部署链当前位：**ec147ecb**（blade-3，游戏画面验收=下次开机用户确认；回退=libxmx_v5c.dll
+  即 52f2a0c4 在 oneapi/ 原位）。
+
 ## 七、交接检查单（新窗口开工先读这些）
 
-1. 本蓝图全文 + 总蓝图 `notes/section100-blueprint.md` §7.5-7.6（★索引行在 7.5 头部）
-2. 分支状态：`b1-wblock-resident`（origin），tip=本提交；部署 md5=**8ad560c2**
-   （blade-1+2，游戏画面已验收 OK）；主分支 healthy-chain-resident-opt tip=12fb8f5 之前
-3. bench 验收尺 = bench_v4full（7 区 JUDGE + PURE-LADDER + fill 探针 + part0 微梯）
+1. 本蓝图全文 + 总蓝图 `notes/section100-blueprint.md` §八军规原文 + §7.4-7.6（补条与账本）
+   + **§六.八 ISA 账本与 §6.8-首刀/blade-3 + §六.九 硬件对照账（10-29 新增，必读）**
+2. 分支状态：`b1-wblock-resident`（origin tip=本提交）；**部署 md5=ec147ecb**（blade-3，
+   691 passes 拓扑未动，1301 端到端 EXACT；游戏画面验收=下次开机确认）；
+   回退位=oneapi/libxmx_v5c.dll（52f2a0c4，blade-1+2+v5a/v5c，游戏画面已验收 OK）
+3. bench 验收尺 = bench_v4full（7 区 JUDGE + PURE-LADDER + fill 探针 + part0 微梯 + GIANT 梯）
+3b. **帧尺 = oneapi/nr_replay_now.exe <dll路径>**（run0..3 打印 ms/691 passes；
+   NR_DUMP_OUT=<前缀> 产 .1301.bin 对 bk.1301.bin；env off 必须 unset 不能置空串）
+3c. **ISA 回路 = kdis/spillcheck.py <AOT-exe> <outdir>**（grf/simd/slm/spill/scratch 账）
+   + census.py/gapmap.py/loopmix.py/density.py；AOT 配方在 §六.八（gen 管线只在链接跑）
 4. WIP 封存：src/bench/sycl/bench_v5_WIP.cpp.txt（8×8 naive，勿复活——
    它的失败机制已在 §六.6-10 W2 推导清楚：dpas 半载+idle lanes）
 4b. v6 开工必读 = §六.6-10 的 v6 设计 + 两条警告 W1/W2 + 方案 A/B 对拍第一步
-5. 当日流水：E:/WorkBuddy/2026-10-25-22-59-21/.workbuddy/memory/2026-10-28.md（全文精读）
-6. 下一步（09:3x 定案）= **v5/v6 几何线已关**（W2''/W2c giants 1.60x 判决）。
-   剩余选项按 EV 排序：(1) v6.1 4-lane 树一小时快判（低 EV，见 W2c）；
-   (2) wblock 微脂（V-scatter 跨 lane 配对=transpose 问题、softmax 链=golden 门）；
-   (3) 接受 ~112 为 dpas/SYCL 栈的当前终点（前辈 48-62 是 coopmat/Vulkan 栈的
-   产物——**架构差不是懒惰差**，§六.6-10 诚实墙）。用户裁决点=要不要打 (1)。
+5. 当日流水：E:/WorkBuddy/2026-10-25-22-59-21/.workbuddy/memory/2026-10-29.md（全文精读）
+6. 下一步（14:0x 定案，与 §六.6 B2 判决对齐——**NR_Q_FUSE 早已默认开（P2 288/448 溶解），
+   take_b 两次判死，B2 已降级"~2-3ms 残肉+高手术成本"，别再拿它当大肉画饼**）：
+   (1) **B5-1 = qkv 家族（帧账 27.6ms，未被 B2 判决覆盖）**：先给 qkv_norm_scatter_esimd
+       本体上 v5a 式 4-lane 向量 butterfly 树（纯 kernel 内形态，不碰拓扑；⚠ "连续 item"
+       v2 形态已两次帧死 127 vs 113，勿再走）→ 立 NR_QKV_STOP 边际探针定刀值 → 三关+帧 A/B；
+   (2) **B3 = wblock 指令数战（v4full 自家几何，blade-3 是第一刀已定型 QKV staging）**：
+       gapmap 还剩 scores 段 16×d64x8t、attnV/outproj 段 store16s 群没砍；
+       mov=875/体的构成继续拆（loopmix 已入库）；每刀 JUDGE+边际+帧 A/B；
+   (3) B2 残肉（生产者内嵌 -2ms 上限）排最后，动 5 个 gemm 族 epilogue 的成本高，
+       等 (1)(2) 出账后再裁决。
+   ~~接受 ~112 为终点~~（永久作废，用户 10-28 判决 + §六.九 硬件账双重死刑）。
