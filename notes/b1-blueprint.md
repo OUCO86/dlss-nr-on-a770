@@ -158,7 +158,7 @@ simd<float,32> 而非 64×2）、epilogue 无 scr 往返（norm 走 shuffle、e4
 |---|---|---|---|---|---|
 | **quant B2** | 11.5ms | 1.64ms（=7x，最大倍数） | ~9ms | 折叠进生产 gemm epilogue（P2 已证半条路：288/448 已溶） | **-7~9ms** |
 | **wblock B1(v5a-c)** | 25.9 | ~9.7（290ns×折算） | 2.7x | shuffle/vector epilogue + barrier 审计（本蓝图） | **-4~6ms** |
-| **wblock B3（指令数）** | ~420ns（v5 后） | 290ns | 1.45x | 更大 tile/tc 合并/SIMD32 新地形——**未探，单独立项** | 再 -6~8ms（不确定） |
+| **wblock B3（几何/链数）** | 497ns（giants 实测） | 290ns | 1.70x | **已否证关闭**：dpas@SIMD16 满载只允许 16 行/sg=v4 几何；8x8 移植 giants 1.60x 慢（W2''）| **无**（此轴已死）|
 | **ffn/giants** | 17+16.6 | ffn 5.6×折算 | ~2x | P8-l/m 已收两轮；giants split 对拍未做 | -3~5ms |
 | **host/提交线** | 未动 | 前辈自己账：50-34.6=**15.4ms 不在设备上** | — | daemon 流水化（前辈 notes 提过 NR_DAEMON_PIPELINE，从未与 async 分开量过） | **-10ms 级潜力，零 GPU 风险** |
 
@@ -310,7 +310,7 @@ host 线并行另案（不碰 GPU 数值，风险最低肉最大）→ B3 视 B2
      线程/SM；我们 LW=64 + 45KB SLM ⇒ **1 WG/SM = 64 线程/SM**——延迟绑定
      核（fill 探针）没有链可换。v5-WIP 双输里 60KB=1WG/SM 是主症、idle-lane
      是表症。
-   - **★ v6 正式设计（前辈几何的 SIMD16 正确移植 = B3 主刀）**：
+   - **✖ v6 设计（已执行并全线否证，见 W2''——保留原文供考古）**：
      * LW=128 = 8 subgroup x 16 lane x 8 行/subgroup（前辈的行账）；
      * **epilogue = 前辈的 4-lane x 8-channel 树**：每行 4 lane（lane l:
        row=sg*8+(l>>2)、ch=(l&3)*8..+7），行归约 2 次 shuffleXor(2)/(1)
@@ -336,13 +336,20 @@ host 线并行另案（不碰 GPU 数值，风险最低肉最大）→ B3 视 B2
          a1=rows8-15）。v5-WIP 的 tile8h 载的也是同样的 128-half 满条
          ⇒ **dpas 半载不存在**；"方案 A（两 subgroup 拼 16 行 tile）"
          解决的是不存在的问题，作废。
-     (W2') **v5-WIP 慢的真因（复核后重钉，这次有代码证据）**：
-         ① **barrier 结构**：v5-WIP 的 QKV 是旧式 per-part store->barrier->
-           reload->barrier = **6 个 subgroup barrier**；v4 经 blade-2 只剩 2 个。
-           fill 探针说延迟绑定 ⇒ barrier 差 4 个就是主罪（blade-2 实测 6->2
-           = +1.32ms 的外推）。
-         ② **epilogue idle-lane**（lane<8 半退休）——4-lane 树正是解药。
-         ③ 60KB SLM 在 128KB 桶下仍 2 WG/SM（60x2=120<=128），**不是**主症。
+     (W2') **v5-WIP 慢的真因（复核后重钉）**：①"6 个 barrier"说法**错**——
+         WIP 已是两段式（查代码证实，只剩 2 个）；③60KB SLM=2 WG/SM 不是主症。
+         ② **epilogue idle-lane（lane<8 半退休）= 唯一确认的结构缺陷**。
+     (W2'') **★ 决定性否证（09:3x，bench_v6 giants 数据点，一次跑拿的）**：
+         v6 核（=v5-WIP+stop6 dump 越界修复）在 **8160w GIANT 形状**
+         （grid 够大、占用不是借口：2 WG/SM x 128 线程 = 256 线程/SM > v4 的
+         128）**per-window 仍比 v4 慢 1.60x**（797 vs 497 ns/win；small 也 1.57x）。
+         ⇒ **8x8 行几何在 dpas/SIMD16 栈上是方向性死路**，不是"修 idle-lane
+         就活"——线程数翻倍、链深减半、barrier 已两段式，全都补上还是慢 1.6x。
+         根因（本轮想透，写死）：dpas<8,8>@SIMD16 要 **16 行/subgroup 才满载**
+         （a0/a1 两条满 128-half 消息）；窗口只有 64 行 ⇒ 每窗最多 4 subgroup
+         =v4 的 4x16 就是 **SIMD16 栈上的唯一满载几何**。前辈的 8x8 行是
+         SIMD8x32lane（8 行 x 4 lane 的 A 消息满载）的产物，**不可移植**。
+         ⇒ v4 几何=已是最优适配；v6/v5 线**全线关闭**（雷 #6 定案）。
      (W3=新钉) **v6 的正确构成**（= v5-WIP 几何 + v4 的教训全叠上）：
          * LW=128、8 subgroup x 8 行（dpas 满条，W2 否证后此几何无障碍）；
          * **blade-2 两段式** QKV（phase1 三 part dpas+store 全做、1 barrier、
