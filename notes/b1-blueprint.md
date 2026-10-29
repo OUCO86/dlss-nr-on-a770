@@ -590,6 +590,24 @@ walk_plan.py 的 sigs 断言是 json(31 压缩表) vs .c(55 全枚举) 索引错
 ⇒ 攻击面 = epilogue staging 的 SLM 往返与 mov 群（QKV 段 1.61ms、scores 段 1.41ms 的
 giants 微梯已定位），不是 dpas 载重本身。
 
+**★ density.py 全链普查（13:1x，"38x 差距"的指令级铁证）**：热家族 kernel 的 dpas 密度
+（dpas 条数 / 静态指令总数）：**v4full=4.1%，gemm_b 族=0.1-0.7%，ffn 族=1.1-4.1%，
+wa_res=1.0%**；TOP30 合计 57400 条指令里只有 381 条 dpas = **0.7%**。
+⇒ 我们 1-2% 的 TC 利用率不是测速口径，是**指令构成**：每 1 条矩阵指令配 ~24-100 条
+搬运/标量指令（movish 占 33-47%）。lmxxf 的核是 fragment 直喂 TC，这个比值倒过来。
+**这坐实了 §六.九 的三条成因之②，也判死了"指令削减 2% 刀能追平"——密度差是 1-2 个数量级，
+只有 launch 塌缩（把 55 次 wblock + 每 call 的 pack/gemm/tail 三段融成一个 resident 核、
+让中间量留在片上）能把分母的搬运项整体消掉。**
+
+**blade-3 实测判决（13:5x，热路径第一刀，提交 d38ed4c，新 dll=ec147ecb）**：
+QKV phase-1 的 32 条 `store.slm.d64x8t`/part → 合并同行左右半成 `simd<float,32>` 单 store
+（96→48 条/call，构造性位精确）。三关全过（gate 绿 / 端到端 100%×2 vs bk.1301.bin + 确定性 0 /
+bench 尺 A/B **5/5 W，FULL 1.112→1.093 -1.9%**）。但**帧 A/B 5 对 vs 52f2a0c4：
+均值 -0.17ms，落在 ±1ms 噪声带=帧级中性**。按 P8-k 军规保留（无负收益）。
+⇒ **诚实结论（写给下一个窗口，也是给用户的直话）**：单 kernel 指令削减在帧级被摊薄
+（wblock 42ms ÷ ~55 call = -0.02ms/call 清不出噪声）。**112→20 不可能靠 blade 级微脂，
+必须打 launch 塌缩。blade-3 保留是为 B5 重写时这些 store 已经是最优形态，不返工。**
+
 **spill 天花板的架构结论（11:5x，重要）**：resident 修完所有标量数组后 spill 仍 2400B≠0，
 因为剩余 4 处是 `jm::joint_matrix<...layout::dynamic> acc[4]/context[4]/projected[4]`
 ——**coopmat 动态布局碎片是结构性 spill，编译器无法 SROA**（j 虽是编译期循环，但
