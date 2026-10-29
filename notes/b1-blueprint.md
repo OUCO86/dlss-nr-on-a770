@@ -728,3 +728,42 @@ pack_a_fused_gather（**gather** 1270→dAp）。两者映射不同 ⇒ **dAp �
     ~90 行 kernel + fold-slot 接线）——消 qkv 的 120 发 gather pack（-6ms 级）；
 (b) 前辈真形 = 每层一个核（wres+qkv+wa 三合一），pack 腿整体不存在——大工程，
     建议先 (a) 后 (b)，(a) 的 gather-tiled store 机制就是 (b) 的积木。
+
+## 六.十一、B5-1..4 完整性审计 + B5-5 设计定案（17:4x，用户"不留返工尾巴"核查轮）
+
+**审计结论：dC 往返层已清，且与前辈形态同构**。逐刀边界（下次别当"没弄完"重挖）：
+1. B5-1 qres：guard `C%64==0 && NH==3C && heads==C/32` = 帧内 120/120 全覆盖（含 vit）。无尾巴。
+2. B5-2 gemm-f16 fold：82/84 覆盖。**唯一 dC 残留 = 2 发 compact（N=16/ldc=4 head 形）**：
+   gemm_b_pub_f16 的 BN=64 tile 几何装不下 N=16（tile 半空 = 违反军规①宽 tile），
+   dC 仅 32KB/call 且 L2 热。**裁决：保留 split 是几何正确，不是偷懒**——若将来
+   head 形改宽（N>=64 合并），此 2 发自动进 fold。别再为它写特化核。
+3. B5-3 chipres(epi0/!narrow guard)=帧内 ffn/stem/merge 全形状覆盖。无尾巴。
+4. B5-4 GA fold：rows%16==0 帧内全部满足。无尾巴。
+5. **幸存 160 发 quant 归因结案（今天新证）**：pk=1305/1312 是**引擎内部 scratch
+   （buffer 表只到 1301，1302+ = init/pre 家族的运行期内部缓冲）**，且 1305 被
+   batched144+residual104+qkv104+wres104+int8-32 **多消费者共享**——一个 pk 平面喂
+   5 族不同 (M,K) 视图 ⇒ tiled 直写满足不了所有消费者的 tile 布局（一个平面只能按
+   一种 K 切块）。**⇒ 这 160 发不是往返税，是共享输入平面本身；消它=改游戏侧缓冲
+   复用=plan/bridge 禁区。我写的 tiled-quant 变体核因此无接线点，已撤销不留死码**
+   （git checkout，树干净）。
+6. take_b 新结构下重测仍 -14ms ⇒ 消费者内嵌 quant **三连判死永久封**（§六.十）。
+
+**B5-5 设计定案（开工序写死，下窗口直接建，不再解剖）**：
+- 靶 = **每层 wres+wa 二合一**（104+104 发 → 104 发；wb 只有 20 发且已 resident，
+  二合一后再并入 = 前辈 window_block.comp 三合一形态）。
+- 几何对齐（已核）：wres WG = BM128×BN64 tile（N=64 层行完整在一个 WG ⇒ 行 peak
+  可在 epilogue 内算，无跨 WG）；wa WG = 1 window(batch) 64 tokens ⇒ **一个融合 WG
+  = 2 windows**（wres 的 128 行 = 2×64 token 行，行序 window*64+token 天然对上）。
+- SLM 预算（64KB 帽内）：wres operand 双缓冲 32KB + 行峰/scale 尾 2KB +
+  wa 的 Z(probs staging)——**复用 wres 的 dead operand 区**（qres 同款 aliasing，
+  B5-1 已证形态）：acc f32 落 SLM → wa scores gemm 直接吃（Q/K/V=acc tile 的
+  head 切片 = qkv 已折叠进 wres epilogue？不——qkv 的 B 是权重，A 是 1270：
+  正确链 = wres epilogue 顺手做 gather-tiled int8 直出 dAp（N=64 层行完整 ⇒ 可fold），
+  qkv 的 pack 腿与 1270 f16 plane 双双消失 → qkv gemm 的 acc 直接进 wa 的 SLM。
+- 预期（诚实）：消 1270 plane 往返（0.66GB/帧）+ 104 发 pack + 104 launch
+  = 帧内边际 **-7~10ms**（三族同删上限 24.7 里 gemm 计算本体 ~15 不随融合消失）。
+- 门 = 新 bench_layer_fused：split 链 (wres+qkv+wa) vs 融合核，Q/K/V/Out 逐字节对拍；
+  GEMM_WINDOW_INT8_RESIDUAL + INT8_QKV + WINDOW_ATTENTION 三门现成判官。
+- pad≠0 的 78 层 = 最大难点：out-of-bound 行 wres 现在 continue 跳过不写 1270，
+  融合核里这些行必须**照 gather-pack 语义写零行+scale 1.0**（不是跳过）——
+  这是当年 131/8192 同族坑，开工第一件事就是门里放 pad 层（416×236 那 12 层）。
