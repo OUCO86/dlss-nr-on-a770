@@ -4893,6 +4893,9 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
                 uint64_t kk = (uint64_t)(uintptr_t)a * 1000003ull + (uint64_t)M * 65536ull + K;
                 auto wc = wqc.find(kk);
                 if (wc != wqc.end()) {
+                    if (getenv("NR_Q_STATS")) { static std::unordered_map<uint64_t,void*> lastpk; auto lp=lastpk.find(kk);
+                        printf("[wq-hit] M=%u K=%u pk=%p %s\n", M, K, (void*)pk, (lp!=lastpk.end()&&lp->second==(void*)pk)?"SAME-PTR":"new-ptr");
+                        lastpk[kk]=(void*)pk; }
                     GQ->memcpy(pk, wc->second.first, (size_t)M * K);
                     GQ->memcpy(sc, wc->second.second, (size_t)M * 4u);
                     return;
