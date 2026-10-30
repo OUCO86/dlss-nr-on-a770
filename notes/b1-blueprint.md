@@ -1090,3 +1090,23 @@ f16-pack gather 形态（-5.0）→ 每刀 16 对协议 + NR_* 开关 + bench �
 下一刀不在宽度）、f16-pack gather（-5.0，vec 形已在，标量残留审计）、
 v4full 家族 pub 站点（window_block_v4 无 8 宽 pub=已宽形态）。
 今日总账：74.5 -> **~67.0-67.5 干净带**（热机段 71-72：交错对差才是真账）。
+
+## 六.二十八、★★ 最强归因仪器诞生：NR_RUN_TIMING 稳态 per-op 表（19:2x）
+
+现成诊断（rtiming 逐闭包 GQ->wait 串行计时）跑两遍取第二遍（去 JIT warmup）：
+691 passes total 149ms（串行口径）：
+window_block 18.0 | gemm_int8_batched 17.7 | gemm_int8_residual 17.0 |
+window_attention 16.2 | gemm_int8_qkv 14.1 | gemm_window_int8_residual 12.3 |
+global_attention 11.5 | gemm(f16) 10.2 | quant 9.7 | ffn 5.8 | gemm_int8 5.3 |
+ffn_merge 3.7 | unary 2.8 | ffn_stem 1.9 | quant(FUSED) 1.8 | unary2 1.3
+（首遍里 ffn_stem 58ms 是 JIT-warmup 假象，第二遍 1.9——**读这张表必须用第二遍**。）
+这比 cgraph 删除探针快 100 倍且无重叠歧义（串行口径），= 每 op 家族的直接 GPU 账。
+配套现成定价仪器：bench_batched（gemm_b 0.14 vs +pub 0.23ms @M32640：publish 腿
+再加 60%）、bench_res、bench_wa_res、bench_qrg、bench_ffnchip、bench_b3。
+**下窗口刀序（按这张表从大到小，全部单核仪器已存在）**：
+1. window_block(18.0)+batched(17.7)+res(17.0) 三兄弟共用 s8v8 gemm（BM128/BN64/BK32/NT32）
+   ——先 bench_batched 扫 tile 变体（BN=128? BK=64? 双缓冲深度），再上帧。
+2. quant 9.7：ILP 已证伪（bench_qilp 2-row 0.55-0.94x 全负=非延迟绑定）。行宽 16B store
+   是嫌疑（rowthread store=KMAX×1B 连续，K=64 时仅 64B/线程）——试 2 行合并 store。
+3. 别忘了 RUN_TIMING 是串行口径：帧 67 < 149 说明重叠吃掉 ~55%——刀要砍在
+   关键路径上（腿账 v2 的删除探针仍是关键路径权威；两账对照用）。
