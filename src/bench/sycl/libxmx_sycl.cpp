@@ -4875,7 +4875,7 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
         // plain run already executed it). The walk's 1301 + every gate is the
         // judge; NR_WQFUSE=0 = escape. NOT the qfuse_take axis (that mechanism
         // stays for the activation quants -- the 1272 family, all dissolved).
-        static bool wqf = getenv("NR_WQFUSE") != nullptr && atoi(getenv("NR_WQFUSE")) != 0;   // WQFUSE v1 VERDICT: 1301 MISMATCH -- pk is PER-FRAME fresh (init kernels read THIS frame's pk); skip unsafe as wired. Mechanism kept for the pointer-stable variant.
+        static bool wqf = getenv("NR_WQFUSE") != nullptr && atoi(getenv("NR_WQFUSE")) != 0;   // WQ-CACHE v4: the id-key ABA FIX is CORRECT and stays, but the NR_WQVERIFY probe KILLED the premise: all 160 CACHE-DIFF ~97% STALE -- these src planes are REWRITTEN EVERY FRAME by the init family (xmx_int8_init records sit inside every frame in the plan census). The ecc000e -2.65 win was FAST-BUT-WRONG (voided, honest). The SAFE next shape (banked): producer-side fusion -- make the init-family recorders qfuse-consume the quant, or quantize INSIDE whatever writes 1271/1307; the round trips are still there, the cache premise was not.   // WQFUSE v1 VERDICT: 1301 MISMATCH -- pk is PER-FRAME fresh (init kernels read THIS frame's pk); skip unsafe as wired. Mechanism kept for the pointer-stable variant.
         auto genof = [&](int id) { auto it = g_bufs.find(id); return it == g_bufs.end() ? -1 : it->second.gen; };
         const bool wq_static = wqf && genof(source) >= 0 && genof(packed) >= 0 && genof(source) <= genof(packed);   // census: NO recorder op ever WRITES these 8 src planes (1271/1280/1282/1292/1295/1298/1303/1307 = engine-init content, frame-invariant)
         g_cmds.push_back([=]() {
@@ -4890,12 +4890,29 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
             if (getenv("NR_Q_STATS")) printf("[quant-EXEC] M=%u K=%u src=%d pk=%d cmd=%zu gen(s=%d p=%d sc=%d)\n", M, K, source, packed, mycmd, genof(source), genof(packed), genof(scale));
             if (wq_static) {
                 static std::unordered_map<uint64_t, std::pair<int8_t*, float*>> wqc;
-                uint64_t kk = (uint64_t)(uintptr_t)a * 1000003ull + (uint64_t)M * 65536ull + K;
+                // WQ-CACHE v4 KEY FIX (the ABA root cause found by the 18:3x
+                // decisive test: ecc000e ON = 1301 MISMATCH => the old win was
+                // fast-but-wrong; the POINTER key aliased: sycl::malloc_device
+                // RECYCLES addresses across recordings (140/150 SAME-PTR census),
+                // so a src id's plane could FREE and a NEW plane could get the
+                // SAME address -> false hit -> stale content. THE SAFE KEY =
+                // (source buffer id, pk id, M, K): ids are monotonic (g_nextbuf++)
+                // and NEVER reused, and the frame-invariance premise is per-id
+                // (src id 1271 = the same init plane for the whole process).
+                uint64_t kk = ((uint64_t)(uint32_t)source << 40) ^ ((uint64_t)(uint32_t)packed << 20) ^ ((uint64_t)M << 8) ^ (uint64_t)K;
                 auto wc = wqc.find(kk);
                 if (wc != wqc.end()) {
-                    if (getenv("NR_Q_STATS")) { static std::unordered_map<uint64_t,void*> lastpk; auto lp=lastpk.find(kk);
-                        printf("[wq-hit] M=%u K=%u pk=%p %s\n", M, K, (void*)pk, (lp!=lastpk.end()&&lp->second==(void*)pk)?"SAME-PTR":"new-ptr");
-                        lastpk[kk]=(void*)pk; }
+                    if (getenv("NR_WQVERIFY")) {   // run the REAL quant into a temp, diff vs cache content
+                        int8_t* ref = (int8_t*)sycl::malloc_device((size_t)M * K, *GQ);
+                        float* refs = (float*)sycl::malloc_device((size_t)M * 4u, *GQ);
+                        qr_launch_esimd(*GQ, *GD, a, (sycl::uint2*)ref, refs, M, K);
+                        GQ->wait();
+                        std::vector<int8_t> ha((size_t)M*K), hb((size_t)M*K);
+                        GQ->memcpy(ha.data(), ref, (size_t)M*K); GQ->memcpy(hb.data(), wc->second.first, (size_t)M*K); GQ->wait();
+                        size_t bad=0; for(size_t i=0;i<ha.size();++i) if(ha[i]!=hb[i]) ++bad;
+                        printf("[wq-verify] src=%d pk=%d M=%u K=%u CACHE-DIFF %zu/%zu %s\n", source, packed, M, K, bad, ha.size(), bad?"STALE":"ok");
+                        sycl::free(ref,*GQ); sycl::free(refs,*GQ);
+                    }
                     GQ->memcpy(pk, wc->second.first, (size_t)M * K);
                     GQ->memcpy(sc, wc->second.second, (size_t)M * 4u);
                     return;
