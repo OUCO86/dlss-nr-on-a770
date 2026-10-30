@@ -910,3 +910,31 @@ v4full ✓ batched/residual BM128xBN64 ✓）。差距本体=核内 dpas 供数�
 （热循环 4.5-5.2% vs 前辈 40-50%）⇒ 下一战场 B3：v4full/gemm 家族热循环的
 mov 群 980 / SLM 消息 171 vs dpas 112 —— 更深 K 循环、GRF 常驻、每 dpas 摊更少
 SLM 消息。纯核内手术，门+交错 A/B 判生死，不碰链路结构。
+
+## 六.十八、b3-2 实验判决 + "寄存器广播"提案裁决（09:0x-09:2x）
+
+**b3-2 实验（已做已回退，未提交）**：s8v8 全 8 站点 A 侧去 SLM 改 direct-global
+读（L1 预取假说）。三关全过（1301 EXACT）但交错 A/B 4 对 = +0.4 中性偏负
+（无一赢对）=> git checkout 回退，基线 74.7 复验。**结论：A 侧 SLM staging 留着。**
+
+**外部参考的 L1 合并诊断**：采纳其现象解释（4x 同址散读重发有真实代价，与
++0.4 一致），但其硬件数字（"每周期合并 2 个同线请求"、"延迟翻 3-4 倍"）未经
+本机 PM 证实，标 unverified。
+
+**其处方"单线程宽 load + subgroup 寄存器广播"= 判死，两条自家铁证**：
+1. **本工具链没有公开的 subgroup 寄存器交换原语**——§20 归档注（quantize_row
+   header line 10："this toolchain has no public sub_group.shuffle_xor"），当年
+   quantize 行归约正是因此改走 SLM+barrier；全仓 grep esimd::shuffle = 0 命中。
+   "GEN 原生广播指令"在 SPIR-V GEN 后端存在但公开 API 不可达——不是没用它，
+   是用不了（这正是当年绕过 joint_matrix 时探过一遍的边界）。
+2. **它引用的"你之前 B580 的 L1 延迟探针"不存在**——本项目没有 B580 也没有
+   L1 延迟探针（我们有的是 §96 srcmodes 和 gapmap）。引用虚构=该方案整体降权。
+
+**b3-2 回退后真正的密度账（本次分析落盘，B3 的正解方向）**：s8v8 每 kb 每 subgroup
+SLM 读 = 32KB（A 16KB：每 band 被 4 个 wi_col 线程重复读 4x；B 16KB：被 8 个
+wi_row 线程重复读 8x），unique 只有 6KB ⇒ **5.3x SLM 读放大**，SLM 带宽 ~2x
+压过 XMX 吞吐（4dpas=32cyc vs 32KB@~512B/cyc=64cyc）——这才是 4.5% 密度的本体。
+NT=16 减冗余已算死（累加器 2KB/线程=GRF 满→spill）。正解方向 = **GRF 常驻操作数**
+（B=权重整个 K 段驻 GRF，SLM 只走 A：per-kb SLM 读 16KB 而非 32KB）——这是
+bench_s8v2 级形态实验（新 fragment 布局），不是 dll 里的快刀；先在 bench 仪器上
+打，三关+交错 A/B 判生死。
