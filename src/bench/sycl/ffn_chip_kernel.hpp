@@ -50,7 +50,8 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                                     bool half_skip = false,
                                     bool fjoin = true,
                                     bool pw16 = true,
-                                    bool ff9 = true) {   // B3-ffn-9: hoisted cp + 16-wide skip loads (escape NR_FF9=0)
+                                    bool ff9 = true,
+                                    int cstop = 0) {   // NR_CS_STOP segment probe (host-captured)
     const unsigned cin = 32;
     int tiles = Mp / 16;
     int wgs = (tiles + LW - 1) / LW;
@@ -121,6 +122,7 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
             uint hs = FFC_EA_OFF + (unsigned)LW * 1024u + lid * 1024u;   // the HS area follows EA (LW-scaled)   // per-thread 1KB hidden stage (this chunk)
             esimd::simd<float,64> p00(0.f), p01(0.f), p10(0.f), p11(0.f);   // out cols 0..15
             esimd::simd<float,64> q00(0.f), q01(0.f), q10(0.f), q11(0.f);   // out cols 16..31
+            if (cstop == 1) return;   // expand-only stop (after the HS stores above)
             const esimd::simd<half,8> z8((half)0.f);
             for (int c = 0; c < 4; ++c) {
                 for (int tl = 0; tl < 2; ++tl) {
@@ -227,6 +229,10 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
             esimd::simd<float,16> wcA, wcB;
             if (dSkip && ff9) { wcA = esimd::block_load<float,16>(cp, esimd::overaligned_tag<16>{});
                                  wcB = esimd::block_load<float,16>(cp + 16, esimd::overaligned_tag<16>{}); }
+            // NR_CS_STOP segment attribution (TIME-ONLY diagnostic; host-captured
+            // param cstop -- ESIMD kernels ban non-const statics, section 96):
+            // =1 stop after EXPAND, =2 stop before the projection's dpas block.
+            if (cstop >= 2) return;
             size_t outb = (size_t)(tr * 16) * cin;
             #pragma unroll
             for (int r = 0; r < 8; ++r) {
