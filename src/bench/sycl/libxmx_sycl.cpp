@@ -3340,7 +3340,7 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
         // the in-bounds test depends on (y,x) only, CONSTANT across a 16-channel
         // run (CH%16==0 -> no pixel crossing). Frame calls: epi=0 (identity),
         // narrow=false (f32 out), a_half=false. Guards enforce exactly that.
-        static bool uvec4 = !getenv("NR_UNARY_VEC2") || atoi(getenv("NR_UNARY_VEC2")) != 0;
+        static bool uvec4 = getenv("NR_UNARY_VEC2") != nullptr && atoi(getenv("NR_UNARY_VEC2")) != 0;   // U-4 VERDICT 16-pair: 6w/10l mean +0.42 = NEGATIVE -> default OFF (asset kept)
         if (uvec4 && !a_half && !narrow && epi == 0u && (CH % 16u) == 0u && (N % 16u) == 0u) {
             g_cmds.push_back([=]() {
                 GQ->parallel_for(sycl::range((size_t)N / 16u), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
