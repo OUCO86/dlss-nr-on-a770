@@ -49,7 +49,8 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                                     const void* dSkip = nullptr, const float* cp = nullptr,
                                     bool half_skip = false,
                                     bool fjoin = true,
-                                    bool pw16 = true) {   // B3-ffn-3: the 16-wide pub chain (escape NR_FF3=0)
+                                    bool pw16 = true,
+                                    bool ff9 = true) {   // B3-ffn-9: hoisted cp + 16-wide skip loads (escape NR_FF9=0)
     const unsigned cin = 32;
     int tiles = Mp / 16;
     int wgs = (tiles + LW - 1) / LW;
@@ -215,6 +216,17 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                     q11 = esimd::xmx::dpas<8,8,float>(q11, c1, a1);
                 }
             }
+            // B3-ffn-9 (the leg ledger: the ffn leg = -10.5 wall but the chip's own
+            // traffic roof is ~2.5ms -> the leg is ISSUE-bound; the fold re-reads the
+            // 32-float cosine plane cp EIGHT TIMES PER ROW-HALF (loop-invariant!) and
+            // loads skip as 8-wide 32B messages). Hoist cp to two 16-wide registers
+            // outside the r-loop; widen the skip load to 16-wide (64B). The FMA shape
+            // rule is UNTOUCHED: every 8-lane o = k*w + acc keeps the identical
+            // straight-line text (the section-75 lesson is about PHI reassignment,
+            // not hoisting); the FFN gate + 1301 are the judges. NR_FF9=0 escape.
+            esimd::simd<float,16> wcA, wcB;
+            if (dSkip && ff9) { wcA = esimd::block_load<float,16>(cp, esimd::overaligned_tag<16>{});
+                                 wcB = esimd::block_load<float,16>(cp + 16, esimd::overaligned_tag<16>{}); }
             size_t outb = (size_t)(tr * 16) * cin;
             #pragma unroll
             for (int r = 0; r < 8; ++r) {
@@ -233,6 +245,20 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                     if (dSkip) {
                         // B5-3: the skip load honors half_skip (ffn-main's 0x40000 form):
                         // the tail read (float)(half)skp[i] == a half block_load + convert.
+                        if (ff9) {
+                            esimd::simd<float,16> kA = half_skip
+                                ? esimd::convert<float>(esimd::block_load<half,16>((const half*)dSkip + rb, esimd::overaligned_tag<16>{}))
+                                : esimd::block_load<float,16>((const float*)dSkip + rb, esimd::overaligned_tag<16>{});
+                            esimd::simd<float,16> kB = half_skip
+                                ? esimd::convert<float>(esimd::block_load<half,16>((const half*)dSkip + rb + 16u, esimd::overaligned_tag<16>{}))
+                                : esimd::block_load<float,16>((const float*)dSkip + rb + 16u, esimd::overaligned_tag<16>{});
+                            { esimd::simd<float,8> oA = kA.template select<8,1>(0) * wcA.template select<8,1>(0) + f0;
+                              esimd::simd<float,8> oB = kA.template select<8,1>(8) * wcA.template select<8,1>(8) + f1;
+                              esimd::simd<float,16> oa; oa.template select<8,1>(0) = oA; oa.template select<8,1>(8) = oB; oa.copy_to(Cout + rb); }
+                            { esimd::simd<float,8> oA = kB.template select<8,1>(0) * wcB.template select<8,1>(0) + g0;
+                              esimd::simd<float,8> oB = kB.template select<8,1>(8) * wcB.template select<8,1>(8) + g1;
+                              esimd::simd<float,16> ob; ob.template select<8,1>(0) = oA; ob.template select<8,1>(8) = oB; ob.copy_to(Cout + rb + 16u); }
+                        } else {
                         auto fold8 = [&](esimd::simd<float,8>& acc, size_t off) SYCL_ESIMD_FUNCTION {
                             esimd::simd<float,8> k = half_skip
                                 ? esimd::convert<float>(esimd::block_load<half,8>(
@@ -244,14 +270,11 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                             esimd::simd<float,8> o = k * w + acc;   // straight-line = ONE HW FMA
                             return o;
                         };
-                        // B3-ffn-7: join the two adjacent 8-wide fold results of one
-                        // row into ONE 16-wide (64B) store (fjoin precedent; the FMA
-                        // shape rule is UNTOUCHED -- the lambda still computes each
-                        // 8-group straight-line, only the STORE widens).
                         { esimd::simd<float,16> oa; oa.template select<8,1>(0) = fold8(f0, 0);
                           oa.template select<8,1>(8) = fold8(f1, 8); oa.copy_to(Cout + rb); }
                         { esimd::simd<float,16> ob; ob.template select<8,1>(0) = fold8(g0, 16);
                           ob.template select<8,1>(8) = fold8(g1, 24); ob.copy_to(Cout + rb + 16u); }
+                        }
                     } else {
                         f0.copy_to(Cout + rb + 0);
                         f1.copy_to(Cout + rb + 8);
@@ -264,6 +287,20 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                     esimd::simd<float,8> g0 = q10.template select<8,1>(r*8), g1 = q11.template select<8,1>(r*8);
                     size_t rb = outb + (size_t)(8+r) * cin;
                     if (dSkip) {
+                        if (ff9) {
+                            esimd::simd<float,16> kA = half_skip
+                                ? esimd::convert<float>(esimd::block_load<half,16>((const half*)dSkip + rb, esimd::overaligned_tag<16>{}))
+                                : esimd::block_load<float,16>((const float*)dSkip + rb, esimd::overaligned_tag<16>{});
+                            esimd::simd<float,16> kB = half_skip
+                                ? esimd::convert<float>(esimd::block_load<half,16>((const half*)dSkip + rb + 16u, esimd::overaligned_tag<16>{}))
+                                : esimd::block_load<float,16>((const float*)dSkip + rb + 16u, esimd::overaligned_tag<16>{});
+                            { esimd::simd<float,8> oA = kA.template select<8,1>(0) * wcA.template select<8,1>(0) + f0;
+                              esimd::simd<float,8> oB = kA.template select<8,1>(8) * wcA.template select<8,1>(8) + f1;
+                              esimd::simd<float,16> oa; oa.template select<8,1>(0) = oA; oa.template select<8,1>(8) = oB; oa.copy_to(Cout + rb); }
+                            { esimd::simd<float,8> oA = kB.template select<8,1>(0) * wcB.template select<8,1>(0) + g0;
+                              esimd::simd<float,8> oB = kB.template select<8,1>(8) * wcB.template select<8,1>(8) + g1;
+                              esimd::simd<float,16> ob; ob.template select<8,1>(0) = oA; ob.template select<8,1>(8) = oB; ob.copy_to(Cout + rb + 16u); }
+                        } else {
                         auto fold8 = [&](esimd::simd<float,8>& acc, size_t off) SYCL_ESIMD_FUNCTION {
                             esimd::simd<float,8> k = half_skip
                                 ? esimd::convert<float>(esimd::block_load<half,8>(
@@ -275,14 +312,11 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                             esimd::simd<float,8> o = k * w + acc;   // straight-line = ONE HW FMA
                             return o;
                         };
-                        // B3-ffn-7: join the two adjacent 8-wide fold results of one
-                        // row into ONE 16-wide (64B) store (fjoin precedent; the FMA
-                        // shape rule is UNTOUCHED -- the lambda still computes each
-                        // 8-group straight-line, only the STORE widens).
                         { esimd::simd<float,16> oa; oa.template select<8,1>(0) = fold8(f0, 0);
                           oa.template select<8,1>(8) = fold8(f1, 8); oa.copy_to(Cout + rb); }
                         { esimd::simd<float,16> ob; ob.template select<8,1>(0) = fold8(g0, 16);
                           ob.template select<8,1>(8) = fold8(g1, 24); ob.copy_to(Cout + rb + 16u); }
+                        }
                     } else {
                         f0.copy_to(Cout + rb + 0);
                         f1.copy_to(Cout + rb + 8);

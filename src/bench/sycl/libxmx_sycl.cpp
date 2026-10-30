@@ -1620,8 +1620,9 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
             if (chipres_m) {
                 static bool fjoin = !getenv("NR_FFN_JOIN") || atoi(getenv("NR_FFN_JOIN")) != 0;
                 static bool ff3 = !getenv("NR_FF3") || atoi(getenv("NR_FF3")) != 0;
-                CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, Araw, dEp, dPp, (float*)Cout, (int)M, Mp, skp, cp, half_skip, fjoin, ff3),
-                                 ffnc::launch_ffn_chip<16>(*GQ, Araw, dEp, dPp, (float*)Cout, (int)M, Mp, skp, cp, half_skip, fjoin, ff3));
+                static bool ff9 = !getenv("NR_FF9") || atoi(getenv("NR_FF9")) != 0;
+                CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, Araw, dEp, dPp, (float*)Cout, (int)M, Mp, skp, cp, half_skip, fjoin, ff3, ff9),
+                                 ffnc::launch_ffn_chip<16>(*GQ, Araw, dEp, dPp, (float*)Cout, (int)M, Mp, skp, cp, half_skip, fjoin, ff3, ff9));
                 return;
             }
             float* dC2 = (float*)pool_get((size_t)Mp * cin * 4);
@@ -1801,7 +1802,8 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
             sycl::half* dPp2 = cached_pack_b_f16(projection, Praw, 128, 32);
             static bool fjoinm = !getenv("NR_FFN_JOIN") || atoi(getenv("NR_FFN_JOIN")) != 0;
             static bool ff3m = !getenv("NR_FF3") || atoi(getenv("NR_FF3")) != 0;
-            CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp, false, fjoinm, ff3m), ffnc::launch_ffn_chip<16>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp, false, fjoinm, ff3m));
+            static bool ff9m = !getenv("NR_FF9") || atoi(getenv("NR_FF9")) != 0;
+            CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp, false, fjoinm, ff3m, ff9m), ffnc::launch_ffn_chip<16>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp, false, fjoinm, ff3m, ff9m));
             pool_put(dM16);   // dA2 was never packed on this path; dB2/dPp2 cache-owned
             pool_put(dMerged);
             return;
