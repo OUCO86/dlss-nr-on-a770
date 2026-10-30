@@ -1592,8 +1592,9 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
             // qr_publish is the identity and the fold matches the tail by construction.
             static bool chipres_m = !getenv("NR_FFN_CHIPRES") || atoi(getenv("NR_FFN_CHIPRES")) != 0;
             if (chipres_m) {
-                CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, Araw, dEp, dPp, (float*)Cout, (int)M, Mp, skp, cp, half_skip),
-                                 ffnc::launch_ffn_chip<16>(*GQ, Araw, dEp, dPp, (float*)Cout, (int)M, Mp, skp, cp, half_skip));
+                static bool fjoin = !getenv("NR_FFN_JOIN") || atoi(getenv("NR_FFN_JOIN")) != 0;
+                CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, Araw, dEp, dPp, (float*)Cout, (int)M, Mp, skp, cp, half_skip, fjoin),
+                                 ffnc::launch_ffn_chip<16>(*GQ, Araw, dEp, dPp, (float*)Cout, (int)M, Mp, skp, cp, half_skip, fjoin));
                 return;
             }
             float* dC2 = (float*)pool_get((size_t)Mp * cin * 4);
@@ -1771,7 +1772,8 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
         static bool chipres = !getenv("NR_FFN_CHIPRES") || atoi(getenv("NR_FFN_CHIPRES")) != 0;
         if (merge_chip && chipres) {
             sycl::half* dPp2 = cached_pack_b_f16(projection, Praw, 128, 32);
-            CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp), ffnc::launch_ffn_chip<16>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp));
+            static bool fjoinm = !getenv("NR_FFN_JOIN") || atoi(getenv("NR_FFN_JOIN")) != 0;
+            CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp, false, fjoinm), ffnc::launch_ffn_chip<16>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp, false, fjoinm));
             pool_put(dM16);   // dA2 was never packed on this path; dB2/dPp2 cache-owned
             pool_put(dMerged);
             return;

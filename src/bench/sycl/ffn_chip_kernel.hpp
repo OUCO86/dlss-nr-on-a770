@@ -47,7 +47,8 @@ template <int LW>
 static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                                     const half* dPp, float* Cout, int M, int Mp,
                                     const void* dSkip = nullptr, const float* cp = nullptr,
-                                    bool half_skip = false) {   // B5-3: ffn-main's f32 AND half-skip both fold
+                                    bool half_skip = false,
+                                    bool fjoin = true) {   // B3-ffn-1: the 32B-joined HS stores (host-captured; escape NR_FFN_JOIN=0 at the call site)
     const unsigned cin = 32;
     int tiles = Mp / 16;
     int wgs = (tiles + LW - 1) / LW;
@@ -127,10 +128,24 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                             h10 = esimd::convert<half>(s8v8::pub_vec_v8<8>(3u, a));
                             h11 = esimd::convert<half>(s8v8::pub_vec_v8<8>(3u, b)); }
                         else { h10 = z8; h11 = z8; }
+                        // B3-ffn-1 (leg map 11:0x: the ffn leg = -11.4 wall, the chip
+                        // kernel itself priced at 106-135 GB/s by bench_ffnchip):
+                        // the four 16B SLM stores below are ADJACENT PAIRS (h00|
+                        // h01 at +16B, h10|h11 at +256B+16B) -- join into two 32B
+                        // stores (values identical by construction; the P8-q2
+                        // store-join precedent, bench-proven instruction-count win).
+                        // (fjoin is a host-captured param now -- ESIMD bans non-const statics)
+                        if (fjoin) {
+                        esimd::simd<half,16> j0; j0.template select<8,1>(0) = h00; j0.template select<8,1>(8) = h01;
+                        esimd::simd<half,16> j1; j1.template select<8,1>(0) = h10; j1.template select<8,1>(8) = h11;
+                        esimd::slm_block_store(hb + (uint)r * 32u, j0, esimd::overaligned_tag<16>{});
+                        esimd::slm_block_store(hb + 256u + (uint)r * 32u, j1, esimd::overaligned_tag<16>{});
+                        } else {
                         esimd::slm_block_store(hb + (uint)r * 32u, h00, esimd::overaligned_tag<16>{});
                         esimd::slm_block_store(hb + (uint)r * 32u + 16u, h01, esimd::overaligned_tag<16>{});
                         esimd::slm_block_store(hb + 256u + (uint)r * 32u, h10, esimd::overaligned_tag<16>{});
                         esimd::slm_block_store(hb + 256u + (uint)r * 32u + 16u, h11, esimd::overaligned_tag<16>{});
+                        }
                     }
                 }
                 // (v3: NO barrier here -- HS is this thread's private 1KB; the
