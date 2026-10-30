@@ -890,3 +890,23 @@ v5a tail 双写 plane+tile，blade-7 gather，wa stages1-3 VERBATIM）：
 SLM 消息数），不在继续融合 qkv+wa。B5-5 家族到此关门（dC 全歼=结构清零已兑现，
 融合片=已建已证不转正）。三族同删 12.4ms 上限里真正可回收的部分需要的是
 "更快的 gemm 本体"，不是"更少的核"。
+
+## 六.十七、"双WG异构分治+跨WG SLM接力"提案判死（08:2x，外部 AI 方案，三条硬墙全部来自自家归档实测）
+
+提案：DPAS 满宽 WG 池(768) + attention 轻量 WG 池(1020) 同 launch 异构，
+"跨 WG SLM 环形缓冲"接力，声称净赚 3-5ms。判死依据（无需新实验，归档就是铁证）：
+1. **SLM 是 WG 私有**：§96 bench_srcmodes D/F 探针证的是同一 WG 内跨 SUBGROUP 可见；
+   归档原话 "stage handoff through GLOBAL per-window scratch"。XE_HPG 无 cluster
+   distributed shared memory（那是 NVIDIA Hopper 的东西）。跨 WG SLM 通路不存在。
+2. **同 launch 双池接力需要 device-wide barrier → spin-wait → 共驻容量算死**：
+   768x32 + 1020x16 = 40896 线程 > A770 并发容量 32768（32 Xe-core x 1024）→ 必死锁。
+   与 §96 DEVICE_LOST 毒同源。
+3. **plane 不可省**（bench_lfw 调试实锤：planes=本层输出+下层 quant 输入，必须写）。
+且提案的"目标态"（BN=64 满宽 qkv 池 + 1020 attention 池 + 并行度对齐）**就是现役
+qres+wa_res 链本身**；增量机制不存在 ⇒ 3-5ms 无来源。两条真融合路（slice1 胖 WG、
+slice2 半宽）都已实测帧负 ⇒ B5-5 家族关门是数据判决。
+**军规自查（满宽高并行=健康）：现役链无违规**（qres BN64x768 ✓ wa_res 1020 ✓
+v4full ✓ batched/residual BM128xBN64 ✓）。差距本体=核内 dpas 供数形态
+（热循环 4.5-5.2% vs 前辈 40-50%）⇒ 下一战场 B3：v4full/gemm 家族热循环的
+mov 群 980 / SLM 消息 171 vs dpas 112 —— 更深 K 循环、GRF 常驻、每 dpas 摊更少
+SLM 消息。纯核内手术，门+交错 A/B 判生死，不碰链路结构。
