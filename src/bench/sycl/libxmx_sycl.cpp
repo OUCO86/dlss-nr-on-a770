@@ -1931,7 +1931,10 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
             if (mega && ffntile3m && ffchip3m && !narrow && epi == 0u) {
                 sycl::half* dEp3 = cached_pack_b_f16(expand, Eraw, 32, 128);        // weight (cached = idempotent)
                 sycl::half* dPp3 = cached_pack_b_f16(projection, Praw, 128, 32);    // weight
-                ffnc::stem_mega(*GQ, dA, dB, dEp3, dPp3, cp, (float*)Cout, (int)M, Mp);
+                { static int mwlw = getenv("SM_LW") ? atoi(getenv("SM_LW")) : 16;
+                  if (mwlw == 4)      ffnc::stem_mega<4>(*GQ, dA, dB, dEp3, dPp3, cp, (float*)Cout, (int)M, Mp);
+                  else if (mwlw == 8) ffnc::stem_mega<8>(*GQ, dA, dB, dEp3, dPp3, cp, (float*)Cout, (int)M, Mp);
+                  else                ffnc::stem_mega<16>(*GQ, dA, dB, dEp3, dPp3, cp, (float*)Cout, (int)M, Mp); }
                 pool_put(dA);   // dB/dEp3/dPp3 cache-owned weights
                 return;
             }

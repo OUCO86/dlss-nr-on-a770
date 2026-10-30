@@ -351,15 +351,23 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
 #define SM_HS 3072u
 #define SM_THR 4096u
 
+template <int LW = 16>
 static inline event stem_mega(queue& q, const half* dAp, const half* dAdB, const half* dEp,
                        const half* dPp, const float* cp, float* Cout, int M, int Mp) {
     const int tiles = Mp / 16;
-    const int LW = getenv("SM_LW") ? atoi(getenv("SM_LW")) : 16;
     int wgs = (tiles + LW - 1) / LW;
     return q.submit([&](handler& h) {
         h.parallel_for(nd_range(range((size_t)wgs * LW), range((size_t)LW)),
             [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
-            esimd::slm_init<64u * 1024u>();
+            // B3-ffn-11 (the lmxx architecture lesson, native_wave_c32_ffn.hlsl:
+            // their WG = ONE WAVE = 32 threads x ~13KB LDS -> 4-8 WG resident per
+            // CU; ours = 16 threads x 4KB = 64KB FIXED -> 1 WG/SM = the latency
+            // fully exposed -- THE reason the bit-exact mega lost the frame A/B
+            // (-0.22) while lmxx's same fusion shape wins 30x). Parameterize the
+            // SLM to LW x SM_THR so SM_LW=8 -> 32KB -> 2 WG/SM, SM_LW=4 -> 16KB
+            // -> 4 WG/SM (the lmxx density ladder). Judges: bench_stem_mega +
+            // frame A/B NR_FFN_MEGA=1 x SM_LW sweep + 16-pair + 1301 + gates.
+            esimd::slm_init<(unsigned)LW * SM_THR>();   // ffn-11: LW-templated (was fixed 64KB)
             uint wg = (uint)it.get_group(0);
             uint lid = (uint)it.get_local_id(0);
             int tr = (int)(wg * (unsigned)LW + lid);
