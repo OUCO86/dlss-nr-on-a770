@@ -1,35 +1,44 @@
-// b6_res_kernel.hpp -- B6-1 (2026-10-30, the traffic-roof campaign §6.22): ONE
-// resident kernel per window covering qkv + window-attention + attended-quant +
-// outproj + residual-fold. The traffic ledger proved the frame sits on the
-// plane-transfer roof (write+one-read ~= 68ms ~= frame time); blade wins only
-// shave issue overhead on top. B6 deletes ROUND TRIPS: the 1277 attended plane
-// (W120/R120 -- census: its ONLY readers are the 16 lfw-layer quants, which move
-// inside this kernel), the attended-pk plane (1272 leg) and the 1270 skip-side
-// plane all become SLM-only; the wa + quant + wres launches fold into one.
-// Phases 1-2 = lfw2 VERBATIM (bench_lfw2 8/8 EXACT today). Phase 3 NEW:
-//  (a) stage-3 attended halves join into ATT = Y0 (64 rows x 64 halfs, col =
-//      hh*32+c) instead of the global 1277 plane;
-//  (b) attended quantize: 4 rows/thread: 128B block load, hmax(abs) ->
-//      scale = fdiv_rn(peak,127), qq = fdiv_rn(v,scale), rint, clamp [-127,127],
-//      int8 -> PKT = Z0 row-major [row][kb*32+c] (4KB) + AS2 = Z0+4096 (64 f32
-//      scales). The chain is the qr_kernel_rowthread / quantize VERBATIM
-//      (fdiv_rn per element = the shipped quant semantics, NOT the mulh form);
-//  (c) outproj gemm int8 BM64(tokens) x BN64 x K64, NT16: thread tile = 8 rows
-//      (rb) x 32 cols (cb); A = PKT SLM-direct (256B/kb), B = dOp (cached packed
-//      weight, global->X0 staging 2x2048B, 8x reuse across rb like phase 1);
-//  (d) epilogue = gemm_b_res_window's fold VERBATIM: f = float(c)*as2[tok]*bs2
-//      [col]; straight-line sk*ccl + f = ONE HW FMA (the section-75 shape rule);
-//      pub_vec_v8(epi=1); narrow -> f16 store at the IMAGE-MAP slot (window/
-//      token -> yy/xx cull), skip read from 1267 f16 at that same slot.
-// SLM = the lfw2 map (45056B, 64KB bucket). NO new allocation.
-// Guard (recorder): lfw2 guard + the FOLLOWING two recorded calls are exactly
-// quant(1277 -> pk 1272, sc 1273) and gemm_window_int8_residual(that pk, W,
-// out 1270, sc, b_scale 80, skip 1267, cosine 72) with flags 0x41100 (epi1,
-// narrow, half_skip) + image map (across/top/left/h) + M == the lfw M. The
-// recorder rewrites the wres closure to no-op and the quant closure to no-op;
-// THIS launch produces 1270 directly. Escape NR_B6=0.
-// Judges: bench_b6 (fused vs shipped trio), WINDOW_ATTENTION + QUANT +
-// WINDOW_INT8_RESIDUAL gates, 1301 EXACT, 16-pair A/B.
+// b6_res_kernel.hpp -- B6-1 (2026-10-30, the traffic-roof campaign §6.22-23):
+// ONE resident kernel per WINDOW (slice-1 geometry: WG = window, qkv full-width
+// BN=64, BOTH heads' tiles -- NOT lfw2's per-head WG: phase-3's outproj K=64
+// spans both heads' attended cols (1277 is (32640,64) token-major with
+// head-concat cols -- the wa_res merge-fold map, verified against the quant's
+// row addressing), a cross-WG impossibility). Chain fused:
+//   qkv gemm+tail -> wa stages 1-3 per head -> attended-quantize -> outproj gemm
+//   -> residual fold -> write 1270. The 1277 attended plane (census: for THESE
+//   16 layers its only reader is the matching quant, which moves inside), the
+//   attended-pk plane (1272 leg) and the 1270 skip-side round trip all become
+//   SLM-only; the wa + quant + wres LAUNCHES disappear.
+// Phases 1-2 = slice-1 lfw VERBATIM (bench_lfw 8/8 EXACT: planes + Out), with
+//   stage-3's global Out store REPLACED by ATT joins into the dead tile region:
+//   after head-hh's stage-3, QT[hh]'s 4KB is dead (head-1's tiles live in the
+//   OTHER 4KB sub-regions of the 8KB QT band) -> ATT_hh = QT + hh*4096,
+//   [token][32] f16 = the shipped 1277 slice VERBATIM.
+// Phase 3 NEW:
+//   3b quantize: 4 rows/thread: ATT0 row (32 halves) ++ ATT1 row (32) = the
+//      1277 row (token-major, head-concat) VERBATIM; hmax -> fdiv_rn(peak,127)
+//      -> fdiv_rn(v,scale) -> rint -> clamp -> int8 (the qr_kernel_rowthread/
+//      shipped-quant authority: fdiv_rn per element, NOT the mulh shortcut);
+//      PKT = kb-slice-major [kb][row][32B] at Z0 (the gemm SLM_A band layout),
+//      AS2 = 64 f32 row-scales at Z0+4096 (= the shipped 1273 slice, index
+//      w*64+token = the wres a_scale addressing VERBATIM);
+//   3c outproj gemm int8 64x64xK64 NT16: thread tile = 8 rows (rb=lid/2) x 32
+//      cols (cb=lid%2): A = PKT SLM-direct 256B/kb; B = dOp (pack_b(64,64),
+//      cached) staged X0 2x2048B; 4 dpas/kb (the BN=64 tile, full width);
+//   3d fold = gemm_b_res_window epilogue VERBATIM: f = float(c)*as2[tok]*bs2
+//      [col]; straight-line sk*cc + f = ONE HW FMA (the section-75 shape rule);
+//      pub_vec_v8(epi=1); narrow f16; the image-map slot ((yy-top)*image_w +
+//      (xx-left))*64 + gc with the bounds cull; skip = 1267 f16 at that slot.
+// SLM: X0 8K | Z0 16K (h-stage/scores/PKT+AS2) | Y0 8K (temps/probs) |
+//      QT 8K (QT0|QT1 = ATT after phase 2) | KT 8K | VT 8K | SLMB 57344
+//      (the 64KB bucket, slice-1's blade-8 map). No new allocation.
+// Guard (recorder): the lfw guard + the FOLLOWING two recorded calls = exactly
+// quant(1277 -> 1272, 1273, M, 64) and gemm_window_int8_residual(that pk, W,
+// 1270, 1273, b_scale, skip=1267, cosine, M,64,64, 0x41100, h,w,across...);
+// the quant + wres closures no-op; THIS launch produces 1270 directly.
+// Escape NR_B6=0 (falls back to the lfw2 probe / the shipped chain).
+// Judges: bench_b6 (vs the shipped qres+wa_res+quant+wres trio), the
+// WINDOW_ATTENTION/QUANT/WINDOW_INT8_RESIDUAL gates, 1301, 16-pair A/B.
 #pragma once
 #include "gemm_s8_v8_kernel.hpp"
 #include "window_block_mega.hpp"
@@ -40,84 +49,96 @@ namespace b6 {
 using namespace sycl;
 namespace esimd = sycl::ext::intel::esimd;
 
-static const uint X0 = 0u;        // 8KB: gemm operand buffers (all phases)
-static const uint Z0 = 8192u;     // 16KB: qkv stage -> scores -> PKT(4KB)+AS2(256B)
-static const uint Y0 = 24576u;    // 8KB: K/V temps -> probs -> ATTENDED (phase 3)
-static const uint QT = 32768u, KT = 36864u, VT = 40960u;
-static const uint SLMB = 45056u;
+static const uint X0 = 0u;
+static const uint Z0 = 8192u;
+static const uint Y0 = 24576u;
+static const uint QT = 32768u, KT = 40960u, VT = 49152u;
+static const uint SLMB = 57344u;
 
 static inline sycl::event launch_b6(sycl::queue& q, const int8_t* dAp, const int8_t* dBp,
                                     const float* as, const float* bs,
                                     const float* qs, const float* dBias,
-                                    unsigned windows, unsigned heads,
+                                    unsigned windows,
                                     sycl::half* Qp, sycl::half* Kp, sycl::half* Vp,
                                     const int8_t* dOp, const float* bs2, const float* cosv,
                                     const sycl::half* dSkip, sycl::half* Out2,
                                     unsigned across, unsigned top, unsigned left,
-                                    unsigned image_h, unsigned image_w) {
-    constexpr unsigned C = 64u, NH = 192u, tokens = 64u;
-    const unsigned batches = windows * heads;
+                                    unsigned image_h, unsigned image_w,
+                                    int8_t* DbgPKT = nullptr, float* DbgAS = nullptr,
+                                    half* DbgATT = nullptr) {
+    constexpr unsigned heads = 2u, C = 64u, NH = 192u;
     return q.submit([&](handler& h) {
-        h.parallel_for(nd_range(range((size_t)batches * 16u), range(16u)),
+        h.parallel_for(nd_range(range((size_t)windows * 16u), range(16u)),
             [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
             esimd::slm_init<SLMB>();
-            uint b = (uint)it.get_group(0);
+            uint w = (uint)it.get_group(0);
             uint lid = (uint)it.get_local_id(0);
-            uint w = b / heads, hh = b % heads;
-            int rb = (int)(lid / 2u);
-            int cb = (int)(lid % 2u);
+            int wi_row = (int)(lid / 4u), wi_col = (int)(lid % 4u);
 
-            // ================= phases 1-2: lfw2 VERBATIM ========================
+            // ============ phase 1: qkv gemm x3 parts (BN=64) + v5a tail ========
             #pragma unroll 1
             for (int part = 0; part < 3; ++part) {
-                const int SLM_AB = 2048, SLM_BB = 1024;
+                const int SLM_AB = 2048, SLM_BB = 2048;
                 const int kb_n = (int)C / 32;
                 const uint band = w / 2u;
-                const uint wioff = (w % 2u) * 2048u;
-                const int8_t* apb = dAp + (size_t)band * kb_n * 4096u + wioff;
-                const int8_t* bp = dBp + (size_t)(part * 8u + hh * 4u) * 256u;
+                const uint hb = (w % 2u) * 2048u;
+                const int8_t* apb = dAp + (size_t)band * kb_n * 4096u + hb;
+                const int8_t* bp = dBp + (size_t)part * 2048u;
                 auto load_block = [=](int buf, int kb) SYCL_ESIMD_FUNCTION {
                     esimd::simd<int8_t,128> av = esimd::block_load<int8_t,128>(
                         apb + (size_t)kb * 4096u + lid * 128u, esimd::overaligned_tag<16>{});
                     esimd::slm_block_store(buf * SLM_AB + lid * 128u, av, esimd::overaligned_tag<16>{});
-                    esimd::simd<int8_t,64> bv = esimd::block_load<int8_t,64>(
-                        bp + (size_t)kb * (NH * 32u) + lid * 64u, esimd::overaligned_tag<16>{});
-                    esimd::slm_block_store(2 * SLM_AB + buf * SLM_BB + lid * 64u, bv, esimd::overaligned_tag<16>{});
+                    esimd::simd<int8_t,128> bv = esimd::block_load<int8_t,128>(
+                        bp + (size_t)kb * (NH * 32u) + lid * 128u, esimd::overaligned_tag<16>{});
+                    esimd::slm_block_store(2 * SLM_AB + buf * SLM_BB + lid * 128u, bv, esimd::overaligned_tag<16>{});
                 };
-                esimd::simd<int32_t,64> c0(0), c1(0);
+                auto load_grf = [=](int buf, esimd::simd<int8_t,256>& a0, esimd::simd<int8_t,256>& a1,
+                                    esimd::simd<int8_t,256>& b0, esimd::simd<int8_t,256>& b1) SYCL_ESIMD_FUNCTION {
+                    uint32_t offA = buf * SLM_AB + wi_row * 512;
+                    uint32_t offB = 2 * SLM_AB + buf * SLM_BB + wi_col * 512;
+                    a0 = esimd::slm_block_load<int8_t,256>(offA + 0, esimd::overaligned_tag<16>{});
+                    a1 = esimd::slm_block_load<int8_t,256>(offA + 256, esimd::overaligned_tag<16>{});
+                    b0 = esimd::slm_block_load<int8_t,256>(offB + 0, esimd::overaligned_tag<16>{});
+                    b1 = esimd::slm_block_load<int8_t,256>(offB + 256, esimd::overaligned_tag<16>{});
+                };
+                esimd::simd<int8_t,256> a0, a1, b0, b1;
+                esimd::simd<int32_t,64> c00(0), c01(0), c10(0), c11(0);
                 load_block(0, 0);
                 esimd::barrier();
                 #pragma unroll
-                for (int kbi = 0; kbi < kb_n; ++kbi) {
-                    int cur = kbi & 1, nxt = cur ^ 1;
-                    if (kbi + 1 < kb_n) load_block(nxt, kbi + 1);
-                    esimd::simd<int8_t,256> a0 = esimd::slm_block_load<int8_t,256>(
-                        (uint32_t)(cur * SLM_AB + rb * 256), esimd::overaligned_tag<16>{});
-                    uint32_t offB = (uint32_t)(2 * SLM_AB + cur * SLM_BB + cb * 512);
-                    esimd::simd<int8_t,256> b0 = esimd::slm_block_load<int8_t,256>(offB, esimd::overaligned_tag<16>{});
-                    esimd::simd<int8_t,256> b1 = esimd::slm_block_load<int8_t,256>(offB + 256, esimd::overaligned_tag<16>{});
-                    c0 = esimd::xmx::dpas<8,8,int32_t>(c0, b0, a0);
-                    c1 = esimd::xmx::dpas<8,8,int32_t>(c1, b1, a0);
+                for (int b = 0; b < kb_n; ++b) {
+                    int cur = b & 1, nxt = cur ^ 1;
+                    if (b + 1 < kb_n) load_block(nxt, b + 1);
+                    load_grf(cur, a0, a1, b0, b1);
+                    c00 = esimd::xmx::dpas<8,8,int32_t>(c00, b0, a0);
+                    c01 = esimd::xmx::dpas<8,8,int32_t>(c01, b1, a0);
+                    c10 = esimd::xmx::dpas<8,8,int32_t>(c10, b0, a1);
+                    c11 = esimd::xmx::dpas<8,8,int32_t>(c11, b1, a1);
                     esimd::barrier();
                 }
-                int gc = (int)(part * C + hh * 32u) + cb * 16;
+                int gc = part * (int)C + wi_col * 16;
                 esimd::simd<float,16> cs = esimd::block_load<float,16>(bs + gc, esimd::overaligned_tag<16>{});
                 #pragma unroll
                 for (int r = 0; r < 8; ++r) {
-                    int gr = (int)(w * tokens) + rb * 8 + r;
-                    float rs = as[gr];
-                    esimd::simd<float,16> f;
-                    f.template select<8,1>(0) = esimd::convert<float>(c0.template select<8,1>(r*8).read()) * rs;
-                    f.template select<8,1>(8) = esimd::convert<float>(c1.template select<8,1>(r*8).read()) * rs;
-                    f = f * cs;
-                    esimd::slm_block_store<float,16>(Z0 + (uint32_t)((rb*8 + r) * 32 + cb * 16) * 4u, f, esimd::overaligned_tag<16>{});
+                    int gr0 = (int)(w * 64u) + wi_row * 16 + r, gr1 = gr0 + 8;
+                    float rs0 = as[gr0], rs1 = as[gr1];
+                    esimd::simd<float,16> f0, f1;
+                    f0.template select<8,1>(0) = esimd::convert<float>(c00.template select<8,1>(r*8).read()) * rs0;
+                    f0.template select<8,1>(8) = esimd::convert<float>(c01.template select<8,1>(r*8).read()) * rs0;
+                    f1.template select<8,1>(0) = esimd::convert<float>(c10.template select<8,1>(r*8).read()) * rs1;
+                    f1.template select<8,1>(8) = esimd::convert<float>(c11.template select<8,1>(r*8).read()) * rs1;
+                    f0 = f0 * cs; f1 = f1 * cs;
+                    esimd::slm_block_store<float,16>(Z0 + (uint32_t)((wi_row*16 + r) * 64 + wi_col*16) * 4u, f0, esimd::overaligned_tag<16>{});
+                    esimd::slm_block_store<float,16>(Z0 + (uint32_t)((wi_row*16 + 8 + r) * 64 + wi_col*16) * 4u, f1, esimd::overaligned_tag<16>{});
                 }
                 esimd::barrier();
                 #pragma unroll
-                for (int t = 0; t < 4; ++t) {
-                    uint row = (uint)(t * 16 + (int)lid);
+                for (int k = 0; k < 8; ++k) {
+                    int idx = k * 16 + (int)lid;
+                    int row = idx / 2, hpart = idx % 2;
+                    unsigned head = (unsigned)hpart;
                     esimd::simd<float,32> seg = esimd::slm_block_load<float,32>(
-                        Z0 + row * 128u, esimd::overaligned_tag<16>{});
+                        Z0 + (uint32_t)(row * 64 + hpart * 32) * 4u, esimd::overaligned_tag<16>{});
                     esimd::simd<half,32> oh;
                     if (part == 2) {
                         oh = esimd::convert<half>(wbv3::e4m3_vec<32>(seg));
@@ -125,26 +146,30 @@ static inline sycl::event launch_b6(sycl::queue& q, const int8_t* dAp, const int
                         esimd::simd<float,32> hr = esimd::convert<float>(esimd::convert<half>(seg));
                         float recip = wbv3::cosine_recip_vec(hr);
                         if (part == 0) {
-                            float sc = wbmega::eh_round(qs[hh]);
+                            float sc = wbmega::eh_round(qs[head]);
                             esimd::simd<float,32> t1 = wbv3::mulh(hr, recip);
                             oh = esimd::convert<half>(wbv3::e4m3_vec<32>(wbv3::mulh(t1, sc)));
                         } else {
                             oh = esimd::convert<half>(wbv3::e4m3_vec<32>(wbv3::mulh(hr, recip)));
                         }
                     }
+                    // plane scatter (the slice-1/qres map VERBATIM -- the downstream
+                    // chain still reads 1274/1275/1276; the Q/K/V planes STAY).
                     {
+                        unsigned r = w * 64u + (unsigned)row;
+                        size_t pofs = (((size_t)(r / 64u) * heads + head) * 64u + (r % 64u)) * 32u;
                         sycl::half* T = (part == 0) ? Qp : ((part == 1) ? Kp : Vp);
-                        oh.copy_to(T + ((size_t)b * tokens + row) * 32u);
+                        oh.copy_to(T + pofs);
                     }
                     if (part == 0) {
-                        uint tr = row / 16u, strip = (row % 16u) / 8u, il = row % 8u;
+                        uint tr = (uint)row / 16u, strip = ((uint)row % 16u) / 8u, il = (uint)row % 8u;
                         uint e0 = ((tr * 2u + 0u) * 2u + strip) * 128u + il * 16u;
                         uint e1 = ((tr * 2u + 1u) * 2u + strip) * 128u + il * 16u;
                         esimd::simd<half,16> qa0 = oh.template select<16,1>(0), qa1 = oh.template select<16,1>(16);
-                        esimd::slm_block_store(QT + e0 * 2u, qa0, esimd::overaligned_tag<16>{});
-                        esimd::slm_block_store(QT + e1 * 2u, qa1, esimd::overaligned_tag<16>{});
+                        esimd::slm_block_store(QT + head * 4096u + e0 * 2u, qa0, esimd::overaligned_tag<16>{});
+                        esimd::slm_block_store(QT + head * 4096u + e1 * 2u, qa1, esimd::overaligned_tag<16>{});
                     } else {
-                        uint off = (row * 32u) * 2u;
+                        uint off = (head * 2048u + (uint)row * 32u) * 2u;
                         esimd::simd<half,16> ya0 = oh.template select<16,1>(0), ya1 = oh.template select<16,1>(16);
                         esimd::slm_block_store(Y0 + off, ya0, esimd::overaligned_tag<16>{});
                         esimd::slm_block_store(Y0 + off + 32u, ya1, esimd::overaligned_tag<16>{});
@@ -156,55 +181,61 @@ static inline sycl::event launch_b6(sycl::queue& q, const int8_t* dAp, const int
                     uint dst = (part == 1) ? KT : VT;
                     if (part == 1) {
                         uint kc2 = bidx / 8u, tc2 = (bidx / 2u) % 4u, js = bidx % 2u;
-                        esimd::simd<half,128> blk;
-                        #pragma unroll
-                        for (int jl = 0; jl < 8; ++jl) {
-                            uint r = tc2 * 16u + js * 8u + (uint)jl;
-                            esimd::simd<half,16> vr = esimd::slm_block_load<half,16>(
-                                Y0 + (r * 32u + kc2 * 16u) * 2u, esimd::overaligned_tag<16>{});
+                        #pragma unroll 1
+                        for (uint head = 0; head < heads; ++head) {
+                            esimd::simd<half,128> blk;
                             #pragma unroll
-                            for (int kq = 0; kq < 8; ++kq)
-                                blk.template select<2,1>(kq * 16 + jl * 2) = vr.template select<2,1>(kq * 2);
+                            for (int jl = 0; jl < 8; ++jl) {
+                                uint r = tc2 * 16u + js * 8u + (uint)jl;
+                                esimd::simd<half,16> vr = esimd::slm_block_load<half,16>(
+                                    Y0 + (head * 2048u + r * 32u + kc2 * 16u) * 2u, esimd::overaligned_tag<16>{});
+                                #pragma unroll
+                                for (int kq = 0; kq < 8; ++kq)
+                                    blk.template select<2,1>(kq * 16 + jl * 2) = vr.template select<2,1>(kq * 2);
+                            }
+                            esimd::slm_block_store(dst + head * 4096u + bidx * 256u, blk, esimd::overaligned_tag<16>{});
                         }
-                        esimd::slm_block_store(dst + bidx * 256u, blk, esimd::overaligned_tag<16>{});
                     } else {
                         uint kc2 = bidx / 4u, tc2 = (bidx / 2u) % 2u, js = bidx % 2u;
-                        esimd::simd<half,128> blk;
-                        #pragma unroll
-                        for (int kq = 0; kq < 8; ++kq) {
-                            esimd::simd<half,8> a = esimd::slm_block_load<half,8>(
-                                Y0 + ((kc2 * 16u + kq * 2u) * 32u + tc2 * 16u + js * 8u) * 2u, esimd::overaligned_tag<16>{});
-                            esimd::simd<half,8> bv = esimd::slm_block_load<half,8>(
-                                Y0 + ((kc2 * 16u + kq * 2u + 1u) * 32u + tc2 * 16u + js * 8u) * 2u, esimd::overaligned_tag<16>{});
-                            blk.template select<8,2>(kq * 16 + 0) = a;
-                            blk.template select<8,2>(kq * 16 + 1) = bv;
+                        #pragma unroll 1
+                        for (uint head = 0; head < heads; ++head) {
+                            esimd::simd<half,128> blk;
+                            #pragma unroll
+                            for (int kq = 0; kq < 8; ++kq) {
+                                esimd::simd<half,8> a = esimd::slm_block_load<half,8>(
+                                    Y0 + (head * 2048u + (kc2 * 16u + kq * 2u) * 32u + tc2 * 16u + js * 8u) * 2u, esimd::overaligned_tag<16>{});
+                                esimd::simd<half,8> bv = esimd::slm_block_load<half,8>(
+                                    Y0 + (head * 2048u + (kc2 * 16u + kq * 2u + 1u) * 32u + tc2 * 16u + js * 8u) * 2u, esimd::overaligned_tag<16>{});
+                                blk.template select<8,2>(kq * 16 + 0) = a;
+                                blk.template select<8,2>(kq * 16 + 1) = bv;
+                            }
+                            esimd::slm_block_store(dst + head * 4096u + bidx * 256u, blk, esimd::overaligned_tag<16>{});
                         }
-                        esimd::slm_block_store(dst + bidx * 256u, blk, esimd::overaligned_tag<16>{});
                     }
                     esimd::barrier();
                 }
             }
 
-            // ---- phase 2: wa stages 1-2 for THIS head (scores + softmax) ----
+            // ============ phase 2: wa stages 1-3 per head (slice-1 VERBATIM,
+            //            stage-3 OUT -> ATT = QT[hh] instead of global 1277) ====
             const int TS = 16, BK = 16;
             const int SLM_A = 64*BK*2, SLM_B = BK*64*2, SLM_B_BASE = 2*SLM_A;
-            int wi_row = (int)(lid / 4u), wi_col = (int)(lid % 4u);
-            auto load_block = [=](int buf, int kc) SYCL_ESIMD_FUNCTION {
-                #pragma unroll
-                for (int p = 0; p < 4; ++p) {
-                    int tt = (int)(lid / 4u), w4 = (int)(lid % 4u);
-                    if (tt != p) continue;
-                    esimd::simd<half,64> av = esimd::slm_block_load<half,64>(
-                        QT + (uint)(((tt*2+kc)*2)*128 + w4*64) * 2u, esimd::overaligned_tag<16>{});
-                    esimd::simd<half,64> bv = esimd::slm_block_load<half,64>(
-                        KT + (uint)(((kc*4+tt)*2)*128 + w4*64) * 2u, esimd::overaligned_tag<16>{});
-                    esimd::slm_block_store(X0 + buf * SLM_A + (uint)(tt * 256 + w4 * 64) * 2u, av, esimd::overaligned_tag<16>{});
-                    esimd::slm_block_store(X0 + SLM_B_BASE + buf * SLM_B + (uint)(tt * 256 + w4 * 64) * 2u, bv, esimd::overaligned_tag<16>{});
-                }
-            };
             #pragma unroll 1
-            for (uint h2 = 0; h2 < heads; ++h2) {
-                uint b2 = w * heads + h2;
+            for (uint hh = 0; hh < heads; ++hh) {
+                uint b = w * heads + hh;
+                auto load_block = [=](int buf, int kc) SYCL_ESIMD_FUNCTION {
+                    #pragma unroll
+                    for (int p = 0; p < 4; ++p) {
+                        int tt = (int)(lid / 4u), w4 = (int)(lid % 4u);
+                        if (tt != p) continue;
+                        esimd::simd<half,64> av = esimd::slm_block_load<half,64>(
+                            QT + hh * 4096u + (uint)(((tt*2+kc)*2)*128 + w4*64) * 2u, esimd::overaligned_tag<16>{});
+                        esimd::simd<half,64> bv = esimd::slm_block_load<half,64>(
+                            KT + hh * 4096u + (uint)(((kc*4+tt)*2)*128 + w4*64) * 2u, esimd::overaligned_tag<16>{});
+                        esimd::slm_block_store(X0 + buf * SLM_A + (uint)(tt * 256 + w4 * 64) * 2u, av, esimd::overaligned_tag<16>{});
+                        esimd::slm_block_store(X0 + SLM_B_BASE + buf * SLM_B + (uint)(tt * 256 + w4 * 64) * 2u, bv, esimd::overaligned_tag<16>{});
+                    }
+                };
                 esimd::simd<float,64> c00(0.f), c01(0.f), c10(0.f), c11(0.f);
                 load_block(0, 0);
                 esimd::barrier();
@@ -239,7 +270,7 @@ static inline sycl::event launch_b6(sycl::queue& q, const int8_t* dAp, const int
                 #pragma unroll
                 for (int rr = 0; rr < 4; ++rr) {
                     uint row = lid * 4u + rr;
-                    uint rgl = b2 * 64u + row;
+                    uint rgl = b * 64u + row;
                     esimd::simd<float,32> s0 = esimd::slm_block_load<float,32>(Z0 + row * 256u, esimd::overaligned_tag<16>{});
                     esimd::simd<float,32> s1 = esimd::slm_block_load<float,32>(Z0 + row * 256u + 128u, esimd::overaligned_tag<16>{});
                     size_t boff = ((size_t)(rgl / 64u) % (size_t)heads) * 4096u + (size_t)(rgl % 64u) * 64u;
@@ -284,8 +315,6 @@ static inline sycl::event launch_b6(sycl::queue& q, const int8_t* dAp, const int
                     esimd::slm_block_store(ybase + 1536u, q3, esimd::overaligned_tag<16>{});
                 }
                 esimd::barrier();
-                // attnV stage 3 (wa_res VERBATIM); the attended halves go to ATT (Y0
-                // cols h2*32..) instead of the global 1277 plane.
                 {
                     const int SLM_B2 = BK*32*2;
                     const int BCH2 = (BK*32)/8;
@@ -296,7 +325,7 @@ static inline sycl::event launch_b6(sycl::queue& q, const int8_t* dAp, const int
                         for (int i = 0; i < BCH2 / 64; ++i) {
                             int lb = t8 * BCH2 + i * 64;
                             esimd::simd<half,64> v2 = esimd::slm_block_load<half,64>(
-                                VT + (uint)(kc * 512 + lb) * 2u, esimd::overaligned_tag<16>{});
+                                VT + hh * 4096u + (uint)(kc * 512 + lb) * 2u, esimd::overaligned_tag<16>{});
                             esimd::slm_block_store(X0 + 4096u + buf * SLM_B2 + lb * 2, v2, esimd::overaligned_tag<16>{});
                         }
                     };
@@ -318,6 +347,11 @@ static inline sycl::event launch_b6(sycl::queue& q, const int8_t* dAp, const int
                         d11 = esimd::xmx::dpas<8,8,float>(d11, vb1, pa1);
                         esimd::barrier();
                     }
+                    // B6: ATT_hh = QT + hh*4096 ([token][32] f16; the head-hh tiles
+                    // are dead from here; head-(1-hh)'s tiles live in the OTHER 4KB
+                    // sub-region of the same band -> no clash). The shipped chain
+                    // wrote the f16 1277 plane here; its readers for THESE layers
+                    // are only the fused quant below (census).
                     #pragma unroll
                     for (int r = 0; r < 8; ++r) {
                         esimd::simd<float,8> r00 = d00.template select<8,1>(r*8), r01 = d01.template select<8,1>(r*8);
@@ -326,49 +360,57 @@ static inline sycl::event launch_b6(sycl::queue& q, const int8_t* dAp, const int
                         esimd::simd<half,8> h01 = esimd::convert<half>(s8v8::e4m3_vec_v8<8>(r01));
                         esimd::simd<half,8> h10 = esimd::convert<half>(s8v8::e4m3_vec_v8<8>(r10));
                         esimd::simd<half,8> h11 = esimd::convert<half>(s8v8::e4m3_vec_v8<8>(r11));
-                        // B6-1: joined 16-half stores into ATT (Y0): row-major 64x64,
-                        // col = h2*32 + tc2*16 (+8). (The shipped path wrote the f16
-                        // 1277 plane here; its only readers = the 16 quants, now here.)
                         esimd::simd<half,16> j0; j0.template select<8,1>(0) = h00; j0.template select<8,1>(8) = h01;
                         esimd::simd<half,16> j1; j1.template select<8,1>(0) = h10; j1.template select<8,1>(8) = h11;
                         uint row0 = tr2 * 16u + (uint)r, row1 = row0 + 8u;
-                        esimd::slm_block_store(Y0 + (row0 * 64u + h2 * 32u + (unsigned)tc2 * 16u) * 2u,
+                        esimd::slm_block_store(QT + hh * 4096u + (row0 * 32u + (unsigned)tc2 * 16u) * 2u,
                                                j0, esimd::overaligned_tag<16>{});
-                        esimd::slm_block_store(Y0 + (row1 * 64u + h2 * 32u + (unsigned)tc2 * 16u) * 2u,
+                        esimd::slm_block_store(QT + hh * 4096u + (row1 * 32u + (unsigned)tc2 * 16u) * 2u,
                                                j1, esimd::overaligned_tag<16>{});
                     }
-                    esimd::barrier();   // ATT ready (both heads after the loop)
+                    esimd::barrier();
                 }
             }
 
-            // ============ phase 3a/3b: attended quantize -> PKT + AS2 ==========
-            // 64 rows / 16 threads = 4 each. The chain = the shipped quant
-            // (quantize_row / qr_kernel_rowthread): scale = fdiv_rn(hmax|v|,127),
-            // qq = fdiv_rn(v,scale), rint, clamp [-127,127], int8 (the fdiv_rn
-            // per-element form -- NOT the mulh shortcut: the quantize gate's
-            // authority). ATT rows are 64 halfs = 128B.
+            // ============ phase 3b: attended quantize -> PKT (Z0) + AS2 ========
             #pragma unroll
             for (int t = 0; t < 4; ++t) {
                 uint row = (uint)(t * 16 + (int)lid);
-                esimd::simd<float,64> v = esimd::convert<float>(
-                    esimd::slm_block_load<half,64>(Y0 + row * 128u, esimd::overaligned_tag<16>{}));
+                esimd::simd<half,32> a0h = esimd::slm_block_load<half,32>(QT + (row * 32u) * 2u, esimd::overaligned_tag<16>{});
+                esimd::simd<half,32> a1h = esimd::slm_block_load<half,32>(QT + 4096u + (row * 32u) * 2u, esimd::overaligned_tag<16>{});
+                if (DbgATT) {   // ATT dump = the 1277 row the quant should see
+                    esimd::block_store<half,32>(DbgATT + ((size_t)w*64u+row)*32u, a0h, esimd::overaligned_tag<16>{});
+                    esimd::block_store<half,32>(DbgATT + ((size_t)w*64u+row)*32u + (size_t)windows*64u*32u, a1h, esimd::overaligned_tag<16>{});
+                }
+
+                esimd::simd<float,64> v;
+                v.template select<32,1>(0) = esimd::convert<float>(a0h);
+                v.template select<32,1>(32) = esimd::convert<float>(a1h);   // (1) was an OFFSET bug: lanes 1..32!
                 float peak = esimd::hmax<float,float,64>(esimd::abs(v));
                 const float scale = (peak == 0.0f) ? 1.0f
                     : esimd::div_ieee<float,1>(esimd::simd<float,1>(peak), esimd::simd<float,1>(127.0f))[0];
                 esimd::simd<float,64> qq = esimd::div_ieee<float,64>(v, esimd::simd<float,64>(scale));
                 qq = esimd::min(esimd::max(esimd::rnde<float,64>(qq), esimd::simd<float,64>(-127.f)), esimd::simd<float,64>(127.f));
-                // PKT = kb-slice-major [kb][row][32B] (the gemm SLM_A band layout:
-                // phase 3c's a0 = Z0 + kbi*2048 + rb*256 = 8 rows x 32B contiguous).
                 esimd::simd<int8_t,64> qi = esimd::convert<int8_t>(esimd::convert<int>(qq));
                 esimd::slm_block_store<int8_t,32>(Z0 + row * 32u, qi.template select<32,1>(0), esimd::overaligned_tag<16>{});
-                esimd::slm_block_store<int8_t,32>(Z0 + 2048u + row * 32u, qi.template select<32,1>(1), esimd::overaligned_tag<16>{});
+                esimd::slm_block_store<int8_t,32>(Z0 + 2048u + row * 32u, qi.template select<32,1>(32), esimd::overaligned_tag<16>{});
                 esimd::slm_block_store<float,1>(Z0 + 4096u + row * 4u, esimd::simd<float,1>(scale));
             }
             esimd::barrier();
+            if (DbgPKT) {   // B6-1 bisect outlet: PKT row-major + AS per window
+                #pragma unroll
+                for (uint t2 = 0; t2 < 4u; ++t2) { uint row = t2*16u + lid;
+                    esimd::block_store<int8_t,32>(DbgPKT + ((size_t)w*64u + row)*64u,
+                        esimd::slm_block_load<int8_t,32>(Z0 + row*32u, esimd::overaligned_tag<16>{}), esimd::overaligned_tag<16>{});
+                    esimd::block_store<int8_t,32>(DbgPKT + ((size_t)w*64u + row)*64u + 32u,
+                        esimd::slm_block_load<int8_t,32>(Z0 + 2048u + row*32u, esimd::overaligned_tag<16>{}), esimd::overaligned_tag<16>{});
+                    esimd::block_store<float,1>(DbgAS + (size_t)w*64u + row,
+                        esimd::slm_block_load<float,1>(Z0 + 4096u + row * 4u));
+                }
+            }
+            esimd::barrier();
 
-            // ============ phase 3c: outproj gemm int8 (BM64 x BN64 x K64) ======
-            // A = PKT (Z0 row-major [row][kb*32+c]) SLM-direct; B = dOp packed
-            // (kb*N*32 + ...; block per kb = 64x32 = 2048B staged X0 2-buffer).
+            // ============ phase 3c: outproj gemm int8 64x64xK64 ================
             {
                 const int SLM_BB3 = 2048;
                 const int8_t* bp3 = dOp;
@@ -377,6 +419,7 @@ static inline sycl::event launch_b6(sycl::queue& q, const int8_t* dAp, const int
                         bp3 + (size_t)kb * (64u * 32u) + lid * 128u, esimd::overaligned_tag<16>{});
                     esimd::slm_block_store(buf * SLM_BB3 + lid * 128u, bv, esimd::overaligned_tag<16>{});
                 };
+                int rb = (int)(lid / 2u), cb = (int)(lid % 2u);
                 esimd::simd<int32_t,64> o0(0), o1(0), o2(0), o3(0);
                 load_block3(0, 0);
                 esimd::barrier();
@@ -402,37 +445,29 @@ static inline sycl::event launch_b6(sycl::queue& q, const int8_t* dAp, const int
                 esimd::simd<float,16> csl = esimd::block_load<float,16>(bs2 + gc0, esimd::overaligned_tag<16>{});
                 esimd::simd<float,16> csh = esimd::block_load<float,16>(bs2 + gc0 + 16, esimd::overaligned_tag<16>{});
                 esimd::simd<float,16> ccl = esimd::block_load<float,16>(cosv + gc0, esimd::overaligned_tag<16>{});
-                esimd::simd<float,16> cch = esimd::block_load<float,16>(cosv + gc0 + 16, esimd::overaligned_tag<16>{});
+                esimd::simd<float,16> cc2 = esimd::block_load<float,16>(cosv + gc0 + 16, esimd::overaligned_tag<16>{});
                 esimd::simd<float,8> csl0=csl.template select<8,1>(0), csl1=csl.template select<8,1>(8);
                 esimd::simd<float,8> csh0=csh.template select<8,1>(0), csh1=csh.template select<8,1>(8);
                 esimd::simd<float,8> ccl0=ccl.template select<8,1>(0), ccl1=ccl.template select<8,1>(8);
-                esimd::simd<float,8> cch0=cch.template select<8,1>(0), cch1=cch.template select<8,1>(8);
-                #pragma unroll
+                esimd::simd<float,8> cc20=cc2.template select<8,1>(0), cc21=cc2.template select<8,1>(8);
+                #pragma unroll 1
                 for (int r = 0; r < 8; ++r) {
                     uint token = (uint)(rb * 8 + r);
                     unsigned yy = (w / across) * 8u + token / 8u, xx = (w % across) * 8u + token % 8u;
                     bool in = (yy >= top && xx >= left && yy - top < image_h && xx - left < image_w);
                     if (!in) continue;
                     size_t out = ((size_t)(yy - top) * image_w + (xx - left)) * 64u + (size_t)gc0;
-                    // attended scales (AS2) play the a_scale role (the shipped chain
-                    // read plane 1273; we read the in-kernel AS2 -- same values, never
-                    // left the chip). row token of THIS window:
                     float rs = esimd::slm_block_load<float,1>(Z0 + 4096u + token * 4u)[0];
                     esimd::simd<float,8> f0 = esimd::convert<float>(o0.template select<8,1>(r*8).read()) * rs * csl0;
                     esimd::simd<float,8> f1 = esimd::convert<float>(o1.template select<8,1>(r*8).read()) * rs * csl1;
                     esimd::simd<float,8> f2 = esimd::convert<float>(o2.template select<8,1>(r*8).read()) * rs * csh0;
                     esimd::simd<float,8> f3 = esimd::convert<float>(o3.template select<8,1>(r*8).read()) * rs * csh1;
-                    // skip = the f16 image plane at the SAME slot, 32 cols wide:
-                    // two 16-half block loads (cols gc0..+15, +16..+31).
                     esimd::simd<half,16> sha = esimd::block_load<half,16>(dSkip + out, esimd::overaligned_tag<16>{});
                     esimd::simd<half,16> shb = esimd::block_load<half,16>(dSkip + out + 16u, esimd::overaligned_tag<16>{});
                     esimd::simd<float,8> sk0 = esimd::convert<float>(sha.template select<8,1>(0).read());
                     esimd::simd<float,8> sk1 = esimd::convert<float>(sha.template select<8,1>(8).read());
                     esimd::simd<float,8> sk2 = esimd::convert<float>(shb.template select<8,1>(0).read());
                     esimd::simd<float,8> sk3 = esimd::convert<float>(shb.template select<8,1>(8).read());
-                    // the fold: straight-line sk*cc + f per 8-group = ONE HW FMA each
-                    // (the section-75 shape rule; the gemm_b_res_window BLADE-4 form:
-                    // the fma expression elementwise, pub_vec_v8 on the vector tails).
                     esimd::simd<float,16> pubA, pubB;
                     {
                         esimd::simd<float,8> t0, t1;
@@ -440,14 +475,13 @@ static inline sycl::event launch_b6(sycl::queue& q, const int8_t* dAp, const int
                         pubA.template select<8,1>(0) = s8v8::pub_vec_v8<8>(1u, t0);
                         pubA.template select<8,1>(8) = s8v8::pub_vec_v8<8>(1u, t1);
                         esimd::simd<float,8> t2, t3;
-                        for (int e = 0; e < 8; ++e) { t2[e] = sk2[e]*cch0[e] + f2.read()[e]; t3[e] = sk3[e]*cch1[e] + f3.read()[e]; }
+                        for (int e = 0; e < 8; ++e) { t2[e] = sk2[e]*cc20[e] + f2.read()[e]; t3[e] = sk3[e]*cc21[e] + f3.read()[e]; }
                         pubB.template select<8,1>(0) = s8v8::pub_vec_v8<8>(1u, t2);
                         pubB.template select<8,1>(8) = s8v8::pub_vec_v8<8>(1u, t3);
                     }
                     esimd::convert<half>(pubA).copy_to(Out2 + out);
                     esimd::convert<half>(pubB).copy_to(Out2 + out + 16u);
                 }
-                esimd::barrier();   // X0 reused by the next head's stages / PKT done
             }
         });
     });

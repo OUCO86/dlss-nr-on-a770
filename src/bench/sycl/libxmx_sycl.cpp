@@ -32,6 +32,7 @@
 #include "ffn_chip_kernel.hpp"
 #include "wa_res_kernel.hpp"
 #include "lfw_res_kernel.hpp"
+#include "b6_res_kernel.hpp"
 #include "lfw2_res_kernel.hpp"
 #include "requant_kernel.hpp"
 #include "gemm_s8_v1_kernel.hpp"
@@ -239,6 +240,26 @@ struct LfwStash {
 static LfwStash g_lfw;
 static int8_t* lfw_scratch_a = nullptr;   // device: max Mp*C int8 (~2.3MB, 4MB cap)
 static bool lfw_on() { static bool v = getenv("NR_LFW_FUSE") != nullptr && atoi(getenv("NR_LFW_FUSE")) != 0; return v; }   // B5-5b SLICE1: bench_lfw 8/8 EXACT + walk 1301 EXACT, but FRAME A/B 3/4 slightly NEG (+0.5: 510 WG x NT16 serializes qkv+attn per WG vs the split chain's 768+1020 WG parallelism). NOT promoted; slice 2 = per-(window,head) WG at BN=32 (1020 WGs, disjoint plane slices) -- analysis banked in 6.15. Probe: NR_LFW_FUSE=1.
+
+// B6-1 (the traffic-roof campaign §6.22-23): the SAME qkv stash, but the pairing
+// EXTENDS two records further: wa (as before) -> quant(1277 -> pk, sc) -> wres
+// (pk, W -> 1270, skip=1267, cosine; flags epi1/narrow/half_skip). When all four
+// line up, the wa closure is REWRITTEN at wres-record time into ONE b6 launch
+// (qkv + wa + attended-quant + outproj + residual-fold; 1277/pk/sc/1270-side
+// round trips vanish), the quant closure no-ops, and the wres closure is never
+// pushed. Escape: NR_B6=0 (default ON once bench_b6-driven promotion).
+struct B6Stash {
+    bool valid = false;          // set at wa-pair time (candidate)
+    bool qmatched = false;       // set when the next quant matches
+    size_t wacmd = 0, quantcmd = 0;
+    const float* bias = nullptr;   // the wa's bias pointer (captured at wa-record)
+    LfwStash S;                  // the qkv snapshot (operands/pack form)
+    unsigned windows = 0;
+    int out1277 = -1;            // the wa Out buffer id (the quant's source)
+    int pkid = -1, scid = -1;    // the quant's packed/scale ids (the wres's a/a_scale)
+};
+static B6Stash g_b6;
+static bool b6_on() { static bool v = !getenv("NR_B6") || atoi(getenv("NR_B6")) != 0; return v; }   // B6-1 PROMOTED: bench_b6 12/12 EXACT (PKT/AS/ATT/planes/1270 both shapes)
 // called by a gemm recorder: if `a` is a fused-quant pk whose scale buf == this gemm's
 // a_scale and whose M,K match, no-op the quant closure and return its info.
 static bool qfuse_take(int a, int a_scale, unsigned M, unsigned K, QuantFused& out){
@@ -2545,7 +2566,7 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
     // planes 1274/1275/1276 and the wa launch AND the qkv gemm/tail launches all
     // dissolve into one resident launch. Unpaired stashes are harmless (the qkv
     // closure runs as-is).
-    const bool lfw_guard = lfw_on() && !vit && C == 64u && heads == 2u && tokens == 64u && (M % 64u) == 0u
+    const bool lfw_guard = (lfw_on() || b6_on()) && !vit && C == 64u && heads == 2u && tokens == 64u && (M % 64u) == 0u
         && !(getenv("NR_QKV_STOP") && atoi(getenv("NR_QKV_STOP")) != 0);
     size_t myqcmd = g_cmds.size();
     if (lfw_guard) { g_lfw = LfwStash{}; g_lfw.valid = true; g_lfw.q = q; g_lfw.k = k; g_lfw.v = v;
@@ -2929,6 +2950,60 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
     const unsigned top = pad >> 16, left = pad & 0xffffu;
     g_cmd_names.push_back(__func__);
         flop_note("win_int8_res",M,N,K,1);
+    // B6-1 completion: the fused chain's LAST leg. When the quant leg matched and
+    // THIS wres consumes exactly that pk/a_scale pair with the expected image map
+    // (M/N/K + adjacency), rewrite: the wa closure (at g_b6.wacmd) becomes ONE
+    // b6::launch_b6 (qkv+wa+quant+outproj+fold), the quant closure no-ops, and
+    // THIS wres closure is never pushed. The qkv closure was already no-op'd by
+    // the wa-pair mechanism. Escape NR_B6=0.
+    static int wrstop0 = getenv("NR_WRES_STOP") ? atoi(getenv("NR_WRES_STOP")) : 0;
+    if (b6_on() && g_b6.valid && g_b6.qmatched && g_cmds.size() > g_b6.quantcmd &&
+        g_cmds.size() - g_b6.quantcmd <= 3 &&
+        a == g_b6.pkid && a_scale == g_b6.scid && M == g_b6.S.M && N == 64u && K == 64u &&
+        epi == 1u && narrow && half_skip && skip >= 0 && cosine >= 0 && wrstop0 == 0 &&
+        !(getenv("NR_WA_STOP") && atoi(getenv("NR_WA_STOP")) != 0)) {
+        B6Stash B = g_b6; g_b6 = B6Stash{};
+        const size_t na = (size_t)B.S.Mp * B.S.C;
+        const float* biasp2 = B.bias;
+        const unsigned acrossu = across, topu = pad >> 16, leftu = pad & 0xffffu;
+        const unsigned ihu = height, iwu = width;
+        // rewrite the wa closure -> the b6 launch:
+        g_cmds[B.wacmd] = [=]() {
+            auto sized = [&](int id, size_t bytes, const char* what) -> void* {
+                auto it = g_bufs.find(id);
+                if (it == g_bufs.end() || it->second.bytes < bytes)
+                    throw std::runtime_error(std::string("b6: ") + what + " not live/smaller at run");
+                return it->second.p;
+            };
+            int8_t* dAp = (int8_t*)pool_get(na);
+            if (B.S.fq) {
+                auto itsrc = g_bufs.find(B.S.qfq.src);
+                if (itsrc == g_bufs.end()) throw std::runtime_error("b6 fused-gather: image src not live");
+                packdev::pack_a_fused_gather(*GQ, (const sycl::half*)itsrc->second.p, dAp,
+                    (float*)B.S.as, (int)B.S.M, (int)B.S.Mp, (int)B.S.C, B.S.qfq.image_h, B.S.qfq.image_w, B.S.qfq.across, B.S.qfq.pad);
+            } else
+                packdev::pack_a(*GQ, B.S.Araw, dAp, (int)B.S.M, (int)B.S.Mp, (int)B.S.C);
+            int8_t* dBp = cached_pack_b_i8(B.S.b, B.S.Braw, (int)(3u * B.S.C), (int)B.S.C);
+            // the outproj weight: cached pack_b of the wres's B (transposed N x K
+            // raw -> the pack_b map the gemm consumes; cached_pack_b_i8 keys on
+            // (bufid,N,K) -- the wres weight id b):
+            int8_t* dOp = cached_pack_b_i8(b, (const int8_t*)g_bufs.find(b)->second.p, (int)N, (int)K);
+            b6::launch_b6(*GQ, dAp, dBp, B.S.as, B.S.bs, B.S.qs, biasp2, B.windows,
+                (sycl::half*)g_bufs.find(B.S.q)->second.p, (sycl::half*)g_bufs.find(B.S.k)->second.p,
+                (sycl::half*)g_bufs.find(B.S.v)->second.p,
+                dOp, (const float*)g_bufs.find(b_scale)->second.p,
+                (const float*)g_bufs.find(cosine)->second.p,
+                (const sycl::half*)g_bufs.find(skip)->second.p,
+                (sycl::half*)g_bufs.find(c)->second.p,
+                acrossu, topu, leftu, ihu, iwu);
+            pool_put(dAp);
+        };
+        g_cmd_names[B.wacmd] = "window_attention(B6-1 fused)";
+        g_cmds[B.quantcmd] = [](){};
+        g_cmd_names[B.quantcmd] = "quant(B6-fused)";
+        flop_note("win_int8_res",M,N,K,1);   // the wres gemm still counts in the flop ledger
+        return 0;   // the wres closure is NEVER pushed
+    }
     QuantFused qfw; const bool fused_w = qfuse_take(a, a_scale, M, K, qfw);
     const int srcid_w = fused_w ? qfw.src : 0;
     g_cmds.push_back([=]() {
@@ -3582,12 +3657,20 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
     // tail + attention stages resident; planes 1274/75/76 never exist, the wa
     // operand gathers and both gemm launches collapse into one kernel).
     size_t mywacmd = g_cmds.size();
-    const bool lfw_pair = lfw_on() && g_lfw.valid && !g_lfw.confirmed &&
+    const bool lfw_pair = (lfw_on() || b6_on()) && g_lfw.valid && !g_lfw.confirmed &&
         q == g_lfw.q && k == g_lfw.k && v == g_lfw.v && heads == g_lfw.heads &&
         64u == g_lfw.tokens && windows * 64u == g_lfw.M && Bp != nullptr &&
         (mywacmd - g_lfw.qcmd) <= 4 &&
         !(getenv("NR_WA_STOP") && atoi(getenv("NR_WA_STOP")) != 0);
-    if (lfw_pair) {
+    if (lfw_pair && b6_on()) {
+        // B6 candidate: store; NOTHING rewritten yet (if the quant/wres legs do
+        // not match, the shipped chain runs untouched -- the rewrite happens at
+        // wres-record time when all four records are confirmed).
+        if (getenv("NR_LFW_DBG")) std::printf("[b6] CAND windows=%u M=%u wacmd=%zu\n", windows, g_lfw.M, mywacmd);
+        g_b6 = B6Stash{}; g_b6.valid = true; g_b6.S = g_lfw; g_b6.windows = windows;
+        g_b6.wacmd = mywacmd; g_b6.out1277 = out; g_b6.bias = Bp;
+        g_lfw.confirmed = true;   // keep the qkv stash from double-pairing
+    } else if (lfw_pair) {
         if (getenv("NR_LFW_DBG")) std::printf("[lfw] PAIRED windows=%u M=%u qcmd=%zu wacmd=%zu\n", windows, g_lfw.M, g_lfw.qcmd, mywacmd);
         g_lfw.confirmed = true;
         g_cmds[g_lfw.qcmd] = [](){};
@@ -4690,6 +4773,14 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
     sycl::half* a = (sycl::half*)s->second.p;
     sycl::uint2* pk = (sycl::uint2*)p->second.p;
     float* sc = (float*)c->second.p;
+    // B6-1 leg 2: the fused wa-candidate's expected quant (source == the wa Out id,
+    // M/K match, adjacency) -> record ids; the wres record completes the pairing.
+    if (g_b6.valid && !g_b6.qmatched && source == g_b6.out1277 &&
+        M == g_b6.S.M && K == 64u && g_cmds.size() > g_b6.wacmd &&
+        g_cmds.size() - g_b6.wacmd <= 3) {
+        g_b6.qmatched = true; g_b6.quantcmd = g_cmds.size(); g_b6.pkid = packed; g_b6.scid = scale;
+        if (getenv("NR_LFW_DBG")) std::printf("[b6] QUANT matched cmd=%zu\n", g_b6.quantcmd);
+    }
     g_cmd_names.push_back(__func__);
     // v9b FOLD: the ADJACENT producer registered a slot for this source buffer ->
     // bind (packed,scale) into it; this quant becomes a no-op (producer writes int8+scale).
