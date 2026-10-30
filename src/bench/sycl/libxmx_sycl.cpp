@@ -3136,6 +3136,28 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
     // compile error); scalars/pointers are captured by value.
     if (sub == 18u) {   // E4M3_HALF: value=a.f32; e4m3; write half (no gate, no epilogue)
         g_cmd_names.push_back(__func__);
+        // BLADE U-1 (the unary leg map 10:4x: U_STOP=9 = -7.5ms measured; this
+        // branch alone = 18.5M elements/frame): the shipping form is ONE SCALAR
+        // thread per element (f32 load, software qr_e4m3, 2B store) = the frame's
+        // biggest elementwise and the blade-4 pattern at its purest. Vector twin:
+        // e4m3_vec_v8 = bench_e4m3vec-proven bit-identical to qr_e4m3 (0/4096).
+        // SIMD16 block form (64B loads / 32B stores per thread). Guards: N%16==0
+        // (every frame N: 98304..4177920 all mult of 16), !a_half (the f32-read
+        // contract). Escape NR_UNARY_VEC=0. Judges: UNARY_KINDS gate + 1301.
+        static bool uvec = !getenv("NR_UNARY_VEC") || atoi(getenv("NR_UNARY_VEC")) != 0;
+        if (uvec && (N % 16u) == 0u && !a_half) {
+            g_cmds.push_back([=]() {
+                GQ->parallel_for(sycl::range((size_t)N / 16u), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
+                    namespace esimd = sycl::ext::intel::esimd;
+                    size_t i = (size_t)it.get_id(0) * 16u;
+                    esimd::simd<float,16> v = esimd::block_load<float,16>(
+                        (const float*)A + i, esimd::overaligned_tag<16>{});
+                    esimd::simd<sycl::half,16> o = esimd::convert<sycl::half>(s8v8::e4m3_vec_v8<16>(v));
+                    esimd::block_store<sycl::half,16>((sycl::half*)C + i, o, esimd::overaligned_tag<16>{});
+                });
+            });
+            return 0;
+        }
         g_cmds.push_back([=]() {
             GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
                 size_t i = it.get_id(0);
