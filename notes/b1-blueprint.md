@@ -997,3 +997,32 @@ EXACT，16 对在跑。**ESIMD 核内禁 non-const static（§96 再证）**—�
 战役账：112.5 → 74.5（昨日收）→ **68.3-68.5（今）**：PAF -0.5 + U系 -1.2 + ffn-1(待判)。
 距 50 = 还差 ~18：ffn 腿剩余（chip 核 106→374 GB/s 形态战 = 最大单块）、
 wa -4.6、quant -6.1、f16-pack -5.0 的核级账。
+
+## 六.二十二、★★ 真正的问题钉死（11:4x，用户的质问命中）：帧=plane 搬运屋顶，B5 结论要修正
+
+**流量账**（plan buffer 图逐 call 读写计数）：60.3GB/帧。前三大往返：
+- buf1267（residual 主平面 66.8MB）W122×R278 = **26.7GB**
+- buf1274（33.6MB 输出平面）W264×R258 = **17.5GB**
+- buf1272（pk scratch 17.8MB）W488×R488 = **8.9GB**
+**写下限 19GB=34ms，写+一读=38GB=68ms ≈ 当前帧时** ⇒ 帧贴在 plane 传输屋顶上；
+blade 级核内优化只能在屋顶上削 10-15ms 的发射/延迟开销（今天 U 系/PAF 的账正是
+这个量级）。**50ms 及以下必须删往返本身。**
+
+**§六.十六 结论修正（诚实）**："融合不值"只对"两 op 融合+保留 plane 双写"成立
+（slice1/2 的实际形态）。前辈 82-launch 的根因不是核快 4 倍，是**每层一 mega-kernel、
+层内中间量不出片上**（全网 ~5GB/帧量级）。B5-5 家族不该关门——该开 **B6：
+每 window 整块 resident 核**（quant→qkv→wa→outproj→residual→ffn 一核，
+plane 只在层边界存在）。
+
+**B6 算术（可行性先过）**：64-token 块链上片上足迹 pk 4KB + qkv tiles 12KB +
+scores 16KB(Z) + probs/attended 8KB + outproj A-tile 4KB + ffn hidden 8KB +
+skip 流水读 ≈ **55-65KB → 64KB SLM 桶装得下**（v4full 已在 45-56KB 桶跑通）。
+每层流量：现在 ~6 plane 往返 ≈250MB/层 → B6 后 = skip 读+写 ≈134MB/层，
+**全帧 60GB → ~30GB**（再叠 ffn 融合则 ~25GB）⇒ DRAM 屋顶 68ms → **~45-53ms**。
+这就是 <50 的唯一路，也是最终目标的路。
+
+**已证积木全部复用**：lfw2 两 phase（bench_lfw2 8/8 EXACT 就是 B6 的 phase1-2！）
++ s8v8::gemm_b_res（outproj+residual 折叠，转正件）+ ffn_chip 两 gemm（转正件）
++ fused-quant publish（take 机制）。B6-1 = bench_b6 仪器：lfw2 核加 phase-3
+（attended→e4m3 rowmax quant→outproj gemm（SLM A tile）→deq+skip fold→写 1267），
+对拍=现链 wa+quant+outproj+residual 四件套。
