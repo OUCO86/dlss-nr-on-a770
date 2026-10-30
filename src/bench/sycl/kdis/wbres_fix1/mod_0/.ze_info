@@ -1,0 +1,304 @@
+---
+version:         '1.73'
+kernels:
+  - name:            _ZTSZZN5wbres15launch_residentERN4sycl3_V15queueEPKvbPKNS1_6detail9half_impl4halfESA_PvPKfSD_SD_jjjjjjjbjPS8_ENKUlRNS1_7handlerEE_clESG_EUlNS1_7nd_itemILi1EEEE_
+    user_attributes:
+      intel_reqd_sub_group_size: 8
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      barrier_count:   1
+      grf_count:       128
+      has_dpas:        true
+      has_no_stateless_write: true
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       8
+      private_size:    1536
+      spill_size:      2400
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        arg_bypointer
+        offset:          16
+        size:            8
+        arg_index:       0
+        addrmode:        slm
+        addrspace:       local
+        access_type:     readwrite
+        slm_alignment:   4
+      - arg_type:        arg_bypointer
+        offset:          24
+        size:            8
+        arg_index:       5
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          32
+        size:            8
+        arg_index:       8
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          40
+        size:            8
+        arg_index:       10
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          48
+        size:            8
+        arg_index:       11
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          56
+        size:            8
+        arg_index:       12
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          64
+        size:            8
+        arg_index:       13
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          72
+        size:            8
+        arg_index:       14
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          80
+        size:            8
+        arg_index:       17
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_byvalue
+        offset:          88
+        size:            4
+        arg_index:       1
+      - arg_type:        arg_byvalue
+        offset:          92
+        size:            4
+        arg_index:       2
+      - arg_type:        arg_byvalue
+        offset:          96
+        size:            4
+        arg_index:       3
+      - arg_type:        arg_byvalue
+        offset:          100
+        size:            4
+        arg_index:       4
+      - arg_type:        arg_byvalue
+        offset:          104
+        size:            4
+        arg_index:       6
+      - arg_type:        arg_byvalue
+        offset:          108
+        size:            1
+        arg_index:       7
+      - arg_type:        arg_byvalue
+        offset:          112
+        size:            4
+        arg_index:       9
+      - arg_type:        arg_byvalue
+        offset:          116
+        size:            4
+        arg_index:       15
+      - arg_type:        arg_byvalue
+        offset:          120
+        size:            1
+        arg_index:       16
+      - arg_type:        private_base_stateless
+        offset:          128
+        size:            8
+      - arg_type:        buffer_offset
+        offset:          136
+        size:            4
+        arg_index:       5
+      - arg_type:        buffer_offset
+        offset:          140
+        size:            4
+        arg_index:       8
+      - arg_type:        buffer_offset
+        offset:          144
+        size:            4
+        arg_index:       10
+      - arg_type:        buffer_offset
+        offset:          148
+        size:            4
+        arg_index:       13
+      - arg_type:        buffer_offset
+        offset:          152
+        size:            4
+        arg_index:       17
+      - arg_type:        local_size
+        offset:          160
+        size:            12
+      - arg_type:        arg_bypointer
+        offset:          172
+        size:            4
+        arg_index:       5
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          176
+        size:            4
+        arg_index:       8
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          180
+        size:            4
+        arg_index:       10
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          184
+        size:            4
+        arg_index:       12
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          188
+        size:            4
+        arg_index:       13
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          192
+        size:            4
+        arg_index:       14
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          196
+        size:            4
+        arg_index:       17
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            96
+    per_thread_memory_buffers:
+      - type:            scratch
+        usage:           spill_fill_space
+        size:            4096
+      - type:            global
+        usage:           private_space
+        size:            192
+        is_simt_thread:  true
+kernels_misc_info:
+  - name:            _ZTSZZN5wbres15launch_residentERN4sycl3_V15queueEPKvbPKNS1_6detail9half_impl4halfESA_PvPKfSD_SD_jjjjjjjbjPS8_ENKUlRNS1_7handlerEE_clESG_EUlNS1_7nd_itemILi1EEEE_
+    args_info:
+      - index:           0
+        address_qualifier: __local
+        access_qualifier: NONE
+        type_name:       'half*;8'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           2
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           3
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           4
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           5
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'half*;8'
+        type_qualifiers: NONE
+      - index:           6
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           7
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'char;1'
+        type_qualifiers: NONE
+      - index:           8
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'class.sycl::_V1::detail::half_impl::half*;8'
+        type_qualifiers: NONE
+      - index:           9
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           10
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           11
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'float*;8'
+        type_qualifiers: NONE
+      - index:           12
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'float*;8'
+        type_qualifiers: NONE
+      - index:           13
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'half*;8'
+        type_qualifiers: NONE
+      - index:           14
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'float*;8'
+        type_qualifiers: NONE
+      - index:           15
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           16
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'char;1'
+        type_qualifiers: NONE
+      - index:           17
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'class.sycl::_V1::detail::half_impl::half*;8'
+        type_qualifiers: NONE
+...

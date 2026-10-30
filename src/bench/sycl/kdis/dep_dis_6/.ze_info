@@ -1,0 +1,3379 @@
+---
+version:         '1.73'
+kernels:
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN4s8v97pack_a9ERNS0_5queueEPKaPaiiiiyiEUlS4_E_EE
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      indirect_stateless_count: 1
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       16
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_byvalue
+        offset:          24
+        size:            8
+        arg_index:       0
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          32
+        size:            8
+        arg_index:       1
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            8
+        arg_index:       1
+        source_offset:   8
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            5
+        arg_index:       1
+        source_offset:   16
+      - arg_type:        arg_byvalue
+        offset:          56
+        size:            1
+        arg_index:       1
+        source_offset:   21
+      - arg_type:        arg_byvalue
+        offset:          60
+        size:            1
+        arg_index:       1
+        source_offset:   22
+      - arg_type:        arg_byvalue
+        offset:          64
+        size:            1
+        arg_index:       1
+        source_offset:   23
+      - arg_type:        arg_byvalue
+        offset:          72
+        size:            8
+        arg_index:       1
+        source_offset:   24
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          80
+        size:            13
+        arg_index:       1
+        source_offset:   32
+      - arg_type:        arg_byvalue
+        offset:          96
+        size:            1
+        arg_index:       1
+        source_offset:   45
+      - arg_type:        arg_byvalue
+        offset:          100
+        size:            1
+        arg_index:       1
+        source_offset:   46
+      - arg_type:        arg_byvalue
+        offset:          104
+        size:            1
+        arg_index:       1
+        source_offset:   47
+      - arg_type:        const_base
+        offset:          112
+        size:            8
+      - arg_type:        global_size
+        offset:          128
+        size:            12
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            96
+  - name:            _ZTSZN4s8v97pack_a9ERN4sycl3_V15queueEPKaPaiiiiyiEUlNS1_4itemILi1ELb1EEEE_
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       32
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_bypointer
+        offset:          24
+        size:            8
+        arg_index:       2
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          32
+        size:            8
+        arg_index:       4
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            4
+        arg_index:       0
+      - arg_type:        arg_byvalue
+        offset:          44
+        size:            4
+        arg_index:       1
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            4
+        arg_index:       3
+      - arg_type:        arg_byvalue
+        offset:          56
+        size:            8
+        arg_index:       5
+      - arg_type:        arg_byvalue
+        offset:          64
+        size:            4
+        arg_index:       6
+      - arg_type:        const_base
+        offset:          72
+        size:            8
+      - arg_type:        buffer_offset
+        offset:          80
+        size:            4
+        arg_index:       2
+      - arg_type:        buffer_offset
+        offset:          84
+        size:            4
+        arg_index:       4
+      - arg_type:        arg_bypointer
+        offset:          88
+        size:            4
+        arg_index:       2
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          92
+        size:            4
+        arg_index:       4
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            192
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN4s8v97pack_b9ERNS0_5queueEPKaPaiiiyiEUlS4_E_EE
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      indirect_stateless_count: 1
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       16
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_byvalue
+        offset:          24
+        size:            8
+        arg_index:       0
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          32
+        size:            8
+        arg_index:       1
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            8
+        arg_index:       1
+        source_offset:   8
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            8
+        arg_index:       1
+        source_offset:   16
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          56
+        size:            13
+        arg_index:       1
+        source_offset:   24
+      - arg_type:        arg_byvalue
+        offset:          72
+        size:            1
+        arg_index:       1
+        source_offset:   37
+      - arg_type:        arg_byvalue
+        offset:          76
+        size:            1
+        arg_index:       1
+        source_offset:   38
+      - arg_type:        arg_byvalue
+        offset:          80
+        size:            1
+        arg_index:       1
+        source_offset:   39
+      - arg_type:        const_base
+        offset:          88
+        size:            8
+      - arg_type:        global_size
+        offset:          96
+        size:            12
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            96
+  - name:            _ZTSZN4s8v97pack_b9ERN4sycl3_V15queueEPKaPaiiiyiEUlNS1_4itemILi1ELb1EEEE_
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       32
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_bypointer
+        offset:          24
+        size:            8
+        arg_index:       2
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          32
+        size:            8
+        arg_index:       3
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            4
+        arg_index:       0
+      - arg_type:        arg_byvalue
+        offset:          44
+        size:            4
+        arg_index:       1
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            8
+        arg_index:       4
+      - arg_type:        arg_byvalue
+        offset:          56
+        size:            4
+        arg_index:       5
+      - arg_type:        const_base
+        offset:          64
+        size:            8
+      - arg_type:        buffer_offset
+        offset:          72
+        size:            4
+        arg_index:       2
+      - arg_type:        buffer_offset
+        offset:          76
+        size:            4
+        arg_index:       3
+      - arg_type:        arg_bypointer
+        offset:          80
+        size:            4
+        arg_index:       2
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          84
+        size:            4
+        arg_index:       3
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            192
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN5s8v9b8pack_a9bERNS0_5queueEPKaPaiiiiEUlS4_E_EE
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      indirect_stateless_count: 1
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       16
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_byvalue
+        offset:          24
+        size:            8
+        arg_index:       0
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          32
+        size:            5
+        arg_index:       1
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            1
+        arg_index:       1
+        source_offset:   5
+      - arg_type:        arg_byvalue
+        offset:          44
+        size:            1
+        arg_index:       1
+        source_offset:   6
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            1
+        arg_index:       1
+        source_offset:   7
+      - arg_type:        arg_byvalue
+        offset:          56
+        size:            8
+        arg_index:       1
+        source_offset:   8
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          64
+        size:            5
+        arg_index:       1
+        source_offset:   16
+      - arg_type:        arg_byvalue
+        offset:          72
+        size:            1
+        arg_index:       1
+        source_offset:   21
+      - arg_type:        arg_byvalue
+        offset:          76
+        size:            1
+        arg_index:       1
+        source_offset:   22
+      - arg_type:        arg_byvalue
+        offset:          80
+        size:            1
+        arg_index:       1
+        source_offset:   23
+      - arg_type:        arg_byvalue
+        offset:          88
+        size:            8
+        arg_index:       1
+        source_offset:   24
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          96
+        size:            5
+        arg_index:       1
+        source_offset:   32
+      - arg_type:        arg_byvalue
+        offset:          104
+        size:            1
+        arg_index:       1
+        source_offset:   37
+      - arg_type:        arg_byvalue
+        offset:          108
+        size:            1
+        arg_index:       1
+        source_offset:   38
+      - arg_type:        arg_byvalue
+        offset:          112
+        size:            1
+        arg_index:       1
+        source_offset:   39
+      - arg_type:        const_base
+        offset:          120
+        size:            8
+      - arg_type:        global_size
+        offset:          128
+        size:            12
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            96
+  - name:            _ZTSZN5s8v9b8pack_a9bERN4sycl3_V15queueEPKaPaiiiiEUlNS1_4itemILi1ELb1EEEE_
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       32
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_bypointer
+        offset:          24
+        size:            8
+        arg_index:       1
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          32
+        size:            8
+        arg_index:       3
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            4
+        arg_index:       0
+      - arg_type:        arg_byvalue
+        offset:          44
+        size:            4
+        arg_index:       2
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            4
+        arg_index:       4
+      - arg_type:        const_base
+        offset:          56
+        size:            8
+      - arg_type:        buffer_offset
+        offset:          64
+        size:            4
+        arg_index:       1
+      - arg_type:        buffer_offset
+        offset:          68
+        size:            4
+        arg_index:       3
+      - arg_type:        arg_bypointer
+        offset:          72
+        size:            4
+        arg_index:       1
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          76
+        size:            4
+        arg_index:       3
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            192
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN5s8v9b8pack_b9bERNS0_5queueEPKaPaiiiiyiEUlS4_E_EE
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      indirect_stateless_count: 1
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       16
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_byvalue
+        offset:          24
+        size:            8
+        arg_index:       0
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          32
+        size:            8
+        arg_index:       1
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            8
+        arg_index:       1
+        source_offset:   8
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            8
+        arg_index:       1
+        source_offset:   16
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          56
+        size:            13
+        arg_index:       1
+        source_offset:   24
+      - arg_type:        arg_byvalue
+        offset:          72
+        size:            1
+        arg_index:       1
+        source_offset:   37
+      - arg_type:        arg_byvalue
+        offset:          76
+        size:            1
+        arg_index:       1
+        source_offset:   38
+      - arg_type:        arg_byvalue
+        offset:          80
+        size:            1
+        arg_index:       1
+        source_offset:   39
+      - arg_type:        const_base
+        offset:          88
+        size:            8
+      - arg_type:        global_size
+        offset:          96
+        size:            12
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            96
+  - name:            _ZTSZN5s8v9b8pack_b9bERN4sycl3_V15queueEPKaPaiiiiyiEUlNS1_4itemILi1ELb1EEEE_
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       32
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_bypointer
+        offset:          24
+        size:            8
+        arg_index:       2
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          32
+        size:            8
+        arg_index:       3
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            4
+        arg_index:       0
+      - arg_type:        arg_byvalue
+        offset:          44
+        size:            4
+        arg_index:       1
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            8
+        arg_index:       4
+      - arg_type:        arg_byvalue
+        offset:          56
+        size:            4
+        arg_index:       5
+      - arg_type:        const_base
+        offset:          64
+        size:            8
+      - arg_type:        buffer_offset
+        offset:          72
+        size:            4
+        arg_index:       2
+      - arg_type:        buffer_offset
+        offset:          76
+        size:            4
+        arg_index:       3
+      - arg_type:        arg_bypointer
+        offset:          80
+        size:            4
+        arg_index:       2
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          84
+        size:            4
+        arg_index:       3
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            192
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN7packdevL8pack_a_vERNS0_5queueEPKaPaiiiEUlS4_E_EE
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      indirect_stateless_count: 1
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       16
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_byvalue
+        offset:          24
+        size:            8
+        arg_index:       0
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          32
+        size:            8
+        arg_index:       1
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            8
+        arg_index:       1
+        source_offset:   8
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            5
+        arg_index:       1
+        source_offset:   16
+      - arg_type:        arg_byvalue
+        offset:          56
+        size:            1
+        arg_index:       1
+        source_offset:   21
+      - arg_type:        arg_byvalue
+        offset:          60
+        size:            1
+        arg_index:       1
+        source_offset:   22
+      - arg_type:        arg_byvalue
+        offset:          64
+        size:            1
+        arg_index:       1
+        source_offset:   23
+      - arg_type:        arg_byvalue
+        offset:          72
+        size:            8
+        arg_index:       1
+        source_offset:   24
+        is_ptr:          true
+      - arg_type:        const_base
+        offset:          80
+        size:            8
+      - arg_type:        global_size
+        offset:          96
+        size:            12
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            96
+  - name:            _ZTSZN7packdevL8pack_a_vERN4sycl3_V15queueEPKaPaiiiEUlNS1_4itemILi1ELb1EEEE_
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       32
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_bypointer
+        offset:          24
+        size:            8
+        arg_index:       2
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          32
+        size:            8
+        arg_index:       4
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            4
+        arg_index:       0
+      - arg_type:        arg_byvalue
+        offset:          44
+        size:            4
+        arg_index:       1
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            4
+        arg_index:       3
+      - arg_type:        const_base
+        offset:          56
+        size:            8
+      - arg_type:        buffer_offset
+        offset:          64
+        size:            4
+        arg_index:       2
+      - arg_type:        buffer_offset
+        offset:          68
+        size:            4
+        arg_index:       4
+      - arg_type:        arg_bypointer
+        offset:          72
+        size:            4
+        arg_index:       2
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          76
+        size:            4
+        arg_index:       4
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            192
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN7packdevL6pack_aERNS0_5queueEPKaPaiiiEUlS4_E_EE
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      indirect_stateless_count: 1
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       16
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_byvalue
+        offset:          24
+        size:            8
+        arg_index:       0
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          32
+        size:            5
+        arg_index:       1
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            1
+        arg_index:       1
+        source_offset:   5
+      - arg_type:        arg_byvalue
+        offset:          44
+        size:            1
+        arg_index:       1
+        source_offset:   6
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            1
+        arg_index:       1
+        source_offset:   7
+      - arg_type:        arg_byvalue
+        offset:          56
+        size:            8
+        arg_index:       1
+        source_offset:   8
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          64
+        size:            5
+        arg_index:       1
+        source_offset:   16
+      - arg_type:        arg_byvalue
+        offset:          72
+        size:            1
+        arg_index:       1
+        source_offset:   21
+      - arg_type:        arg_byvalue
+        offset:          76
+        size:            1
+        arg_index:       1
+        source_offset:   22
+      - arg_type:        arg_byvalue
+        offset:          80
+        size:            1
+        arg_index:       1
+        source_offset:   23
+      - arg_type:        arg_byvalue
+        offset:          88
+        size:            8
+        arg_index:       1
+        source_offset:   24
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          96
+        size:            5
+        arg_index:       1
+        source_offset:   32
+      - arg_type:        arg_byvalue
+        offset:          104
+        size:            1
+        arg_index:       1
+        source_offset:   37
+      - arg_type:        arg_byvalue
+        offset:          108
+        size:            1
+        arg_index:       1
+        source_offset:   38
+      - arg_type:        arg_byvalue
+        offset:          112
+        size:            1
+        arg_index:       1
+        source_offset:   39
+      - arg_type:        const_base
+        offset:          120
+        size:            8
+      - arg_type:        global_size
+        offset:          128
+        size:            12
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            96
+  - name:            _ZTSZN7packdevL6pack_aERN4sycl3_V15queueEPKaPaiiiEUlNS1_4itemILi1ELb1EEEE_
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       32
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_bypointer
+        offset:          24
+        size:            8
+        arg_index:       1
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          32
+        size:            8
+        arg_index:       3
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            4
+        arg_index:       0
+      - arg_type:        arg_byvalue
+        offset:          44
+        size:            4
+        arg_index:       2
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            4
+        arg_index:       4
+      - arg_type:        const_base
+        offset:          56
+        size:            8
+      - arg_type:        buffer_offset
+        offset:          64
+        size:            4
+        arg_index:       1
+      - arg_type:        buffer_offset
+        offset:          68
+        size:            4
+        arg_index:       3
+      - arg_type:        arg_bypointer
+        offset:          72
+        size:            4
+        arg_index:       1
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          76
+        size:            4
+        arg_index:       3
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            192
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN7packdevL6pack_bERNS0_5queueEPKaPaiiEUlS4_E_EE
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      indirect_stateless_count: 1
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       16
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_byvalue
+        offset:          24
+        size:            8
+        arg_index:       0
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          32
+        size:            5
+        arg_index:       1
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            1
+        arg_index:       1
+        source_offset:   5
+      - arg_type:        arg_byvalue
+        offset:          44
+        size:            1
+        arg_index:       1
+        source_offset:   6
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            1
+        arg_index:       1
+        source_offset:   7
+      - arg_type:        arg_byvalue
+        offset:          56
+        size:            8
+        arg_index:       1
+        source_offset:   8
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          64
+        size:            8
+        arg_index:       1
+        source_offset:   16
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          72
+        size:            5
+        arg_index:       1
+        source_offset:   24
+      - arg_type:        arg_byvalue
+        offset:          80
+        size:            1
+        arg_index:       1
+        source_offset:   29
+      - arg_type:        arg_byvalue
+        offset:          84
+        size:            1
+        arg_index:       1
+        source_offset:   30
+      - arg_type:        arg_byvalue
+        offset:          88
+        size:            1
+        arg_index:       1
+        source_offset:   31
+      - arg_type:        const_base
+        offset:          96
+        size:            8
+      - arg_type:        global_size
+        offset:          104
+        size:            12
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            96
+  - name:            _ZTSZN7packdevL6pack_bERN4sycl3_V15queueEPKaPaiiEUlNS1_4itemILi1ELb1EEEE_
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       32
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_bypointer
+        offset:          24
+        size:            8
+        arg_index:       1
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          32
+        size:            8
+        arg_index:       2
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            4
+        arg_index:       0
+      - arg_type:        arg_byvalue
+        offset:          44
+        size:            4
+        arg_index:       3
+      - arg_type:        const_base
+        offset:          48
+        size:            8
+      - arg_type:        buffer_offset
+        offset:          56
+        size:            4
+        arg_index:       1
+      - arg_type:        buffer_offset
+        offset:          60
+        size:            4
+        arg_index:       2
+      - arg_type:        arg_bypointer
+        offset:          64
+        size:            4
+        arg_index:       1
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          68
+        size:            4
+        arg_index:       2
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            192
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN7packdevL8gather_aERNS0_5queueEPKaPaiiiyiEUlS4_E_EE
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      indirect_stateless_count: 1
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       16
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_byvalue
+        offset:          24
+        size:            8
+        arg_index:       0
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          32
+        size:            5
+        arg_index:       1
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            1
+        arg_index:       1
+        source_offset:   5
+      - arg_type:        arg_byvalue
+        offset:          44
+        size:            1
+        arg_index:       1
+        source_offset:   6
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            1
+        arg_index:       1
+        source_offset:   7
+      - arg_type:        arg_byvalue
+        offset:          56
+        size:            8
+        arg_index:       1
+        source_offset:   8
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          64
+        size:            8
+        arg_index:       1
+        source_offset:   16
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          72
+        size:            5
+        arg_index:       1
+        source_offset:   24
+      - arg_type:        arg_byvalue
+        offset:          80
+        size:            1
+        arg_index:       1
+        source_offset:   29
+      - arg_type:        arg_byvalue
+        offset:          84
+        size:            1
+        arg_index:       1
+        source_offset:   30
+      - arg_type:        arg_byvalue
+        offset:          88
+        size:            1
+        arg_index:       1
+        source_offset:   31
+      - arg_type:        arg_byvalue
+        offset:          96
+        size:            13
+        arg_index:       1
+        source_offset:   32
+      - arg_type:        arg_byvalue
+        offset:          112
+        size:            1
+        arg_index:       1
+        source_offset:   45
+      - arg_type:        arg_byvalue
+        offset:          116
+        size:            1
+        arg_index:       1
+        source_offset:   46
+      - arg_type:        arg_byvalue
+        offset:          120
+        size:            1
+        arg_index:       1
+        source_offset:   47
+      - arg_type:        const_base
+        offset:          128
+        size:            8
+      - arg_type:        global_size
+        offset:          136
+        size:            12
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            96
+  - name:            _ZTSZN7packdevL8gather_aERN4sycl3_V15queueEPKaPaiiiyiEUlNS1_4itemILi1ELb1EEEE_
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       32
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_bypointer
+        offset:          24
+        size:            8
+        arg_index:       1
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          32
+        size:            8
+        arg_index:       2
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            4
+        arg_index:       0
+      - arg_type:        arg_byvalue
+        offset:          44
+        size:            4
+        arg_index:       3
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            8
+        arg_index:       4
+      - arg_type:        arg_byvalue
+        offset:          56
+        size:            4
+        arg_index:       5
+      - arg_type:        const_base
+        offset:          64
+        size:            8
+      - arg_type:        buffer_offset
+        offset:          72
+        size:            4
+        arg_index:       1
+      - arg_type:        buffer_offset
+        offset:          76
+        size:            4
+        arg_index:       2
+      - arg_type:        arg_bypointer
+        offset:          80
+        size:            4
+        arg_index:       1
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          84
+        size:            4
+        arg_index:       2
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            192
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN7packdevL8gather_bERNS0_5queueEPKaPaiiiiyiEUlS4_E_EE
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      indirect_stateless_count: 1
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       16
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_byvalue
+        offset:          24
+        size:            8
+        arg_index:       0
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          32
+        size:            5
+        arg_index:       1
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            1
+        arg_index:       1
+        source_offset:   5
+      - arg_type:        arg_byvalue
+        offset:          44
+        size:            1
+        arg_index:       1
+        source_offset:   6
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            1
+        arg_index:       1
+        source_offset:   7
+      - arg_type:        arg_byvalue
+        offset:          56
+        size:            8
+        arg_index:       1
+        source_offset:   8
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          64
+        size:            8
+        arg_index:       1
+        source_offset:   16
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          72
+        size:            5
+        arg_index:       1
+        source_offset:   24
+      - arg_type:        arg_byvalue
+        offset:          80
+        size:            1
+        arg_index:       1
+        source_offset:   29
+      - arg_type:        arg_byvalue
+        offset:          84
+        size:            1
+        arg_index:       1
+        source_offset:   30
+      - arg_type:        arg_byvalue
+        offset:          88
+        size:            1
+        arg_index:       1
+        source_offset:   31
+      - arg_type:        arg_byvalue
+        offset:          96
+        size:            16
+        arg_index:       1
+        source_offset:   32
+      - arg_type:        const_base
+        offset:          112
+        size:            8
+      - arg_type:        global_size
+        offset:          128
+        size:            12
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            96
+  - name:            _ZTSZN7packdevL8gather_bERN4sycl3_V15queueEPKaPaiiiiyiEUlNS1_4itemILi1ELb1EEEE_
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       32
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_bypointer
+        offset:          24
+        size:            8
+        arg_index:       1
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          32
+        size:            8
+        arg_index:       2
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            4
+        arg_index:       0
+      - arg_type:        arg_byvalue
+        offset:          44
+        size:            4
+        arg_index:       3
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            8
+        arg_index:       4
+      - arg_type:        arg_byvalue
+        offset:          56
+        size:            4
+        arg_index:       5
+      - arg_type:        arg_byvalue
+        offset:          60
+        size:            4
+        arg_index:       6
+      - arg_type:        const_base
+        offset:          64
+        size:            8
+      - arg_type:        buffer_offset
+        offset:          72
+        size:            4
+        arg_index:       1
+      - arg_type:        buffer_offset
+        offset:          76
+        size:            4
+        arg_index:       2
+      - arg_type:        arg_bypointer
+        offset:          80
+        size:            4
+        arg_index:       1
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          84
+        size:            4
+        arg_index:       2
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            192
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN7packdevL13gather_pack_aERNS0_5queueEPKaPaiiiiyiEUlS4_E_EE
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      indirect_stateless_count: 1
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       16
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_byvalue
+        offset:          24
+        size:            8
+        arg_index:       0
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          32
+        size:            5
+        arg_index:       1
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            1
+        arg_index:       1
+        source_offset:   5
+      - arg_type:        arg_byvalue
+        offset:          44
+        size:            1
+        arg_index:       1
+        source_offset:   6
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            1
+        arg_index:       1
+        source_offset:   7
+      - arg_type:        arg_byvalue
+        offset:          56
+        size:            8
+        arg_index:       1
+        source_offset:   8
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          64
+        size:            5
+        arg_index:       1
+        source_offset:   16
+      - arg_type:        arg_byvalue
+        offset:          72
+        size:            1
+        arg_index:       1
+        source_offset:   21
+      - arg_type:        arg_byvalue
+        offset:          76
+        size:            1
+        arg_index:       1
+        source_offset:   22
+      - arg_type:        arg_byvalue
+        offset:          80
+        size:            1
+        arg_index:       1
+        source_offset:   23
+      - arg_type:        arg_byvalue
+        offset:          88
+        size:            8
+        arg_index:       1
+        source_offset:   24
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          96
+        size:            5
+        arg_index:       1
+        source_offset:   32
+      - arg_type:        arg_byvalue
+        offset:          104
+        size:            1
+        arg_index:       1
+        source_offset:   37
+      - arg_type:        arg_byvalue
+        offset:          108
+        size:            1
+        arg_index:       1
+        source_offset:   38
+      - arg_type:        arg_byvalue
+        offset:          112
+        size:            1
+        arg_index:       1
+        source_offset:   39
+      - arg_type:        arg_byvalue
+        offset:          120
+        size:            13
+        arg_index:       1
+        source_offset:   40
+      - arg_type:        arg_byvalue
+        offset:          136
+        size:            1
+        arg_index:       1
+        source_offset:   53
+      - arg_type:        arg_byvalue
+        offset:          140
+        size:            1
+        arg_index:       1
+        source_offset:   54
+      - arg_type:        arg_byvalue
+        offset:          144
+        size:            1
+        arg_index:       1
+        source_offset:   55
+      - arg_type:        const_base
+        offset:          152
+        size:            8
+      - arg_type:        global_size
+        offset:          160
+        size:            12
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            96
+  - name:            _ZTSZN7packdevL13gather_pack_aERN4sycl3_V15queueEPKaPaiiiiyiEUlNS1_4itemILi1ELb1EEEE_
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       32
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_bypointer
+        offset:          24
+        size:            8
+        arg_index:       1
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          32
+        size:            8
+        arg_index:       3
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            4
+        arg_index:       0
+      - arg_type:        arg_byvalue
+        offset:          44
+        size:            4
+        arg_index:       2
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            4
+        arg_index:       4
+      - arg_type:        arg_byvalue
+        offset:          56
+        size:            8
+        arg_index:       5
+      - arg_type:        arg_byvalue
+        offset:          64
+        size:            4
+        arg_index:       6
+      - arg_type:        const_base
+        offset:          72
+        size:            8
+      - arg_type:        buffer_offset
+        offset:          80
+        size:            4
+        arg_index:       1
+      - arg_type:        buffer_offset
+        offset:          84
+        size:            4
+        arg_index:       3
+      - arg_type:        arg_bypointer
+        offset:          88
+        size:            4
+        arg_index:       1
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          92
+        size:            4
+        arg_index:       3
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            192
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN7packdevL15gather_pack_a_bERNS0_5queueEPKaPaiiiiyiEUlS4_E_EE
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      indirect_stateless_count: 1
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       16
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_byvalue
+        offset:          24
+        size:            8
+        arg_index:       0
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          32
+        size:            13
+        arg_index:       1
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            1
+        arg_index:       1
+        source_offset:   13
+      - arg_type:        arg_byvalue
+        offset:          52
+        size:            1
+        arg_index:       1
+        source_offset:   14
+      - arg_type:        arg_byvalue
+        offset:          56
+        size:            1
+        arg_index:       1
+        source_offset:   15
+      - arg_type:        arg_byvalue
+        offset:          64
+        size:            8
+        arg_index:       1
+        source_offset:   16
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          72
+        size:            5
+        arg_index:       1
+        source_offset:   24
+      - arg_type:        arg_byvalue
+        offset:          80
+        size:            1
+        arg_index:       1
+        source_offset:   29
+      - arg_type:        arg_byvalue
+        offset:          84
+        size:            1
+        arg_index:       1
+        source_offset:   30
+      - arg_type:        arg_byvalue
+        offset:          88
+        size:            1
+        arg_index:       1
+        source_offset:   31
+      - arg_type:        arg_byvalue
+        offset:          96
+        size:            8
+        arg_index:       1
+        source_offset:   32
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          104
+        size:            13
+        arg_index:       1
+        source_offset:   40
+      - arg_type:        arg_byvalue
+        offset:          120
+        size:            1
+        arg_index:       1
+        source_offset:   53
+      - arg_type:        arg_byvalue
+        offset:          124
+        size:            1
+        arg_index:       1
+        source_offset:   54
+      - arg_type:        arg_byvalue
+        offset:          128
+        size:            1
+        arg_index:       1
+        source_offset:   55
+      - arg_type:        const_base
+        offset:          136
+        size:            8
+      - arg_type:        global_size
+        offset:          144
+        size:            12
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            96
+  - name:            _ZTSZN7packdevL15gather_pack_a_bERN4sycl3_V15queueEPKaPaiiiiyiEUlNS1_4itemILi1ELb1EEEE_
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       32
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_bypointer
+        offset:          24
+        size:            8
+        arg_index:       2
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          32
+        size:            8
+        arg_index:       4
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            8
+        arg_index:       0
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            4
+        arg_index:       1
+      - arg_type:        arg_byvalue
+        offset:          52
+        size:            4
+        arg_index:       3
+      - arg_type:        arg_byvalue
+        offset:          56
+        size:            8
+        arg_index:       5
+      - arg_type:        arg_byvalue
+        offset:          64
+        size:            4
+        arg_index:       6
+      - arg_type:        const_base
+        offset:          72
+        size:            8
+      - arg_type:        buffer_offset
+        offset:          80
+        size:            4
+        arg_index:       2
+      - arg_type:        buffer_offset
+        offset:          84
+        size:            4
+        arg_index:       4
+      - arg_type:        arg_bypointer
+        offset:          88
+        size:            4
+        arg_index:       2
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          92
+        size:            4
+        arg_index:       4
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            192
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN7packdevL17gather_pack_a_b_vERNS0_5queueEPKaPaiiiiyiEUlS4_E_EE
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      indirect_stateless_count: 2
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       16
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_byvalue
+        offset:          24
+        size:            8
+        arg_index:       0
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          32
+        size:            16
+        arg_index:       1
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            8
+        arg_index:       1
+        source_offset:   16
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          56
+        size:            13
+        arg_index:       1
+        source_offset:   24
+      - arg_type:        arg_byvalue
+        offset:          72
+        size:            1
+        arg_index:       1
+        source_offset:   37
+      - arg_type:        arg_byvalue
+        offset:          76
+        size:            1
+        arg_index:       1
+        source_offset:   38
+      - arg_type:        arg_byvalue
+        offset:          80
+        size:            1
+        arg_index:       1
+        source_offset:   39
+      - arg_type:        arg_byvalue
+        offset:          88
+        size:            8
+        arg_index:       1
+        source_offset:   40
+        is_ptr:          true
+      - arg_type:        const_base
+        offset:          96
+        size:            8
+      - arg_type:        global_size
+        offset:          104
+        size:            12
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            96
+  - name:            _ZTSZN7packdevL17gather_pack_a_b_vERN4sycl3_V15queueEPKaPaiiiiyiEUlNS1_4itemILi1ELb1EEEE_
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       32
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_bypointer
+        offset:          24
+        size:            8
+        arg_index:       3
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          32
+        size:            8
+        arg_index:       6
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            8
+        arg_index:       0
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            4
+        arg_index:       1
+      - arg_type:        arg_byvalue
+        offset:          52
+        size:            4
+        arg_index:       2
+      - arg_type:        arg_byvalue
+        offset:          56
+        size:            8
+        arg_index:       4
+      - arg_type:        arg_byvalue
+        offset:          64
+        size:            4
+        arg_index:       5
+      - arg_type:        const_base
+        offset:          72
+        size:            8
+      - arg_type:        buffer_offset
+        offset:          80
+        size:            4
+        arg_index:       3
+      - arg_type:        buffer_offset
+        offset:          84
+        size:            4
+        arg_index:       6
+      - arg_type:        arg_bypointer
+        offset:          88
+        size:            4
+        arg_index:       3
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          92
+        size:            4
+        arg_index:       6
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            192
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN7packdevL20gather_pack_b_diag_bERNS0_5queueEPKaPaiiiyiEUlS4_E_EE
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      indirect_stateless_count: 1
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       16
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_byvalue
+        offset:          24
+        size:            8
+        arg_index:       0
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          32
+        size:            8
+        arg_index:       1
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            8
+        arg_index:       1
+        source_offset:   8
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            5
+        arg_index:       1
+        source_offset:   16
+      - arg_type:        arg_byvalue
+        offset:          56
+        size:            1
+        arg_index:       1
+        source_offset:   21
+      - arg_type:        arg_byvalue
+        offset:          60
+        size:            1
+        arg_index:       1
+        source_offset:   22
+      - arg_type:        arg_byvalue
+        offset:          64
+        size:            1
+        arg_index:       1
+        source_offset:   23
+      - arg_type:        arg_byvalue
+        offset:          72
+        size:            8
+        arg_index:       1
+        source_offset:   24
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          80
+        size:            13
+        arg_index:       1
+        source_offset:   32
+      - arg_type:        arg_byvalue
+        offset:          96
+        size:            1
+        arg_index:       1
+        source_offset:   45
+      - arg_type:        arg_byvalue
+        offset:          100
+        size:            1
+        arg_index:       1
+        source_offset:   46
+      - arg_type:        arg_byvalue
+        offset:          104
+        size:            1
+        arg_index:       1
+        source_offset:   47
+      - arg_type:        const_base
+        offset:          112
+        size:            8
+      - arg_type:        global_size
+        offset:          128
+        size:            12
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            96
+  - name:            _ZTSZN7packdevL20gather_pack_b_diag_bERN4sycl3_V15queueEPKaPaiiiyiEUlNS1_4itemILi1ELb1EEEE_
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       32
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_bypointer
+        offset:          24
+        size:            8
+        arg_index:       2
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          32
+        size:            8
+        arg_index:       4
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            4
+        arg_index:       0
+      - arg_type:        arg_byvalue
+        offset:          44
+        size:            4
+        arg_index:       1
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            4
+        arg_index:       3
+      - arg_type:        arg_byvalue
+        offset:          56
+        size:            8
+        arg_index:       5
+      - arg_type:        arg_byvalue
+        offset:          64
+        size:            4
+        arg_index:       6
+      - arg_type:        const_base
+        offset:          72
+        size:            8
+      - arg_type:        buffer_offset
+        offset:          80
+        size:            4
+        arg_index:       2
+      - arg_type:        buffer_offset
+        offset:          84
+        size:            4
+        arg_index:       4
+      - arg_type:        arg_bypointer
+        offset:          88
+        size:            4
+        arg_index:       2
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          92
+        size:            4
+        arg_index:       4
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            192
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN7packdevL15gather_pack_b_bERNS0_5queueEPKaPaiiiyiEUlS4_E_EE
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      indirect_stateless_count: 1
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       16
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_byvalue
+        offset:          24
+        size:            8
+        arg_index:       0
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          32
+        size:            13
+        arg_index:       1
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            1
+        arg_index:       1
+        source_offset:   13
+      - arg_type:        arg_byvalue
+        offset:          52
+        size:            1
+        arg_index:       1
+        source_offset:   14
+      - arg_type:        arg_byvalue
+        offset:          56
+        size:            1
+        arg_index:       1
+        source_offset:   15
+      - arg_type:        arg_byvalue
+        offset:          64
+        size:            8
+        arg_index:       1
+        source_offset:   16
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          72
+        size:            8
+        arg_index:       1
+        source_offset:   24
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          80
+        size:            13
+        arg_index:       1
+        source_offset:   32
+      - arg_type:        arg_byvalue
+        offset:          96
+        size:            1
+        arg_index:       1
+        source_offset:   45
+      - arg_type:        arg_byvalue
+        offset:          100
+        size:            1
+        arg_index:       1
+        source_offset:   46
+      - arg_type:        arg_byvalue
+        offset:          104
+        size:            1
+        arg_index:       1
+        source_offset:   47
+      - arg_type:        const_base
+        offset:          112
+        size:            8
+      - arg_type:        global_size
+        offset:          128
+        size:            12
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            96
+  - name:            _ZTSZN7packdevL15gather_pack_b_bERN4sycl3_V15queueEPKaPaiiiyiEUlNS1_4itemILi1ELb1EEEE_
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       32
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_bypointer
+        offset:          24
+        size:            8
+        arg_index:       2
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          32
+        size:            8
+        arg_index:       3
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            8
+        arg_index:       0
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            4
+        arg_index:       1
+      - arg_type:        arg_byvalue
+        offset:          56
+        size:            8
+        arg_index:       4
+      - arg_type:        arg_byvalue
+        offset:          64
+        size:            4
+        arg_index:       5
+      - arg_type:        const_base
+        offset:          72
+        size:            8
+      - arg_type:        buffer_offset
+        offset:          80
+        size:            4
+        arg_index:       2
+      - arg_type:        buffer_offset
+        offset:          84
+        size:            4
+        arg_index:       3
+      - arg_type:        arg_bypointer
+        offset:          88
+        size:            4
+        arg_index:       2
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          92
+        size:            4
+        arg_index:       3
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            192
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZZ20xmx_rec_window_blockENKUlvE_clEvEUlS4_E8_EE
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       16
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_byvalue
+        offset:          24
+        size:            8
+        arg_index:       0
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          32
+        size:            8
+        arg_index:       1
+        source_offset:   0
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            8
+        arg_index:       1
+        source_offset:   8
+        is_ptr:          true
+      - arg_type:        const_base
+        offset:          48
+        size:            8
+      - arg_type:        global_size
+        offset:          64
+        size:            12
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            96
+  - name:            _ZTSZZ20xmx_rec_window_blockENKUlvE_clEvEUlN4sycl3_V14itemILi1ELb1EEEE8_
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       32
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_bypointer
+        offset:          24
+        size:            8
+        arg_index:       0
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          32
+        size:            8
+        arg_index:       1
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        const_base
+        offset:          40
+        size:            8
+      - arg_type:        arg_bypointer
+        offset:          48
+        size:            4
+        arg_index:       0
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          52
+        size:            4
+        arg_index:       1
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            192
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZZN7requant17requant_i8_kernelEvENKUlPKiPKfS9_PaPfjjE_clES7_S9_S9_SA_SB_jjEUlS4_E_EE
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       16
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_byvalue
+        offset:          24
+        size:            8
+        arg_index:       0
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          32
+        size:            5
+        arg_index:       1
+        source_offset:   0
+      - arg_type:        arg_byvalue
+        offset:          40
+        size:            1
+        arg_index:       1
+        source_offset:   5
+      - arg_type:        arg_byvalue
+        offset:          44
+        size:            1
+        arg_index:       1
+        source_offset:   6
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            1
+        arg_index:       1
+        source_offset:   7
+      - arg_type:        arg_byvalue
+        offset:          56
+        size:            8
+        arg_index:       1
+        source_offset:   8
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          64
+        size:            5
+        arg_index:       1
+        source_offset:   16
+      - arg_type:        arg_byvalue
+        offset:          72
+        size:            1
+        arg_index:       1
+        source_offset:   21
+      - arg_type:        arg_byvalue
+        offset:          76
+        size:            1
+        arg_index:       1
+        source_offset:   22
+      - arg_type:        arg_byvalue
+        offset:          80
+        size:            1
+        arg_index:       1
+        source_offset:   23
+      - arg_type:        arg_byvalue
+        offset:          88
+        size:            8
+        arg_index:       1
+        source_offset:   24
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          96
+        size:            8
+        arg_index:       1
+        source_offset:   32
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          104
+        size:            8
+        arg_index:       1
+        source_offset:   40
+        is_ptr:          true
+      - arg_type:        arg_byvalue
+        offset:          112
+        size:            8
+        arg_index:       1
+        source_offset:   48
+        is_ptr:          true
+      - arg_type:        const_base
+        offset:          120
+        size:            8
+      - arg_type:        global_size
+        offset:          128
+        size:            12
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            96
+  - name:            _ZTSZZN7requant17requant_i8_kernelEvENKUlPKiPKfS3_PaPfjjE_clES1_S3_S3_S4_S5_jjEUlN4sycl3_V14itemILi1ELb1EEEE_
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      inline_data_payload_size: 32
+      offset_to_skip_per_thread_data_load: 192
+      simd_size:       32
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 8
+    payload_arguments:
+      - arg_type:        global_id_offset
+        offset:          0
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          12
+        size:            12
+      - arg_type:        arg_bypointer
+        offset:          24
+        size:            8
+        arg_index:       1
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          32
+        size:            8
+        arg_index:       3
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          40
+        size:            8
+        arg_index:       4
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          48
+        size:            8
+        arg_index:       5
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          56
+        size:            8
+        arg_index:       6
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_byvalue
+        offset:          64
+        size:            4
+        arg_index:       0
+      - arg_type:        arg_byvalue
+        offset:          68
+        size:            4
+        arg_index:       2
+      - arg_type:        const_base
+        offset:          72
+        size:            8
+      - arg_type:        buffer_offset
+        offset:          80
+        size:            4
+        arg_index:       3
+      - arg_type:        arg_bypointer
+        offset:          84
+        size:            4
+        arg_index:       1
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          88
+        size:            4
+        arg_index:       3
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          92
+        size:            4
+        arg_index:       4
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          96
+        size:            4
+        arg_index:       5
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+      - arg_type:        arg_bypointer
+        offset:          100
+        size:            4
+        arg_index:       6
+        addrmode:        bindless
+        addrspace:       global
+        access_type:     readwrite
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            192
+  - name:            Intel_Symbol_Table_Void_Program
+    user_attributes:
+      intel_reqd_sub_group_size: 8
+    execution_env:
+      grf_count:       128
+      has_no_stateless_write: true
+      inline_data_payload_size: 32
+      simd_size:       8
+      subgroup_independent_forward_progress: true
+      work_group_walk_order_dimensions: [ 0, 0, 0 ]
+      eu_thread_count: 8
+kernels_misc_info:
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN4s8v97pack_a9ERNS0_5queueEPKaPaiiiiyiEUlS4_E_EE
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.sycl::_V1::range;8'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.__generated_.326;48'
+        type_qualifiers: NONE
+  - name:            _ZTSZN4s8v97pack_a9ERN4sycl3_V15queueEPKaPaiiiiyiEUlNS1_4itemILi1ELb1EEEE_
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           2
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           3
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           4
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           5
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'long;8'
+        type_qualifiers: NONE
+      - index:           6
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN4s8v97pack_b9ERNS0_5queueEPKaPaiiiyiEUlS4_E_EE
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.sycl::_V1::range;8'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.__generated_.328;40'
+        type_qualifiers: NONE
+  - name:            _ZTSZN4s8v97pack_b9ERN4sycl3_V15queueEPKaPaiiiyiEUlNS1_4itemILi1ELb1EEEE_
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           2
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           3
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           4
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'long;8'
+        type_qualifiers: NONE
+      - index:           5
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN5s8v9b8pack_a9bERNS0_5queueEPKaPaiiiiEUlS4_E_EE
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.sycl::_V1::range;8'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.__generated_.335;40'
+        type_qualifiers: NONE
+  - name:            _ZTSZN5s8v9b8pack_a9bERN4sycl3_V15queueEPKaPaiiiiEUlNS1_4itemILi1ELb1EEEE_
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           2
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           3
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           4
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN5s8v9b8pack_b9bERNS0_5queueEPKaPaiiiiyiEUlS4_E_EE
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.sycl::_V1::range;8'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.__generated_.328;40'
+        type_qualifiers: NONE
+  - name:            _ZTSZN5s8v9b8pack_b9bERN4sycl3_V15queueEPKaPaiiiiyiEUlNS1_4itemILi1ELb1EEEE_
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           2
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           3
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           4
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'long;8'
+        type_qualifiers: NONE
+      - index:           5
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN7packdevL8pack_a_vERNS0_5queueEPKaPaiiiEUlS4_E_EE
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.sycl::_V1::range;8'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.__generated_.341;32'
+        type_qualifiers: NONE
+  - name:            _ZTSZN7packdevL8pack_a_vERN4sycl3_V15queueEPKaPaiiiEUlNS1_4itemILi1ELb1EEEE_
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           2
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           3
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           4
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN7packdevL6pack_aERNS0_5queueEPKaPaiiiEUlS4_E_EE
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.sycl::_V1::range;8'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.__generated_.335;40'
+        type_qualifiers: NONE
+  - name:            _ZTSZN7packdevL6pack_aERN4sycl3_V15queueEPKaPaiiiEUlNS1_4itemILi1ELb1EEEE_
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           2
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           3
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           4
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN7packdevL6pack_bERNS0_5queueEPKaPaiiEUlS4_E_EE
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.sycl::_V1::range;8'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.__generated_.351;32'
+        type_qualifiers: NONE
+  - name:            _ZTSZN7packdevL6pack_bERN4sycl3_V15queueEPKaPaiiEUlNS1_4itemILi1ELb1EEEE_
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           2
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           3
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN7packdevL8gather_aERNS0_5queueEPKaPaiiiyiEUlS4_E_EE
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.sycl::_V1::range;8'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.__generated_.439;48'
+        type_qualifiers: NONE
+  - name:            _ZTSZN7packdevL8gather_aERN4sycl3_V15queueEPKaPaiiiyiEUlNS1_4itemILi1ELb1EEEE_
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           2
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           3
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           4
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'long;8'
+        type_qualifiers: NONE
+      - index:           5
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN7packdevL8gather_bERNS0_5queueEPKaPaiiiiyiEUlS4_E_EE
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.sycl::_V1::range;8'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.__generated_.441;48'
+        type_qualifiers: NONE
+  - name:            _ZTSZN7packdevL8gather_bERN4sycl3_V15queueEPKaPaiiiiyiEUlNS1_4itemILi1ELb1EEEE_
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           2
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           3
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           4
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'long;8'
+        type_qualifiers: NONE
+      - index:           5
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           6
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN7packdevL13gather_pack_aERNS0_5queueEPKaPaiiiiyiEUlS4_E_EE
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.sycl::_V1::range;8'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.__generated_.449;56'
+        type_qualifiers: NONE
+  - name:            _ZTSZN7packdevL13gather_pack_aERN4sycl3_V15queueEPKaPaiiiiyiEUlNS1_4itemILi1ELb1EEEE_
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           2
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           3
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           4
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           5
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'long;8'
+        type_qualifiers: NONE
+      - index:           6
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN7packdevL15gather_pack_a_bERNS0_5queueEPKaPaiiiiyiEUlS4_E_EE
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.sycl::_V1::range;8'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.__generated_.453;56'
+        type_qualifiers: NONE
+  - name:            _ZTSZN7packdevL15gather_pack_a_bERN4sycl3_V15queueEPKaPaiiiiyiEUlNS1_4itemILi1ELb1EEEE_
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'long;8'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           2
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           3
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           4
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           5
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'long;8'
+        type_qualifiers: NONE
+      - index:           6
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN7packdevL17gather_pack_a_b_vERNS0_5queueEPKaPaiiiiyiEUlS4_E_EE
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.sycl::_V1::range;8'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.__generated_.455;48'
+        type_qualifiers: NONE
+  - name:            _ZTSZN7packdevL17gather_pack_a_b_vERN4sycl3_V15queueEPKaPaiiiiyiEUlNS1_4itemILi1ELb1EEEE_
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'long;8'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           2
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           3
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           4
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'long;8'
+        type_qualifiers: NONE
+      - index:           5
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           6
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN7packdevL20gather_pack_b_diag_bERNS0_5queueEPKaPaiiiyiEUlS4_E_EE
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.sycl::_V1::range;8'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.__generated_.326;48'
+        type_qualifiers: NONE
+  - name:            _ZTSZN7packdevL20gather_pack_b_diag_bERN4sycl3_V15queueEPKaPaiiiyiEUlNS1_4itemILi1ELb1EEEE_
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           2
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           3
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           4
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           5
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'long;8'
+        type_qualifiers: NONE
+      - index:           6
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZN7packdevL15gather_pack_b_bERNS0_5queueEPKaPaiiiyiEUlS4_E_EE
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.sycl::_V1::range;8'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.__generated_.463;48'
+        type_qualifiers: NONE
+  - name:            _ZTSZN7packdevL15gather_pack_b_bERN4sycl3_V15queueEPKaPaiiiyiEUlNS1_4itemILi1ELb1EEEE_
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'long;8'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           2
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           3
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           4
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'long;8'
+        type_qualifiers: NONE
+      - index:           5
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZZ20xmx_rec_window_blockENKUlvE_clEvEUlS4_E8_EE
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.sycl::_V1::range;8'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.__generated_.499;16'
+        type_qualifiers: NONE
+  - name:            _ZTSZZ20xmx_rec_window_blockENKUlvE_clEvEUlN4sycl3_V14itemILi1ELb1EEEE8_
+    args_info:
+      - index:           0
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'float*;8'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'float*;8'
+        type_qualifiers: NONE
+  - name:            _ZTSN4sycl3_V16detail18RoundedRangeKernelINS0_4itemILi1ELb1EEELi1EZZN7requant17requant_i8_kernelEvENKUlPKiPKfS9_PaPfjjE_clES7_S9_S9_SA_SB_jjEUlS4_E_EE
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.sycl::_V1::range;8'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'class.__generated_.724;56'
+        type_qualifiers: NONE
+  - name:            _ZTSZZN7requant17requant_i8_kernelEvENKUlPKiPKfS3_PaPfjjE_clES1_S3_S3_S4_S5_jjEUlN4sycl3_V14itemILi1ELb1EEEE_
+    args_info:
+      - index:           0
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           1
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'int*;8'
+        type_qualifiers: NONE
+      - index:           2
+        address_qualifier: __private
+        access_qualifier: NONE
+        type_name:       'int;4'
+        type_qualifiers: NONE
+      - index:           3
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'char*;8'
+        type_qualifiers: NONE
+      - index:           4
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'float*;8'
+        type_qualifiers: NONE
+      - index:           5
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'float*;8'
+        type_qualifiers: NONE
+      - index:           6
+        address_qualifier: __global
+        access_qualifier: NONE
+        type_name:       'float*;8'
+        type_qualifiers: NONE
+...

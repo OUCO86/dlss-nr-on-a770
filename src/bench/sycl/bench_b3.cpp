@@ -50,12 +50,14 @@ int main(){ try {
         best=std::min(best,t/1e6);} return best;};
     double t_off = timeit([&]{ return ffnc::launch_ffn_chip<16,false>(q,dAp,dEp,dPp,o1,(int)M,(int)Mp,dSkip,dCos,false,true); });
     double t_on  = timeit([&]{ return ffnc::launch_ffn_chip<16,true>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true); });
+    double t_lw8 = timeit([&]{ return ffnc::launch_ffn_chip<8,false>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true); });
+    double t_lw32= timeit([&]{ return ffnc::launch_ffn_chip<32,false>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true); });
     std::vector<float> a((size_t)Mp*cin),b((size_t)Mp*cin);
     q.memcpy(a.data(),o1,(size_t)Mp*cin*4).wait(); q.memcpy(b.data(),o2,(size_t)Mp*cin*4).wait();
     size_t d=0; for(size_t i=0;i<a.size();++i) if(memcmp(&a[i],&b[i],4)) ++d;
     double bytes=(double)M*cin*2 /*A in*/ + (double)M*cin*2 /*skip*/ + (double)M*cin*4 /*out*/ + 2.0*cin*hidden*2; // DRAM-class traffic
-    printf("M=%u: chip off-staging %.4f ms | on-staging %.4f ms | diff %zu %s | GB/s %.0f -> %.0f\n",
-      M,t_off,t_on,d,d?"NOT-EXACT":"EXACT", bytes/t_off/1e3, bytes/t_on/1e3);
+    printf("M=%u: LW16 %.4f | WSTAGE %.4f | LW8 %.4f | LW32 %.4f ms | diff %zu %s | GB/s %.0f -> best %.0f\n",
+      M,t_off,t_on,t_lw8,t_lw32,d,d?"NOT-EXACT":"EXACT", bytes/t_off/1e3, bytes/std::min(std::min(t_on,t_lw8),t_lw32)/1e3);
   }
   return 0;
   } catch (std::exception& e) { printf("EXC: %s\n", e.what()); return 2; }

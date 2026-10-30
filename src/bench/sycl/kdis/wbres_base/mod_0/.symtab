@@ -1,0 +1,5 @@
+Id, Name, Section, Value, Type, Visibility, Binding
+0, UNDEF, UNDEF, 0, 0, 0, 0
+1, _entry, .text._ZTSZZN5wbres15launch_residentERN4sycl3_V15queueEPKvbPKNS1_6detail9half_impl4halfESA_PvPKfSD_SD_jjjjjjjbjPS8_ENKUlRNS1_7handlerEE_clESG_EUlNS1_7nd_itemILi1EEEE_, 288, 0, 0, 0
+2, _ZTSZZN5wbres15launch_residentERN4sycl3_V15queueEPKvbPKNS1_6detail9half_impl4halfESA_PvPKfSD_SD_jjjjjjjbjPS8_ENKUlRNS1_7handlerEE_clESG_EUlNS1_7nd_itemILi1EEEE_, .text._ZTSZZN5wbres15launch_residentERN4sycl3_V15queueEPKvbPKNS1_6detail9half_impl4halfESA_PvPKfSD_SD_jjjjjjjbjPS8_ENKUlRNS1_7handlerEE_clESG_EUlNS1_7nd_itemILi1EEEE_, 0, 2, 0, 0
+3, __INTEL_PATCH_CROSS_THREAD_OFFSET_OFF_R0, UNDEF, 0, 0, 0, 1

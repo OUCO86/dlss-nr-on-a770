@@ -125,16 +125,27 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
             for (int c = 0; c < 4; ++c) {
                 for (int tl = 0; tl < 2; ++tl) {
                     esimd::simd<float,64> e00(0.f), e01(0.f), e10(0.f), e11(0.f);
+                    // B3-ffn-10 (prefetch depth-2: the c-loop issued each weight
+                    // load IMMEDIATELY before its dpas = every global load ate its
+                    // ~300-cycle latency inline. Issue BOTH kc slices' b0/b1 up
+                    // front (4 loads in flight), then the dpas sequence consumes
+                    // them. Loads are pure; dpas order/values UNCHANGED = bit-exact
+                    // by construction. NR_FFP=0 escape via the old inline form?
+                    // (kept single-form: this IS the shipping shape; the judge is
+                    // bench_b3 + FFN gate + 1301 + 16-pair.)
+                    uint tc = (uint)(c * 2 + tl);
+                    const half* bb0 = dEp + ((size_t)0u * 8u + tc) * 2u * 128u;
+                    const half* bb1 = dEp + ((size_t)1u * 8u + tc) * 2u * 128u;
+                    esimd::simd<half,128> w00 = WSTAGE ? esimd::slm_block_load<half,128>(wsb + (uint)((0u * 8u + tc) * 2u * 128u) * 2u, esimd::overaligned_tag<16>{}) : esimd::block_load<half,128>(bb0, esimd::overaligned_tag<16>{});
+                    esimd::simd<half,128> w01 = WSTAGE ? esimd::slm_block_load<half,128>(wsb + (uint)((0u * 8u + tc) * 2u * 128u + 128u) * 2u, esimd::overaligned_tag<16>{}) : esimd::block_load<half,128>(bb0 + 128, esimd::overaligned_tag<16>{});
+                    esimd::simd<half,128> w10 = WSTAGE ? esimd::slm_block_load<half,128>(wsb + (uint)((1u * 8u + tc) * 2u * 128u) * 2u, esimd::overaligned_tag<16>{}) : esimd::block_load<half,128>(bb1, esimd::overaligned_tag<16>{});
+                    esimd::simd<half,128> w11 = WSTAGE ? esimd::slm_block_load<half,128>(wsb + (uint)((1u * 8u + tc) * 2u * 128u + 128u) * 2u, esimd::overaligned_tag<16>{}) : esimd::block_load<half,128>(bb1 + 128, esimd::overaligned_tag<16>{});
                     #pragma unroll
                     for (int kc = 0; kc < 2; ++kc) {
                         esimd::simd<half,128> a0 = esimd::slm_block_load<half,128>(ea + (uint)(kc*2u+0u)*256u, esimd::overaligned_tag<16>{});
                         esimd::simd<half,128> a1 = esimd::slm_block_load<half,128>(ea + (uint)(kc*2u+1u)*256u, esimd::overaligned_tag<16>{});
-                        uint tc = (uint)(c * 2 + tl);
-                        const half* bb = dEp + ((size_t)kc * 8u + tc) * 2u * 128u;
-                        esimd::simd<half,128> b0 = WSTAGE ? esimd::slm_block_load<half,128>(wsb + (uint)((kc * 8u + tc) * 2u * 128u) * 2u, esimd::overaligned_tag<16>{})
-                                                          : esimd::block_load<half,128>(bb, esimd::overaligned_tag<16>{});
-                        esimd::simd<half,128> b1 = WSTAGE ? esimd::slm_block_load<half,128>(wsb + (uint)((kc * 8u + tc) * 2u * 128u + 128u) * 2u, esimd::overaligned_tag<16>{})
-                                                          : esimd::block_load<half,128>(bb + 128, esimd::overaligned_tag<16>{});
+                        esimd::simd<half,128> b0 = kc ? w10 : w00;
+                        esimd::simd<half,128> b1 = kc ? w11 : w01;
                         e00 = esimd::xmx::dpas<8,8,float>(e00, b0, a0);
                         e01 = esimd::xmx::dpas<8,8,float>(e01, b1, a0);
                         e10 = esimd::xmx::dpas<8,8,float>(e10, b0, a1);
@@ -193,6 +204,9 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                 // (v3: NO barrier here -- HS is this thread's private 1KB; the
                 // in-order ESIMD pipeline orders the stores before the loads.
                 // The v2 barriers were for the SHARED per-subgroup stage, gone now.)
+                // B3-ffn-10b HYBRID: the full 8-reg proj hoist cost +3% (GRF
+                // pressure = the v3c wall again); REVERT proj to inline, KEEP
+                // the expand 4-load hoist (only 2 extra live regs there).
                 #pragma unroll
                 for (int kc2 = 0; kc2 < 2; ++kc2) {
                     uint kcg = (uint)(c * 2 + kc2);

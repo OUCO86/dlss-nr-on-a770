@@ -1,0 +1,6 @@
+Id, Name, Section, Value, Type, Visibility, Binding
+0, UNDEF, UNDEF, 0, 0, 0, 0
+1, _ZTSZZN4s8v8L4gemmERN4sycl3_V15queueEPKaS5_PiiiiENKUlRNS1_7handlerEE_clES8_EUlNS1_7nd_itemILi1EEEE_, .text._ZTSZZN4s8v8L4gemmERN4sycl3_V15queueEPKaS5_PiiiiENKUlRNS1_7handlerEE_clES8_EUlNS1_7nd_itemILi1EEEE_, 0, 2, 0, 0
+2, _ZTSZZN4s8v8L6gemm_bERN4sycl3_V15queueEPKaS5_PiiiiiENKUlRNS1_7handlerEE_clES8_EUlNS1_7nd_itemILi1EEEE_, .text._ZTSZZN4s8v8L6gemm_bERN4sycl3_V15queueEPKaS5_PiiiiiENKUlRNS1_7handlerEE_clES8_EUlNS1_7nd_itemILi1EEEE_, 0, 2, 0, 0
+3, _ZTSZZN4s8v8L8gemm32_bERN4sycl3_V15queueEPKaS5_PiiiiiENKUlRNS1_7handlerEE_clES8_EUlNS1_7nd_itemILi1EEEE_, .text._ZTSZZN4s8v8L8gemm32_bERN4sycl3_V15queueEPKaS5_PiiiiiENKUlRNS1_7handlerEE_clES8_EUlNS1_7nd_itemILi1EEEE_, 0, 2, 0, 0
+4, _ZTSZZN4s8v8L6gemm32ERN4sycl3_V15queueEPKaS5_PiiiiENKUlRNS1_7handlerEE_clES8_EUlNS1_7nd_itemILi1EEEE_, .text._ZTSZZN4s8v8L6gemm32ERN4sycl3_V15queueEPKaS5_PiiiiENKUlRNS1_7handlerEE_clES8_EUlNS1_7nd_itemILi1EEEE_, 0, 2, 0, 0

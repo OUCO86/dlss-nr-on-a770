@@ -1,0 +1,1359 @@
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(70,30): warning: 'get_pointer' is deprecated: local_accessor::get_pointer() is deprecated, please use get_multi_ptr() [-Wdeprecated-declarations]
+   70 |             float* f32 = SLM.get_pointer();
+      |                              ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\accessor.hpp(2504,3): note: 'get_pointer' has been explicitly marked deprecated here
+ 2504 |   __SYCL2020_DEPRECATED(
+      |   ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(72,13): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   72 |             uint* u32 = (uint*)f32;
+      |             ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(72,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   72 |             uint* u32 = (uint*)f32;
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(73,19): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   73 |             const uint PROJ = 3072u;                          // proj weights halves
+      |                   ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(74,19): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   74 |             const uint QSTASH = 12288u, KSTASH = 14336u, VSTASH = 16384u, ATTSTASH = 18432u;
+      |                   ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(75,19): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   75 |             const uint RECIPF = 10240u;                       // reciprocals in FLOATS
+      |                   ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(76,13): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   76 |             uint window = (uint)it.get_group(0);
+      |             ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(76,28): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   76 |             uint window = (uint)it.get_group(0);
+      |                            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(80,13): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   80 |             uint sub = sg.get_group_id(), local = sg.get_local_linear_id();   // 0..7 / 0..7
+      |             ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(81,13): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   81 |             uint lid = (uint)it.get_local_id(0);                              // 0..63
+      |             ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(81,25): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   81 |             uint lid = (uint)it.get_local_id(0);                              // 0..63
+      |                         ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(82,13): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   82 |             uint row = sub * 8u;                                              // first token of the row
+      |             ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(83,13): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   83 |             uint scratch = 2048u + 256u * sub;                                // floats
+      |             ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(84,13): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   84 |             uint probs = 4096u + 256u * sub;                                  // u32 words
+      |             ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(85,13): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   85 |             uint top = pad_top, left = pad_left;
+      |             ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(91,18): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   91 |             for (uint i = lid; i < 32u * 96u; i += 64u) h16[i] = Wqkv[i];
+      |                  ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(97,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   97 |                     for (uint c = 0; c < 32; ++c) {
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(102,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  102 |                     for (uint c = 0; c < 32; ++c) h16[scratch*2u + local*32u + c] = half(0.f);
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(109,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  109 |                 for (uint kk = 0; kk < 2; ++kk)
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(112,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  112 |                 for (uint part = 0; part < 3; ++part) {
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(114,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  114 |                     for (uint j = 0; j < 4; ++j) jm::joint_matrix_fill(sg, acc[j], 0.f);
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(115,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  115 |                     for (uint kk = 0; kk < 2; ++kk)
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(116,30): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  116 |                         for (uint j = 0; j < 4; ++j) {
+      |                              ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(122,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  122 |                     for (uint j = 0; j < 4; ++j)
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(155,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  155 |                 for (uint cc = 0; cc < 32u; ++cc)
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(162,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  162 |                 for (uint kk = 0; kk < 2; ++kk)
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(165,17): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  165 |                 uint head_bias = row * 64u;
+      |                 ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(166,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  166 |                 for (uint half_keys = 0; half_keys < 2; ++half_keys) {
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(168,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  168 |                     for (uint j = 0; j < 4; ++j) jm::joint_matrix_fill(sg, acc[j], 0.f);
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(169,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  169 |                     for (uint c = 0; c < 32u; c += 16u)
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(170,30): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  170 |                         for (uint j = 0; j < 4; ++j) {
+      |                              ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(178,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  178 |                     for (uint j = 0; j < 4; ++j)
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(184,30): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  184 |                         for (uint cc = 0; cc < 32u; ++cc)
+      |                              ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(189,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  189 |                     for (uint cc = 0; cc < 32u; cc += 2u) {
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(190,25): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  190 |                         uint bcol = half_keys*32u + cc;
+      |                         ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(202,18): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  202 |             for (uint i = lid; i < 32u * 32u; i += 64u) h16[PROJ + i] = Wproj[i];
+      |                  ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(205,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  205 |                 for (uint w = 0; w < 32; ++w) {
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(216,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  216 |                 for (uint w = 0; w < 32; ++w) {
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(231,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  231 |                 for (uint j = 0; j < 4; ++j) jm::joint_matrix_fill(sg, context[j], 0.f);
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(232,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  232 |                 for (uint c = 0; c < 64u; c += 16u) {
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(236,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  236 |                     for (uint j = 0; j < 4; ++j) {
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(243,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  243 |                 for (uint j = 0; j < 4; ++j)
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(250,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  250 |                 for (uint cc = 0; cc < 32u; ++cc)
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(258,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  258 |                 for (uint cc = 0; cc < 32; ++cc)
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(262,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  262 |                     for (uint i = 0; i < 256u; ++i)
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(267,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  267 |                 for (uint kk = 0; kk < 2; ++kk)
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(271,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  271 |                 for (uint j = 0; j < 4; ++j) jm::joint_matrix_fill(sg, projected[j], 0.f);
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(272,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  272 |                 for (uint kk = 0; kk < 2; ++kk)
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(273,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  273 |                     for (uint j = 0; j < 4; ++j) {
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(279,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  279 |                 for (uint j = 0; j < 4; ++j)
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(286,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  286 |                 for (uint cc = 0; cc < 32u; ++cc)
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(295,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  295 |                     for (uint c = 0; c < 32; ++c) {
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+52 warnings generated.
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(70,30): warning: 'get_pointer' is deprecated: local_accessor::get_pointer() is deprecated, please use get_multi_ptr() [-Wdeprecated-declarations]
+   70 |             float* f32 = SLM.get_pointer();
+      |                              ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\accessor.hpp(2504,3): note: 'get_pointer' has been explicitly marked deprecated here
+ 2504 |   __SYCL2020_DEPRECATED(
+      |   ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(72,13): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   72 |             uint* u32 = (uint*)f32;
+      |             ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(72,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   72 |             uint* u32 = (uint*)f32;
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(73,19): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   73 |             const uint PROJ = 3072u;                          // proj weights halves
+      |                   ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(74,19): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   74 |             const uint QSTASH = 12288u, KSTASH = 14336u, VSTASH = 16384u, ATTSTASH = 18432u;
+      |                   ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(75,19): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   75 |             const uint RECIPF = 10240u;                       // reciprocals in FLOATS
+      |                   ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(76,13): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   76 |             uint window = (uint)it.get_group(0);
+      |             ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(76,28): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   76 |             uint window = (uint)it.get_group(0);
+      |                            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(80,13): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   80 |             uint sub = sg.get_group_id(), local = sg.get_local_linear_id();   // 0..7 / 0..7
+      |             ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(81,13): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   81 |             uint lid = (uint)it.get_local_id(0);                              // 0..63
+      |             ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(81,25): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   81 |             uint lid = (uint)it.get_local_id(0);                              // 0..63
+      |                         ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(82,13): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   82 |             uint row = sub * 8u;                                              // first token of the row
+      |             ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(83,13): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   83 |             uint scratch = 2048u + 256u * sub;                                // floats
+      |             ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(84,13): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   84 |             uint probs = 4096u + 256u * sub;                                  // u32 words
+      |             ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(85,13): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   85 |             uint top = pad_top, left = pad_left;
+      |             ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(91,18): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   91 |             for (uint i = lid; i < 32u * 96u; i += 64u) h16[i] = Wqkv[i];
+      |                  ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(97,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   97 |                     for (uint c = 0; c < 32; ++c) {
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(102,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  102 |                     for (uint c = 0; c < 32; ++c) h16[scratch*2u + local*32u + c] = half(0.f);
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(109,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  109 |                 for (uint kk = 0; kk < 2; ++kk)
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(112,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  112 |                 for (uint part = 0; part < 3; ++part) {
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(114,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  114 |                     for (uint j = 0; j < 4; ++j) jm::joint_matrix_fill(sg, acc[j], 0.f);
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(115,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  115 |                     for (uint kk = 0; kk < 2; ++kk)
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(116,30): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  116 |                         for (uint j = 0; j < 4; ++j) {
+      |                              ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(122,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  122 |                     for (uint j = 0; j < 4; ++j)
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(155,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  155 |                 for (uint cc = 0; cc < 32u; ++cc)
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(162,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  162 |                 for (uint kk = 0; kk < 2; ++kk)
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(165,17): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  165 |                 uint head_bias = row * 64u;
+      |                 ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(166,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  166 |                 for (uint half_keys = 0; half_keys < 2; ++half_keys) {
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(168,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  168 |                     for (uint j = 0; j < 4; ++j) jm::joint_matrix_fill(sg, acc[j], 0.f);
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(169,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  169 |                     for (uint c = 0; c < 32u; c += 16u)
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(170,30): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  170 |                         for (uint j = 0; j < 4; ++j) {
+      |                              ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(178,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  178 |                     for (uint j = 0; j < 4; ++j)
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(184,30): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  184 |                         for (uint cc = 0; cc < 32u; ++cc)
+      |                              ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(189,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  189 |                     for (uint cc = 0; cc < 32u; cc += 2u) {
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(190,25): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  190 |                         uint bcol = half_keys*32u + cc;
+      |                         ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(202,18): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  202 |             for (uint i = lid; i < 32u * 32u; i += 64u) h16[PROJ + i] = Wproj[i];
+      |                  ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(205,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  205 |                 for (uint w = 0; w < 32; ++w) {
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(216,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  216 |                 for (uint w = 0; w < 32; ++w) {
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(231,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  231 |                 for (uint j = 0; j < 4; ++j) jm::joint_matrix_fill(sg, context[j], 0.f);
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(232,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  232 |                 for (uint c = 0; c < 64u; c += 16u) {
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(236,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  236 |                     for (uint j = 0; j < 4; ++j) {
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(243,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  243 |                 for (uint j = 0; j < 4; ++j)
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(250,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  250 |                 for (uint cc = 0; cc < 32u; ++cc)
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(258,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  258 |                 for (uint cc = 0; cc < 32; ++cc)
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(262,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  262 |                     for (uint i = 0; i < 256u; ++i)
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(267,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  267 |                 for (uint kk = 0; kk < 2; ++kk)
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(271,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  271 |                 for (uint j = 0; j < 4; ++j) jm::joint_matrix_fill(sg, projected[j], 0.f);
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(272,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  272 |                 for (uint kk = 0; kk < 2; ++kk)
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(273,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  273 |                     for (uint j = 0; j < 4; ++j) {
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(279,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  279 |                 for (uint j = 0; j < 4; ++j)
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(286,22): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  286 |                 for (uint cc = 0; cc < 32u; ++cc)
+      |                      ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+In file included from E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_wbres_compile.cpp:2:
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\window_block_resident.hpp(295,26): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  295 |                     for (uint c = 0; c < 32; ++c) {
+      |                          ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+52 warnings generated.
+Compilation from IR - skipping loading of FCL
+
+warning: in kernel 'typeinfo name for wbres::launch_resident(sycl::_V1::queue&, void const*, bool, sycl::_V1::detail::half_impl::half const*, sycl::_V1::detail::half_impl::half const*, void*, float const*, float const*, float const*, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, bool, unsigned int, sycl::_V1::detail::half_impl::half*)::'lambda'(sycl::_V1::handler&)::operator()(sycl::_V1::handler&) const::'lambda'(sycl::_V1::nd_item<1>)': compiled SIMD8 allocated 128 regs and spilled around 142
+
+Build succeeded.
