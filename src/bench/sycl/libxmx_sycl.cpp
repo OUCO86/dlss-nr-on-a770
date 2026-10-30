@@ -3166,6 +3166,35 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
         });
     } else if (sub == 12u) {   // POOL2: 2x2 average NHWC, column-first order (.comp:529-531)
         g_cmd_names.push_back(__func__);
+        // BLADE U-3 (3.9M elems/frame): channel-contiguous blocks again -- the
+        // four loads (base, +ch, +width*ch, +(width+1)*ch) are 16-contiguous per
+        // pixel, and the cr_add tree ((a+b)+c)+d keeps its EXACT per-lane order
+        // (esimd + = separate fadd instrs, §92 normalize_esimd proof; NO fma
+        // contraction in ESIMD). cr_mul(total,0.25f): 0.25 is a power of two =
+        // EXACT at any width (no rounding at all, the multiply-by-quarter is a
+        // significand shift); then e4m3_vec_v8 (epi==1 frame form). Guards:
+        // !a_half && narrow && epi==1 && CH%16==0 && N%16==0.
+        static bool uvec3 = !getenv("NR_UNARY_VEC") || atoi(getenv("NR_UNARY_VEC")) != 0;
+        if (uvec3 && !a_half && narrow && epi == 1u && (CH % 16u) == 0u && (N % 16u) == 0u) {
+            g_cmds.push_back([=]() {
+                GQ->parallel_for(sycl::range((size_t)N / 16u), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
+                    namespace esimd = sycl::ext::intel::esimd;
+                    size_t index = (size_t)it.get_id(0) * 16u;
+                    unsigned ch = CH, width = SB;
+                    unsigned cc = (unsigned)(index % ch), rest = (unsigned)(index / ch);
+                    unsigned x = rest % (width / 2u), y = rest / (width / 2u);
+                    size_t base = ((size_t)(2u * y) * width + 2u * x) * ch + cc;
+                    esimd::simd<float,16> t = esimd::block_load<float,16>((const float*)A + base, esimd::overaligned_tag<16>{});
+                    t = t + esimd::block_load<float,16>((const float*)A + base + (size_t)width * ch, esimd::overaligned_tag<16>{});
+                    t = t + esimd::block_load<float,16>((const float*)A + base + ch, esimd::overaligned_tag<16>{});
+                    t = t + esimd::block_load<float,16>((const float*)A + base + (size_t)(width + 1u) * ch, esimd::overaligned_tag<16>{});
+                    t = t * esimd::simd<float,16>(0.25f);
+                    esimd::simd<sycl::half,16> o = esimd::convert<sycl::half>(s8v8::e4m3_vec_v8<16>(t));
+                    esimd::block_store<sycl::half,16>((sycl::half*)C + index, o, esimd::overaligned_tag<16>{});
+                });
+            });
+            return 0;
+        }
         g_cmds.push_back([=]() {
             GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
                 size_t index = it.get_id(0);
@@ -3182,6 +3211,38 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
         });
     } else if (sub == 21u) {   // UPSAMPLE_ADD: a[nearest2x] + (b*sine[c]), publish
         g_cmd_names.push_back(__func__);
+        // BLADE U-2 (the unary leg map): 0x15 = 8.0M elems/frame; the frame's
+        // calls are ALL epi=1 (e4m3 only), narrow, b_half, CH in {64,128,256,512}
+        // -- and the element order is CHANNEL-CONTIGUOUS (index%ch), so a 16-wide
+        // block never crosses a pixel: aval (nearest-source, contiguous 16),
+        // bval (contiguous 16), D[cc] (contiguous 16) all vectorize; the
+        // cr_add/cr_mul twins are the v3d-promoted wbv2::cradd_simd/crmul_simd
+        // (fmul_rn/fadd_rn = IEEE rn = the same bits esimd mul/add lower to --
+        // the §92 normalize_esimd proof), e4m3_vec_v8 = bench_e4m3vec proven.
+        // Guards: !a_half && b_half && narrow && CH%16==0 && N%16==0 && epi==1.
+        // Escape NR_UNARY_VEC=0 (shared with U-1). UNARY_KINDS gate judges.
+        static bool uvec2 = !getenv("NR_UNARY_VEC") || atoi(getenv("NR_UNARY_VEC")) != 0;
+        if (uvec2 && !a_half && b_half && narrow && epi == 1u && (CH % 16u) == 0u && (N % 16u) == 0u) {
+            g_cmds.push_back([=]() {
+                GQ->parallel_for(sycl::range((size_t)N / 16u), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
+                    namespace esimd = sycl::ext::intel::esimd;
+                    size_t index = (size_t)it.get_id(0) * 16u;
+                    unsigned ch = CH, target = SA, source = SB;
+                    unsigned cc = (unsigned)(index % ch), rest = (unsigned)(index / ch);
+                    unsigned x = rest % target, y = rest / target;
+                    esimd::simd<sycl::half,16> bv = esimd::block_load<sycl::half,16>(
+                        (const sycl::half*)B + index, esimd::overaligned_tag<16>{});
+                    esimd::simd<float,16> av = esimd::block_load<float,16>(
+                        (const float*)A + ((size_t)(y / 2u) * source + (x / 2u)) * ch + cc,
+                        esimd::overaligned_tag<16>{});
+                    esimd::simd<float,16> dv = esimd::block_load<float,16>(D + cc, esimd::overaligned_tag<16>{});
+                    esimd::simd<float,16> merged = av + esimd::convert<float>(bv) * dv;
+                    esimd::simd<sycl::half,16> o = esimd::convert<sycl::half>(s8v8::e4m3_vec_v8<16>(merged));
+                    esimd::block_store<sycl::half,16>((sycl::half*)C + index, o, esimd::overaligned_tag<16>{});
+                });
+            });
+            return 0;
+        }
         g_cmds.push_back([=]() {
             GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
                 size_t index = it.get_id(0);
