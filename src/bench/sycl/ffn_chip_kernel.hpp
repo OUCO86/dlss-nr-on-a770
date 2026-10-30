@@ -43,19 +43,19 @@ namespace esimd = sycl::ext::intel::esimd;
 // HS = LW x 1KB): LW=32 -> 64KB (1 WG/SM), LW=16 -> 32KB (2 WG/SM). The occupancy
 // hypothesis for the chip's frame-vs-isolated gap (P8-n: latency chain, NOT the
 // round-trip -- the mega removed 100MB of it and the marginal stayed flat).
-template <int LW>
+template <int LW, bool WSTAGE = false>
 static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                                     const half* dPp, float* Cout, int M, int Mp,
                                     const void* dSkip = nullptr, const float* cp = nullptr,
                                     bool half_skip = false,
-                                    bool fjoin = true) {   // B3-ffn-1: the 32B-joined HS stores (host-captured; escape NR_FFN_JOIN=0 at the call site)
+                                    bool fjoin = true) {   // B3-ffn-2: weight staging via the WSTAGE template param (slm_init needs a compile-time constant)
     const unsigned cin = 32;
     int tiles = Mp / 16;
     int wgs = (tiles + LW - 1) / LW;
     return q.submit([&](handler& h) {
         h.parallel_for(nd_range(range((size_t)wgs * (unsigned)LW), range((unsigned)LW)),
             [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
-            esimd::slm_init<(unsigned)LW * 2048u>();   // EA(LW x 1KB) + HS(LW x 1KB)
+            esimd::slm_init<(unsigned)LW * 2048u + (WSTAGE ? 16384u : 0u)>();   // EA+HS (+16KB weight stage)
             uint wg = (uint)it.get_group(0);
             uint lid = (uint)it.get_local_id(0);
             int tr = (int)(wg * (unsigned)LW + lid);
@@ -88,6 +88,30 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                 esimd::slm_block_store(ea + 256u + (uint)r*32u, lo1, esimd::overaligned_tag<16>{});    // block(kc0,strip1)
                 esimd::slm_block_store(ea + 768u + (uint)r*32u, hi1, esimd::overaligned_tag<16>{});    // block(kc1,strip1)
             }
+            // B3-ffn-2 (Little's-law fix for the chip's 138 GB/s): the c-loop
+            // weight loads are THE redundant global traffic -- every thread loads
+            // 16KB of dEp+dPp (64 x 256B) and the LW threads of a WG load the SAME
+            // 16KB => 256KB of L2 reads per tile, 8160 tiles x 16KB = 130MB of
+            // weight fetches per stem call (MORE than the 100MB data traffic).
+            // Stage both weight planes (8+8KB) into SLM ONCE per WG (cooperative:
+            // LW=16 threads x 1KB each), then the c-loop reads are slm_block_load
+            // (same values, same order, same 256B blocks -> bit-exact by
+            // construction; no GRF cost -- the register wall (v3c) stays honored).
+            uint wsb = (unsigned)LW * 2048u;      // after EA+HS (LW=16: 32KB..48KB, 64KB bucket)
+            if (WSTAGE) {   // 4096 halfs each plane / LW=16 threads = 256 halfs/thread
+                #pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    uint off = (uint)(lid * 256u + i * 128u);
+                    esimd::simd<half,128> wv = esimd::block_load<half,128>(dEp + off, esimd::overaligned_tag<16>{});
+                    esimd::slm_block_store(wsb + off * 2u, wv, esimd::overaligned_tag<16>{});
+                }
+                #pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    uint off = (uint)(lid * 256u + i * 128u);
+                    esimd::simd<half,128> wv = esimd::block_load<half,128>(dPp + off, esimd::overaligned_tag<16>{});
+                    esimd::slm_block_store(wsb + 8192u + off * 2u, wv, esimd::overaligned_tag<16>{});
+                }
+            }
             esimd::barrier();   // v3c FIX: the A stores must be visible before the
                                 // SLM loads (v3b had no SLM A; the removed weight
                                 // barrier also guarded this -- restore it here)
@@ -105,8 +129,10 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                         esimd::simd<half,128> a1 = esimd::slm_block_load<half,128>(ea + (uint)(kc*2u+1u)*256u, esimd::overaligned_tag<16>{});
                         uint tc = (uint)(c * 2 + tl);
                         const half* bb = dEp + ((size_t)kc * 8u + tc) * 2u * 128u;
-                        esimd::simd<half,128> b0 = esimd::block_load<half,128>(bb, esimd::overaligned_tag<16>{});
-                        esimd::simd<half,128> b1 = esimd::block_load<half,128>(bb + 128, esimd::overaligned_tag<16>{});
+                        esimd::simd<half,128> b0 = WSTAGE ? esimd::slm_block_load<half,128>(wsb + (uint)((kc * 8u + tc) * 2u * 128u) * 2u, esimd::overaligned_tag<16>{})
+                                                          : esimd::block_load<half,128>(bb, esimd::overaligned_tag<16>{});
+                        esimd::simd<half,128> b1 = WSTAGE ? esimd::slm_block_load<half,128>(wsb + (uint)((kc * 8u + tc) * 2u * 128u + 128u) * 2u, esimd::overaligned_tag<16>{})
+                                                          : esimd::block_load<half,128>(bb + 128, esimd::overaligned_tag<16>{});
                         e00 = esimd::xmx::dpas<8,8,float>(e00, b0, a0);
                         e01 = esimd::xmx::dpas<8,8,float>(e01, b1, a0);
                         e10 = esimd::xmx::dpas<8,8,float>(e10, b0, a1);
@@ -158,15 +184,16 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                     esimd::simd<half,128> a0 = esimd::slm_block_load<half,128>(ab, esimd::overaligned_tag<16>{});
                     esimd::simd<half,128> a1 = esimd::slm_block_load<half,128>(ab + 256u, esimd::overaligned_tag<16>{});
                     const half* bb = dPp + ((size_t)kcg * 2u + 0u) * 2u * 128u;
-                    esimd::simd<half,128> b0 = esimd::block_load<half,128>(bb, esimd::overaligned_tag<16>{});
-                    esimd::simd<half,128> b1 = esimd::block_load<half,128>(bb + 128, esimd::overaligned_tag<16>{});
+                    uint wb = wsb + 8192u + kcg * 1024u;
+                    esimd::simd<half,128> b0 = WSTAGE ? esimd::slm_block_load<half,128>(wb, esimd::overaligned_tag<16>{}) : esimd::block_load<half,128>(bb, esimd::overaligned_tag<16>{});
+                    esimd::simd<half,128> b1 = WSTAGE ? esimd::slm_block_load<half,128>(wb + 256u, esimd::overaligned_tag<16>{}) : esimd::block_load<half,128>(bb + 128, esimd::overaligned_tag<16>{});
                     p00 = esimd::xmx::dpas<8,8,float>(p00, b0, a0);
                     p01 = esimd::xmx::dpas<8,8,float>(p01, b1, a0);
                     p10 = esimd::xmx::dpas<8,8,float>(p10, b0, a1);
                     p11 = esimd::xmx::dpas<8,8,float>(p11, b1, a1);
                     bb += 256;
-                    esimd::simd<half,128> c0 = esimd::block_load<half,128>(bb, esimd::overaligned_tag<16>{});
-                    esimd::simd<half,128> c1 = esimd::block_load<half,128>(bb + 128, esimd::overaligned_tag<16>{});
+                    esimd::simd<half,128> c0 = WSTAGE ? esimd::slm_block_load<half,128>(wb + 512u, esimd::overaligned_tag<16>{}) : esimd::block_load<half,128>(bb, esimd::overaligned_tag<16>{});
+                    esimd::simd<half,128> c1 = WSTAGE ? esimd::slm_block_load<half,128>(wb + 768u, esimd::overaligned_tag<16>{}) : esimd::block_load<half,128>(bb + 128, esimd::overaligned_tag<16>{});
                     q00 = esimd::xmx::dpas<8,8,float>(q00, c0, a0);
                     q01 = esimd::xmx::dpas<8,8,float>(q01, c1, a0);
                     q10 = esimd::xmx::dpas<8,8,float>(q10, c0, a1);
