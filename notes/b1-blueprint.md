@@ -962,3 +962,15 @@ wres 8.2GB/qw 7.9GB。
 187-357GB/s（§99 普查）vs 前辈 staged 表 374GB/s ⇒ 1.7-2x 差距在 K=64/128/256
 档的 f16 平面读模式。仪器=bench_qv3 现成。路径：单形状对前辈表 → 家族边际
 （Q_STOP=9 已给上限 -6.9）→ 帧 A/B。
+
+## 六.二十、前辈表的硬件出处钉死（09:4x，用户的耻辱判词 + 归档铁证）
+
+improve-b 的 staged 表（3742GF/0.071ms 那组）+ "30-45 GB/s vs 70-91 天花板"
+= **Lunar Lake 核显上测的**（coopmat-table.txt 探针：device "Intel(R) Graphics (LNL)"、
+Mesa ANV、Linux；本机 A770=560GB/s+262TOPS 独显）。⇒
+1. "单核 gemm 只差 1-1.5x"不是好消息——**独显对核显打平=实现质量耻辱线**，
+   前辈表是 FLOOR 不是 TARGET（A770 上 gemm 应数倍于该表）；
+2. 前辈在 90GB/s 机器上把帧跑到 11.7ms@1080p，我们在 560GB/s 机器上 74ms@544p：
+   带宽预算 6x、像素 1/4 ⇒ 差距全部是实现，与 §六.九 结论一致、现在更刺眼。
+3. 腿账地图（§六.十九）+ 本判词合读：memory 腿（quant -6.9/f16-pack -5.4/wa -3.5）
+   先砍=帧账直接收益；gemm 核级差距=第二战场（bench_batched 表已给 Floor）。
