@@ -32,6 +32,7 @@
 #include "ffn_chip_kernel.hpp"
 #include "wa_res_kernel.hpp"
 #include "lfw_res_kernel.hpp"
+#include "lfw2_res_kernel.hpp"
 #include "requant_kernel.hpp"
 #include "gemm_s8_v1_kernel.hpp"
 #include "gemm_s8_v3_kernel.hpp"
@@ -3520,8 +3521,8 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
             // the qkv closure no-ops under the pair, so the weight-cache fill moves
             // HERE (Braw from the stash; cached_pack_b_i8 packs once, reuses after).
             int8_t* dBp = cached_pack_b_i8(S.b, S.Braw, (int)(3u * S.C), (int)S.C);
-            lfw::launch_lfw(*GQ, dAp, dBp, OutH, S.as, S.bs, S.qs, biasp, windows,
-                            (sycl::half*)Q, (sycl::half*)Kk, (sycl::half*)V);
+            lfw2::launch_lfw2(*GQ, dAp, dBp, OutH, S.as, S.bs, S.qs, biasp, windows, heads,
+                              (sycl::half*)Q, (sycl::half*)Kk, (sycl::half*)V);
             pool_put(dAp);
         });
         return 0;

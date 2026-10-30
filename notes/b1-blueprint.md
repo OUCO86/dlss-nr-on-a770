@@ -870,3 +870,23 @@ tile gather + wa_res stages1-3 全在一个 WG=一 window）+ recorder P2 式配
 （32 列正好=一棵）。预期：并行度不再输 split，省下的=1 launch + QK plane 的
 gather 重读（1274/75 只在 fused 内存在；1276 V-plane 保留给下游 batched2 读=半消）。
 bench_lfw 仪器已就位（改 reference 链即可对拍），pad 层雷不变。
+
+## 六.十六、B5-5b SLICE 2 判决：qkv+wa 融合在 cgraph 下二连不转正（07:50-08:2x）
+
+lfw2_res_kernel.hpp（WG=一 (window,head) batch，BN=32 半宽 qkv gemm NT=16，
+v5a tail 双写 plane+tile，blade-7 gather，wa stages1-3 VERBATIM）：
+- **bench_lfw2 8/8 EXACT**（两帧形状 planes+Out 零差）——几何全对，slice 1 的
+  并行度批评（510 fat WG）已按定案修掉（1020+ WG 与 split 持平）；
+- 全门 1250 绿 + 端到端 walk 1301 EXACT + 16 层配对确认（NR_LFW_DBG printf）；
+- **帧 A/B 7 对 = +1.5ms 均值偏负**（干净 5 对 +0.5/+1.7/+0.6/-0.2/+0.5，
+  pair6 的 +10.4 是热漂移弃用）。**不转正**（默认 OFF 探针保留，与 slice 1 同格）。
+
+**结构性结论（两 slice 合读，写死防第三次回头）**：qkv+wa 融合的收益账在今天的
+代码状态下已经**不值**——split 链上它俩的剩余成本只剩 (a) 2 发 launch/cgraph 下
+已 ~µs 级、(b) plane 写读（但 plane 必须写：下游层链的 quant 读它们=bench 实证）。
+融合付出去的是 BN=32 半宽 dpas（tile 效率减半）+ 每 WG 串行 stage 边界。
+**lmxxf 82-launch 快的根因不是 launch 少，是每个核的形态效率高**——我们的下一层
+收益在 B3 形态战（v4full 4.5% 热循环密度 vs 他 40-50%：宽 tile/更深 K 循环/
+SLM 消息数），不在继续融合 qkv+wa。B5-5 家族到此关门（dC 全歼=结构清零已兑现，
+融合片=已建已证不转正）。三族同删 12.4ms 上限里真正可回收的部分需要的是
+"更快的 gemm 本体"，不是"更少的核"。
