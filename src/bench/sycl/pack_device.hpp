@@ -75,8 +75,68 @@ static inline void pack_a(sycl::queue& q, const int8_t* A, int8_t* Ap, int M, in
 // scale-diff 0 on all frame shapes; 1.25-1.97x on the K>=256 heavy shapes).
 // scales[row] is written in the SAME layout the gemm's a_scale operand expects (one
 // f32 per row, row-major) -- the recorder passes the quant's scale buffer.
+
+// the K-templated single-read fused pack (B3-2): ONE contiguous KMAX-wide row load
+// into a KMAX-wide GRF vector (the qr_kernel_rowthread proven budget), hmax (float
+// max is associative/commutative = identical value to the kb-loop hmax), then the
+// pack_a tile-scatter stores VERBATIM. Escape: NR_PAF_SR=0.
+template <int KMAX>
+static inline void pack_a_fused_sr_k(sycl::queue& q, const sycl::half* A_f16, int8_t* Ap,
+                                     float* scales, int M, int Mp, int K) {
+    const int BM = 128, BK = 32;
+    const int kb_n = KMAX / 32;
+    q.parallel_for(sycl::range((size_t)Mp), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
+        namespace esimd = sycl::ext::intel::esimd;
+        int srow = (int)it.get_id(0);
+        int w = srow / BM, rem = srow % BM, wi = rem / 16, row = rem % 16;
+        size_t per_blk = ((size_t)w * kb_n) * 8 + wi;
+        esimd::simd<int8_t,32> z((int8_t)0);
+        if (srow >= M) {
+            for (int kb = 0; kb < kb_n; ++kb)
+                esimd::block_store<int8_t,32>(Ap + (per_blk + (size_t)kb*8)*512 + row*32, z, esimd::overaligned_tag<16>{});
+            return;
+        }
+        esimd::simd<float,KMAX> reg = esimd::convert<float>(
+            esimd::block_load<sycl::half,KMAX>(A_f16 + (size_t)srow*K, esimd::overaligned_tag<16>{}));
+        float peak = esimd::hmax<float,float,KMAX>(esimd::abs(reg));
+        const float scale = (peak == 0.0f) ? 1.0f
+            : esimd::div_ieee<float,1>(esimd::simd<float,1>(peak), esimd::simd<float,1>(127.0f))[0];
+        scales[srow] = scale;
+        #pragma unroll
+        for (int kb = 0; kb < kb_n; ++kb) {
+            esimd::simd<float,32> seg = reg.template select<32,1>(kb*32);
+            esimd::simd<float,32> qq = esimd::div_ieee<float,32>(seg, esimd::simd<float,32>(scale));
+            qq = esimd::min(esimd::max(esimd::rnde<float,32>(qq), esimd::simd<float,32>(-127.f)), esimd::simd<float,32>(127.f));
+            esimd::block_store<int8_t,32>(Ap + (per_blk + (size_t)kb*8)*512 + row*32,
+                esimd::convert<int8_t>(esimd::convert<int>(qq)), esimd::overaligned_tag<16>{});
+        }
+    });
+}
+static inline void pack_a_fused_sr_impl(sycl::queue& q, const sycl::half* A_f16, int8_t* Ap,
+                                        float* scales, int M, int Mp, int K) {
+    if (K == 64)  pack_a_fused_sr_k<64>(q, A_f16, Ap, scales, M, Mp, K);
+    if (K == 128) pack_a_fused_sr_k<128>(q, A_f16, Ap, scales, M, Mp, K);
+    if (K == 256) pack_a_fused_sr_k<256>(q, A_f16, Ap, scales, M, Mp, K);
+    if (K == 512) pack_a_fused_sr_k<512>(q, A_f16, Ap, scales, M, Mp, K);
+}
+
 static inline void pack_a_fused(sycl::queue& q, const sycl::half* A_f16, int8_t* Ap,
                                 float* scales, int M, int Mp, int K) {
+    // B3-2 (leg map 09:5x, G2 = -5.6ms measured three times): the row-parallel
+    // path below reads the f16 row TWICE (peak pass + quantize pass -- the comment
+    // itself says "pass 2 hits L1": L1-hot but still every byte moved twice).
+    // The single-read form is PROVEN at these exact K in qr_kernel_rowthread
+    // (section 99: the whole row in GRF registers, K<=512 safe): route K<=512
+    // here, tile-scatter stores exactly as the double-read path.
+    static bool pafsr = !getenv("NR_PAF_SR") || atoi(getenv("NR_PAF_SR")) != 0;
+    if (pafsr && (K == 64 || K == 128 || K == 256 || K == 512)) {
+        // B3-2 single-read form, TEMPLATED per K (a runtime-K simd<float,512> with
+        // partial selects mis-sized the vectors -- the 512-wide GRF budget is only
+        // legal at K=512; the rowthread precedent uses exact-width kernels).
+        pack_a_fused_sr_impl(q, A_f16, Ap, scales, M, Mp, K);
+        return;
+    }
+
     // SHAPE DISPATCH (bench_qfused2 35bdfc1): row-parallel wins 1.5-2.5x on every
     // frame shape; the (row x kb-group) two-level variant wins where Mp underfills
     // the 512 EU x 32 lanes (K>=2048 && Mp<=512: K=4096/M=192 -> 3.71x vs two-pass).
