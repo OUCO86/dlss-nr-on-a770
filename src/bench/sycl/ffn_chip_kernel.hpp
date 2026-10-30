@@ -242,9 +242,16 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                             esimd::simd<float,8> w = esimd::block_load<float,8>(cp + off,
                                       esimd::overaligned_tag<16>{});
                             esimd::simd<float,8> o = k * w + acc;   // straight-line = ONE HW FMA
-                            o.copy_to(Cout + rb + off);
+                            return o;
                         };
-                        fold8(f0, 0); fold8(f1, 8); fold8(g0, 16); fold8(g1, 24);
+                        // B3-ffn-7: join the two adjacent 8-wide fold results of one
+                        // row into ONE 16-wide (64B) store (fjoin precedent; the FMA
+                        // shape rule is UNTOUCHED -- the lambda still computes each
+                        // 8-group straight-line, only the STORE widens).
+                        { esimd::simd<float,16> oa; oa.template select<8,1>(0) = fold8(f0, 0);
+                          oa.template select<8,1>(8) = fold8(f1, 8); oa.copy_to(Cout + rb); }
+                        { esimd::simd<float,16> ob; ob.template select<8,1>(0) = fold8(g0, 16);
+                          ob.template select<8,1>(8) = fold8(g1, 24); ob.copy_to(Cout + rb + 16u); }
                     } else {
                         f0.copy_to(Cout + rb + 0);
                         f1.copy_to(Cout + rb + 8);
@@ -266,9 +273,16 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                             esimd::simd<float,8> w = esimd::block_load<float,8>(cp + off,
                                       esimd::overaligned_tag<16>{});
                             esimd::simd<float,8> o = k * w + acc;   // straight-line = ONE HW FMA
-                            o.copy_to(Cout + rb + off);
+                            return o;
                         };
-                        fold8(f0, 0); fold8(f1, 8); fold8(g0, 16); fold8(g1, 24);
+                        // B3-ffn-7: join the two adjacent 8-wide fold results of one
+                        // row into ONE 16-wide (64B) store (fjoin precedent; the FMA
+                        // shape rule is UNTOUCHED -- the lambda still computes each
+                        // 8-group straight-line, only the STORE widens).
+                        { esimd::simd<float,16> oa; oa.template select<8,1>(0) = fold8(f0, 0);
+                          oa.template select<8,1>(8) = fold8(f1, 8); oa.copy_to(Cout + rb); }
+                        { esimd::simd<float,16> ob; ob.template select<8,1>(0) = fold8(g0, 16);
+                          ob.template select<8,1>(8) = fold8(g1, 24); ob.copy_to(Cout + rb + 16u); }
                     } else {
                         f0.copy_to(Cout + rb + 0);
                         f1.copy_to(Cout + rb + 8);
