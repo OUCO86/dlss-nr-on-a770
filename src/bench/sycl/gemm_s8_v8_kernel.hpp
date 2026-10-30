@@ -770,8 +770,8 @@ static inline sycl::event gemm_b_res(sycl::queue& q, const int8_t* Ap, const int
                     if (epi != 2u) {
                         esimd::simd<float,8> t0, t1;
                         for (int e = 0; e < 8; ++e) { t0[e] = sk0[e]*ccl[e] + f0.read()[e]; t1[e] = sk1[e]*cch[e] + f1.read()[e]; }
-                        pub.template select<8,1>(0) = pub_vec_v8<8>(epi, t0);
-                        pub.template select<8,1>(8) = pub_vec_v8<8>(epi, t1);
+                        { esimd::simd<float,16> tt; tt.template select<8,1>(0) = t0; tt.template select<8,1>(8) = t1;
+                          pub = pub_vec_v8<16>(epi, tt); }   // B3-ffn-4: 8-wide EU-slot waste (see chip ffn-3)
                     } else {
                         for (int e = 0; e < 8; ++e) pub[e] = pub_esimd(epi, sk0[e]*ccl[e] + f0.read()[e]);
                         for (int e = 0; e < 8; ++e) pub[8+e] = pub_esimd(epi, sk1[e]*cch[e] + f1.read()[e]);
@@ -796,8 +796,8 @@ static inline sycl::event gemm_b_res(sycl::queue& q, const int8_t* Ap, const int
                     if (epi != 2u) {
                         esimd::simd<float,8> t0, t1;
                         for (int e = 0; e < 8; ++e) { t0[e] = sk0[e]*ccl[e] + g0.read()[e]; t1[e] = sk1[e]*cch[e] + g1.read()[e]; }
-                        pub.template select<8,1>(0) = pub_vec_v8<8>(epi, t0);
-                        pub.template select<8,1>(8) = pub_vec_v8<8>(epi, t1);
+                        { esimd::simd<float,16> tt; tt.template select<8,1>(0) = t0; tt.template select<8,1>(8) = t1;
+                          pub = pub_vec_v8<16>(epi, tt); }   // B3-ffn-4: 8-wide EU-slot waste (see chip ffn-3)
                     } else {
                         for (int e = 0; e < 8; ++e) pub[e] = pub_esimd(epi, sk0[e]*ccl[e] + g0.read()[e]);
                         for (int e = 0; e < 8; ++e) pub[8+e] = pub_esimd(epi, sk1[e]*cch[e] + g1.read()[e]);
@@ -894,8 +894,8 @@ static inline sycl::event gemm_b_res_window(sycl::queue& q, const int8_t* Ap, co
                     if (epi != 2u) {   // BLADE-4: same fma text, vectorized pub chain (epi1 proven)
                         esimd::simd<float,8> t0, t1;
                         for (int e = 0; e < 8; ++e) { t0[e] = sk0[e]*ccl[e] + f0.read()[e]; t1[e] = sk1[e]*cch[e] + f1.read()[e]; }
-                        pub.template select<8,1>(0) = pub_vec_v8<8>(epi, t0);
-                        pub.template select<8,1>(8) = pub_vec_v8<8>(epi, t1);
+                        { esimd::simd<float,16> tt; tt.template select<8,1>(0) = t0; tt.template select<8,1>(8) = t1;
+                          pub = pub_vec_v8<16>(epi, tt); }   // B3-ffn-4: 8-wide EU-slot waste (see chip ffn-3)
                     } else {
                     for (int e = 0; e < 8; ++e) pub[e] = pub_esimd(epi, sk0[e]*ccl[e] + f0.read()[e]);
                     for (int e = 0; e < 8; ++e) pub[8+e] = pub_esimd(epi, sk1[e]*cch[e] + f1.read()[e]);
@@ -923,8 +923,8 @@ static inline sycl::event gemm_b_res_window(sycl::queue& q, const int8_t* Ap, co
                     if (epi != 2u) {   // BLADE-4 (window variant, second row): same rule
                         esimd::simd<float,8> t0, t1;
                         for (int e = 0; e < 8; ++e) { t0[e] = sk0[e]*ccl[e] + g0.read()[e]; t1[e] = sk1[e]*cch[e] + g1.read()[e]; }
-                        pub.template select<8,1>(0) = pub_vec_v8<8>(epi, t0);
-                        pub.template select<8,1>(8) = pub_vec_v8<8>(epi, t1);
+                        { esimd::simd<float,16> tt; tt.template select<8,1>(0) = t0; tt.template select<8,1>(8) = t1;
+                          pub = pub_vec_v8<16>(epi, tt); }   // B3-ffn-4: 8-wide EU-slot waste (see chip ffn-3)
                     } else {
                     for (int e = 0; e < 8; ++e) pub[e] = pub_esimd(epi, sk0[e]*ccl[e] + g0.read()[e]);
                     for (int e = 0; e < 8; ++e) pub[8+e] = pub_esimd(epi, sk1[e]*cch[e] + g1.read()[e]);
