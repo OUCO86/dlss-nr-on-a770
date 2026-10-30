@@ -143,6 +143,28 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                         e11 = esimd::xmx::dpas<8,8,float>(e11, b1, a1);
                     }
                     uint hb = hs + (uint)(tl * 2u) * 256u;
+                    // B3-ffn-12 (the segment ledger pinned the gemm+encode block at
+                    // -3.5~-4.8 frame; the pw16 path ASSEMBLES hj then SPLITS it to
+                    // h00|h01 and the fjoin path RE-JOINS the same pair = 6 pure
+                    // select/join ops + 16 predicates per r that cancel to ZERO).
+                    // Fast path: whole tile in range + pw16 + fjoin -> store hj
+                    // DIRECTLY (values identical by construction, bit-exact).
+                    if (pw16 && fjoin && (tr + 1) * 16 <= (int)M) {
+                        #pragma unroll
+                        for (int r = 0; r < 8; ++r) {
+                            esimd::simd<float,16> a0;
+                            a0.template select<8,1>(0) = e00.template select<8,1>(r*8);
+                            a0.template select<8,1>(8) = e01.template select<8,1>(r*8);
+                            esimd::slm_block_store(hb + (uint)r * 32u,
+                                esimd::convert<half>(s8v8::pub_vec_v8<16>(3u, a0)), esimd::overaligned_tag<16>{});
+                            esimd::simd<float,16> a1;
+                            a1.template select<8,1>(0) = e10.template select<8,1>(r*8);
+                            a1.template select<8,1>(8) = e11.template select<8,1>(r*8);
+                            esimd::slm_block_store(hb + 256u + (uint)r * 32u,
+                                esimd::convert<half>(s8v8::pub_vec_v8<16>(3u, a1)), esimd::overaligned_tag<16>{});
+                        }
+                        continue;
+                    }
                     #pragma unroll
                     for (int r = 0; r < 8; ++r) {
                         bool in0 = (tr * 16 + r) < (int)M, in1 = (tr * 16 + 8 + r) < (int)M;
