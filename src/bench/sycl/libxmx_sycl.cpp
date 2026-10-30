@@ -259,7 +259,7 @@ struct B6Stash {
     int pkid = -1, scid = -1;    // the quant's packed/scale ids (the wres's a/a_scale)
 };
 static B6Stash g_b6;
-static bool b6_on() { static bool v = !getenv("NR_B6") || atoi(getenv("NR_B6")) != 0; return v; }   // B6-1 PROMOTED: bench_b6 12/12 EXACT (PKT/AS/ATT/planes/1270 both shapes)
+static bool b6_on() { static bool v = getenv("NR_B6") != nullptr && atoi(getenv("NR_B6")) != 0; return v; }   // B6-1 VERDICT +1.08 (16-pair, 0/16 wins): DEFAULT OFF; NR_B6=1 = retest switch (the axis is frozen-for-retest, not dead -- see 6.25)   // B6-1 PROMOTED: bench_b6 12/12 EXACT (PKT/AS/ATT/planes/1270 both shapes)
 // called by a gemm recorder: if `a` is a fused-quant pk whose scale buf == this gemm's
 // a_scale and whose M,K match, no-op the quant closure and return its info.
 static bool qfuse_take(int a, int a_scale, unsigned M, unsigned K, QuantFused& out){
@@ -3336,6 +3336,28 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
         });
     } else if (sub == 16u) {   // PAD_END: extend with zeros
         g_cmd_names.push_back(__func__);
+        // BLADE U-4 (2.1M elems/frame): channel-contiguous 16-blocks again --
+        // the in-bounds test depends on (y,x) only, CONSTANT across a 16-channel
+        // run (CH%16==0 -> no pixel crossing). Frame calls: epi=0 (identity),
+        // narrow=false (f32 out), a_half=false. Guards enforce exactly that.
+        static bool uvec4 = !getenv("NR_UNARY_VEC2") || atoi(getenv("NR_UNARY_VEC2")) != 0;
+        if (uvec4 && !a_half && !narrow && epi == 0u && (CH % 16u) == 0u && (N % 16u) == 0u) {
+            g_cmds.push_back([=]() {
+                GQ->parallel_for(sycl::range((size_t)N / 16u), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
+                    namespace esimd = sycl::ext::intel::esimd;
+                    size_t index = (size_t)it.get_id(0) * 16u;
+                    unsigned ch = CH, height = SA, width = SB, padded = SC;
+                    unsigned cc = (unsigned)(index % ch), rest = (unsigned)(index / ch);
+                    unsigned x = rest % padded, y = rest / padded;
+                    esimd::simd<float,16> v(0.0f);
+                    if (y < height && x < width)
+                        v = esimd::block_load<float,16>((const float*)A + ((size_t)y * width + x) * ch + cc,
+                                                       esimd::overaligned_tag<16>{});
+                    esimd::block_store<float,16>((float*)C + index, v, esimd::overaligned_tag<16>{});
+                });
+            });
+            return 0;
+        }
         g_cmds.push_back([=]() {
             GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
                 size_t index = it.get_id(0);
