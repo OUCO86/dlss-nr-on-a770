@@ -2138,6 +2138,8 @@ static inline int l0_ceil_bm(unsigned M) { return (int)(((M + 127u) / 128u) * 12
 int xmx_rec_gemm_int8(int a, int b, int c, int a_scale, int b_scale,
                       unsigned M, unsigned N, unsigned K, unsigned flags) {
     if (!g_recording) FAILMSG("not recording");
+    static int istop = getenv("NR_I8_STOP") ? atoi(getenv("NR_I8_STOP")) : 0;
+    if (istop == 9) { g_cmd_names.push_back(__func__); g_cmds.push_back([](){}); return 0; }   // leg map 10:0x: time-only pricing probe (the family never had one)
     if (!M || !N || !K || (N % 64u) || (K % 32u))
         FAILMSG("gemm_int8 needs N%%64==0, K%%32==0 (our tile; shipped guard is N%%32/K%%64)");
     auto ia = g_bufs.find(a), ib = g_bufs.find(b), ic = g_bufs.find(c);
