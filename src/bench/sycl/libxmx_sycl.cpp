@@ -80,10 +80,11 @@ static char GERR[256] = {0};
 // buffer table: int handle -> {device ptr, bytes, dtype-size, imported}. An imported
 // pointer (xmx_buf_import_win32) aliases a buffer owned by the OTHER engine -- freeing
 // our import releases only our reference, the producer keeps the allocation alive.
-struct Buf { void* p; size_t bytes; size_t esz; bool imported = false; };
+struct Buf { void* p; size_t bytes; size_t esz; bool imported = false; int gen = 0; };   // WQFUSE: the xmx_begin generation at creation (0 = pre-first-begin = init/weights)
 static std::unordered_map<int, Buf> g_bufs;
 static void mem_probe(int id, void* p, size_t bytes, const char* tag);  // fwd (ze world)
 static int g_nextbuf = 1;
+static int g_gen = 0;   // WQFUSE: bumped by xmx_begin
 
 // recording
 static bool g_recording = false;
@@ -265,8 +266,12 @@ static bool b6_on() { static bool v = getenv("NR_B6") != nullptr && atoi(getenv(
 static bool qfuse_take(int a, int a_scale, unsigned M, unsigned K, QuantFused& out){
     if (!qfuse_on()) return false;
     auto it = g_quant_pk.find(a);
-    if (it == g_quant_pk.end()) return false;
-    if (it->second.sc != a_scale || it->second.M != M || it->second.K != K) return false;
+    if (it == g_quant_pk.end()) { if (getenv("NR_QFUSE_DBG")) printf("[qf] take MISS pk=%d (M=%u K=%u): no registration\n", a, M, K); return false; }
+    if (it->second.sc != a_scale || it->second.M != M || it->second.K != K) {
+        if (getenv("NR_QFUSE_DBG")) printf("[qf] take MISMATCH pk=%d want(sc=%d M=%u K=%u) reg(sc=%d M=%u K=%u src=%d)\n",
+            a, a_scale, M, K, it->second.sc, it->second.M, it->second.K, it->second.src);
+        return false;
+    }
     out = it->second;
     g_cmds[out.qcmd] = [](){};                 // the quant launch dissolves
     g_cmd_names[out.qcmd] = "quant(FUSED-pack)";
@@ -562,7 +567,7 @@ int xmx_buf_create_kind(unsigned long long bytes, int kind) {
     if (!p) p = sycl::malloc_device<unsigned char>(bytes, *GQ);
     if (!p) FAILMSG("out of device memory");
     int id = g_nextbuf++;
-    g_bufs[id] = { p, (size_t)bytes, (size_t)(kind == 0 ? 2 : kind) };
+    g_bufs[id] = { p, (size_t)bytes, (size_t)(kind == 0 ? 2 : kind), false, g_gen };
     mem_probe(id, p, bytes, "buf");   // section 100 D11 (defined with the ze world)
     return id;
 }
@@ -670,7 +675,7 @@ static int import_handle(unsigned long long handle, unsigned long long bytes, in
     if (r != ZE_RESULT_SUCCESS || !p) FAILMSG("zeMemAllocDevice import(kind 0x%x): 0x%x",
                                               (unsigned)kind, (unsigned)r);
     int id = g_nextbuf++;
-    g_bufs[id] = { p, (size_t)bytes, (size_t)esz, true };
+    g_bufs[id] = { p, (size_t)bytes, (size_t)esz, true, g_gen };
     return id;
 }
 int xmx_buf_import_win32(unsigned long long handle, unsigned long long bytes, int esz) {
@@ -716,7 +721,7 @@ int xmx_buf_destroy(int id) {
     g_bufs.erase(it); return 0;
 }
 
-int xmx_begin(void) { g_recording = true; g_cmds.clear();
+int xmx_begin(void) { ++g_gen; g_recording = true; g_cmds.clear();
     // AUDIT FIX (10-27): the fold registries are RECORD-scoped (qcmd = an index into
     // g_cmds). A stale entry from a PREVIOUS recording -- scratch/probe recordings, or
     // a plan switch (768x448 <-> 960x544, different op streams) -- could dissolve the
@@ -4857,10 +4862,30 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
         if (getenv("NR_Q_STATS")) { static long qn=0; ++qn;
             if (qn<=100000) printf("[quant-live] #%ld M=%u K=%u src=%d pk=%d\n", qn, M, K, source, packed); }
         size_t mycmd = g_cmds.size();
+        // WQFUSE (2026-10-30 16:5x, the user's "the comment says WHY -- then TAKE
+        // the win" ruling hit the real prize): the census PROVED the 160 surviving
+        // quantizes are WEIGHT quants -- src in {1271,1280,1282,1292,1295,1298,
+        // 1303,1307} are all created BEFORE the first xmx_begin (gen 0 = init-era
+        // planes the engine uploads once), and pk=1305 has ZERO recorder-op
+        // readers (the consumers are init-family kernels that ran at init, when
+        // the plain warm-up run already filled 1305). The frame graph therefore
+        // re-quantizes the SAME bytes into a scratch NOTHING IN THE GRAPH READS
+        // -- 160 launches of pure dead weight per frame. Guard = all three
+        // buffers created at gen 0; capture-time the closure no-ops (the warm-up
+        // plain run already executed it). The walk's 1301 + every gate is the
+        // judge; NR_WQFUSE=0 = escape. NOT the qfuse_take axis (that mechanism
+        // stays for the activation quants -- the 1272 family, all dissolved).
+        static bool wqf = getenv("NR_WQFUSE") != nullptr && atoi(getenv("NR_WQFUSE")) != 0;   // WQFUSE v1 VERDICT: 1301 MISMATCH -- pk is PER-FRAME fresh (init kernels read THIS frame's pk); skip unsafe as wired. Mechanism kept for the pointer-stable variant.
+        auto genof = [&](int id) { auto it = g_bufs.find(id); return it == g_bufs.end() ? -1 : it->second.gen; };
+        const bool wq_static = wqf && genof(source) < genof(packed) && genof(source) >= 0 && genof(packed) >= 0 && genof(scale) == genof(packed);   // the src plane was created in an EARLIER recording (init/weights uploaded once); pk+sc belong to THIS recording -- the census: pk has ZERO recorder readers in the frame graph
         g_cmds.push_back([=]() {
+            if (wq_static && g_graphrecording) {
+                if (getenv("NR_Q_STATS")) printf("[quant-WQSKIP] M=%u K=%u src=%d pk=%d cmd=%zu\n", M, K, source, packed, mycmd);
+                return;
+            }
             // B2 EXECUTION-TIME census: this lambda only runs if the launch was
             // NOT dissolved by a downstream gemm's qfuse_take. NR_Q_STATS=1.
-            if (getenv("NR_Q_STATS")) printf("[quant-EXEC] M=%u K=%u src=%d pk=%d cmd=%zu\n", M, K, source, packed, mycmd);
+            if (getenv("NR_Q_STATS")) printf("[quant-EXEC] M=%u K=%u src=%d pk=%d cmd=%zu gen(s=%d p=%d sc=%d)\n", M, K, source, packed, mycmd, genof(source), genof(packed), genof(scale));
             qr_launch_esimd(*GQ, *GD, a, pk, sc, M, K);
         });
         if (qfuse_on())   // register for a downstream gemm to dissolve us (P2 fusion)
