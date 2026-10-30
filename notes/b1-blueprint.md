@@ -974,3 +974,26 @@ Mesa ANV、Linux；本机 A770=560GB/s+262TOPS 独显）。⇒
    带宽预算 6x、像素 1/4 ⇒ 差距全部是实现，与 §六.九 结论一致、现在更刺眼。
 3. 腿账地图（§六.十九）+ 本判词合读：memory 腿（quant -6.9/f16-pack -5.4/wa -3.5）
    先砍=帧账直接收益；gemm 核级差距=第二战场（bench_batched 表已给 Floor）。
+
+## 六.二十一、腿账第二版 + U 系三刀 + ffn 阶梯（10:3x-11:2x）
+
+**腿账 v2（三复现稳）**：BASE 68.3-69.6 | quant -6.1 | f16-pack -5.0 | wa -4.6 |
+**ffn -11.4**（阶梯：chip-vs-split +3.8、tile-vs-twopass +25、chipres +1.5——
+两次形态换都赢过；chip 核自身 bench_ffnchip=106-135 GB/s vs 前辈 374=腿的大头） |
+unary -7.5 | stem -7.6 | merge -4.9 | gemm 本体 ≈0。
+
+**U-1（E4M3_HALF 18.5M 元素 SIMD16 化）16 对 12 赢 -0.50 转正；U-2（UPSAMPLE_ADD
+8.0M）+U-3（POOL2 3.9M）合测 16 对 13 赢 -1.16 转正（U-3 增量带内=P8-k 留形）**。
+unary 家族 24M/30.6M 元素已向量化。判官=UNARY_KINDS 独立门（帧的 kind 全覆盖）。
+
+**ffn-1（chip HS staging 16B 对 → 32B join，256→128 条窄 store/tile）**：门绿+1301
+EXACT，16 对在跑。**ESIMD 核内禁 non-const static（§96 再证）**——开关必须 host
+捕获参数（fjoin 走 launch_ffn_chip 尾参）。
+
+**16 对协议正式成为 <4ms 刀的判定标准**（4 对被 ±4 噪声带淹；16 对均值 0.5+ 且
+赢≥10 = 转正；±0.3 内 = 真中性）。噪声三源（用户归因，采纳入册）：boost 动态调频
+（非温度）、cgraph 帧间调度间隙、L2 冷热波动——腿账隔离口径天然避开三者。
+
+战役账：112.5 → 74.5（昨日收）→ **68.3-68.5（今）**：PAF -0.5 + U系 -1.2 + ffn-1(待判)。
+距 50 = 还差 ~18：ffn 腿剩余（chip 核 106→374 GB/s 形态战 = 最大单块）、
+wa -4.6、quant -6.1、f16-pack -5.0 的核级账。
