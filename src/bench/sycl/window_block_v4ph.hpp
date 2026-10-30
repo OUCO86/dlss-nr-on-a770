@@ -110,12 +110,45 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
                 uint r2 = lane, r = sgid*16u + lane;
                 esimd::simd<float,32> hv = esimd::slm_block_load<float,32>(
                     scr + r2*32u*4u, esimd::overaligned_tag<16>{});
+                // B3-1 RACE FIX (walk 1301 byte-1 mismatch, gate-green frame-red --
+                // the P2-era class again): the half temp lands in scr's FIRST 1KB,
+                // which overlaps OTHER threads' f32 rows (row r2 f32 = bytes
+                // r2*128..+127; thread r2>=2's temp = r2*64..+63 sits inside row
+                // r2/2's f32). Every hv load must complete before ANY temp write:
+                // one barrier after the loads. (The old scatter form never touched
+                // scr, so it had no such hazard.)
+                if (part != 0u) esimd::barrier();
                 if (part == 2u) {
                     esimd::simd<half,32> oh = esimd::convert<half>(wbv3::e4m3_vec<32>(hv));
-                    auto ov = oh.read();
-                    for (uint c = 0; c < 32; ++c)
-                        esimd::slm_block_store(S_VPO + wbv3::pb16_dest_kn(r,c,4u,2u)*2u,
-                                               esimd::simd<half,1>(ov[c]));
+                    // B3-1 (2026-10-30, the supply census): this staging wrote the
+                    // tile with THIRTY-TWO 2-BYTE scalar SLM stores per row
+                    // (pb16_dest_kn scatter) -- ~2048 narrow messages per window,
+                    // the frame's biggest hot-loop supply tax (v4full 20 calls).
+                    // blade-7 form (proven on the wa_res K/V gathers): the row's
+                    // 32 halves go to the thread's OWN scr slot (ONE 64B store --
+                    // the f32 value there was consumed by THIS thread's load above,
+                    // slot-local, no race), then lanes 0..7 assemble the 8 tile
+                    // blocks (kc 0..3 x js 0..1) from the 1KB region: 8 x 32B
+                    // row-slice loads + in-register interleave + ONE 256B store.
+                    // Values/addresses identical to the scalar form by construction.
+                    esimd::slm_block_store(scr + r2 * 32u * 2u, oh, esimd::overaligned_tag<16>{});
+                    esimd::barrier();
+                    if (lane < 4u) {   // 4 V blocks per sgid: tc(0..1) x js(0..1)
+                        uint tc = lane >> 1, js = lane & 1u;
+                        esimd::simd<half,128> blk;
+                        #pragma unroll
+                        for (int kq = 0; kq < 8; ++kq) {
+                            esimd::simd<half,8> a = esimd::slm_block_load<half,8>(
+                                scr + ((uint)(2*kq) * 32u + tc * 16u + js * 8u) * 2u, esimd::overaligned_tag<16>{});
+                            esimd::simd<half,8> bv = esimd::slm_block_load<half,8>(
+                                scr + ((uint)(2*kq+1) * 32u + tc * 16u + js * 8u) * 2u, esimd::overaligned_tag<16>{});
+                            blk.template select<8,2>(kq * 16 + 0) = a;
+                            blk.template select<8,2>(kq * 16 + 1) = bv;
+                        }
+                        esimd::slm_block_store(S_VPO + (((sgid * 2u + tc) * 2u + js) * 128u) * 2u,
+                                               blk, esimd::overaligned_tag<16>{});
+                    }
+                    esimd::barrier();
                 } else {
                     esimd::simd<float,32> hr = esimd::convert<float>(esimd::convert<half>(hv));
                     float recip = wbv3::cosine_recip_vec(hr);
@@ -131,9 +164,27 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
                     } else {
                         esimd::simd<float,32> kv = wbv3::mulh(hr, recip);
                         esimd::simd<half,32> oh = esimd::convert<half>(wbv3::e4m3_vec<32>(kv));
-                        for (uint c = 0; c < 32; c += 2)
-                            esimd::slm_block_store(S_KTO + wbv3::pb16t_dest(r,c,2u,4u)*2u,
-                                                   oh.template select<2,1>(c));
+                        // B3-1 (K side): 16 x 4-BYTE scatter stores -> blade-7 wide
+                        // form (the KT blocks (kc*4+tc)*2+js, tc=sgid: 4 blocks per
+                        // subgroup, lanes 0..3 assemble). scrB slot is this thread's
+                        // own (its f32 was consumed by the part's load above).
+                        esimd::slm_block_store(scr + r2 * 32u * 2u, oh, esimd::overaligned_tag<16>{});
+                        esimd::barrier();
+                        if (lane < 4u) {   // 4 K blocks per sgid: kc(0..1) x js(0..1)
+                            uint kc2 = lane >> 1, js = lane & 1u;
+                            esimd::simd<half,128> blk;
+                            #pragma unroll
+                            for (int jl = 0; jl < 8; ++jl) {
+                                esimd::simd<half,16> vr = esimd::slm_block_load<half,16>(
+                                    scr + ((js * 8u + (uint)jl) * 32u + kc2 * 16u) * 2u, esimd::overaligned_tag<16>{});
+                                #pragma unroll
+                                for (int kq = 0; kq < 8; ++kq)
+                                    blk.template select<2,1>(kq * 16 + jl * 2) = vr.template select<2,1>(kq * 2);
+                            }
+                            esimd::slm_block_store(S_KTO + (((kc2 * 4u + sgid) * 2u + js) * 128u) * 2u,
+                                                   blk, esimd::overaligned_tag<16>{});
+                        }
+                        esimd::barrier();
                     }
                 }
             }
