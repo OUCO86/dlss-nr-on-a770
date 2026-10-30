@@ -48,7 +48,8 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                                     const half* dPp, float* Cout, int M, int Mp,
                                     const void* dSkip = nullptr, const float* cp = nullptr,
                                     bool half_skip = false,
-                                    bool fjoin = true) {   // B3-ffn-2: weight staging via the WSTAGE template param (slm_init needs a compile-time constant)
+                                    bool fjoin = true,
+                                    bool pw16 = true) {   // B3-ffn-3: the 16-wide pub chain (escape NR_FF3=0)
     const unsigned cin = 32;
     int tiles = Mp / 16;
     int wgs = (tiles + LW - 1) / LW;
@@ -143,14 +144,28 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                     for (int r = 0; r < 8; ++r) {
                         bool in0 = (tr * 16 + r) < (int)M, in1 = (tr * 16 + 8 + r) < (int)M;
                         esimd::simd<half,8> h00, h01, h10, h11;
-                        if (in0) { esimd::simd<float,8> a = e00.template select<8,1>(r*8), b = e01.template select<8,1>(r*8);
-                            // v3d: the VECTORIZED pub (bench_pubvec: epi3 vector ==
-                            // scalar IDENTICAL over 1M values, section 99) -- the
-                            // scalar pub_esimd chain is the tail's last fat margin.
+                        // B3-ffn-3 (the chip anatomy §6.26: 98% of the leg is ENCODE
+                        // ISSUE; pub_vec ran as simd<8> chains on 16/32-wide EUs =
+                        // half the slot wasted per instruction). Widen the adjacent
+                        // 8+8 col-groups of one row into ONE simd<16> pub call: the
+                        // chains are PURELY ELEMENTWISE (gate/e4m3 f32 ops; width
+                        // cannot change a bit), and the pair is exactly what the
+                        // fjoin stores below re-join anyway. 4x vec8 pub -> 2x vec16.
+                        if (in0 && pw16) { esimd::simd<float,16> a;
+                            a.template select<8,1>(0) = e00.template select<8,1>(r*8);
+                            a.template select<8,1>(8) = e01.template select<8,1>(r*8);
+                            esimd::simd<half,16> hj = esimd::convert<half>(s8v8::pub_vec_v8<16>(3u, a));
+                            h00 = hj.template select<8,1>(0); h01 = hj.template select<8,1>(8); }
+                        else if (in0) { esimd::simd<float,8> a = e00.template select<8,1>(r*8), b = e01.template select<8,1>(r*8);
                             h00 = esimd::convert<half>(s8v8::pub_vec_v8<8>(3u, a));
                             h01 = esimd::convert<half>(s8v8::pub_vec_v8<8>(3u, b)); }
                         else { h00 = z8; h01 = z8; }
-                        if (in1) { esimd::simd<float,8> a = e10.template select<8,1>(r*8), b = e11.template select<8,1>(r*8);
+                        if (in1 && pw16) { esimd::simd<float,16> a;
+                            a.template select<8,1>(0) = e10.template select<8,1>(r*8);
+                            a.template select<8,1>(8) = e11.template select<8,1>(r*8);
+                            esimd::simd<half,16> hj = esimd::convert<half>(s8v8::pub_vec_v8<16>(3u, a));
+                            h10 = hj.template select<8,1>(0); h11 = hj.template select<8,1>(8); }
+                        else if (in1) { esimd::simd<float,8> a = e10.template select<8,1>(r*8), b = e11.template select<8,1>(r*8);
                             h10 = esimd::convert<half>(s8v8::pub_vec_v8<8>(3u, a));
                             h11 = esimd::convert<half>(s8v8::pub_vec_v8<8>(3u, b)); }
                         else { h10 = z8; h11 = z8; }
