@@ -1026,3 +1026,15 @@ skip 流水读 ≈ **55-65KB → 64KB SLM 桶装得下**（v4full 已在 45-56KB
 + fused-quant publish（take 机制）。B6-1 = bench_b6 仪器：lfw2 核加 phase-3
 （attended→e4m3 rowmax quant→outproj gemm（SLM A tile）→deq+skip fold→写 1267），
 对拍=现链 wa+quant+outproj+residual 四件套。
+
+## 六.二十四、B6-1 完整周期判决：融合链正确但帧 +1.08 系统性负（13:0x-13:4x）——三证合一钉死"融合轴"
+
+bench_b6 12/12 EXACT（修两处 select<32,1>(1)=OFFSET 非块索引 bug + 一处 host memcpy 堆溢出）
++ recorder 三闭包改写全对（16/16 配对、1301 EXACT、691→684 passes）
++ **16 对 A/B = 0 赢 16 负均值 +1.08**（campaign 最系统性的一负）。
+**三证合一**（slice1 +0.5 / slice2 +1.5 / b6 +1.08）：删往返的杠杆（b6 实测 ~0.7GB/16层=1.3ms）
+**付不起长串行链的并行度损失**。前辈 megakernel 赢在"核自身是深流水线 gemm（40-50% 密度）"，
+融合架在忙碌的 XMX 上；我们的融合架在延迟空洞上。⇒ **融合轴永久关门**（不再回锅）。
+**唯一活轴 = 在途深度**：ffn chip（-11.4 腿，106GB/s=19% 带宽）与 v4full 家族的
+2+ tiles/thread、深 K、prefetch——这是 B3 形态战的最终形态定义。
+select 教训入册：写任何 select<N,1>(k) 先问"k 是偏移还是块号"。
