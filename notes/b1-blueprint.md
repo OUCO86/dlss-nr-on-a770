@@ -1125,3 +1125,22 @@ shell 0.005（地板=无地板）。chip full = 1.16ms vs 流量屋顶 ~0.3 → 
 （分支可预测+chip 每帧仅 8 发），但**诊断必须不改变被测量**是仪器纪律，
 csT 按卫生转正部署（帧中性声明，不吹收益）。军规新条款：**任何塞进 shipped
 核的运行时诊断分支，必须同二进制内做"带/不带"对照，否则分段账全是仪器伪影。**
+
+## 六.三十、干净件 RUN_TIMING 真靶序 + wa 归因 + 160-发合并的结构性否决（13:5x）
+
+CS2 件（无探针污染）第二遍稳态：window_block 19.9 | batched 18.5 | res 18.0 |
+wa 17.0 | qkv 14.8 | wres 13.4 | ga 12.0 | gemm(f16) 11.0 | quant 10.3 |
+ffn 6.1 | gemm_int8 5.3 | merge 4.0 | unary 2.8 | stem 1.8（串行总 154，帧 66）。
+vs 中毒件旧表（§6.28）整体 +5ms 漂移——旧表排序仍可用但数字作废，以这张为准。
+用户提议"合并 160 发 quant 成 1 发内部循环 kernel 摊销 1.28ms×160 launch 税"，
+三层数据否决（全部实测）：(1) cs4=1.28ms 是运行时探针伪影（模板化后 0.0048）；
+(2) bench_nodetax：cgraph 节点边际税 ~0.7µs，160 发总 launch 盘 ~0.11ms；
+(3) plan census：160 发 quant 相邻同类 run max=1（全被 gemm 隔开，链=gemm→f16面→
+quant→pk(9MB 共享 scratch 1272)→gemm+1），合并=强制跨 gemm 依赖进单核串行，
+qfmode=2 探针已实测该拓扑破坏 = +9ms。
+wa 归因（现有开关矩阵，零新代码）：noWAFAM -6.2（家族真值）；noTILE/noMERGE
+在带内（fold 形状不是帧瓶颈）。下一步=window_block（串行 #1=19.9）的 v4full
+内账已有（QKV-Q 1.244 大头）+ batched/res 三兄弟共用 s8v8（旧 §6.28 刀序 1
+仍未做：bench_batched 扫 BN=128/BK=64/双缓冲 tile 变体——GRF 账现在清楚了：
+s8v8 NT32+8 累加器=4KB/线程，比 chip 的 12x64B 宽得多，tile 变体的正确形态=
+BN 加倍但累加器减半（16 col x 2 tile 串行）——先 bench_batched 定价再上帧。
