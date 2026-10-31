@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 """quant_window swap-in gate (route(a) step 3 #6, section 77).
 
@@ -19,15 +20,19 @@ import ctypes, os, pathlib, sys
 import numpy as np
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
+_STAGE = os.environ.get("DSH_ONEAPI") or (
+    str(ROOT.parent / "oneapi") if os.path.isdir(str(ROOT.parent / "oneapi"))
+    else str(ROOT.parent.parent / "oneapi"))
+ONER = pathlib.Path(_STAGE)
 sys.path.insert(0, str(ROOT / "src" / "gpu"))
 import int8_quant as IQ
 
-for d in (str(ROOT.parent.parent / "oneapi"), r"E:\WorkBuddy\toolchain-mamba\sycl\Library\bin"):
+for d in (str(ONER), r"E:\WorkBuddy\toolchain-mamba\sycl\Library\bin"):
     if os.path.isdir(d):
         try: os.add_dll_directory(d)
         except OSError: pass
 _k = ctypes.windll.kernel32; _k.SetErrorMode(0x8002)
-os.chdir(str(ROOT.parent.parent / "oneapi"))
+os.chdir(str(ONER))
 for dep in ("libmmd.dll", "tbb12.dll", "ur_win_proxy_loader.dll", "ur_loader.dll", "sycl9.dll"):
     p = pathlib.Path.cwd() / dep
     if p.exists(): _k.LoadLibraryExW(str(p), 0, 0)

@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 """graph gate (route (a) step 1, section 64): capture-then-replay must be IDENTICAL to
 the sequential path, and the replay must read operands written AFTER capture (ops frozen,
@@ -16,21 +17,25 @@ import ctypes, os, pathlib, sys
 import numpy as np
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
+_STAGE = os.environ.get("DSH_ONEAPI") or (
+    str(ROOT.parent / "oneapi") if os.path.isdir(str(ROOT.parent / "oneapi"))
+    else str(ROOT.parent.parent / "oneapi"))
+ONER = pathlib.Path(_STAGE)
 sys.path.insert(0, str(ROOT / "src" / "gpu"))
 sys.path.insert(0, str(ROOT / "src" / "ref"))
 import int8_quant
 
-for d in (str(ROOT.parent.parent / "oneapi"), r"E:\WorkBuddy\toolchain-mamba\sycl\Library\bin"):
+for d in (str(ONER), r"E:\WorkBuddy\toolchain-mamba\sycl\Library\bin"):
     if os.path.isdir(d):
         try: os.add_dll_directory(d)
         except OSError: pass
 _k = ctypes.windll.kernel32; _k.SetErrorMode(0x8002)
 for dep in ("libmmd.dll", "tbb12.dll", "ur_win_proxy_loader.dll", "ur_loader.dll", "sycl9.dll"):
-    p = ROOT.parent.parent / "oneapi" / dep
+    p = ONER / dep
     if p.exists(): _k.LoadLibraryExW(str(p), 0, 0)
 
-os.chdir(str(ROOT.parent.parent / "oneapi"))
-lib = ctypes.CDLL(str(ROOT.parent.parent / "oneapi" / "libxmx_sycl.dll"))
+os.chdir(str(ONER))
+lib = ctypes.CDLL(str(ONER / "libxmx_sycl.dll"))
 lib.xmx_error.restype = ctypes.c_char_p
 for nm, at in (
     ("xmx_init", []), ("xmx_buf_create_kind", [ctypes.c_ulonglong, ctypes.c_int]),

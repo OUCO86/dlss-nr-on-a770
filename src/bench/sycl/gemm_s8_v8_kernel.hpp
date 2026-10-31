@@ -535,6 +535,129 @@ static inline sycl::event gemm_b_pub(sycl::queue& q, const int8_t* Ap, const int
     });
 }
 
+// gemm32_b_pub -- KNIFE C (2026-11-01): the fused-publish twin of gemm32_b for the
+// batched family's N=32 sites. plan_960x544.c captured graph (the region xmx_graph_run
+// replays, lines 5308..6643) contains xmx_rec_gemm_int8_batched with M=32640 N=32 K=128
+// batch=2 EIGHT times (5345/5369/5391/5413/6541/6563/6585/6607) and M=8160 N=32 K=128
+// batch=4 TWELVE times (5438/5460/5482/5504/5526/5548/6407/6429/6451/6473/6495/6517).
+// The split branch they WOULD take is gemm32_b (raw int32, :2700) + a SEPARATE scalar
+// publish parallel_for (:2702-2716) -- see FRAME REACHABILITY at the bottom of this comment:
+// on the frame those 20 calls are already folded by P8-b wide-merge and never get here.
+// Measured at the frame's OWN strides (lda=K*batch,
+// sa=K, sb=N*K, sc=N, ldc=N*batch, col_stride=N, epi1, narrow), 8 processes pooled, 5
+// groups x 15 reps with a 60 ms gap, msM = median of the group-mins:
+//     M=32640: gemm32_b 0.0930 + publish 0.3928 = 0.4858  (publish = 31.9 GB/s = 5.7% of
+//              the 560 GB/s roof -- 4.2x the GEMM it follows)
+//     M=8160 : gemm32_b 0.0701 + publish 0.2056 = 0.2756  (publish = 30.5 GB/s = 5.4%)
+// this kernel (bench): 0.0701 / 0.0447 ms per call TOTAL. That -6.05 ms/frame is a SERIAL
+// bench number for a path the frame does not execute -- it books ZERO to the frame (see
+// FRAME REACHABILITY below and the 16-pair A/B in the takeover notes). Numbers + protocol:
+// src/bench/sycl/gemm32_tile_run.txt (STEP 0 section).
+// GEOMETRY is moved VERBATIM out of src/bench/sycl/gemm32_tile.cpp, where it is
+// g32v::gemm32_var<32,32,32,2,1,true> (BN32 / BK32 / NT32 threads-per-WG / 2 SLM buffers
+// per operand / thread tile 8 rows x 16 cols / fused publish) -- that file diffs this
+// exact code path byte-for-byte against shipped gemm32_b on the raw leg and against the
+// recorder's publish map on this leg (diff = 0 over 2088960 / 1044480 elements).
+// WHY this geometry: at N=32 the shipped NT16 map (16 threads/WG, 16 rows x 16 cols per
+// thread) leaves only (Mp/128)*batch workgroups -- on the M=8160 site that is 256 WGs and
+// the machine is under-filled; NT32 (thread tile 8x16, 2 accumulator
+// fragments instead of 4) doubles the WGs and halves the live accumulator set: -49.5% on
+// M=8160 and neutral-or-better on M=32640. Depth-2 buffers (10KB SLM, prefetch depth 1)
+// beat the shipped s8d2 triple buffer (15KB) on both. JIT-cache ledger for this shape:
+// grf_count=128, spill=private=scratch=0, 0 scratch instructions, slm_size 10240 exactly.
+// The publish math is gemm_b_pub's chain VERBATIM (convert<float>(acc) * rs * cs, then
+// pub_vec_v8<16>): epi 0/1/3/4 only, same gate/contraction caveat as gemm_b_pub's comment
+// (:345-355) -- epi2/3 stay on the split path unless gemm_b_pub itself allows them.
+// GATE: the recorder picks this kernel only when NR_G32_PUB != 0 (default OFF); NR_G32_PUB=0
+// reverts to gemm32_b + publish.
+// FRAME REACHABILITY (measured with a closure-level probe print in a rebuilt dll, then
+// removed -- 2026-11-01): the 20 N=32 batched calls in the captured graph DO NOT reach this
+// kernel or the split path either. libxmx_sycl.cpp:2478-2503 (P8-b wide-merge, DEFAULT ON,
+// escape NR_B_WIDE=0) already folds them into ONE wide gemm_b_pub (Nw=N*batch, Kw=K*batch,
+// block-diagonal B, fused publish) and returns; substituting every plan tuple into wide_ok
+// gives 20/20 caught, 0 missed. So gemm32_b + separate publish is DEAD CODE on the frame
+// (reachable only under NR_B_WIDE=0), and THIS kernel is its fused twin: it is kept as (a)
+// the correct form of the NR_B_WIDE=0 escape path and (b) an S6 brick -- the BN32 geometry
+// previously had no pub twin at all, and block-resident stages need BN32 + fused store.
+// NO frame saving may be booked to this kernel; the prices above are bench-layer only.
+static inline sycl::event gemm32_b_pub(sycl::queue& q, const int8_t* Ap, const int8_t* Bp,
+                                       void* Cout, const float* as, const float* bs,
+                                       int M, int Mp, int N, int K, int batch,
+                                       size_t sc, unsigned ldc, unsigned scale_stride,
+                                       unsigned col_stride, bool narrow, unsigned epi) {
+    const int BN32 = 32, NT32P = 32, ROW_BANDS = BM / 8, COL_BANDS = BN32 / 16;
+    const int SLM_A32 = BM * BK, SLM_B32 = BK * BN32;      // 4096 / 1024 bytes per buffer
+    const int A_PER = SLM_A32 / NT32P;                    // 128 B of A per thread
+    const int B_PER = SLM_B32 / NT32P;                    //  32 B of B per thread
+    const int SLM_B32_BASE = 2 * SLM_A32;                 // the two B buffers follow the A
+    int wg = (Mp / BM) * (N / BN32);
+    size_t apb = (size_t)Mp * K, bpb = (size_t)N * K;
+    return q.submit([&](handler& h) {
+        h.parallel_for(nd_range(range((size_t)wg * batch * NT32P), range(NT32P)), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+            esimd::slm_init<2 * SLM_A32 + 2 * SLM_B32>();   // depth-1 double buffer, 10KB
+            int gid = (int)it.get_group(0);
+            int lid = (int)it.get_local_id(0);
+            int g = gid / wg; int loc = gid % wg;
+            int NB = N / BN32;
+            int wg_row = loc / NB, wg_col = loc % NB;
+            int wi_row = lid / COL_BANDS, wi_col = lid % COL_BANDS;
+            // the A pack band is 16 rows; this thread owns HALF of one (8 rows).
+            int packwi = wi_row / 2, subrow = (wi_row % 2) * 8;
+            const int8_t* apb_g = Ap + (size_t)g * apb;
+            const int8_t* bp_g  = Bp + (size_t)g * bpb;
+            const int8_t* apb = apb_g + (size_t)(wg_row * (K / BK)) * 8 * 512;
+            const int8_t* bp = bp_g + (size_t)wg_col * (BN32 / 8) * 256;
+            auto load_block = [=](int buf, int kb) SYCL_ESIMD_FUNCTION {
+                esimd::simd<int8_t, A_PER> av = esimd::block_load<int8_t, A_PER>(
+                    apb + (size_t)kb * SLM_A32 + lid * A_PER, esimd::overaligned_tag<16>{});
+                esimd::slm_block_store(buf * SLM_A32 + lid * A_PER, av, esimd::overaligned_tag<16>{});
+                esimd::simd<int8_t, B_PER> bv = esimd::block_load<int8_t, B_PER>(
+                    bp + (size_t)kb * N * 32 + lid * B_PER, esimd::overaligned_tag<16>{});
+                esimd::slm_block_store(SLM_B32_BASE + buf * SLM_B32 + lid * B_PER, bv, esimd::overaligned_tag<16>{});
+            };
+            esimd::simd<int8_t, 256> a0, b0, b1;
+            esimd::simd<int32_t, 64> c00(0), c01(0);
+            int kb_n = K / BK;
+            load_block(0, 0);                              // prologue: depth 1
+            esimd::barrier();
+            for (int b = 0; b < kb_n; ++b) {
+                int cur = b % 2;
+                if (b + 1 < kb_n) load_block((b + 1) % 2, b + 1);
+                uint32_t offA = (uint32_t)(cur * SLM_A32) + (uint32_t)(packwi * 512)
+                              + (uint32_t)(subrow * 32);
+                uint32_t offB = SLM_B32_BASE + (uint32_t)(cur * SLM_B32)
+                              + (uint32_t)(wi_col * 512);
+                a0 = esimd::slm_block_load<int8_t, 256>(offA + 0, esimd::overaligned_tag<16>{});
+                b0 = esimd::slm_block_load<int8_t, 256>(offB + 0, esimd::overaligned_tag<16>{});
+                b1 = esimd::slm_block_load<int8_t, 256>(offB + 256, esimd::overaligned_tag<16>{});
+                c00 = esimd::xmx::dpas<8, 8, int32_t>(c00, b0, a0);
+                c01 = esimd::xmx::dpas<8, 8, int32_t>(c01, b1, a0);
+                esimd::barrier();
+            }
+            // ---- fused publish store, the gemm_b_pub tail VERBATIM (gemm_b_pub:505-522),
+            // minus the second row group (this thread tile is 8 rows, not 16). ----
+            int gr = wg_row * BM + wi_row * 8, gc = wg_col * BN32 + wi_col * 16;
+            const float* gas = as + (size_t)g * scale_stride;
+            const float* gbs = bs + (size_t)g * col_stride;
+            esimd::simd<float, 16> cs = esimd::block_load<float, 16>(
+                gbs + gc, esimd::overaligned_tag<16>{});
+            for (int r = 0; r < 8; ++r) {
+                int rr0 = gr + r;
+                if (rr0 < M) {
+                    float rs = gas[rr0];
+                    esimd::simd<int32_t, 16> acc(0);
+                    acc.select<8, 1>(0) = c00.select<8, 1>(r * 8);
+                    acc.select<8, 1>(8) = c01.select<8, 1>(r * 8);
+                    esimd::simd<float, 16> pub = pub_vec_v8<16>(epi, esimd::convert<float>(acc) * rs * cs);
+                    size_t out = (size_t)g * sc + (size_t)rr0 * ldc + gc;
+                    if (narrow) esimd::convert<half>(pub).copy_to((half*)Cout + out);
+                    else        pub.copy_to((float*)Cout + out);
+                }
+            }
+        });
+    });
+}
+
 // gemm_b_pub_slm -- section 100 §99-item-3: the acc-via-SLM publish tail (the senior's
 // pattern, gemm_staged.comp:309-322 -- "the publish happens on scalars, after an
 // UNTOUCHED STORE TO SHARED MEMORY"). bench_batched's honest split: gemm_b (raw int32

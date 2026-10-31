@@ -2675,6 +2675,33 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
             pool_put(dAp);   // dBp is cache-owned (the whole batched weight)
             return;
         }
+        // KNIFE C (2026-11-01): fold the N=32 batched sites' publish into the gemm, the way
+        // the branch above already does for the N%64==0 (BN64) family. Those 20 calls/frame
+        // (plan captured graph: M=32640 N=32 K=128 b=2 x8, M=8160 N=32 K=128 b=4 x12) today
+        // pay gemm32_b + a SEPARATE scalar publish parallel_for below; measured at the
+        // frame's own strides that pass is 0.3929 / 0.2055 ms per call = 31.9 / 30.5 GB/s =
+        // 5.7% / 5.4% of the 560 GB/s roof, i.e. 4.2x / 3.0x the GEMM it follows. The fused
+        // kernel (s8v8::gemm32_b_pub, moved verbatim from the byte-exact bench form in
+        // src/bench/sycl/gemm32_tile.cpp) prices 0.0701 / 0.0447 => -6.1 ms/frame serial.
+        // Evidence + protocol: src/bench/sycl/gemm32_tile_run.txt (STEP 0 / STEP 1 rows).
+        // NOT REACHABLE FOR THE FRAME AS IT STANDS (probe-verified 2026-11-01): the branch
+        // above this one at :2478-2503 (P8-b wide-merge, DEFAULT ON, escape NR_B_WIDE=0)
+        // already catches all 20 N=32 batched calls in the captured graph (plan tuples put
+        // through wide_ok: 20/20) and returns. A temporary closure-level probe print in a
+        // rebuilt dll fired ZERO times with NR_G32_PUB=1 during a full replay -- proof, not
+        // inference. This branch therefore only serves the NR_B_WIDE=0 escape path, plus it
+        // is an S6 brick (BN32 geometry finally has a fused-store twin). DEFAULT OFF, and NO
+        // frame saving is booked to it. Escape: NR_G32_PUB=0 = the split path.
+        // NOTE the early return: on this path dC is NEVER allocated, so the publish closure
+        // below must not run (it would read pool garbage). No runtime diagnostic branch was
+        // added inside the kernel (military rules 4/9) -- the switch is closure-level only.
+        static bool g32pub = getenv("NR_G32_PUB") ? atoi(getenv("NR_G32_PUB")) != 0 : false;
+        if (g32pub && (N % 32u) == 0u && (epi == 0u || epi == 1u || epi == 3u || epi == 4u)) {
+            s8v8::gemm32_b_pub(*GQ, dAp, dBp, Cout, as, bs, (int)M, Mp, (int)N, (int)K,
+                               (int)batch, sc, ldc_, scale_stride, (sb != 0u) ? N : 0u, narrow, epi);
+            pool_put(dAp);   // dBp is cache-owned (the whole batched weight); dC never existed
+            return;
+        }
         int32_t* dC = (int32_t*)pool_get((size_t)batch * Mp * N * 4);
         if ((N % 64u) == 0u) s8v8::gemm_b(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K, (int)batch);
         else                 s8v8::gemm32_b(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K, (int)batch);

@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 """COEXIST gate (route (a) step 0, section 64): the game process has a LIVE D3D12 device
 (the bridge/game built it, on the AMD rendering card) before our dll is loaded. Section 60
@@ -23,15 +24,19 @@ import ctypes, os, pathlib, sys
 import numpy as np
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
+_STAGE = os.environ.get("DSH_ONEAPI") or (
+    str(ROOT.parent / "oneapi") if os.path.isdir(str(ROOT.parent / "oneapi"))
+    else str(ROOT.parent.parent / "oneapi"))
+ONER = pathlib.Path(_STAGE)
 sys.path.insert(0, str(ROOT / "src" / "gpu"))
 import int8_quant
 
-for d in (str(ROOT.parent.parent / "oneapi"), r"E:\WorkBuddy\toolchain-mamba\sycl\Library\bin"):
+for d in (str(ONER), r"E:\WorkBuddy\toolchain-mamba\sycl\Library\bin"):
     if os.path.isdir(d):
         try: os.add_dll_directory(d)
         except OSError: pass
 _k = ctypes.windll.kernel32; _k.SetErrorMode(0x8002)
-os.chdir(str(ROOT.parent.parent / "oneapi"))
+os.chdir(str(ONER))
 
 fails = 0
 def ok(cond, msg):
@@ -67,7 +72,7 @@ if not coexist:
 # is already the coexistence condition. (One variable, per the standing rule.)
 
 # ---------- now the skeleton: xmx_init, and the green s8rq chain ----------
-lib = ctypes.CDLL(str(ROOT.parent.parent / "oneapi" / "libxmx_sycl.dll"))
+lib = ctypes.CDLL(str(ONER / "libxmx_sycl.dll"))
 lib.xmx_error.restype = ctypes.c_char_p
 for nm, at in (
     ("xmx_init", []), ("xmx_buf_create_kind", [ctypes.c_ulonglong, ctypes.c_int]),

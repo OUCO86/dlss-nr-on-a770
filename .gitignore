@@ -1,4 +1,4 @@
-# NVIDIA's property — never committed, never redistributed. See notes/CLAUDE.md "Rules".
+﻿# NVIDIA's property 鈥?never committed, never redistributed. See notes/CLAUDE.md "Rules".
 /ref/
 /work/
 /dist/
@@ -21,7 +21,7 @@ __pycache__/
 *.pyc
 
 # Third-party game frames: test material, not code, and somebody else's copyright. A
-# single one was staged once and is still a loose object in this clone — see
+# single one was staged once and is still a loose object in this clone 鈥?see
 # `src/tools/publish_check.py --history`, which is what found it.
 /pngs/
 *.png
@@ -56,3 +56,4 @@ src/bench/**/*.txt
 *.pdb
 
 backups-plan-*/
+*.pre-knifeC.bak

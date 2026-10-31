@@ -594,13 +594,79 @@ static void frame_phase(int M, int N, int K, int b, int perframe, const std::vec
     printf("  %-22s SPLIT TOTAL msM=%7.4f msm=%7.4f  <-- 刀 C must beat this\n", "gemm+publish",
            stg.msM + stp.msM, stg.msm + stp.msm);
     // (c) the fused forms on the frame map
+    double wide_msM = 0.0;
+    // THE PATH THE FRAME ACTUALLY RUNS (found while probing the recorder, 2026-11-01):
+    // libxmx_sycl.cpp:2478-2503 P8-b wide-merge (DEFAULT ON, escape NR_B_WIDE=0) folds the
+    // b groups into ONE wide gemm -- Nw=N*b, Kw=K*b, block-diagonal B, and the FUSED
+    // gemm_b_pub publish. All 20 frame N=32 sites hit it (verified by substituting the plan
+    // tuples into wide_ok: 20/20). So the split chain priced above is dead code on the frame
+    // (reachable only under NR_B_WIDE=0), and the real comparison for 刀 C' is THIS row vs
+    // the BN32 fused rows below. Cost structure of the wide form: the block-diagonal B holds
+    // only 1/b non-zero, and every row band re-reads Nw*Kw => B traffic = (Mp/128)*Nw*Kw =
+    // 4.08 MB (A) / 4.19 MB (B) vs 1.04 / 1.05 MB for the BN32 family -- 4x the B traffic.
+    {
+        const int Nw = fc.N * fc.b, Kw = fc.K * fc.b;
+        int8_t* dApW = (int8_t*)malloc_device((size_t)fc.Mp * Kw, q);
+        int8_t* dBpW = (int8_t*)malloc_device((size_t)Nw * Kw, q);
+        packdev::gather_pack_a_b_v(q, dA, dApW, fc.M, fc.Mp, Kw, Kw, 0, 1);
+        packdev::gather_pack_b_diag_b(q, dB, dBpW, fc.N, fc.K, fc.K, (size_t)fc.N * fc.K, fc.b);
+        q.wait();
+        Stat sw = timeit([&]() {
+            return s8v8::gemm_b_pub(q, dApW, dBpW, (void*)fc.dOutV, fc.das, fc.dbs, fc.M, fc.Mp,
+                Nw, Kw, 1, (size_t)0, (unsigned)Nw, 0u, 0u, true, 1u);
+        });
+        q.memcpy(fc.hV.data(), fc.dOutV, fc.out_ext * 2).wait();
+        size_t diff = 0, cmp = 0;
+        for (int g = 0; g < fc.b; ++g)
+            for (int r = 0; r < fc.M; ++r)
+                for (int c2 = 0; c2 < fc.N; ++c2) {
+                    size_t i = (size_t)g * fc.sc + (size_t)r * fc.ldc + c2;
+                    ++cmp; if (memcmp(&fc.hRef[i], &fc.hV[i], 2)) ++diff;
+                }
+        double bytesW = (double)fc.Mp * Kw + (double)(fc.Mp / 128) * Nw * Kw + (double)fc.b * fc.M * fc.N * 2.0;
+        double gbsW = bytesW / (sw.msM / 1e3) / 1e9;
+        printf("  %-22s pub  msM=%7.4f msm=%7.4f msX=%7.4f  GB/s=%6.1f %5.1f%%  cmp=%zu diff=%zu SLM= 18.0KB  gm=%s\n",
+               "WIDE gemm_b_pub", sw.msM, sw.msm, sw.msX, gbsW, 100.0 * gbsW / 560.0, cmp, diff, gmfmt(sw));
+        wide_msM = sw.msM;
+        free(dApW, q); free(dBpW, q);
+    }
+    // FIRST: STEP 1 verification -- the kernel that now lives in gemm_s8_v8_kernel.hpp
+    // (s8v8::gemm32_b_pub, moved verbatim from g32v::gemm32_var<32,32,32,2,1,true> below)
+    // must be byte-identical to the bench template AND price the same. If this row is red
+    // the shipped header drifted from the verified form -- stop, do not touch the recorder.
+    {
+        Stat sh = timeit([&]() {
+            return s8v8::gemm32_b_pub(q, fc.dAp, fc.dBp, (void*)fc.dOutV, fc.das, fc.dbs,
+                fc.M, fc.Mp, fc.N, fc.K, fc.b, (size_t)fc.sc, (unsigned)fc.ldc, 0u,
+                (unsigned)fc.N, true, 1u);
+        });
+        q.memcpy(fc.hV.data(), fc.dOutV, fc.out_ext * 2).wait();
+        size_t diff = 0, cmp = 0;
+        for (int g = 0; g < fc.b; ++g)
+            for (int r = 0; r < fc.M; ++r)
+                for (int c2 = 0; c2 < fc.N; ++c2) {
+                    size_t i = (size_t)g * fc.sc + (size_t)r * fc.ldc + c2;
+                    ++cmp; if (memcmp(&fc.hRef[i], &fc.hV[i], 2)) ++diff;
+                }
+        double bytes = (double)fc.b * ((double)fc.Mp * fc.K + (double)(fc.Mp / 128) * fc.N * fc.K)
+                     + (double)fbytes_written(fc) * 2.0;
+        double gbs = bytes / (sh.msM / 1e3) / 1e9;
+        printf("  %-22s pub  msM=%7.4f msm=%7.4f msX=%7.4f  GB/s=%6.1f %5.1f%%  cmp=%zu diff=%zu SLM= 10.0KB  gm=%s\n",
+               "HEADER gemm32_b_pub", sh.msM, sh.msm, sh.msX, gbs, 100.0 * gbs / 560.0, cmp, diff, gmfmt(sh));
+        fr_result = sh.msM;
+    }
+    double a0 = fr_result;
     frame_pub<32, 32, 16, 3, 0>(fc, "anchor32 pub");       double a1 = fr_result;
     frame_pub<32, 32, 32, 2, 1>(fc, "nt32_hr_buf2 pub");   double a2 = fr_result;
     frame_pub<32, 32, 32, 2, 2>(fc, "nt32_hc_buf2 pub");   double a3 = fr_result;
     frame_pub<32, 32, 16, 2, 0>(fc, "bn32_buf2 pub");      double a4 = fr_result;
     frame_pub<32, 64, 32, 2, 1>(fc, "bk64_hr_buf2 pub");   double a5 = fr_result;
     frame_pub<32, 64, 16, 3, 0>(fc, "bk64_nt16 pub");      double a6 = fr_result;
-    double best = std::min(std::min(a1, a2), std::min(a3, std::min(a4, std::min(a5, a6))));
+    double best = std::min(std::min(a0, a1), std::min(std::min(a2, a3), std::min(a4, std::min(a5, a6))));
+    if (wide_msM > 0.0)
+        printf("  刀 C' COMPARISON (bench-layer, DESCRIPTIVE ONLY -- the frame judge is the 16-pair A/B):"
+               " wide %7.4f vs BN32-fused %7.4f -> %+.4f/call; x%d = %+6.2f ms/frame SERIAL\n",
+               wide_msM, a0, a0 - wide_msM, perframe, (a0 - wide_msM) * perframe);
     printf("  GATE: best fused %7.4f vs split total %7.4f -> %s (per-call delta %+7.4f; x%d = %+6.2f ms/frame serial)\n",
            best, stg.msM + stp.msM, (best < 0.9 * (stg.msM + stp.msM)) ? "PASS -- proceed to step 1"
            : (best < stg.msM + stp.msM ? "MARGINAL -- report before writing shipped code" : "FAIL -- STOP"),
