@@ -84,7 +84,12 @@ WQ-Cache 缓存前提 | quant 2-row ILP（roofline）| 编码宽化边界表（f
 QFALIAS 按指针已修但 colslice 扇出算术判死，除非 S2a 的 scale-pregive 改流量）|
 f16-OUT（store 段 <1ms）| 节点合并（0.7µs/节点）| 1267 dtype→f16（golden 锁死，
 军规 2 死刑已判）| B6-1 五件套形态（+1.08）| v5-8x8naive（§100 封存）|
-**rowsplit quant（10-31 事件计时 7/7 形状 0.33-1.0x；§6.6-3 的 59µs/发=wall-clock
+**B6-1 五件套 10-31 复判（仪器修复后真账）：bench_b6 旧 trio 计时=0 是仪器坏
+（per-event profiling 对 4 个 shipped 核返回 0），修成 wall back-to-back 后
+ratio=1.00（510/558 两形状）；帧 16 对=8/8 全负 均值 +1.42 → 形态真死。
+教训=**消 4.6/4.2/2.1MB 小面往返=零收益（L2 早吸收了）；1267 的 66.8MB
+大面 R278 才是 DRAM 真身——S3 的靶不是"小链合并发"，是大面跨层驻留**。**
+rowsplit quant（10-31 事件计时 7/7 形状 0.33-1.0x；§6.6-3 的 59µs/发=wall-clock
 伪账）** | **quant 腿旧价 9.5→新价 5.8（CS2/s8d2 时代）** | **f16-pack 标量残留
 （GA 三 pack vec 化 ≤0.067ms/帧不值；vec 小 per 反慢=pack_a16_v 192x512 0.015→0.044
 已证；pack 真身=gather traffic 本体）** | **S4 GRF-resident-B（bench_s8w5：K=64
