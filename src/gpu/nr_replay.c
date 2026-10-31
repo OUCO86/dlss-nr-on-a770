@@ -1636,7 +1636,21 @@ int main(int argc, char **argv)
 	/* What came out. Every buffer the host was meant to read, so the answer can be
 	 * found without knowing its name. */
 	for (unsigned i = 0; i < nr_plan_buffer_count; i++) {
-		if (nr_plan_buffers[i].kind != 1)
+		/* NR_DUMP_ALL=1 + NR_DUMP_IDS="1267,1274,..." (10-31 e4m3-grid audit):
+		 * dump named kind-0 scratch planes too (the whole kind-0 set would be
+		 * ~60 GB, hence the id list). */
+		int dump_all = getenv("NR_DUMP_ALL") != NULL;
+		if (nr_plan_buffers[i].kind == 1) {
+			/* host-readable: always in scope (the original gate) */
+		} else if (dump_all && nr_plan_buffers[i].kind == 0) {
+			const char *q = getenv("NR_DUMP_IDS");
+			int want = 0;
+			while (q && *q) {
+				if (atoi(q) == (int)i) { want = 1; break; }
+				q = strchr(q, ','); if (q) ++q;
+			}
+			if (!want) continue;
+		} else
 			continue;
 		if (r.ids[i] < 0 || nr_plan_buffers[i].bytes < 16)
 			continue;
