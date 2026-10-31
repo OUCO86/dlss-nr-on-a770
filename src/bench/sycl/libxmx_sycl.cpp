@@ -1809,6 +1809,12 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
             static bool fjoinm = !getenv("NR_FFN_JOIN") || atoi(getenv("NR_FFN_JOIN")) != 0;
             static bool ff3m = !getenv("NR_FF3") || atoi(getenv("NR_FF3")) != 0;
             static bool ff9m = !getenv("NR_FF9") || atoi(getenv("NR_FF9")) != 0;
+            static bool chipcsm = !getenv("NR_CHIP_CS") || atoi(getenv("NR_CHIP_CS")) != 0;
+            if (chipcsm) {
+                static bool lw16m = getenv("NR_CHIP_LW16") && atoi(getenv("NR_CHIP_LW16")) != 0;
+                if (lw16m) ffnc::launch_ffn_chip_cs2<16,false>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp, false, ff3m, ff9m);
+                else       ffnc::launch_ffn_chip_cs2<32,false>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp, false, ff3m, ff9m);
+            } else
             CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp, false, fjoinm, ff3m, ff9m), ffnc::launch_ffn_chip<16>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp, false, fjoinm, ff3m, ff9m));
             pool_put(dM16);   // dA2 was never packed on this path; dB2/dPp2 cache-owned
             pool_put(dMerged);
@@ -1987,6 +1993,12 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
             sycl::half* dPp3 = cached_pack_b_f16(projection, Praw, 128, 32);
             static bool chipres3 = !getenv("NR_FFN_CHIPRES") || atoi(getenv("NR_FFN_CHIPRES")) != 0;   // P8-l (see the merge site)
             if (chipres3) {
+                static bool chipcss = !getenv("NR_CHIP_CS") || atoi(getenv("NR_CHIP_CS")) != 0;
+                if (chipcss) {
+                    static bool lw16s = getenv("NR_CHIP_LW16") && atoi(getenv("NR_CHIP_LW16")) != 0;
+                    if (lw16s) ffnc::launch_ffn_chip_cs2<16,false>(*GQ, dH16, dB2, dPp3, (float*)Cout, (int)M, Mp, dS, cp);
+                    else       ffnc::launch_ffn_chip_cs2<32,false>(*GQ, dH16, dB2, dPp3, (float*)Cout, (int)M, Mp, dS, cp);
+                } else
                 CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, dH16, dB2, dPp3, (float*)Cout, (int)M, Mp, dS, cp), ffnc::launch_ffn_chip<16>(*GQ, dH16, dB2, dPp3, (float*)Cout, (int)M, Mp, dS, cp));
                 pool_put(dH16); pool_put(dA2); pool_put(dS);   // dC2 never allocated
                 return;
