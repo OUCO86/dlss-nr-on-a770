@@ -25,6 +25,21 @@
   2. 流量：我们 60.3GB/帧（1267=26.7GB 等），写+一读 38GB≈68ms=贴 DRAM 屋顶（§6.22）。前辈层内 resident 只流 ~25-30GB。
   3. gemm 形态：帧上窄 K 1.5-2.5 TOPS vs 前辈宽 M 8-30（§2433）。deep-K 30.9 TOPS 我们已实测可达（§537）= 形状问题非核问题。
 
+## ★ 同机对拍 ground truth（14:4x 实测，无外推）
+前辈 coopmat 备份件（work/libxmx.dll.bak-1020-coopmat）在同一 walk 上直接跑：
+**run 3 = 47.19ms（691 passes 同数）** vs 我们 66.5。差距 19.4ms = 纯架构差
+（他们 ~82 launch 层 resident，我们 ~700 节点核间 DRAM）。他们的 coopmat 接口
+税（24.8 TOPS 封顶）我们已用 ESIMD 免掉（deep-K 30.9 TOPS 实测）——B6-2 把
+resident 形态补上后，47 是下限不是上限。
+
+## 11-op 层周期（B6-2 的融合对象，plan census 14:4x 钉死）
+residual(1272,wt->1267) -> quant_window(1267->1272/1273) -> qkv(->1275/1274/1276)
+-> window_attention(->1277) -> quant(->1272) -> wres(1272,1267->1279)
+-> unary x2(1269->1270/1271) -> gemm f16(1271->1279) -> quant(->1272)
+-> batched x2(->1274->1275) -> quant x2 -> residual(next layer, 1272->1267)
+= 12 launches/layer x 120 layers。B6-2 = 这个 12-launch 周期合 1-2 个 resident 核
+（1267/1272/1273/1274/1275 全部片上化；权重 1276+ 流式）。
+
 ## 路线图（每档的账）
 - 刀尾（本周）：s8v8 三兄弟 tile 变体（串行 56.4ms；先 bench_batched 定价：BN128/BK64/累加器减半形）+ wa 供数审计 → 60-62。
 - B6-2 层 resident（主刀）：residual-gemm+quant_window+ffn 一核（1267 省 18.6GB/帧读）→ ~49-52。= 前辈 82-launch 逐层复刻；v4full resident 骨架已在帧上跑（50 块全走）。
