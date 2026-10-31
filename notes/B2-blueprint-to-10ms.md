@@ -122,6 +122,12 @@ campaign（blade-4 已证 22ms 先例：砍标量 store/pub 群）。下一刀�
 单核解剖：gemm_b_res 108µs/发 vs 前辈同 op ~50µs（47ms 帧反推）= 2x 差距在
 epilogue 的 256 标量 fma（golden 锁）+ dpas 短 K；batched pub 尾同刑。| §6.22 整面流量计数法
 （每 op 按整面计=16x 高估；真实 8GB/帧=14ms 地板，帧=latency bound）|
+PGRAPH 多流并行（11-01 建成并实测判死：691 闭包 touch-set 全登记、贪心波次
+规划器输出 waves=691/maxwidth=1 = 帧是严格串行依赖链（每层读写同一条残差流
++ 金字塔共享 pk/scale 面），op 间零可挖并行度——双流跑 156ms 纯因每波 barrier
+开销。双流/四流=死。链的短路只有一条=减环节数=融合，而融合唯一没试过的
+形态 = lmxx C256 persistent ready-queue（6 层一 launch，链 691->~115 环节）
+= S6 本体，非 B6-1 那种小链。）|
 WQ-Cache 缓存前提 | quant 2-row ILP（roofline）| 编码宽化边界表（ffn-3/4/12 赢长链、
 5/6 输短链/故意冗余）| PW32/SPLITC/ACCSLM（GRF 三杀）| take_b 按 id 查（+25；
 QFALIAS 按指针已修但 colslice 扇出算术判死，除非 S2a 的 scale-pregive 改流量）|
