@@ -163,7 +163,8 @@ static std::map<int,int> g_fused_quant;   // quant-source cb -> a_scale buf (new
 // launch AND its pk buffer disappear. bench_qfused: FUSED-PACK tile-diff 0 scale-diff
 // 0 on every frame shape. Gate NR_Q_FUSE (default OFF until the three gates pass).
 struct QuantFused { size_t qcmd; int src; int sc; unsigned M; unsigned K;
-    bool gather = false; unsigned image_h = 0, image_w = 0, across = 0, pad = 0; };
+    bool gather = false; unsigned image_h = 0, image_w = 0, across = 0, pad = 0;
+    void *pkp = nullptr, *scp = nullptr; };   // QFALIAS: device pointers for engine aliasing
 static std::map<int,QuantFused> g_quant_pk;   // pk buf id -> the quant that wrote it
 // the P11 recip table: host-built from the reference chain, device-cached once.
 static float* g_dbgbuf = nullptr;   // shared dbg buffer for the vit recip comparison
@@ -303,14 +304,27 @@ static bool qfuse_take_b(int a, int a_scale, unsigned M, unsigned K, unsigned ld
     if (!qfuse_on() || scale_stride != 0u) return false;       // pack +8ms eats the
                                                         // quant -12; kept as a probe
     auto it = g_quant_pk.find(a);
-    if (it == g_quant_pk.end()) return false;
+    if (it == g_quant_pk.end()) {
+        // QFALIAS: the engine hands the SAME device memory to the producer under
+        // id `packed` and to the consumer under a DIFFERENT id `a` (pointer
+        // census 12:3x: PKP(1305) == AP(1273)). Match on the POINTER.
+        auto ai = g_bufs.find(a);
+        if (ai == g_bufs.end()) return false;
+        for (auto q = g_quant_pk.begin(); q != g_quant_pk.end(); ++q)
+            if (q->second.pkp == ai->second.p) { it = q; break; }
+        if (it == g_quant_pk.end()) return false;
+    }
     // the two frame forms (census 99c4034, guards per the user's reference):
     //   shared-A:   quant-K == gemm-K == lda, sa==0 (groups read the SAME rows)
     //   col-slice:  quant-K == lda (full wide row), sa == K (group g reads cols g*K..)
     const bool shared    = (it->second.K == K && K == lda_e && sa == 0u);
     const bool colslice  = (it->second.K == lda_e && sa == K);
     if (!shared && !colslice) return false;
-    if (it->second.sc != a_scale || it->second.M != M) return false;
+    if (it->second.M != M) return false;
+    if (it->second.sc != a_scale) {   // QFALIAS: scale may ride a different id too
+        auto si = g_bufs.find(a_scale);
+        if (si == g_bufs.end() || it->second.scp != si->second.p) return false;
+    }
     if (my_cmd - it->second.qcmd > 4) return false;   // adjacency sanity: only INIT/BUF
     out = it->second;                                  // ops may sit in between
     g_cmds[out.qcmd] = [](){};
@@ -2291,6 +2305,8 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
     if (v9b_will) { ++v9b_rec_calls; v9b_slot = g_cmds.size(); g_pending_fold_slot = v9b_slot; g_fold_slot.resize(v9b_slot + 1); g_fold_slot[v9b_slot].cbuf = c; }
     // P2 batched fusion decision at RECORD time (the take no-ops the quant closure):
     QuantFused qfb;
+    if (getenv("NR_Q_STATS")) { auto it0 = g_bufs.find(a);
+        printf("[gemmB-REC] a=%d AP=%p a_scale=%d M=%u K=%u lda=%u sa=%u ss=%u\n", a, it0==g_bufs.end()?(void*)0:it0->second.p, a_scale, M, K, lda_, sa, scale_stride); }
     const bool fused_b = !v9b_will && qfuse_take_b(a, a_scale, M, K, lda_, sa, scale_stride, g_cmds.size(), qfb);
     sycl::half* a16b = fused_b ? (sycl::half*)g_bufs[qfb.src].p : nullptr;
     g_cmds.push_back([=]() {
@@ -2345,7 +2361,12 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
         }
         if (bstop2 < 2) {
         static long bfp = 0, bgp = 0;   // P8 census: fused vs scalar-gather pack_a hits
-        if (fused_b) { bfp++; packdev::pack_a_fused_b(*GQ, a16b, dAp, (float*)ias->second.p, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch); }
+        if (fused_b) { bfp++;
+            static int qfmode = getenv("NR_QF_B1") ? atoi(getenv("NR_QF_B1")) : 1;   // 1 = single-read b1 (QFALIAS-v2), 0 = the old per-group peak
+            if (qfmode == 1 && lda_e <= 512 && sa + K <= lda_e)
+                packdev::pack_a_fused_b1(*GQ, a16b, dAp, (float*)ias->second.p, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch);
+            else
+                packdev::pack_a_fused_b(*GQ, a16b, dAp, (float*)ias->second.p, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch); }
         else { bgp++; if (getenv("NR_BPACK_TRACE") && bgp <= 8) printf("[bpack] gather M=%u N=%u K=%u b=%u sa=%u lda=%u\n", M, N, K, batch, (unsigned)sa, lda_e);
             // P8-a: the 128-bit vector gather when the strides are 16-aligned (the
             // frame: lda=K mult32, sa in {0,128,256} -- and the operand buffers are
@@ -4910,7 +4931,7 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
             // CONSTRUCTION (the cache content = a real executed quant's output);
             // the recorded graph carries the memcpy nodes, so pk is refilled
             // every replay regardless of pointer stability.
-            if (getenv("NR_Q_STATS")) printf("[quant-EXEC] M=%u K=%u src=%d pk=%d cmd=%zu gen(s=%d p=%d sc=%d)\n", M, K, source, packed, mycmd, genof(source), genof(packed), genof(scale));
+            if (getenv("NR_Q_STATS")) printf("[quant-EXEC] M=%u K=%u src=%d pk=%d SCALE=%d PKP=%p SRCP=%p cmd=%zu\n", M, K, source, packed, scale, (void*)pk, (void*)a, mycmd);
             if (wq_static) {
                 static std::unordered_map<uint64_t, std::pair<int8_t*, float*>> wqc;
                 // WQ-CACHE v4 KEY FIX (the ABA root cause found by the 18:3x
@@ -4954,7 +4975,14 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
             qr_launch_esimd(*GQ, *GD, a, pk, sc, M, K);
         });
         if (qfuse_on())   // register for a downstream gemm to dissolve us (P2 fusion)
-            g_quant_pk[packed] = QuantFused{ g_cmds.size()-1, source, scale, M, K };
+            { QuantFused qf2{ g_cmds.size()-1, source, scale, M, K };
+              qf2.pkp = (void*)pk; qf2.scp = (void*)sc;
+              g_quant_pk[packed] = qf2; }   // QFALIAS: + device pointers (the engine ALIASES
+                                            // pk/scale under DIFFERENT ids: the pointer census
+                                            // PROVED gemmB's a=1273 AP == quant pk=1305 PKP
+                                            // (FFFFB80225800000) and a_scale=1274 aliases the
+                                            // quant's scale buf 1306 -- id-lookup misses, the
+                                            // POINTER is the real wire.)
         return 0;
     }
     g_cmds.push_back([=]() {
