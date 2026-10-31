@@ -1,80 +1,72 @@
-# lmxx 3080 整体架构 vs 前辈 49ms vs 我们：到 10ms 的路（2026-10-31 14:4x，精读 lmxx 架构后重写）
+# lmxx 3080/9070XT 分支的 71 层完整模型架构 vs 前辈 47ms vs 我们：10ms 路径（14:5x 重写，前版 31-block 误读已废）
 
-## 一、lmxx 3080 分支的整体架构逻辑（六刀之前 v0.1.0 就 15.83ms@720p——架构才是主体）
+## 0. 勘误链（本轮对话内两次被用户点破，记录防再犯）
+- 撤"带宽归一"：A770=560GB/s+262 TOPS ≥ 3080L=448+238（官方规格）。零硬件借口。
+- 撤"31 块=31 megakernel"：31 块/15 fatbin 是 Preset 2 的 0.5x Small **降画质新模型**
+  （只快 ~30%，用户明确：那个好适配、之后再弄）。**我们跑的是 71 层完整 NR 模型**
+  （=前辈 coopmat 47ms 同款）。本章全部数字取自 lmxx 姊妹项目 **hip-port（RX 9070XT
+  上 71 层完整模型的从零重做）**的 CHANGELOG——这才是 71 层模型的架构账。
 
-读 native_wave_c32_ffn.hlsl（一个完整 FFN 块）+ block*/c32* 命名体系 + README：
+## 1. lmxx 71 层完整模型的真实架构账（hip-port CHANGELOG，逐条实测）
 
-1. **一 fatbin = 网络一段 = 一个 megakernel**（15 fatbin / 31 块）。kernel 内部
-   干完整功能块：quantize→expand gemm→gelu→proj gemm→residual fold——
-   **阶段间数据走 LDS+寄存器，块内任何中间量不落显存**。
-2. **残差 tile 在 wave 手里穿块**：wave(32 线程)持 16 token × 32ch；输入读一次、
-   穿过整个块（gelu 的 e4m3 往返在 accumulator 寄存器内做 H()/F() 内联）、写回一次。
-3. **权重每 kernel 载一次进 LDS（coeff 8KB），块内所有 token 复用**。
-4. launch 数 = 31（每块一发）。**残差流量 = 2 × 31 次往返，不是 2 × 120 层**。
+**基线轨迹（9070XT，网络离线 1000 帧稳态）**：
+- 0.01：71 块全部 wave-matrix 核、逐块 split、186ms（bit-identical）
+- 0.03：硬件 f16/E4M3 转换 + **fused QKV+norm** → 62.7ms
+- 0.30：**wave-owned 核**（C32 全十块/C64 融合窗）−6%
+- 0.36 第8项：**上采样折进下一层首块**（C64/C128/C32），−0.17/−0.25ms，launches −3
+- 0.37：**C256 persistent stage**（每 stage 内 6 层走**设备 ready-queue**，超时自动回退串行）launches 197→179；**ViT QKV 五 wave LDS 共权重**（8KB 双缓冲，读÷5）48.8→37.0µs；C512 head-pool+proj 合一 launch；**逐核 roofline 对照表**（"our 169 vs **reference 154 launches**"——他们对标的参照系是 154 发！）
+- 0.38：**900 档 7.6ms / 1080 档 10.4ms，launches 162/158**；composite quantization（FP8 往返=整数位掩码，全 2^32 输入证明）；三处宽 store 重写。
+- 未采纳（负结果，同样有价值）：C128/C64 persistent（<0.5%）、C512 proj 共权重（bit-exact 但更慢）、MAKE_RESIDENT spike（离线复现不了）。
 
-## 二、前辈 coopmat A770 版 47.19ms（同 walk 实测）——要超越的地板，不是老师
+**71 层模型每帧 launch 数：~160（不是 31！）**。他们到 7.6ms@900p 靠的不是把 71 块合成 31 发，而是：
+1. **块内融合到底**：QKV+norm、attention+proj+residual、upsample+下块首层——中间量 LDS/寄存器穿阶段；
+2. **persistent ready-queue**：一个 stage 的多层在设备内排队跑（launch 边界消失）；
+3. **wave-owned**：一个 wave 拥有一层的全部阶段；
+4. **权重共享**（W5：5 wave LDS 共权重双缓冲）；
+5. **逐核 roofline 审计**：每个核对着 per-kernel map 找离带宽/算力屋顶的差距，逐个削；
+6. **数字级微观**（FP8 往返=位掩码、宽 store、recip+FMA）——每刀 0.005-0.07ms 但全收。
 
-前辈源在 src/gpu/（22 个 .comp）。他们**已经在做块融合**：
-- window_block.comp：QKV+attention+proj 三趟合一（Q/K/V 不出 workgroup，注释
-  明说省 ~210MB/帧）；
-- ffn_fused.comp：stem 三趟合一；
-- gemm_staged_int8_fused.comp：**quant 折进 gemm 载入**（"quantising as it goes"），
-  文件头还写了踩过的坑：on-chip 测 scale 会让 int32 累加器碎成 f32（27.1ms vs
-  14.8），正解=**scale 由上一块的 publish epilogue 顺带写出，gemm 读时现成**。
+## 2. 前辈 coopmat 47ms 的真实位置（超越对象，不是老师）
 
-**但他们停在 47 = 贴着自己的残差屋顶**：plan census 1267 写 122+读 278 次
-=26.7GB=47.7ms@560。为什么他们不往上融合？§227 案卷白纸黑字：
-**"A770 的 32KB coopmat shared 配额与 megakernel 不相容，B1a 作废"**——
-Vulkan coopmat 的 LDS 上限卡死了他们做 lmxx 式块穿寄存器。
+前辈=同 71 层模型、同 A770、半融合（window_block 三合一、ffn_fused 三合一、
+fused gemm 读侧 quant）+ resident 缓冲，**47.19 实测贴 1267 残差 ping-pong 屋顶**。
+§227 案卷：他们想做更深的 B1a megakernel，**Vulkan coopmat 32KB SLM 死限作废**。
+他们的残差往返数（census 400 次）比 lmxx 的形态（融合后 ~2×71=142 次量级）多 ~2.8 倍
+——**这就是 47→~20 的空间，前辈被工具链卡住没走到的那步**。
 
-## 三、我们反超前辈的硬件窗口（这是"为什么能到 10ms"的核心）
+## 3. 我们到 10ms 级的修正账（960×544，golden f32 残差）
 
-| 配额 | 前辈 coopmat | 我们 ESIMD | lmxx 需要 |
-|---|---|---|---|
-| 片上共享 | **32KB 死限**（B1a 作废主因） | **64KB/WG**（chip 现役） | 13KB LDS（720p tile） |
-| 矩阵算力 | 24.8 TOPS coopmat 封顶 | XMX dpas 30.9-59 TOPS（实测） | TC 238 |
-| 带宽 | 560GB/s | 560GB/s | 448（3080L 反而更低） |
+融合到 lmxx 深度后的每帧 DRAM 硬流量：
+- 残差 1267：71 块链 × 写1+读1 × 66.8MB ≈ **9.5GB**（现 26.7GB，降 2.8 倍）
+- 权重 ~1.0GB（LMXX 教训：W5 五 wave 共享后权重读 ÷5）
+- 图 I/O + history ≈ 0.5GB
+- **总 ~11GB @ 560GB/s = 19.6ms 流量下界**；再往下：残差面在层内 resident（写读合一）
+  → 残差往返 142→71 次 ≈ 4.8GB → **下界 ~10.5ms**。
+- 算力账：XMX 262 TOPS、模型 ~40-50 GOPs/帧 = 0.2ms——计算完全藏在流量里。
+**结论：10-12ms = lmxx 同等融合深度在 A770 上的物理地板；9070XT 在 3.7 倍分辨率上
+才 7.6ms，我们在 0.52Mpx 到 10ms 完全成比例。之前"31 发 megakernel"的说法作废，
+正确目标形态 = ~160 发 + 块内全融合 + persistent stage。**
 
-**前辈想做而硬件不让做的（块 megakernel、残差穿寄存器），我们的 ESIMD 栈做得起。
-这就是超 47 → 10ms 的窗口：不是抄前辈，是补上他被 32KB 卡死的那一层。**
+## 4. 开工序（照 lmxx 的演化路径补我们的缺课，按性价比排）
 
-## 四、10ms 的算术（A770@560GB/s，golden f32 残差锁死下）
+lmxx 从 186→7.6ms 的每一步都有我们的对应物。我们已做的：b3-1/PAF/ffn 系宽 store
+（=他们第 4 类）、chip/v4full 阶段融合（=他们 0.03 类）。**我们缺的四大件**：
 
-10ms 预算 = **5.6GB/帧**。lmxx 形态在 960x544：
-- 残差 f32 66.8MB × 2（一进一出）× **31 块** = 4.14GB
-- 权重 ~1GB（每 kernel 载一次，64KB SLM 装得下单块权重）
-- 图输入/输出/直方图 ≈ 0.3GB
-- **总 5.4GB → 流量下界 9.6ms**；XMX 算力账（前辈宽 M 形态 8-30 TOPS，我们
-  deep-K 30.9 已证）把计算藏进流量。→ **10-12ms 是这套 golden 下 A770 的物理地板。**
+1. **S2a 读侧 quant 折进 gemm**（前辈 fused 设计 + 我们的 QFALIAS wire + 他们的
+   scale-pregive 教训）：residual x120→quant_window x104 相邻对已验证。-12ms 预期。
+   **本周主刀。**
+2. **S2b 上采样/小 op 折进邻块**（他们 0.36#8 的复刻）：unary 腿 -5.0、wa 供数 -4.4
+   都是这条路（"ViT/downsample 候选实测无增益不折"——连哪些不该折他们都有账）。
+3. **S3 persistent ready-queue stage**（他们 0.37#3：C256 六层设备内排队，
+   launches 197→179）：我们的 cgraph 就是现成的"queue"——把同层相邻 9-op 周期录成
+   一个子图节点串（B6-1 的教训=五件套形态，改按他们 stage=6 层的粒度）。
+4. **S4 wave-owned + W5 权重共享**：s8v8 三兄弟的 SLM 放大 5.3x（§6.22 旧账）
+   = W5 直接对症（5 wave LDS 共权重双缓冲）——他们实测读÷5、48.8→37µs。
+5. **逐核 roofline 审计文化**：他们的 kernel-map（169 vs 154）打法=我们已有的
+   RUN_TIMING 表制度化——每表行配一个 bench 单核价，离屋顶 >2 倍的排队修。
 
-## 五、阶梯（每档有实测锚点）
-
-| 档 | 形态 | 残差往返 | 帧预期 | 锚点 |
-|---|---|---|---|---|
-| S0 现状 | ~700 节点全 split | 400 次（26.7GB） | 66.5 | 实测 |
-| S1 ILP 吃满 | 同图，s8v8/qkv 在途深度 2 预取 | 同 | ~60 | laws 592-734 vs 我们 100-190=19ms 泡 |
-| S2 前辈级半融合 | quant 折生产 gemm epilogue（scale 由 publish 出——前辈文件头给了正解+踩坑）；window_block 级（v4full 已在跑） | ~150 次 | **~40-44 破 47** | 前辈 fused comp 全套设计在手 |
-| S3 lmxx 块 megakernel | 一 kernel = attention 块 + ffn 块（9 层周期合 2 发）；残差 tile 穿寄存器/LDS；权重每 kernel 一载 | 62 次 | ~20-25 | 64KB SLM 装得下 8tok×32ch×f32×多阶段 |
-| S4 fatbin 粒度 | 31 块 = 31 发 + cp.async 预取 + 多 wave 接力 | 31 次 | **10-12** | 上表 9.6ms 下界 |
-
-## 六、开工序（替换全部旧刀序）
-
-1. **S2 第一铲（今天）**：GEMM_INT8_RESIDUAL 的 store epilogue 内嵌 quant_window
-   （§6.5 深剖钉死的真靶 (a)：x120 写 1267 → x104 QUANT_WINDOW 读，写读严格相邻，
-   100.7M 元素）——省 1267 的 104 次读 = -6.9GB ≈ **-12ms**。
-   设计母本=前辈 gemm_staged_int8_fused.comp（读侧折）+ 我们 pub_vec_v8(3u)
-   （写侧 e4m3 已在 epilogue）。行 scale 归约=前辈 publish.glsl 同款（行在
-   gemm 输出侧持有）。判官=三关+16 对+bench_res。
-2. S2 第二铲：quant 折 qkv/batched 载入（前辈 fused 的读侧形态，QFALIAS 已证
-   wire——这次按前辈的 scale 预给设计，不再 on-chip 测 peak）。
-3. S3 立项：一 block 一核（母本=native_wave_c32_ffn.hlsl 结构 + v4full/chip 部件），
-   64KB SLM 预算按 f32 残差重开（lmxx 是 f16，我们 golden 锁 f32=tile 宽度 x2）。
-4. S1 的 s8v8 双缓冲 depth-2 降为配菜（S2 落地后这些 gemm 会被 epilogue 化重写，
-   单独 ILP 优化给将死的形态镀金不值）。
-
-## 七、教训记录（本轮对话）
-- 我曾用"9070XT 2.3TB/s、3080 带宽归一"给差距找硬件借口——未查证编造，被用户
-  点破，官方规格撤回（A770 560GB/s+262 TOPS ≥ 3080L 448+238）。
-- 我一度把前辈 coopmat 版当"学习目标"——用户点破：它是被超越对象，照抄=停在 47。
-  真正的老师=lmxx 的块级 megakernel 逻辑；前辈的价值=他踩过的坑清单
-  （32KB 配额死因、on-chip scale 碎累加器、读侧折 vs 写侧折的实测数字）全在源码头注释里。
+## 5. 教训记录
+- 两次被用户点破（带宽借口、31-block 误读）根因相同：**没读全参照系就下结论**。
+  lmxx 主仓库 README 的 5.62ms 是 Small 模型；71 层完整模型的架构在 hip-port
+  姊妹线（9070XT 从零重做，bit-exact 对照）。以后引用任何数字先答"哪个模型、
+  哪个分辨率、什么形态"三问。
