@@ -61,6 +61,8 @@ int main(){ try {
     // cs5: the SAME nd_range grid but NO slm_init and NO body -- isolates the
     // launch-config floor (grid dispatch) from the SLM-carveout floor.
     int tiles2=((Mp/16)+15)/16;
+    double t_aslm = timeit([&]{ return ffnc::launch_ffn_chip<16,false,0,true>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true); });
+    double t_cs6p = timeit([&]{ return ffnc::launch_ffn_chip<16,false,6>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true); });
     double t_cs5 = timeit([&]{ return q.parallel_for(nd_range(range((size_t)tiles2*16u),range(16u)),[=](nd_item<1> it){
         float* o=(float*)o2; o[it.get_global_id(0)]=0.f; }); });
     // cs6: plain range() form (no nd_range, no SLM): the raw launch floor.
@@ -106,8 +108,8 @@ int main(){ try {
     q.memcpy(a.data(),o1,(size_t)Mp*cin*4).wait(); q.memcpy(b.data(),o2,(size_t)Mp*cin*4).wait();
     size_t d=0; for(size_t i=0;i<a.size();++i) if(memcmp(&a[i],&b[i],4)) ++d;
     double bytes=(double)M*cin*2 /*A in*/ + (double)M*cin*2 /*skip*/ + (double)M*cin*4 /*out*/ + 2.0*cin*hidden*2; // DRAM-class traffic
-    printf("M=%u: LW16 %.4f | WSTAGE %.4f | LW8 %.4f | LW32 %.4f | cs1(A-only) %.4f | cs3(quarter-exp) %.4f | cs4(shell) %.4f | cs5(no-q-chain) %.4f | cs5(nd-noSLM) %.4f | cs6(plain) %.4f ms | diff %zu %s\n",
-      M,t_off,t_on,t_lw8,t_lw32,t_cs1,t_cs3,t_cs4,t_c5,t_cs5,t_cs6,d,d?"NOT-EXACT":"EXACT");
+    printf("M=%u: LW16 %.4f | WSTAGE %.4f | LW8 %.4f | LW32 %.4f | cs1(A-only) %.4f | cs3(quarter-exp) %.4f | cs4(shell) %.4f | cs5(no-q) %.4f | cs6p(no-p) %.4f | ACCSLM %.4f | cs5(nd-noSLM) %.4f | cs6(plain) %.4f ms | diff %zu %s\n",
+      M,t_off,t_on,t_lw8,t_lw32,t_cs1,t_cs3,t_cs4,t_c5,t_cs6p,t_aslm,t_cs5,t_cs6,d,d?"NOT-EXACT":"EXACT");
   }
   return 0;
   } catch (std::exception& e) { printf("EXC: %s\n", e.what()); return 2; }

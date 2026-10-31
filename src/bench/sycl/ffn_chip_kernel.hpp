@@ -43,7 +43,7 @@ namespace esimd = sycl::ext::intel::esimd;
 // HS = LW x 1KB): LW=32 -> 64KB (1 WG/SM), LW=16 -> 32KB (2 WG/SM). The occupancy
 // hypothesis for the chip's frame-vs-isolated gap (P8-n: latency chain, NOT the
 // round-trip -- the mega removed 100MB of it and the marginal stayed flat).
-template <int LW, bool WSTAGE = false, int CSTOP = 0>
+template <int LW, bool WSTAGE = false, int CSTOP = 0, bool ACCSLM = false>
 static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                                     const half* dPp, float* Cout, int M, int Mp,
                                     const void* dSkip = nullptr, const float* cp = nullptr,
@@ -66,7 +66,7 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
     return q.submit([&](handler& h) {
         h.parallel_for(nd_range(range((size_t)gridwgs * (unsigned)LW), range((unsigned)LW)),
             [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
-            esimd::slm_init<(unsigned)LW * 2048u + (WSTAGE ? 16384u : 0u)>();   // EA+HS (+16KB weight stage)
+            esimd::slm_init<(unsigned)LW * (ACCSLM ? 4096u : 2048u) + (WSTAGE ? 16384u : 0u)>();   // EA+HS (+ACC 2KB/thread, ffn-18)
             uint wg = (uint)it.get_group(0);
             uint lid = (uint)it.get_local_id(0);
             const int tstride = (int)it.get_group_range(0) * (int)LW;
@@ -131,8 +131,19 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                                 // barrier also guarded this -- restore it here)
             if (!ours) continue;  // SAFE after the barrier (tile-loop form)
             uint hs = FFC_EA_OFF + (unsigned)LW * 1024u + lid * 1024u;   // the HS area follows EA (LW-scaled)   // per-thread 1KB hidden stage (this chunk)
-            esimd::simd<float,64> p00(0.f), p01(0.f), p10(0.f), p11(0.f);   // out cols 0..15
-            esimd::simd<float,64> q00(0.f), q01(0.f), q10(0.f), q11(0.f);   // out cols 16..31
+            esimd::simd<float,64> p00(0.f), p01(0.f), p10(0.f), p11(0.f);   // out cols 0..15 (DCE'd under ACCSLM)
+            esimd::simd<float,64> q00(0.f), q01(0.f), q10(0.f), q11(0.f);   // out cols 16..31 (DCE'd under ACCSLM)
+            uint accb = FFC_EA_OFF + (unsigned)LW * 2048u + lid * 2048u;   // ACCSLM tile base
+            if constexpr (ACCSLM) {
+                // B3-ffn-18 ACCSLM: the GRF wall PROVEN by the symmetric cs5/cs6p
+                // probes (deleting EITHER proj chain saves 0.65 = superlinear ->
+                // the 8 cross-c live accumulators spill). The proj accumulators
+                // live in a per-thread SLM tile (2KB): the kc2 loop loads 4 + dpas
+                // + stores back, then the other 4 -- GRF peak 4 accs + operands.
+                const esimd::simd<float,64> zz(0.f);
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) esimd::slm_block_store(accb + (uint)i * 256u, zz, esimd::overaligned_tag<16>{});
+            }
             if constexpr (CSTOP == 1) { tr0 = tiles; continue; }   // expand-only stop (after the HS stores above)
             const esimd::simd<half,8> z8((half)0.f);
             for (int c = 0; c < 4; ++c) {
@@ -239,6 +250,35 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                     uint wb = wsb + 8192u + kcg * 1024u;
                     esimd::simd<half,128> b0 = WSTAGE ? esimd::slm_block_load<half,128>(wb, esimd::overaligned_tag<16>{}) : esimd::block_load<half,128>(bb, esimd::overaligned_tag<16>{});
                     esimd::simd<half,128> b1 = WSTAGE ? esimd::slm_block_load<half,128>(wb + 256u, esimd::overaligned_tag<16>{}) : esimd::block_load<half,128>(bb + 128, esimd::overaligned_tag<16>{});
+                    if constexpr (ACCSLM) {
+                    esimd::simd<float,64> A0 = esimd::slm_block_load<float,64>(accb, esimd::overaligned_tag<16>{});
+                    esimd::simd<float,64> A1 = esimd::slm_block_load<float,64>(accb + 256u, esimd::overaligned_tag<16>{});
+                    esimd::simd<float,64> A2 = esimd::slm_block_load<float,64>(accb + 512u, esimd::overaligned_tag<16>{});
+                    esimd::simd<float,64> A3 = esimd::slm_block_load<float,64>(accb + 768u, esimd::overaligned_tag<16>{});
+                    A0 = esimd::xmx::dpas<8,8,float>(A0, b0, a0);
+                    A1 = esimd::xmx::dpas<8,8,float>(A1, b1, a0);
+                    A2 = esimd::xmx::dpas<8,8,float>(A2, b0, a1);
+                    A3 = esimd::xmx::dpas<8,8,float>(A3, b1, a1);
+                    esimd::slm_block_store(accb, A0, esimd::overaligned_tag<16>{});
+                    esimd::slm_block_store(accb + 256u, A1, esimd::overaligned_tag<16>{});
+                    esimd::slm_block_store(accb + 512u, A2, esimd::overaligned_tag<16>{});
+                    esimd::slm_block_store(accb + 768u, A3, esimd::overaligned_tag<16>{});
+                    esimd::simd<float,64> B0 = esimd::slm_block_load<float,64>(accb + 1024u, esimd::overaligned_tag<16>{});
+                    esimd::simd<float,64> B1 = esimd::slm_block_load<float,64>(accb + 1280u, esimd::overaligned_tag<16>{});
+                    esimd::simd<float,64> B2 = esimd::slm_block_load<float,64>(accb + 1536u, esimd::overaligned_tag<16>{});
+                    esimd::simd<float,64> B3 = esimd::slm_block_load<float,64>(accb + 1792u, esimd::overaligned_tag<16>{});
+                    bb += 256;
+                    esimd::simd<half,128> c0 = WSTAGE ? esimd::slm_block_load<half,128>(wb + 512u, esimd::overaligned_tag<16>{}) : esimd::block_load<half,128>(bb, esimd::overaligned_tag<16>{});
+                    esimd::simd<half,128> c1 = WSTAGE ? esimd::slm_block_load<half,128>(wb + 768u, esimd::overaligned_tag<16>{}) : esimd::block_load<half,128>(bb + 128, esimd::overaligned_tag<16>{});
+                    B0 = esimd::xmx::dpas<8,8,float>(B0, c0, a0);
+                    B1 = esimd::xmx::dpas<8,8,float>(B1, c1, a0);
+                    B2 = esimd::xmx::dpas<8,8,float>(B2, c0, a1);
+                    B3 = esimd::xmx::dpas<8,8,float>(B3, c1, a1);
+                    esimd::slm_block_store(accb + 1024u, B0, esimd::overaligned_tag<16>{});
+                    esimd::slm_block_store(accb + 1280u, B1, esimd::overaligned_tag<16>{});
+                    esimd::slm_block_store(accb + 1536u, B2, esimd::overaligned_tag<16>{});
+                    esimd::slm_block_store(accb + 1792u, B3, esimd::overaligned_tag<16>{});
+                    } else {
                     p00 = esimd::xmx::dpas<8,8,float>(p00, b0, a0);
                     p01 = esimd::xmx::dpas<8,8,float>(p01, b1, a0);
                     p10 = esimd::xmx::dpas<8,8,float>(p10, b0, a1);
@@ -250,6 +290,7 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                     q01 = esimd::xmx::dpas<8,8,float>(q01, c1, a0);
                     q10 = esimd::xmx::dpas<8,8,float>(q10, c0, a1);
                     q11 = esimd::xmx::dpas<8,8,float>(q11, c1, a1);
+                    }
                 }
             }
             // B3-ffn-9 (the leg ledger: the ffn leg = -10.5 wall but the chip's own
@@ -267,12 +308,26 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
             // param cstop -- ESIMD kernels ban non-const statics, section 96):
             // =1 stop after EXPAND, =2 stop before the projection's dpas block.
             if constexpr (CSTOP >= 2) { tr0 = tiles; continue; }
+            esimd::simd<float,64> tp00, tp01, tp10, tp11, tq00, tq01, tq10, tq11;
+            if constexpr (ACCSLM) {
+                tp00 = esimd::slm_block_load<float,64>(accb, esimd::overaligned_tag<16>{});
+                tp01 = esimd::slm_block_load<float,64>(accb + 256u, esimd::overaligned_tag<16>{});
+                tp10 = esimd::slm_block_load<float,64>(accb + 512u, esimd::overaligned_tag<16>{});
+                tp11 = esimd::slm_block_load<float,64>(accb + 768u, esimd::overaligned_tag<16>{});
+                tq00 = esimd::slm_block_load<float,64>(accb + 1024u, esimd::overaligned_tag<16>{});
+                tq01 = esimd::slm_block_load<float,64>(accb + 1280u, esimd::overaligned_tag<16>{});
+                tq10 = esimd::slm_block_load<float,64>(accb + 1536u, esimd::overaligned_tag<16>{});
+                tq11 = esimd::slm_block_load<float,64>(accb + 1792u, esimd::overaligned_tag<16>{});
+            } else {
+                tp00 = p00; tp01 = p01; tp10 = p10; tp11 = p11;
+                tq00 = q00; tq01 = q01; tq10 = q10; tq11 = q11;
+            }
             size_t outb = (size_t)(tr * 16) * cin;
             #pragma unroll
             for (int r = 0; r < 8; ++r) {
                 if (tr * 16 + r < M) {
-                    esimd::simd<float,8> f0 = p00.template select<8,1>(r*8), f1 = p01.template select<8,1>(r*8);
-                    esimd::simd<float,8> g0 = q00.template select<8,1>(r*8), g1 = q01.template select<8,1>(r*8);
+                    esimd::simd<float,8> f0 = tp00.template select<8,1>(r*8), f1 = tp01.template select<8,1>(r*8);
+                    esimd::simd<float,8> g0 = tq00.template select<8,1>(r*8), g1 = tq01.template select<8,1>(r*8);
                     // P8-l + B5-3 REWRITE (2026-10-29): the ffn-main 131/8192 gate red was
                     // the scope/phi contraction trap (section 75's lesson: reassigning f0
                     // inside if(dSkip){} makes k*w+f lower as muladd = TWO roundings; the
@@ -323,8 +378,8 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                     }
                 }
                 if (tr * 16 + 8 + r < M) {
-                    esimd::simd<float,8> f0 = p10.template select<8,1>(r*8), f1 = p11.template select<8,1>(r*8);
-                    esimd::simd<float,8> g0 = q10.template select<8,1>(r*8), g1 = q11.template select<8,1>(r*8);
+                    esimd::simd<float,8> f0 = tp10.template select<8,1>(r*8), f1 = tp11.template select<8,1>(r*8);
+                    esimd::simd<float,8> g0 = tq10.template select<8,1>(r*8), g1 = tq11.template select<8,1>(r*8);
                     size_t rb = outb + (size_t)(8+r) * cin;
                     if (dSkip) {
                         if (ff9) {
