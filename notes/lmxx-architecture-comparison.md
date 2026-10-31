@@ -32,7 +32,23 @@
 税（24.8 TOPS 封顶）我们已用 ESIMD 免掉（deep-K 30.9 TOPS 实测）——B6-2 把
 resident 形态补上后，47 是下限不是上限。
 
-## 11-op 层周期（B6-2 的融合对象，plan census 14:4x 钉死）
+## ★★ 战略再修正（14:5x，流量精确账 + ground truth 撞出真结论）
+精确平面流量（plan 全普查）：1267=26.74GB(47.7ms@560) + 1274=17.31GB(30.9) +
+1272=8.92GB(15.9) + 1275/1277/1279/1273≈7.6GB -> 总 ~60GB ≈ 107ms 名义预算。
+但前辈 coopmat 件在同 plan 同 691-op 图上跑 47.19 —— 说明 (a) 我的 reads=全平面
+计数高估（相邻核 L2 命中：1272 9MB、1275 4.6MB、1277 4.6MB 都装得进 8MB L2；
+真正的 DRAM 硬流量=1267 66.8MB ping-pong + 权重流），(b) 前辈 ~47 恰 = 1267
+一项的 DRAM 时间 47.7 = **他们贴 DRAM 屋顶跑**。
+我们 66.5 = 屋顶 + ~19ms 的 LATENCY BUBBLES（s8v8 三兄弟 + qkv 有效带宽
+100-190GB/s vs laws 在途上限 592-734）。
+=> 差距的真身不是"resident 架构 vs split 架构"（前辈同 691-op split 图！），
+而是**我们的 DRAM-heavy 核没把在途深度吃满**。B6-2 megakernel 不是主线，
+主线=§6.28 刀序 1 的 s8v8 ILP/双缓冲/宽 tile 战役（正是 PAF/b3-1 已知打法）。
+10-15ms 的远期账同样重写：前辈 47 已是 691-op split 形态的屋顶极限；
+要到 10-15 必须减 1267 的 DRAM 往返本身（层 resident 或 dtype 契约）——
+那是 B7 的事，但第一档肉（66->48）在 ILP，不在 megakernel。
+
+## 11-op 层周期（B7 的融合对象，plan census 14:4x 钉死）
 residual(1272,wt->1267) -> quant_window(1267->1272/1273) -> qkv(->1275/1274/1276)
 -> window_attention(->1277) -> quant(->1272) -> wres(1272,1267->1279)
 -> unary x2(1269->1270/1271) -> gemm f16(1271->1279) -> quant(->1272)
