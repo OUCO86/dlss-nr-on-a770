@@ -49,7 +49,8 @@ int main(){ try {
       for(int it=0;it<11;++it){ event e=fn(); e.wait();
         double t=double(e.get_profiling_info<info::event_profiling::command_end>()-e.get_profiling_info<info::event_profiling::command_start>());
         best=std::min(best,t/1e6);} return best;};
-    double t_off = timeit([&]{ return ffnc::launch_ffn_chip<16,false>(q,dAp,dEp,dPp,o1,(int)M,(int)Mp,dSkip,dCos,false,true); });
+    unsigned cin_dbg=32; (void)cin_dbg;
+  double t_off = timeit([&]{ return ffnc::launch_ffn_chip<16,false>(q,dAp,dEp,dPp,o1,(int)M,(int)Mp,dSkip,dCos,false,true); });
     double t_on  = timeit([&]{ return ffnc::launch_ffn_chip<16,true>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true); });
     double t_lw8 = timeit([&]{ return ffnc::launch_ffn_chip<8,false>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true); });
     double t_lw32= timeit([&]{ return ffnc::launch_ffn_chip<32,false>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true); });
@@ -61,6 +62,10 @@ int main(){ try {
     // cs5: the SAME nd_range grid but NO slm_init and NO body -- isolates the
     // launch-config floor (grid dispatch) from the SLM-carveout floor.
     int tiles2=((Mp/16)+15)/16;
+    float* o3=malloc_device<float>((size_t)Mp*cin*4,q); q.memset(o3,0,(size_t)Mp*cin*4); q.wait();
+    float* o4=malloc_device<float>((size_t)Mp*cin*4,q); q.memset(o4,0,(size_t)Mp*cin*4); q.wait();
+    double t_csp = timeit([&]{ return ffnc::launch_ffn_chip_cs<16,false>(q,dAp,dEp,dPp,o3,(int)M,(int)Mp,dSkip,dCos,false,true); });
+    double t_csp2 = timeit([&]{ return ffnc::launch_ffn_chip_cs2<16,false>(q,dAp,dEp,dPp,o4,(int)M,(int)Mp,dSkip,dCos,false,true); });
     double t_aslm = timeit([&]{ return ffnc::launch_ffn_chip<16,false,0,true>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true); });
     double t_cs6p = timeit([&]{ return ffnc::launch_ffn_chip<16,false,6>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true); });
     double t_cs5 = timeit([&]{ return q.parallel_for(nd_range(range((size_t)tiles2*16u),range(16u)),[=](nd_item<1> it){
@@ -107,6 +112,13 @@ int main(){ try {
     std::vector<float> a((size_t)Mp*cin),b((size_t)Mp*cin);
     q.memcpy(a.data(),o1,(size_t)Mp*cin*4).wait(); q.memcpy(b.data(),o2,(size_t)Mp*cin*4).wait();
     size_t d=0; for(size_t i=0;i<a.size();++i) if(memcmp(&a[i],&b[i],4)) ++d;
+    std::vector<float> cc((size_t)Mp*cin); q.memcpy(cc.data(),o3,(size_t)Mp*cin*4).wait();
+    size_t dcsp=0; for(size_t i=0;i<a.size();++i) if(memcmp(&a[i],&cc[i],4)) ++dcsp;
+    std::vector<float> c4((size_t)Mp*cin); q.memcpy(c4.data(),o4,(size_t)Mp*cin*4).wait();
+    size_t dcsp2=0; size_t firstm=(size_t)-1; for(size_t i=0;i<a.size();++i) if(memcmp(&a[i],&c4[i],4)){ if(firstm==(size_t)-1) firstm=i; ++dcsp2; }
+    if(dcsp2) printf("   first cs2 mismatch idx=%zu row=%zu col=%zu ship=%.6f cs2=%.6f\n", firstm, firstm/cin, firstm%cin, (double)a[firstm], (double)c4[firstm]);
+    printf("   COLSPLIT-v1 %.4f ms (diff %zu %s) | COLSPLIT-v2 %.4f ms (diff %zu %s)\n",
+      t_csp, dcsp, dcsp?"MISMATCH":"EXACT", t_csp2, dcsp2, dcsp2?"MISMATCH":"EXACT");
     double bytes=(double)M*cin*2 /*A in*/ + (double)M*cin*2 /*skip*/ + (double)M*cin*4 /*out*/ + 2.0*cin*hidden*2; // DRAM-class traffic
     printf("M=%u: LW16 %.4f | WSTAGE %.4f | LW8 %.4f | LW32 %.4f | cs1(A-only) %.4f | cs3(quarter-exp) %.4f | cs4(shell) %.4f | cs5(no-q) %.4f | cs6p(no-p) %.4f | ACCSLM %.4f | cs5(nd-noSLM) %.4f | cs6(plain) %.4f ms | diff %zu %s\n",
       M,t_off,t_on,t_lw8,t_lw32,t_cs1,t_cs3,t_cs4,t_c5,t_cs6p,t_aslm,t_cs5,t_cs6,d,d?"NOT-EXACT":"EXACT");
