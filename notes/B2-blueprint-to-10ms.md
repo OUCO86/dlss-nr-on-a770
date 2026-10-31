@@ -70,11 +70,11 @@ lmxx hip-port（71 层完整模型，9070XT 从零重做）实测架构账：~16
    判官=bench_res 定价 → 三关 → 16 对。**破 47 第一铲。**
 2. **S2b 小 op 折邻块**（lmxx 0.36#8）：unary 32 发/UPSAMPLE 折前后 gemm 边界；
    wa 供数审计先跑（闭包级 stop，零核内探针）。-3~5ms。
-3. **S3 persistent stage**（lmxx 0.37#3；=§100 R8a/P8 megakernel stage 化）：
+3. **S3 persistent stage = 现主刀**（lmxx 0.37#3；=§100 R8a/P8 megakernel stage 化）：
    同层 9-op 周期按 6 层 stage 粒度串 resident 链（B6-1 五件套教训=粒度，不是方向）。
    -5~8ms。
-4. **S4 W5 权重共享**（lmxx 0.37#5；对症我们 §6.22 旧账 s8v8 SLM 读 5.3x 放大）：
-   gemm 三兄弟单核 2-3x（为关键路径腾 SM；他们负结果 C512 proj 共权重更慢=对照自查）。
+4. ~~S4 W5 权重共享~~ **10-31 判死**（上条关门账）：s8v8 密度账的 5.3x 是片段结构必税，
+   唯一例外 K=64 家族 1.05x（0.28ms/帧，不值三关）。密度刀清零。
 5. **S5 逐核 roofline map 制度化**：RUN_TIMING(第二遍) × 每行 bench 单价，离屋顶
    >2x 排队修。每窗口一跑。
 
@@ -83,7 +83,14 @@ WQ-Cache 缓存前提 | quant 2-row ILP（roofline）| 编码宽化边界表（f
 5/6 输短链/故意冗余）| PW32/SPLITC/ACCSLM（GRF 三杀）| take_b 按 id 查（+25；
 QFALIAS 按指针已修但 colslice 扇出算术判死，除非 S2a 的 scale-pregive 改流量）|
 f16-OUT（store 段 <1ms）| 节点合并（0.7µs/节点）| 1267 dtype→f16（golden 锁死，
-军规 2 死刑已判）| B6-1 五件套形态（+1.08）| v5-8x8naive（§100 封存）。
+军规 2 死刑已判）| B6-1 五件套形态（+1.08）| v5-8x8naive（§100 封存）|
+**rowsplit quant（10-31 事件计时 7/7 形状 0.33-1.0x；§6.6-3 的 59µs/发=wall-clock
+伪账）** | **quant 腿旧价 9.5→新价 5.8（CS2/s8d2 时代）** | **f16-pack 标量残留
+（GA 三 pack vec 化 ≤0.067ms/帧不值；vec 小 per 反慢=pack_a16_v 192x512 0.015→0.044
+已证；pack 真身=gather traffic 本体）** | **S4 GRF-resident-B（bench_s8w5：K=64
+1.05x / K=128 0.72-0.78x 全 EXACT——B 片段 8x SLM 冗余=dpas 8x8x32 的 wi_row 数
+=片段结构必税，SLM 省与 occupancy 零和；lmxx W5 是 AMD wave64 跨 wave 共 LDS，
+Intel 片段结构无对应物）**。
 
 ## 四、开关表（当前件）
 NR_CHIP_CS(默认ON) | NR_FF9/FF3(ON) | NR_FFN_CHIPRES/TILE/DUAL, MEGA(OFF) |

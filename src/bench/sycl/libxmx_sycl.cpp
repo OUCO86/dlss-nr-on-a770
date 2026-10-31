@@ -3132,6 +3132,7 @@ int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
     const unsigned CH = heads * 32u;
     const size_t sc = (size_t)heads * rows * rows;   // scores & probs
     const size_t cx = (size_t)heads * rows * 32u;    // ctx
+    if (getenv("NR_Q_STATS")) printf("[ga-REC] rows=%u tokens=%u heads=%u\n", rows, tokens, heads);
     g_cmd_names.push_back(__func__);
     g_cmds.push_back([=]() {
         float* dScores = (float*)pool_get(sc * 4);
