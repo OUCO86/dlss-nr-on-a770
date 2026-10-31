@@ -1,67 +1,80 @@
-# lmxx/前辈 coopmat vs 我们：完整架构对比（2026-10-31 14:2x，全部数字有据）
+# lmxx 3080 整体架构 vs 前辈 49ms vs 我们：到 10ms 的路（2026-10-31 14:4x，精读 lmxx 架构后重写）
 
-## 对比表
-| 引擎 | GPU | 分辨率 | 实测 | 形态 |
+## 一、lmxx 3080 分支的整体架构逻辑（六刀之前 v0.1.0 就 15.83ms@720p——架构才是主体）
+
+读 native_wave_c32_ffn.hlsl（一个完整 FFN 块）+ block*/c32* 命名体系 + README：
+
+1. **一 fatbin = 网络一段 = 一个 megakernel**（15 fatbin / 31 块）。kernel 内部
+   干完整功能块：quantize→expand gemm→gelu→proj gemm→residual fold——
+   **阶段间数据走 LDS+寄存器，块内任何中间量不落显存**。
+2. **残差 tile 在 wave 手里穿块**：wave(32 线程)持 16 token × 32ch；输入读一次、
+   穿过整个块（gelu 的 e4m3 往返在 accumulator 寄存器内做 H()/F() 内联）、写回一次。
+3. **权重每 kernel 载一次进 LDS（coeff 8KB），块内所有 token 复用**。
+4. launch 数 = 31（每块一发）。**残差流量 = 2 × 31 次往返，不是 2 × 120 层**。
+
+## 二、前辈 coopmat A770 版 47.19ms（同 walk 实测）——要超越的地板，不是老师
+
+前辈源在 src/gpu/（22 个 .comp）。他们**已经在做块融合**：
+- window_block.comp：QKV+attention+proj 三趟合一（Q/K/V 不出 workgroup，注释
+  明说省 ~210MB/帧）；
+- ffn_fused.comp：stem 三趟合一；
+- gemm_staged_int8_fused.comp：**quant 折进 gemm 载入**（"quantising as it goes"），
+  文件头还写了踩过的坑：on-chip 测 scale 会让 int32 累加器碎成 f32（27.1ms vs
+  14.8），正解=**scale 由上一块的 publish epilogue 顺带写出，gemm 读时现成**。
+
+**但他们停在 47 = 贴着自己的残差屋顶**：plan census 1267 写 122+读 278 次
+=26.7GB=47.7ms@560。为什么他们不往上融合？§227 案卷白纸黑字：
+**"A770 的 32KB coopmat shared 配额与 megakernel 不相容，B1a 作废"**——
+Vulkan coopmat 的 LDS 上限卡死了他们做 lmxx 式块穿寄存器。
+
+## 三、我们反超前辈的硬件窗口（这是"为什么能到 10ms"的核心）
+
+| 配额 | 前辈 coopmat | 我们 ESIMD | lmxx 需要 |
+|---|---|---|---|
+| 片上共享 | **32KB 死限**（B1a 作废主因） | **64KB/WG**（chip 现役） | 13KB LDS（720p tile） |
+| 矩阵算力 | 24.8 TOPS coopmat 封顶 | XMX dpas 30.9-59 TOPS（实测） | TC 238 |
+| 带宽 | 560GB/s | 560GB/s | 448（3080L 反而更低） |
+
+**前辈想做而硬件不让做的（块 megakernel、残差穿寄存器），我们的 ESIMD 栈做得起。
+这就是超 47 → 10ms 的窗口：不是抄前辈，是补上他被 32KB 卡死的那一层。**
+
+## 四、10ms 的算术（A770@560GB/s，golden f32 残差锁死下）
+
+10ms 预算 = **5.6GB/帧**。lmxx 形态在 960x544：
+- 残差 f32 66.8MB × 2（一进一出）× **31 块** = 4.14GB
+- 权重 ~1GB（每 kernel 载一次，64KB SLM 装得下单块权重）
+- 图输入/输出/直方图 ≈ 0.3GB
+- **总 5.4GB → 流量下界 9.6ms**；XMX 算力账（前辈宽 M 形态 8-30 TOPS，我们
+  deep-K 30.9 已证）把计算藏进流量。→ **10-12ms 是这套 golden 下 A770 的物理地板。**
+
+## 五、阶梯（每档有实测锚点）
+
+| 档 | 形态 | 残差往返 | 帧预期 | 锚点 |
 |---|---|---|---|---|
-| lmxx v0.3.0 3080 分支 | RTX3080Lap 700GB/s+TC | 720p 0.92Mpx | 5.62ms | NVIDIA 原版 megakernel SASS 的 PTX 指令级补丁（六刀全是微观：PRMT/HMNMX2/mapped 零拷贝/K16 原位拆/C32 168cap/mbarrier）。**非架构重写**。 |
-| lmxx RDNA4 姊妹 | 9070XT **2.3TB/s** | 720p | 2.99ms | 同架构从零重做 |
-| **前辈 coopmat A770（真参照）** | **A770 0.56TB/s** | **960x544 0.52Mpx** | **49ms**（游戏 work= 实测，§99） | 82 launch，每层 resident，层内中间量 LDS 交接 |
-| 我们 B1（今天） | A770 | 960x544 | 66.5 walk（游戏 work≈84 含游戏自身负载） | ~700 节点 cgraph，核间 DRAM scratch |
+| S0 现状 | ~700 节点全 split | 400 次（26.7GB） | 66.5 | 实测 |
+| S1 ILP 吃满 | 同图，s8v8/qkv 在途深度 2 预取 | 同 | ~60 | laws 592-734 vs 我们 100-190=19ms 泡 |
+| S2 前辈级半融合 | quant 折生产 gemm epilogue（scale 由 publish 出——前辈文件头给了正解+踩坑）；window_block 级（v4full 已在跑） | ~150 次 | **~40-44 破 47** | 前辈 fused comp 全套设计在手 |
+| S3 lmxx 块 megakernel | 一 kernel = attention 块 + ffn 块（9 层周期合 2 发）；残差 tile 穿寄存器/LDS；权重每 kernel 一载 | 62 次 | ~20-25 | 64KB SLM 装得下 8tok×32ch×f32×多阶段 |
+| S4 fatbin 粒度 | 31 块 = 31 发 + cp.async 预取 + 多 wave 接力 | 31 次 | **10-12** | 上表 9.6ms 下界 |
 
-## 更正（14:3x，用户点破后查证官方规格——之前的带宽归一是错的，撤回）
-- Intel ARK / NVIDIA 官方：A770 16GB = **560 GB/s + 262 Int8 TOPS(XMX)**；
-  RTX 3080 Laptop = 448 GB/s + ~238 TOPS(TC)。**A770 两项都不输甚至更优。**
-  硬件没有任何借口。5.6ms vs 66.5ms 的差 100% 是架构成熟度差。
-- 3080 上跑的是 NVIDIA 官方 DLSS5 架构（38 megakernel、核内 LDS 交接、激活不落
-  显存——NVIDIA 按 3060 级 5-8ms 设计），lmxx 社区只补了指令。这套架构搬到
-  A770（带宽更高+XMX int8 同级+16GB 显存）只会更快。
-- 战略修正：全 resident megakernel 不是 "out of scope 的季度工程"，是主线终点；
-  每层 resident（B6-2/B7）是它的逐层砖。流量下界账：全 resident 后每帧 DRAM
-  ≈权重 ~1GB=1.8ms@560GB/s；bench_laws 实测在途能力 592-734GB/s 贴标称。
-  10-15ms 是算术结果。50ms = B6-2 出口，不是墙。
-- NVIDIA 的 DLSS5 网络本来就是按 3060 级 5ms 设计的（38 个 megakernel，每核内部 LDS/寄存器交接，中间量不落显存）。lmxx 是移植者不是架构师。
-- 同 GPU 真参照 = 前辈 coopmat 49ms。差距 66.5/49 = **1.36x**，来源三条已量化：
-  1. 接口税：A770 Vulkan-coopmat 封顶 24.8（§285 已证）；我们 ESIMD 40-59 TOPS 上限更高——输形态不输指令。
-  2. 流量：我们 60.3GB/帧（1267=26.7GB 等），写+一读 38GB≈68ms=贴 DRAM 屋顶（§6.22）。前辈层内 resident 只流 ~25-30GB。
-  3. gemm 形态：帧上窄 K 1.5-2.5 TOPS vs 前辈宽 M 8-30（§2433）。deep-K 30.9 TOPS 我们已实测可达（§537）= 形状问题非核问题。
+## 六、开工序（替换全部旧刀序）
 
-## ★ 同机对拍 ground truth（14:4x 实测，无外推）
-前辈 coopmat 备份件（work/libxmx.dll.bak-1020-coopmat）在同一 walk 上直接跑：
-**run 3 = 47.19ms（691 passes 同数）** vs 我们 66.5。差距 19.4ms = 纯架构差
-（他们 ~82 launch 层 resident，我们 ~700 节点核间 DRAM）。他们的 coopmat 接口
-税（24.8 TOPS 封顶）我们已用 ESIMD 免掉（deep-K 30.9 TOPS 实测）——B6-2 把
-resident 形态补上后，47 是下限不是上限。
+1. **S2 第一铲（今天）**：GEMM_INT8_RESIDUAL 的 store epilogue 内嵌 quant_window
+   （§6.5 深剖钉死的真靶 (a)：x120 写 1267 → x104 QUANT_WINDOW 读，写读严格相邻，
+   100.7M 元素）——省 1267 的 104 次读 = -6.9GB ≈ **-12ms**。
+   设计母本=前辈 gemm_staged_int8_fused.comp（读侧折）+ 我们 pub_vec_v8(3u)
+   （写侧 e4m3 已在 epilogue）。行 scale 归约=前辈 publish.glsl 同款（行在
+   gemm 输出侧持有）。判官=三关+16 对+bench_res。
+2. S2 第二铲：quant 折 qkv/batched 载入（前辈 fused 的读侧形态，QFALIAS 已证
+   wire——这次按前辈的 scale 预给设计，不再 on-chip 测 peak）。
+3. S3 立项：一 block 一核（母本=native_wave_c32_ffn.hlsl 结构 + v4full/chip 部件），
+   64KB SLM 预算按 f32 残差重开（lmxx 是 f16，我们 golden 锁 f32=tile 宽度 x2）。
+4. S1 的 s8v8 双缓冲 depth-2 降为配菜（S2 落地后这些 gemm 会被 epilogue 化重写，
+   单独 ILP 优化给将死的形态镀金不值）。
 
-## ★★ 战略再修正（14:5x，流量精确账 + ground truth 撞出真结论）
-精确平面流量（plan 全普查）：1267=26.74GB(47.7ms@560) + 1274=17.31GB(30.9) +
-1272=8.92GB(15.9) + 1275/1277/1279/1273≈7.6GB -> 总 ~60GB ≈ 107ms 名义预算。
-但前辈 coopmat 件在同 plan 同 691-op 图上跑 47.19 —— 说明 (a) 我的 reads=全平面
-计数高估（相邻核 L2 命中：1272 9MB、1275 4.6MB、1277 4.6MB 都装得进 8MB L2；
-真正的 DRAM 硬流量=1267 66.8MB ping-pong + 权重流），(b) 前辈 ~47 恰 = 1267
-一项的 DRAM 时间 47.7 = **他们贴 DRAM 屋顶跑**。
-我们 66.5 = 屋顶 + ~19ms 的 LATENCY BUBBLES（s8v8 三兄弟 + qkv 有效带宽
-100-190GB/s vs laws 在途上限 592-734）。
-=> 差距的真身不是"resident 架构 vs split 架构"（前辈同 691-op split 图！），
-而是**我们的 DRAM-heavy 核没把在途深度吃满**。B6-2 megakernel 不是主线，
-主线=§6.28 刀序 1 的 s8v8 ILP/双缓冲/宽 tile 战役（正是 PAF/b3-1 已知打法）。
-10-15ms 的远期账同样重写：前辈 47 已是 691-op split 形态的屋顶极限；
-要到 10-15 必须减 1267 的 DRAM 往返本身（层 resident 或 dtype 契约）——
-那是 B7 的事，但第一档肉（66->48）在 ILP，不在 megakernel。
-
-## 11-op 层周期（B7 的融合对象，plan census 14:4x 钉死）
-residual(1272,wt->1267) -> quant_window(1267->1272/1273) -> qkv(->1275/1274/1276)
--> window_attention(->1277) -> quant(->1272) -> wres(1272,1267->1279)
--> unary x2(1269->1270/1271) -> gemm f16(1271->1279) -> quant(->1272)
--> batched x2(->1274->1275) -> quant x2 -> residual(next layer, 1272->1267)
-= 12 launches/layer x 120 layers。B6-2 = 这个 12-launch 周期合 1-2 个 resident 核
-（1267/1272/1273/1274/1275 全部片上化；权重 1276+ 流式）。
-
-## 路线图（每档的账）
-- 刀尾（本周）：s8v8 三兄弟 tile 变体（串行 56.4ms；先 bench_batched 定价：BN128/BK64/累加器减半形）+ wa 供数审计 → 60-62。
-- B6-2 层 resident（主刀）：residual-gemm+quant_window+ffn 一核（1267 省 18.6GB/帧读）→ ~49-52。= 前辈 82-launch 逐层复刻；v4full resident 骨架已在帧上跑（50 块全走）。
-- B7 全布局原生：scratch 面 dtype/布局原生化 + gemm 宽形态（30.9 TOPS 已证）→ ~30-35。
-- 全 resident megakernel（NVIDIA 38 核形态）：权重 1GB/帧=1.8ms 带宽下界，激活不出片上 → **10-15ms 物理可行**，代价=引擎重写（前辈 coopmat 同量级季度工程；他们停 49 = 半 resident 的封顶）。
-
-## 判决性提醒
-- 帧在路径上的账（腿账 v4）：ffn -9.5 / quant -5.8 / unary -5.0 / wa -6.2；gemm 三兄弟串行 64.7 但删除收益≈0（被 overlap 隐藏）——刀要砍在路径上，tile 变体的价值在腾出 SM 时间给 resident 化后的关键路径。
-- 1267 f32→f16 不合法：它是残差累加面，golden=前辈 coopmat 引擎本身（walk 判官），多一次舍入必红（P3c 教训）。减它只能靠 resident（不落 DRAM），不能换 dtype。
+## 七、教训记录（本轮对话）
+- 我曾用"9070XT 2.3TB/s、3080 带宽归一"给差距找硬件借口——未查证编造，被用户
+  点破，官方规格撤回（A770 560GB/s+262 TOPS ≥ 3080L 448+238）。
+- 我一度把前辈 coopmat 版当"学习目标"——用户点破：它是被超越对象，照抄=停在 47。
+  真正的老师=lmxx 的块级 megakernel 逻辑；前辈的价值=他踩过的坑清单
+  （32KB 配额死因、on-chip scale 碎累加器、读侧折 vs 写侧折的实测数字）全在源码头注释里。
