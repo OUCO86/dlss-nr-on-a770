@@ -699,11 +699,32 @@ static inline sycl::event gemm_b_pub_slm(sycl::queue& q, const int8_t* Ap, const
 // plain sk*cp+stage auto-contracts to an FMA (the gate_esimd lesson, used correctly here),
 // so the semantics match. skip is per-element (M x N, half or float), cos is per-column (N).
 // dpas main loop byte-identical to gemm_b/gemm_b_pub. GEMM_INT8_RESIDUAL gate is the judge.
+// RES8-ALL (10-31, the user's "牺牲画质不顾一切" blade): residual planes stored as
+// row-scale E4M3 BYTES. plane bytes = M*N (1B/elem) + M row-scales (f32, pow2 so the
+// decode is an exponent add and the encode a pow2 divide -- the lmxx residual form:
+// "residual scale f32[] + E4M3 bytes"). N==BN==64 -> the WHOLE row lives in one WG:
+// partial absmax per thread (its 16 cols x 2 rows) -> SLM [BM][4] f32 -> ONE barrier
+// -> row peak -> scale = 2^ceil(log2(peak/448)) -> v*recip(s) -> e4m3 grid snap
+// (e4m3_vec on the scaled value) -> pack 4 codes/word -> 64B store. The f16 path
+// stays verbatim under RES8=false (NR_RES8=0 escape, bit-exact old chain).
+// skip-decode (RES8SKIP): 64B byte load -> bit-trick e4m3->f32 (lmxx's composite:
+// mantissa<<20 | (e+120)<<23, subnormal band folded) -> *row scale -> f32.
+static inline esimd::simd<float, 64> res8_decode(const int8_t* p, float s) {
+    esimd::simd<int8_t, 64> b8 = esimd::block_load<int8_t, 64>(p, esimd::overaligned_tag<16>{});
+    esimd::simd<uint32_t, 64> b = esimd::convert<uint32_t>(b8) & 255u;
+    esimd::simd<uint32_t, 64> sgn = (b >> 7) << 31;
+    esimd::simd<uint32_t, 64> e = (b >> 3) & 15u, m = b & 7u;
+    esimd::simd<uint32_t, 64> f32b = ((e + 120u) << 23) | (m << 20);
+    esimd::simd<uint32_t, 64> sv = f32b | sgn;
+    return sv.template bit_cast_view<float>() * esimd::simd<float, 64>(s);
+}
+template <bool RES8, bool RES8SKIP>
 static inline sycl::event gemm_b_res(sycl::queue& q, const int8_t* Ap, const int8_t* Bp,
                                      void* Cout, const float* as, const float* bs,
                                      const void* skip, const float* cos,
                                      int M, int Mp, int N, int K,
-                                     bool narrow, bool half_skip, unsigned epi) {
+                                     bool narrow, bool half_skip, unsigned epi,
+                                     float* rowScales = nullptr) {
     int wg = (Mp / BM) * (N / BN);
     size_t apb = (size_t)Mp * K, bpb = (size_t)N * K;
     return q.submit([&](handler& h) {

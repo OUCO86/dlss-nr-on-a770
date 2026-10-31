@@ -84,18 +84,19 @@ static inline sycl::event gemm_qkv_res(sycl::queue& q, const int8_t* Ap, const i
             int wi_row = lid / 4, wi_col = lid % 4;
             const int8_t* apb = Ap + (size_t)(wg_row * (C / BK)) * 8 * 512;
             const int8_t* bp = Bp + (size_t)wg_col * (BN / 8) * 256;
+            const int SLM_B_BASE3 = 3 * SLM_A;   // s8d2 three-buffer (10-31): operands 18KB < the 32KB stage alias budget
             auto load_block = [=](int buf, int kb) SYCL_ESIMD_FUNCTION {
                 esimd::simd<int8_t, 128> av = esimd::block_load<int8_t, 128>(
                     apb + (size_t)kb * SLM_A + lid * 128, esimd::overaligned_tag<16>{});
                 esimd::slm_block_store(buf * SLM_A + lid * 128, av, esimd::overaligned_tag<16>{});
                 esimd::simd<int8_t, 64> bv = esimd::block_load<int8_t, 64>(
                     bp + (size_t)kb * NH * 32 + lid * 64, esimd::overaligned_tag<16>{});
-                esimd::slm_block_store(SLM_B_BASE + buf * SLM_B + lid * 64, bv, esimd::overaligned_tag<16>{});
+                esimd::slm_block_store(SLM_B_BASE3 + buf * SLM_B + lid * 64, bv, esimd::overaligned_tag<16>{});
             };
             auto load_grf = [=](int buf, esimd::simd<int8_t,256>& a0, esimd::simd<int8_t,256>& a1,
                                 esimd::simd<int8_t,256>& b0, esimd::simd<int8_t,256>& b1) SYCL_ESIMD_FUNCTION {
                 uint32_t offA = buf * SLM_A + wi_row * 512;
-                uint32_t offB = SLM_B_BASE + buf * SLM_B + wi_col * 512;
+                uint32_t offB = SLM_B_BASE3 + buf * SLM_B + wi_col * 512;
                 a0 = esimd::slm_block_load<int8_t, 256>(offA + 0, esimd::overaligned_tag<16>{});
                 a1 = esimd::slm_block_load<int8_t, 256>(offA + 256, esimd::overaligned_tag<16>{});
                 b0 = esimd::slm_block_load<int8_t, 256>(offB + 0, esimd::overaligned_tag<16>{});
@@ -104,11 +105,12 @@ static inline sycl::event gemm_qkv_res(sycl::queue& q, const int8_t* Ap, const i
             esimd::simd<int8_t, 256> a0, a1, b0, b1;
             esimd::simd<int32_t, 64> c00(0), c01(0), c10(0), c11(0);
             load_block(0, 0);
+            if (C / BK > 1) load_block(1, 1);   // s8d2 prologue
             esimd::barrier();
             int kb_n = C / BK;
             for (int b = 0; b < kb_n; ++b) {
-                int cur = b & 1, nxt = cur ^ 1;
-                if (b + 1 < kb_n) load_block(nxt, b + 1);
+                int cur = b % 3;
+                if (b + 2 < kb_n) load_block((b + 2) % 3, b + 2);   // s8d2 depth-2
                 load_grf(cur, a0, a1, b0, b1);
                 c00 = esimd::xmx::dpas<8, 8, int32_t>(c00, b0, a0);
                 c01 = esimd::xmx::dpas<8, 8, int32_t>(c01, b1, a0);
