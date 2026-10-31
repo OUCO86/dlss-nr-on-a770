@@ -51,17 +51,27 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                                     bool fjoin = true,
                                     bool pw16 = true,
                                     bool ff9 = true,
-                                    int cstop = 0) {   // NR_CS_STOP segment probe (host-captured)
+                                    int cstop = 0,
+                                    int pers = 0) {   // B3-ffn-13 persistent WG cap (0=off)
     const unsigned cin = 32;
     int tiles = Mp / 16;
     int wgs = (tiles + LW - 1) / LW;
+    // B3-ffn-13 PERSISTENT (the cs4 shell floor says it: a near-EMPTY kernel with
+    // the same slm_init + 2040-WG launch = 1.09 of 1.35ms -- the leg is dominated
+    // by PER-WG setup (slm_init reconfig + WG dispatch), NOT by the math. lmxx's
+    // shape has the same answer from the other side: few big waves, tile-LOOP
+    // inside. pers = WG count cap (0 = one WG per tile as shipped); each WG loops
+    // tiles with stride grid*LW, SLM configured ONCE per WG.
+    int gridwgs = pers ? (pers < wgs ? pers : wgs) : wgs;
     return q.submit([&](handler& h) {
-        h.parallel_for(nd_range(range((size_t)wgs * (unsigned)LW), range((unsigned)LW)),
+        h.parallel_for(nd_range(range((size_t)gridwgs * (unsigned)LW), range((unsigned)LW)),
             [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
             esimd::slm_init<(unsigned)LW * 2048u + (WSTAGE ? 16384u : 0u)>();   // EA+HS (+16KB weight stage)
             uint wg = (uint)it.get_group(0);
             uint lid = (uint)it.get_local_id(0);
-            int tr = (int)(wg * (unsigned)LW + lid);
+            const int tstride = (int)it.get_group_range(0) * (int)LW;
+            for (int tr0 = (int)(wg * (unsigned)LW); tr0 < tiles; tr0 += tstride) {
+            int tr = tr0 + (int)lid;
             const bool ours = (tr < tiles);   // HANG LESSON (the gate caught it,
                                        // the bench hid it): an early return BEFORE
                                        // esimd::barrier desyncs the WG barrier --
@@ -73,6 +83,7 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
             // ---- v3c: A operand -> SLM (pack_a16 map), NOT GRF: frees 4 x 256B
             // registers -- the 16-live-GRF spill suspect (v9b ">8 accs" family) ----
             uint ea = FFC_EA_OFF + lid * 1024u;
+            if (cstop == 4) { tr0 = tiles; continue; }   // EMPTY-SHELL probe (after slm_init/barrier-free point): launch+WG floor
             #pragma unroll
             for (int r = 0; r < 8 && ours; ++r) {
                 esimd::simd<half,32> v((half)0.f);
@@ -118,11 +129,11 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
             esimd::barrier();   // v3c FIX: the A stores must be visible before the
                                 // SLM loads (v3b had no SLM A; the removed weight
                                 // barrier also guarded this -- restore it here)
-            if (!ours) return;  // SAFE after the barrier
+            if (!ours) continue;  // SAFE after the barrier (tile-loop form)
             uint hs = FFC_EA_OFF + (unsigned)LW * 1024u + lid * 1024u;   // the HS area follows EA (LW-scaled)   // per-thread 1KB hidden stage (this chunk)
             esimd::simd<float,64> p00(0.f), p01(0.f), p10(0.f), p11(0.f);   // out cols 0..15
             esimd::simd<float,64> q00(0.f), q01(0.f), q10(0.f), q11(0.f);   // out cols 16..31
-            if (cstop == 1) return;   // expand-only stop (after the HS stores above)
+            if (cstop == 1) { tr0 = tiles; continue; }   // expand-only stop (after the HS stores above)
             const esimd::simd<half,8> z8((half)0.f);
             for (int c = 0; c < 4; ++c) {
                 for (int tl = 0; tl < 2; ++tl) {
@@ -217,6 +228,7 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                 // (v3: NO barrier here -- HS is this thread's private 1KB; the
                 // in-order ESIMD pipeline orders the stores before the loads.
                 // The v2 barriers were for the SHARED per-subgroup stage, gone now.)
+                if (cstop == 3) { tr0 = tiles; continue; }   // after ONE tl-iter of expand+encode (quarter probe)
                 #pragma unroll
                 for (int kc2 = 0; kc2 < 2; ++kc2) {
                     uint kcg = (uint)(c * 2 + kc2);
@@ -254,7 +266,7 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
             // NR_CS_STOP segment attribution (TIME-ONLY diagnostic; host-captured
             // param cstop -- ESIMD kernels ban non-const statics, section 96):
             // =1 stop after EXPAND, =2 stop before the projection's dpas block.
-            if (cstop >= 2) return;
+            if (cstop >= 2) { tr0 = tiles; continue; }
             size_t outb = (size_t)(tr * 16) * cin;
             #pragma unroll
             for (int r = 0; r < 8; ++r) {
@@ -352,6 +364,7 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                         g1.copy_to(Cout + rb + 24);
                     }
                 }
+            }   // tile loop (persistent form)
             }
         });
     });
