@@ -337,20 +337,21 @@ inline auto qr_kernel_rowgroup() {
 // but per_row is computed from CHUNKS (16-half units), and no local_accessor.
 inline void qr_launch_esimd(sycl::queue& q, sycl::device& dev,
                             sycl::half* dsrc, sycl::uint2* dpack, float* dscale,
-                            unsigned m, unsigned k) {
+                            unsigned m, unsigned k, sycl::event *out_ev = nullptr) {
     // ROW-THREAD dispatch (section 99): exact small-K shapes get the senior geometry.
-    if (k == 64u)  { q.parallel_for(sycl::range(m), qr_kernel_rowthread<64>()(dsrc, dpack, dscale, m, k)); return; }
-    if (k == 128u) { q.parallel_for(sycl::range(m), qr_kernel_rowthread<128>()(dsrc, dpack, dscale, m, k)); return; }
-    if (k == 256u) { q.parallel_for(sycl::range(m), qr_kernel_rowthread<256>()(dsrc, dpack, dscale, m, k)); return; }
-    if (k == 512u) { q.parallel_for(sycl::range(m), qr_kernel_rowthread<512>()(dsrc, dpack, dscale, m, k)); return; }
+    // out_ev (bench-only, defaulted): the last enqueued event, for GPU-side timing.
+    if (k == 64u)  { if(out_ev) *out_ev = q.parallel_for(sycl::range(m), qr_kernel_rowthread<64>()(dsrc, dpack, dscale, m, k)); else q.parallel_for(sycl::range(m), qr_kernel_rowthread<64>()(dsrc, dpack, dscale, m, k)); return; }
+    if (k == 128u) { if(out_ev) *out_ev = q.parallel_for(sycl::range(m), qr_kernel_rowthread<128>()(dsrc, dpack, dscale, m, k)); else q.parallel_for(sycl::range(m), qr_kernel_rowthread<128>()(dsrc, dpack, dscale, m, k)); return; }
+    if (k == 256u) { if(out_ev) *out_ev = q.parallel_for(sycl::range(m), qr_kernel_rowthread<256>()(dsrc, dpack, dscale, m, k)); else q.parallel_for(sycl::range(m), qr_kernel_rowthread<256>()(dsrc, dpack, dscale, m, k)); return; }
+    if (k == 512u) { if(out_ev) *out_ev = q.parallel_for(sycl::range(m), qr_kernel_rowthread<512>()(dsrc, dpack, dscale, m, k)); else q.parallel_for(sycl::range(m), qr_kernel_rowthread<512>()(dsrc, dpack, dscale, m, k)); return; }
     // P8-j: K>512 -> the single-read rowgroup form (the double-read ESIMD path
     // below stays as the NR_QR_RG=0 escape hatch). K%1024==0 required (the frame
     // census: 1024/2048/4096 only); other K fall through to the old path.
     static bool rg = !getenv("NR_QR_RG") || atoi(getenv("NR_QR_RG")) != 0;
     if (rg && k % 1024u == 0u && k <= 4096u) {
-        if (k == 1024u) { q.submit([&](sycl::handler& h){ h.parallel_for(sycl::nd_range<1>(sycl::range(m*64u), sycl::range(64u)), qr_kernel_rowgroup<1>()(dsrc, dpack, dscale, m, k)); }); return; }
-        if (k == 2048u) { q.submit([&](sycl::handler& h){ h.parallel_for(sycl::nd_range<1>(sycl::range(m*64u), sycl::range(64u)), qr_kernel_rowgroup<2>()(dsrc, dpack, dscale, m, k)); }); return; }
-        if (k == 4096u) { q.submit([&](sycl::handler& h){ h.parallel_for(sycl::nd_range<1>(sycl::range(m*64u), sycl::range(64u)), qr_kernel_rowgroup<4>()(dsrc, dpack, dscale, m, k)); }); return; }
+        if (k == 1024u) { auto e = q.submit([&](sycl::handler& h){ h.parallel_for(sycl::nd_range<1>(sycl::range(m*64u), sycl::range(64u)), qr_kernel_rowgroup<1>()(dsrc, dpack, dscale, m, k)); }); if(out_ev) *out_ev=e; return; }
+        if (k == 2048u) { auto e = q.submit([&](sycl::handler& h){ h.parallel_for(sycl::nd_range<1>(sycl::range(m*64u), sycl::range(64u)), qr_kernel_rowgroup<2>()(dsrc, dpack, dscale, m, k)); }); if(out_ev) *out_ev=e; return; }
+        if (k == 4096u) { auto e = q.submit([&](sycl::handler& h){ h.parallel_for(sycl::nd_range<1>(sycl::range(m*64u), sycl::range(64u)), qr_kernel_rowgroup<4>()(dsrc, dpack, dscale, m, k)); }); if(out_ev) *out_ev=e; return; }
     }
     // LW: §96/bench_v2crash proved the BIG-state v2 ESIMD+barrier kernels HANG at
     // LW>=128 (GRF rule). The quant kernel's state is small (one 32-wide vector), so

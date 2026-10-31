@@ -1,0 +1,50 @@
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_qsplit.cpp(42,33): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   42 |         esimd::slm_block_store((uint)it.get_local_id(0)*4u, esimd::simd<float,1>(part), esimd::overaligned_tag<16>{});
+      |                                 ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_qsplit.cpp(114,33): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  114 |         esimd::slm_block_store((uint)it.get_local_id(0)*4u,
+      |                                 ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+2 warnings generated.
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_qsplit.cpp(42,33): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+   42 |         esimd::slm_block_store((uint)it.get_local_id(0)*4u, esimd::simd<float,1>(part), esimd::overaligned_tag<16>{});
+      |                                 ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+E:\WorkBuddy\2026-10-09-04-20-55\src\dlss-nr-on-a770\src\bench\sycl\bench_qsplit.cpp(114,33): warning: 'uint' is deprecated [-Wdeprecated-declarations]
+  114 |         esimd::slm_block_store((uint)it.get_local_id(0)*4u,
+      |                                 ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\aliases.hpp(96,12): note: 'uint' has been explicitly marked deprecated here
+   96 | using uint __SYCL2020_DEPRECATED("") = unsigned int;
+      |            ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(75,40): note: expanded from macro '__SYCL2020_DEPRECATED'
+   75 | #define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+      |                                        ^
+E:\WorkBuddy\toolchain-mamba\sycl\Library\include\sycl\detail\defines_elementary.hpp(66,38): note: expanded from macro '__SYCL_DEPRECATED'
+   66 | #define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+      |                                      ^
+2 warnings generated.
