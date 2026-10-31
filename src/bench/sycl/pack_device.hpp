@@ -591,13 +591,23 @@ static inline void pack_a_fused_b1(sycl::queue& q, const sycl::half* A_f16, int8
         esimd::simd<float,512> qq = esimd::div_ieee<float,512>(reg, rs);
         qq = esimd::min(esimd::max(esimd::rnde<float,512>(qq), esimd::simd<float,512>(-127.f)), esimd::simd<float,512>(127.f));
         esimd::simd<int8_t,512> qi = esimd::convert<int8_t>(esimd::convert<int>(qq));
+        // (b1 FIX: the select offset must be COMPILE-TIME -- a runtime gg*sa
+        // turned every slice extract into a local-memory spill, the true +25ms.
+        // Dispatch the common (sa,K) pairs with constexpr offsets; the general
+        // runtime form stays on pack_a_fused_b.)
+        #pragma unroll 1
         for (int gg = 0; gg < batch; ++gg) {
             int8_t* Apg = Ap + (size_t)gg * per;
-            const int off = gg * (int)sa;   // the group's column slice within the row
-            #pragma unroll
-            for (int kb = 0; kb < kb_n; ++kb)
+            #pragma unroll 1
+            for (int kb = 0; kb < kb_n; ++kb) {
+                esimd::simd<int8_t,32> v;
+                if (sa == 0) v = qi.template select<32,1>(kb*32);
+                else if (sa == 64 && kb == 0) v = qi.template select<32,1>(gg*64);
+                else if (sa == 128 && kb == 0) v = qi.template select<32,1>(gg*128);
+                else v = qi.template select<32,1>(0);   // (guarded below; K<=32 cases only)
                 esimd::block_store<int8_t,32>(Apg + (per_blk + (size_t)kb*8)*512 + row*32,
-                    qi.template select<32,1>(kb*32 + off), esimd::overaligned_tag<16>{});
+                    v, esimd::overaligned_tag<16>{});
+            }
         }
     });
 }

@@ -2362,8 +2362,11 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
         if (bstop2 < 2) {
         static long bfp = 0, bgp = 0;   // P8 census: fused vs scalar-gather pack_a hits
         if (fused_b) { bfp++;
-            static int qfmode = getenv("NR_QF_B1") ? atoi(getenv("NR_QF_B1")) : 1;   // 1 = single-read b1 (QFALIAS-v2), 0 = the old per-group peak
-            if (qfmode == 1 && lda_e <= 512 && sa + K <= lda_e)
+            static int qfmode = getenv("NR_QF_B1") ? atoi(getenv("NR_QF_B1")) : 1;
+            if (qfmode == 2) { /* TIME-ONLY attribution: skip the fused pack entirely
+                (output WRONG by design) -> isolates the pack kernel's cost from
+                the quant-dissolve bookkeeping */ }
+            else if (qfmode == 1 && lda_e <= 512 && sa == 0u)
                 packdev::pack_a_fused_b1(*GQ, a16b, dAp, (float*)ias->second.p, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch);
             else
                 packdev::pack_a_fused_b(*GQ, a16b, dAp, (float*)ias->second.p, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch); }
