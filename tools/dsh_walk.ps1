@@ -1,4 +1,4 @@
-<# walk.ps1 — DS 接手：帧判官（端到端 walk + passes + 1301 逐位对拍）
+﻿<# walk.ps1 — DS 接手：帧判官（端到端 walk + passes + 1301 逐位对拍）
    用法:
      pwsh -File E:\DSH\walk.ps1                      # 用 E:\DSH\out\libxmx.dll，tag=cur
      pwsh -File E:\DSH\walk.ps1 -Dll E:\DSH\out\libxmx_new.dll -Tag new -Runs 4
