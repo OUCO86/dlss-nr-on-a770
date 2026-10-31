@@ -70,9 +70,28 @@ lmxx hip-port（71 层完整模型，9070XT 从零重做）实测架构账：~16
    判官=bench_res 定价 → 三关 → 16 对。**破 47 第一铲。**
 2. **S2b 小 op 折邻块**（lmxx 0.36#8）：unary 32 发/UPSAMPLE 折前后 gemm 边界；
    wa 供数审计先跑（闭包级 stop，零核内探针）。-3~5ms。
-3. **S3 persistent stage = 现主刀**（lmxx 0.37#3；=§100 R8a/P8 megakernel stage 化）：
-   同层 9-op 周期按 6 层 stage 粒度串 resident 链（B6-1 五件套教训=粒度，不是方向）。
-   -5~8ms。
+3. **★ RES8 字节面 = 现主刀（10-31 20:3x 定价完毕，用户批准 PSNR 口径）**：
+   1267 残差面 f16→**行-scale E4M3 字节**（lmxx 3080L 路线 A 同款：核名 b8/b8d、
+   `residual scale f32[] + E4M3 bytes`）。bench_res8 实测：写 0.555→0.417、
+   读 0.606→0.402 ms/触（解码 ALU 免费）；帧 W122+R278 冷回放净省 73.5ms，
+   L2 修正后保守 **-15~25ms = 第一把真大刀**。数值有损（6.25% 相对步长）→
+   验收 = 对 bk.1301 PSNR≥40dB + NR_RES8=0 逐位逃生门（旧路不删）。
+   手术现场（plan census 钉死）：
+   - 写者 4 处：gemm_b_res c=1267（×120，flags 0x41100 epi1，pub_vec 后
+     行 peak→scale→byte 化；BN=64=N ⇒ 整行在一个 WG 内，SLM 128×4 partial
+     max + 1 barrier 即可）；ffn_chip 三族 out=1267（stem ×2/main ×16/merge
+     ×2）；xmx_rec_gemm c=1267（f16 族 ×2）；初始 blob 上传转换（×1）。
+   - 读者 5 处：GEMM_WINDOW_INT8_RESIDUAL skip=1267（×104，half_skip 形改
+     byte_skip：64B 载+行 scale 解码）；GEMM_INT8_RESIDUAL skip=1267（×16）；
+     QUANT_WINDOW source=1267（×104，gather 读=qr_kernel 的 e4m3 解码支路，
+     前辈 quantize_row.comp 本来就有 e4m3 容器支路=图纸）；QUANT source=1267
+     （×16 rowthread 读）；FFN skip=1267（×20）。
+   - buffer 层：1267 分配 = bytes/2 + rows×4 scale（recorder 侧记账，
+     g_bufs[id].bytes 语义不变）；blob 上传走转换核。
+   判官 = PSNR(bk.1301) + 三关(逃生门) + 16 对。开工序：先 gemm_b_res 写侧 +
+   window-resid 读侧成对切（同层闭环）→ walk 对拍 PSNR → 再推 FFN/QUANT 面。
+4. S3 persistent stage（=§100 R8a；RES8 之后的第二铲：消 1267 边界读写本身，
+   400 触→71 触）；B6-1 教训=只融小链不动大面。
 4. ~~S4 W5 权重共享~~ **10-31 判死**（上条关门账）：s8v8 密度账的 5.3x 是片段结构必税，
    唯一例外 K=64 家族 1.05x（0.28ms/帧，不值三关）。密度刀清零。
 5. **S5 逐核 roofline map 制度化**：RUN_TIMING(第二遍) × 每行 bench 单价，离屋顶
