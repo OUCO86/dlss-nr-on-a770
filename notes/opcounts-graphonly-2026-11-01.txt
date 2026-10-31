@@ -1,0 +1,118 @@
+opcounts_graphonly.txt -- per-frame op counts, CAPTURED GRAPH region only
+plan_960x544.c lines 5308..6643 (steps 3915..5250). The aborted recording (lines 3922..5294,
+steps 2529..3901) holds the SAME op mix and is NOT replayed -- any count that sums
+both is 2x too high (this is the correction to bench_n32.cpp:2 "x16+x24=40 calls").
+
+CROSS-CHECK: sum of OP_XMX_REC_* in the graph region = 691  (the judge reports passes=691)
+             same scan over the aborted region            = 691
+
+OP                                            graph  scratch   recorder / what it launches today
+----------------------------------------------------------------------------------------------------------------------
+OP_XMX_QUANT_INIT                               276      276   (init/declaration pseudo-op, no launch)
+OP_XMX_REC_QUANT                                224      224   xmx_rec_quant
+OP_XMX_INT8_INIT                                156      156   (init/declaration pseudo-op, no launch)
+OP_XMX_INT8_RESIDUAL_INIT                       120      120   (init/declaration pseudo-op, no launch)
+OP_XMX_REC_GEMM_INT8_BATCHED                     72       72   xmx_rec_gemm_int8_batched
+OP_XMX_REC_GEMM_INT8_RESIDUAL                    68       68   xmx_rec_gemm_int8_residual
+OP_XMX_REC_GEMM_INT8_QKV                         60       60   xmx_rec_gemm_int8_qkv
+OP_XMX_REC_QUANT_WINDOW                          52       52   xmx_rec_quant_window
+OP_XMX_WINDOW_INIT                               52       52   (init/declaration pseudo-op, no launch)
+OP_XMX_REC_WINDOW_ATTENTION                      52       52   xmx_rec_window_attention
+OP_XMX_REC_GEMM_WINDOW_INT8_RESIDUAL             52       52   xmx_rec_gemm_window_int8_residual
+OP_XMX_REC_GEMM                                  42       42   xmx_rec_gemm (f16-in gemm family; blade-5 fold :2303)
+OP_XMX_REC_GEMM_INT8                             24       24   xmx_rec_gemm_int8
+OP_XMX_REC_UNARY                                 16       16   xmx_rec_unary
+OP_BUF                                           11       37   (init/declaration pseudo-op, no launch)
+OP_XMX_FFN_INIT                                  10       10   (init/declaration pseudo-op, no launch)
+OP_XMX_WINDOW_BLOCK_INIT                         10       10   (init/declaration pseudo-op, no launch)
+OP_XMX_REC_WINDOW_BLOCK                          10       10   xmx_rec_window_block
+OP_XMX_REC_FFN                                    8        8   xmx_rec_ffn
+OP_XMX_GLOBAL_ATTENTION_INIT                      8        8   (init/declaration pseudo-op, no launch)
+OP_XMX_REC_GLOBAL_ATTENTION                       8        8   xmx_rec_global_attention
+OP_XMX_BEGIN                                      1        1   (init/declaration pseudo-op, no launch)
+OP_XMX_REC_FFN_STEM                               1        1   xmx_rec_ffn_stem
+OP_XMX_BUF_ZERO                                   1        0   (init/declaration pseudo-op, no launch)
+OP_XMX_REC_UNARY2                                 1        1   xmx_rec_unary2
+OP_XMX_REC_FFN_MERGE                              1        1   xmx_rec_ffn_merge
+
+=== gemm-class shape breakdown (graph region only) ===
+
+OP_XMX_REC_GEMM_INT8_BATCHED  -> xmx_rec_gemm_int8_batched
+   (M,N,K,batch)                       calls       A MB       B MB     C32 MB   frame MB
+   (2040,128,256,8)                       16       4.18       0.26       8.36     204.73
+   (640,64,256,8)                         16       1.31       0.13       1.31      44.04
+   (8160,128,128,4)                       12       4.18       0.07      16.71     251.46
+   (8160,32,128,4)                        12       4.18       0.02       4.18     100.47
+   (32640,128,64,2)                        8       4.18       0.02      33.42     300.94
+   (32640,32,128,2)                        8       8.36       0.01       8.36     133.76
+   family total (A+B+C32 once each, excl. pack re-reads / publish / quant): 1035.4 MB/frame
+
+OP_XMX_REC_GEMM_INT8_RESIDUAL  -> xmx_rec_gemm_int8_residual
+   (M,N,K,batch)                       calls       A MB       B MB     C32 MB   frame MB
+   (2040,256,256,1)                       16       0.52       0.07       2.09      42.83
+   (640,512,512,1)                        16       0.33       0.26       1.31      30.41
+   (8160,128,128,1)                       12       1.04       0.02       4.18      62.87
+   (32640,64,64,1)                         8       2.09       0.00       8.36      83.59
+   (192,1024,4096,1)                       8       0.79       4.19       0.79      46.14
+   (192,1024,1024,1)                       8       0.20       1.05       0.79      16.25
+   family total (A+B+C32 once each, excl. pack re-reads / publish / quant): 282.1 MB/frame
+
+OP_XMX_REC_GEMM_WINDOW_INT8_RESIDUAL  -> xmx_rec_gemm_window_int8_residual
+   (M,N,K,batch)                       calls       A MB       B MB     C32 MB   frame MB
+   (2560,256,256,1)                       16       0.66       0.07       2.62      53.48
+   (768,512,512,1)                         8       0.39       0.26       1.57      17.83
+   (960,512,512,1)                         8       0.49       0.26       1.97      21.76
+   (8640,128,128,1)                        6       1.11       0.02       4.42      33.28
+   (9216,128,128,1)                        6       1.18       0.02       4.72      35.49
+   (32640,64,64,1)                         2       2.09       0.00       8.36      20.90
+   (35712,64,64,1)                         2       2.29       0.00       9.14      22.86
+   (33728,64,64,1)                         2       2.16       0.00       8.63      21.59
+   (34560,64,64,1)                         2       2.21       0.00       8.85      22.13
+   family total (A+B+C32 once each, excl. pack re-reads / publish / quant): 249.3 MB/frame
+
+OP_XMX_REC_GEMM  -> xmx_rec_gemm (f16-in gemm family; blade-5 fold :2303)
+   (M,N,K,batch)                       calls       A MB       B MB     C32 MB   frame MB
+   (2040,32,128,8)                        16       2.09       0.03       2.09      67.37
+   (640,256,64,8)                         16       0.33       0.13       5.24      91.23
+   (32640,64,32,1)                         1       1.04       0.00       8.36       9.40
+   (8160,128,64,1)                         1       0.52       0.01       4.18       4.71
+   (2040,256,128,1)                        1       0.26       0.03       2.09       2.38
+   (640,512,256,1)                         1       0.16       0.13       1.31       1.61
+   (192,1024,512,1)                        1       0.10       0.52       0.79       1.41
+   (192,512,1024,1)                        1       0.20       0.52       0.39       1.11
+   (640,256,512,1)                         1       0.33       0.13       0.66       1.11
+   (2040,128,256,1)                        1       0.52       0.03       1.04       1.60
+   (8160,64,128,1)                         1       1.04       0.01       2.09       3.14
+   (32640,32,64,1)                         1       2.09       0.00       4.18       6.27
+   family total (A+B+C32 once each, excl. pack re-reads / publish / quant): 191.3 MB/frame
+
+OP_XMX_REC_GEMM_INT8  -> xmx_rec_gemm_int8
+   (M,N,K,batch)                       calls       A MB       B MB     C32 MB   frame MB
+   (640,512,512,1)                        16       0.33       0.26       1.31      30.41
+   (192,4096,1024,1)                       8       0.20       4.19       3.15      60.29
+   family total (A+B+C32 once each, excl. pack re-reads / publish / quant): 90.7 MB/frame
+
+OP_XMX_REC_GEMM_INT8_QKV -> xmx_rec_gemm_int8_qkv   (no plain N/K: the qkv epilogue takes M, channels, heads, tokens)
+   (M,channels,heads,tokens)                 calls
+   (2560, 256, 8, 64)                           16
+   (768, 512, 16, 64)                            8
+   (960, 512, 16, 64)                            8
+   (192, 1024, 32, 192)                          8
+   (8640, 128, 4, 64)                            6
+   (9216, 128, 4, 64)                            6
+   (32640, 64, 2, 64)                            2
+   (35712, 64, 2, 64)                            2
+   (33728, 64, 2, 64)                            2
+   (34560, 64, 2, 64)                            2
+
+=== the N=32 batched sites (the 刀 C target) ===
+   M=640     N=64   K=256  batch=8   x16   fused pub (N%64==0 branch, libxmx_sycl.cpp:2660)
+   M=2040    N=128  K=256  batch=8   x16   fused pub (N%64==0 branch, libxmx_sycl.cpp:2660)
+   M=8160    N=32   K=128  batch=4   x12   SPLIT: gemm32_b + separate publish (:2680/:2682)
+   M=8160    N=128  K=128  batch=4   x12   fused pub (N%64==0 branch, libxmx_sycl.cpp:2660)
+   M=32640   N=32   K=128  batch=2   x8    SPLIT: gemm32_b + separate publish (:2680/:2682)
+   M=32640   N=128  K=64   batch=2   x8    fused pub (N%64==0 branch, libxmx_sycl.cpp:2660)
+
+=== quant-class (knife B) ===
+   xmx_rec_quant 224 + xmx_rec_quant_window 52 = 276 quant-class launches/frame
+   (OP_XMX_QUANT_INIT 276 is the declaration pseudo-op, not a launch)

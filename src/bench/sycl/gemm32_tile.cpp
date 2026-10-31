@@ -471,7 +471,147 @@ static void run_variant(Ctx& cx, const char* name, int forceNp = 0) {
            gf, diff, slm / 1024.0, pad, gmfmt(st));
 }
 
+// ================= STEP 0 (刀 C gate): the pub leg on the FRAME'S REAL strides =================
+// The contiguous sweep above writes C with ldc=N (each group its own block). The frame does NOT:
+// plan_960x544.c lines 5345/5369/5391/5413/6541/6563/6585/6607 (M=32640 N=32 K=128 b=2) and
+// 5438/5460/5482/5504/5526/5548/6407/6429/6451/6473/6495/6517 (M=8160 N=32 K=128 b=4) all carry
+//   sa=128(=K)  sb=4096(=N*K)  sc=32(=N)  lda=K*batch  ldb=128(=K)  ldc=N*batch  ss=0  flags=0x1100 (epi1, narrow)
+// i.e. the A face is ONE row-interleaved wide row (lda=256/512, group stride sa=128), every group
+// has its OWN weight block (sb=N*K, not the shared sb=0 of the sweep above), and the published f16
+// face is the WIDE row: out = g*sc + r*ldc + col -> each group writes a 32-half (64 B) run into a
+// 128/256-byte row, i.e. 64B PARTIAL-LINE stores. col_stride = N because sb != 0 (recorder :2674).
+// This phase re-prices (a) shipped gemm32_b, (b) the recorder's separate publish with that map,
+// and (c) the fused pub forms with that map, in ONE process, and diffs (c) against (a)+(b)
+// byte-for-byte over the written region. 刀 C is only allowed if (c) < (a)+(b) here.
+struct FrameCtx {
+    int M, N, K, b, Mp, lda, sa, sb, sc, ldc;
+    size_t out_ext;
+    int8_t *dAp, *dAp64, *dBp;
+    float  *das, *dbs;
+    int32_t* dC32;
+    half   *dOutRef, *dOutV;
+    std::vector<half> hRef, hV;
+};
+
+static size_t fbytes_written(const FrameCtx& fc) { return (size_t)fc.b * fc.M * fc.N; }
+static double fr_result = 0.0;      // out-param: the last frame_pub's msM (for the GATE line)
+
+template <int BNV, int BKV, int NTV, int NBUF, int MODE>
+static void frame_pub(FrameCtx& fc, const char* name) {
+    queue& q = *GQ;
+    const int8_t* Ap = (BKV == 32) ? fc.dAp : fc.dAp64;
+    Stat st = timeit([&]() {
+        return g32v::gemm32_var<BNV, BKV, NTV, NBUF, MODE, true>(q, Ap, fc.dBp, nullptr, (void*)fc.dOutV,
+            fc.das, fc.dbs, fc.M, fc.Mp, fc.N, fc.N, fc.K, fc.b, (size_t)fc.sc, (unsigned)fc.ldc,
+            0u, (unsigned)fc.N, true, 1u);
+    });
+    q.memcpy(fc.hV.data(), fc.dOutV, fc.out_ext * 2).wait();
+    size_t diff = 0, cmp = 0;
+    for (int g = 0; g < fc.b; ++g)
+        for (int r = 0; r < fc.M; ++r)
+            for (int c2 = 0; c2 < fc.N; ++c2) {
+                size_t i = (size_t)g * fc.sc + (size_t)r * fc.ldc + c2;
+                ++cmp; if (memcmp(&fc.hRef[i], &fc.hV[i], 2)) ++diff;
+            }
+    double bytes = (double)fc.b * ((double)fc.Mp * fc.K + (double)(fc.Mp / 128) * BNV * fc.K)
+                 + (double)fbytes_written(fc) * 2.0;
+    double gbs = bytes / (st.msM / 1e3) / 1e9;
+    printf("  %-22s pub  msM=%7.4f msm=%7.4f msX=%7.4f  GB/s=%6.1f %5.1f%%  cmp=%zu diff=%zu SLM=%5.1fKB  gm=%s\n",
+           name, st.msM, st.msm, st.msX, gbs, 100.0 * gbs / 560.0, cmp, diff,
+           NBUF * (128 * BKV + BKV * BNV) / 1024.0, gmfmt(st));
+    fr_result = st.msM;
+}
+
+static void frame_phase(int M, int N, int K, int b, int perframe, const std::vector<int8_t>& A,
+                        const std::vector<int8_t>& B, const std::vector<float>& as1) {
+    queue& q = *GQ;
+    FrameCtx fc; fc.M = M; fc.N = N; fc.K = K; fc.b = b;
+    fc.Mp = ((M + 127) / 128) * 128;
+    fc.lda = K * b; fc.sa = K; fc.sb = N * K; fc.sc = N; fc.ldc = N * b;
+    fc.out_ext = (size_t)(M - 1) * fc.ldc + (size_t)(b - 1) * fc.sc + N + 1;
+    printf("\n== FRAME-STRIDE phase (M=%d N=%d K=%d b=%d) lda=%d sa=%d sb=%d sc=%d ldc=%d col_stride=%d epi1 "
+           "[x%d calls/frame] ==\n", M, N, K, b, fc.lda, fc.sa, fc.sb, fc.sc, fc.ldc, fc.N, perframe);
+    // raw A = M rows x (K*b) INTERLEAVED (frame lda/sa); raw B = b blocks of N x K (frame sb).
+    std::vector<int8_t> Ar((size_t)(M - 1) * fc.lda + (size_t)(b - 1) * fc.sa + K, 0);
+    for (int g = 0; g < b; ++g)
+        for (int r = 0; r < M; ++r)
+            memcpy(&Ar[(size_t)r * fc.lda + (size_t)g * fc.sa], &A[(size_t)r * K], K);
+    std::vector<int8_t> Br((size_t)b * N * K);
+    for (int g = 0; g < b; ++g) memcpy(&Br[(size_t)g * N * K], B.data(), (size_t)N * K);
+    std::vector<float> bs((size_t)b * N, 1.f);
+    fc.dAp   = (int8_t*)malloc_device((size_t)b * fc.Mp * K, q);
+    fc.dAp64 = (int8_t*)malloc_device((size_t)b * fc.Mp * K, q);
+    fc.dBp   = (int8_t*)malloc_device((size_t)b * N * K, q);
+    fc.das   = (float*)malloc_device((size_t)fc.Mp * 4, q);
+    fc.dbs   = (float*)malloc_device(bs.size() * 4, q);
+    fc.dC32  = (int32_t*)malloc_device((size_t)b * fc.Mp * N * 4, q);
+    fc.dOutRef = (half*)malloc_device(fc.out_ext * 2, q);
+    fc.dOutV   = (half*)malloc_device(fc.out_ext * 2, q);
+    q.memset(fc.dC32, 0, (size_t)b * fc.Mp * N * 4);
+    q.memset(fc.dOutRef, 0, fc.out_ext * 2); q.memset(fc.dOutV, 0, fc.out_ext * 2);
+    int8_t* dA = (int8_t*)malloc_device(Ar.size(), q);
+    int8_t* dB = (int8_t*)malloc_device(Br.size(), q);
+    q.memcpy(dA, Ar.data(), Ar.size()).wait();
+    q.memcpy(dB, Br.data(), Br.size()).wait();
+    q.memcpy(fc.das, as1.data(), (size_t)fc.Mp * 4).wait();
+    q.memcpy(fc.dbs, bs.data(), bs.size() * 4).wait();
+    packdev::gather_pack_a_b(q, dA, fc.dAp, M, fc.Mp, K, fc.lda, fc.sa, b);
+    packdev::gather_pack_b_b(q, dB, fc.dBp, N, K, K, (size_t)N * K, b);
+    {
+        std::vector<int8_t> Ap64((size_t)b * fc.Mp * K);
+        pack_a64_host(Ar.data(), Ap64.data(), M, fc.Mp, K, b, fc.lda, fc.sa);
+        q.memcpy(fc.dAp64, Ap64.data(), Ap64.size()).wait();
+    }
+    q.wait();
+    // (a) shipped gemm32_b on the frame-packed operands
+    s8v8::gemm32_b(q, fc.dAp, fc.dBp, fc.dC32, fc.Mp, N, K, b).wait();
+    Stat stg = timeit([&]() { return s8v8::gemm32_b(q, fc.dAp, fc.dBp, fc.dC32, fc.Mp, N, K, b); });
+    // (b) the recorder's separate publish, map VERBATIM from libxmx_sycl.cpp:2682-2693
+    int32_t* C32 = fc.dC32; float* as = fc.das; float* bs2 = fc.dbs; half* OC = fc.dOutRef;
+    int Mp = fc.Mp, ldc = fc.ldc, sc = fc.sc;
+    Stat stp = timeit([&]() -> event {
+        return q.parallel_for(range((size_t)b * M * N), [=](item<1> it) {
+            size_t i = it.get_id(0); unsigned mn = (unsigned)M * N;
+            unsigned g = (unsigned)(i / mn); size_t rem = i % mn;
+            unsigned r = (unsigned)(rem / N), col = (unsigned)(rem % N);
+            float* gas = as + (size_t)g * 0u;                       // scale_stride = 0 (plan ss=0)
+            float* gbs = bs2 + (size_t)g * N;                       // sb != 0 -> col_stride = N
+            float v = cr_mul(cr_mul((float)C32[(size_t)g * Mp * N + (size_t)r * N + col], gas[r]), gbs[col]);
+            size_t out = (size_t)g * sc + (size_t)r * ldc + col;
+            ((half*)OC)[out] = sycl::half(qr_publish(1u, v));
+        });
+    });
+    fc.hRef.resize(fc.out_ext); fc.hV.resize(fc.out_ext);
+    q.memcpy(fc.hRef.data(), fc.dOutRef, fc.out_ext * 2).wait();     // the reference the fused forms must hit
+    double gbsG = (double)b * ((double)fc.Mp * K + (double)(fc.Mp / 128) * N * K
+                             + (double)fc.Mp * N * 4) / (stg.msM / 1e3) / 1e9;
+    double bytesX = (double)b * M * N * 6.0;
+    printf("  %-22s raw  msM=%7.4f msm=%7.4f msX=%7.4f  GB/s=%6.1f %5.1f%%  (shipped gemm32_b, frame packs)\n",
+           "shipped gemm32_b", stg.msM, stg.msm, stg.msX, gbsG, 100.0 * gbsG / 560.0);
+    printf("  %-22s pub  msM=%7.4f msm=%7.4f msX=%7.4f  GB/s=%6.1f %5.1f%%  (recorder separate publish)\n",
+           "split publish", stp.msM, stp.msm, stp.msX, bytesX / (stp.msM / 1e3) / 1e9,
+           100.0 * (bytesX / (stp.msM / 1e3) / 1e9) / 560.0);
+    printf("  %-22s SPLIT TOTAL msM=%7.4f msm=%7.4f  <-- 刀 C must beat this\n", "gemm+publish",
+           stg.msM + stp.msM, stg.msm + stp.msm);
+    // (c) the fused forms on the frame map
+    frame_pub<32, 32, 16, 3, 0>(fc, "anchor32 pub");       double a1 = fr_result;
+    frame_pub<32, 32, 32, 2, 1>(fc, "nt32_hr_buf2 pub");   double a2 = fr_result;
+    frame_pub<32, 32, 32, 2, 2>(fc, "nt32_hc_buf2 pub");   double a3 = fr_result;
+    frame_pub<32, 32, 16, 2, 0>(fc, "bn32_buf2 pub");      double a4 = fr_result;
+    frame_pub<32, 64, 32, 2, 1>(fc, "bk64_hr_buf2 pub");   double a5 = fr_result;
+    frame_pub<32, 64, 16, 3, 0>(fc, "bk64_nt16 pub");      double a6 = fr_result;
+    double best = std::min(std::min(a1, a2), std::min(a3, std::min(a4, std::min(a5, a6))));
+    printf("  GATE: best fused %7.4f vs split total %7.4f -> %s (per-call delta %+7.4f; x%d = %+6.2f ms/frame serial)\n",
+           best, stg.msM + stp.msM, (best < 0.9 * (stg.msM + stp.msM)) ? "PASS -- proceed to step 1"
+           : (best < stg.msM + stp.msM ? "MARGINAL -- report before writing shipped code" : "FAIL -- STOP"),
+           best - (stg.msM + stp.msM), perframe, (best - (stg.msM + stp.msM)) * perframe);
+    free(dA, q); free(dB, q);
+    free(fc.dAp, q); free(fc.dAp64, q); free(fc.dBp, q); free(fc.das, q); free(fc.dbs, q);
+    free(fc.dC32, q); free(fc.dOutRef, q); free(fc.dOutV, q);
+}
+
 int main() {
+    device dev;
     for (auto& d : device::get_devices(info::device_type::gpu))
         if (d.get_backend() == backend::ext_oneapi_level_zero &&
             d.get_info<info::device::name>().find("Arc") != std::string::npos) { dev = d; break; }
@@ -482,7 +622,10 @@ int main() {
     printf("pub leg: epi=1 narrow=f16 (the frame's N=32 plan); scales all 1.0\n");
 
     struct Cfg { int M, N, K, b, perframe; };
-    std::vector<Cfg> cfgs = { {32640, 32, 128, 2, 16}, {8160, 32, 128, 4, 24} };
+    // perframe = calls/frame in the CAPTURED graph only (plan lines 5308..6643) -- the
+    // x16/x24 figure inherited from bench_n32.cpp:2 double-counts the aborted recording
+    // (TRAP 9 in this file's header). Re-counted: 8 and 12.
+    std::vector<Cfg> cfgs = { {32640, 32, 128, 2, 8}, {8160, 32, 128, 4, 12} };
     for (auto cf : cfgs) {
         Ctx cx; cx.M = cf.M; cx.N = cf.N; cx.K = cf.K; cx.b = cf.b;
         cx.Mp = ((cx.M + 127) / 128) * 128;
@@ -643,6 +786,9 @@ int main() {
             printf("  %-22s raw+pub SPLIT total msM=%7.4f  msm=%7.4f  (what the frame pays today)\n",
                    "SPLIT TOTAL", stb.msM + stx.msM, stb.msm + stx.msm);
         }
+
+        // ---- STEP 0 (the 刀 C gate): the same forms on the FRAME'S real strides ----
+        frame_phase(cf.M, cf.N, cf.K, cf.b, cf.perframe, A, B, as);
 
         free(dA, q); free(dB, q);
         free(cx.dAp, q); free(cx.dAp64, q);
