@@ -1,150 +1,100 @@
-# B2 蓝图：71 层完整模型到 10ms 的路线（2026-10-31 15:0x 制定）
-# （军规与验收标准置顶，任何窗口开工先读这一页，再读流水/交接卡）
+# B2 战役蓝图（2026-10-31 立；军规原文继承自 §100 总蓝图，本文件只做补条与战线更新）
+# 权威军规原文 = notes/section100-blueprint.md 的「🚩🚩🚩 底线」一节，逐字如下，不许改写：
 
 ════════════════════════════════════════════════════════════════════
-## ⚑ 军规（用户制定，违反=返工，顺序不可颠倒）
+## ⚑⚑ 底线（军规，任何一步不可违背）【§100 原文】
 
-### 第 0 条 · 窗口开局必读（最高优先）
-精读上一窗口**全部**流水（`.workbuddy/memory/YYYY-MM-DD.md` 全文，不许跳读/grep
-代替）+ 本蓝图 + 项目 `MEMORY.md` + `notes/lmxx-architecture-comparison.md`。
-读完要在回复里明说学到了什么、因此改了什么设计。
+**数据链路健康是根本。破坏了它，做什么都白搭，之前所有工作全部作废。这是不可碰的底线。**
 
-### 第 1 条 · 收益优先：负结果≠方案错，是实现错
-参照 lmxx/前辈布局做的改动测出无收益甚至负收益——**第一动作是找解决方案把收益
-弄到手，不是回退**。除硬件物理限制外都是实现问题；硬件限制多半也是"实现方式不
-适配 A770"。判决为负的账必须写清：实现错在哪、下一形状是什么。留开关留仪器，
-不把方案本身判死。（正面例：CS2 v1 半闲置 +0.22 → v2 全员有活干 -10%。）
+1. **不出现小 M**：GEMM 必须宽 M 大 tile（R8a）；batch 进 grid 维，绝不拆成一堆小 dispatch。
+2. **不出现中间量化往返**：全程 int8 直通 + 单一世界；quant 只在 plan 规定处发生；
+   不为省时间放宽任何数值标准（改数值形态必须先过 numpy golden 考古，过不了就地死刑）。
+3. **不出现额外开销**：CPU 不碰像素路径；无 host pack/download；无多余 launch；
+   无多余 buffer 往返；不为绕路新增搬运。
+4. **照搬的是思路，不是代码**：前辈 coopmat/Vulkan 的实现不能直接搬进 SYCL/ESIMD；
+   可搬的是结构（resident、fold、SLM staging、acc-via-SLM、epilogue-on-accumulator）。
+5. **每步三关**：39 独立门 GREEN → 端到端 recorded walk 100.0000% 0 mismatch（vs bk 基线）
+   + 确定性两遍 100% → 同热交替 A/B 计时。任何一关红 = 当场回滚，不过夜。
+   否证也要落盘（否证是资产）。
+6. **每步流程**：先查参考（文件:行）→ 写明"学到什么、因此改了什么设计" → 先立门再写码
+   → 动手 → 三关 → 自查违规（小M?中间量化?额外开销?CPU牵扯?）→ 提交推送 →
+   部署 md5 入账 → 游戏验收画面。
 
-### 第 2 条 · 先测量后开刀（防"十次九错靶"）
-每个假说先用 <10 分钟探针判生死，再决定开刀。禁止烧完整实现才发现错靶。
-仪器在手：bench_b3 / bench_batched / bench_res / bench_wa_res / bench_qrg /
-bench_qilp / bench_laws / bench_nodetax / NR_RUN_TIMING / NR_*_STOP 家族。
+## ⚑ 健康链路验收标准（三关细则，=军规 5 的操作化）【原文口径】
+- 门全套（现 1250 门，build_sycl_dll.sh 内嵌）GREEN；
+- recorded walk 100.0000% 0 mismatch vs bk.1301.bin + **passes=691 必查**（少=op 被吞）；
+- 确定性两遍 100%；同热交替 A/B；单家族账本 delta 不能当判据（挪账假象），
+  判据=同热端到端 A/B；16 对协议（赢≥10 且均值≤-0.5 转正；±0.5 带内留形不吹）。
 
-### 第 3 条 · 诊断不得改变被测量（探针污染案 §6.29）
-塞进 shipped 核的运行时诊断分支会毒化寄存器分配（实测：壳 1.28→0.005ms）。
-规则：诊断用 **if constexpr 模板参数** 或 recorder 闭包级 stop；任何分段账必须
-在"带/不带诊断"对照下测；作废账要明写作废并重测。
-
-### 第 4 条 · 任何缓存/跳过/折并的"不变"前提，先 VERIFY 再上协议
-内容稳定性用 diff 探针实测（WQ 案：160/160 STALE，-2.65 是 fast-but-wrong）。
-16 对协议只测快慢不测对错——**三关（对错）永远先于协议（快慢）**。
-
-### 第 5 条 · 引用任何外部数字先答三问
-哪个模型（71 层完整 / 31 块 Small）？哪个分辨率（900/1080/960×544）？
-什么形态（split / 半融合 / resident）？（本会话两次栽在这：带宽借口、31-block 误读）
-
-### 第 6 条 · 遇到问题先全网搜索（含官方文档），归因一次一个变量
-官方规格查 Intel ARK / NVIDIA / Khronos；坑查 GitHub issue 与前辈源码头注释
-（前辈 src/gpu/*.comp 的文件头=已付学费的坑清单，先读再写）。
-搜到即归档（refs/ + 中文提炼 + 来源 URL），下次读本地。
-
-### 第 7 条 · 自己续跑
-命令失败/一轮结束未到结论——不等催，当轮读报错→搜索→单变量对照→落盘→换路
-继续。"？？"和"咋不动了"=已在违反。
+## ⚑ 本战役新增补条（2026-10-31 血案入账，编号续军规）
+7. **收益优先**：参照 lmxx/前辈布局的改动测出负收益=我的实现有问题，不是方案错。
+   第一动作=找解决方案把收益弄到手；负账必须写"实现错在哪、下一形状"。留开关留仪器。
+   （正面例：CS2 v1 半闲置+0.22 → v2 全员有活干 -10%。）
+8. **先测量后开刀**：假说先 <10 分钟探针判生死再开刀；禁止烧完整实现才发现错靶。
+9. **诊断不得改变被测量**：运行时 if 探针会毒化寄存器分配（cs4 壳 1.28→0.005ms 案）——
+   进核诊断一律 if constexpr 模板参数或闭包级 stop；分段账必须在带/不带诊断对照下测。
+10. **缓存/跳过/折并的"不变"前提先 VERIFY**：内容稳定性用 diff 探针实测（WQ 案
+    160/160 STALE）；三关（对错）永远先于 16 对（快慢）。
+11. **引用外部数字先答三问**：哪个模型（71 层完整/31 块 Small）、哪个分辨率、
+    什么形态（本会话两次栽：带宽借口、31-block 误读）。规格必查官方（Intel ARK/NVIDIA）。
+12. **自己续跑**：失败/未到结论当轮自愈继续，不等催。
 
 ════════════════════════════════════════════════════════════════════
-## ⚑ 健康链路验收标准（每刀必过，缺一个 = 该刀不成立）
+## 一、战线现状（2026-10-31，接 §100 的 P1-P8 序列）
 
-1. **1250 门全绿**（build_sycl_dll.sh 内嵌全套 golden 门：FFN/WINDOW/COEXIST/…）
-2. **walk 1301 逐字节 EXACT**（对错权威=前辈 coopmat 引擎 golden，`cmp *.1301.bin bk.1301.bin`）
-3. **passes=691 必查**（B6 误接线事故教训：684/690 少 passes=有 op 被吞）
-4. **16 对协议**：同热交错 16 对，**赢≥10 且均值≤-0.5 = 转正**；±0.5 内 = 带内
-   （留形不吹，P8-k）；负 = 按军规 1 处理（找形状，不裸回退）。
-   仪器：两 dll 或同 dll 双开关（开关必须 `!getenv||atoi!=0` 形，防 =0 也算 ON）。
-5. **三复现**：任何单点读数（腿账/归因）至少 3 次或两 rep 一致才入账。
-6. **判决当场落盘**：commit message 写全（数字+机制+教训+下一刀），blueprint
-   节号同步；部署位 `cp src/bench/sycl/libxmx_sycl.dll work/libxmx.dll` + md5 记录。
-7. **游戏侧健康**：OptiScaler.log 的 `work=` 与 walk 同量级（游戏垫 ~17ms 自身
-   负载属正常）；`gap run` 无 failures；画面 A/B 无差异投诉。
+- §100 蓝图早已写下：**理论地板=健康链路+全程 resident+int8 直通+宽 M ≈ 10-15ms**；
+  中期 ≤24ms、终局 10-15ms；"跑不赢前辈就是丢人"。B2 不新造路线=把 P 序列跑完。
+- 现状：walk 带 **66.2-66.5 冷**（部署位 `1cb94804`：CS2 全家族+QFALIAS 资产 OFF+
+  cstop 模板探针）。同机 ground truth：前辈 coopmat 件实测 **47.19ms**（=超越对象）。
+- 里程碑账（§100 口径更新）：463 → 214 → 127（10-28）→ 112.5 → 74.5 → **66.5**。
+- 腿账 v4（关键路径靶序，CS2 件实测）：ffn -9.5（stem-4.7/main+merge-4.5）|
+  quant -5.8 | unary -5.0 | wa -6.2 | gemm 三兄弟 ≈0（overlap 隐藏，串行 64.7）。
+- 流量精确账（plan census）：1267=26.7GB(47.7ms@560 屋顶) + 1274=17.3 + 1272=8.9 +
+  其余≈7.6；L2 命中修正后前辈 47.19≈其残差屋顶。**我们的 19.4ms 超额=latency 泡**
+  （s8v8/qkv 有效 100-190GB/s vs laws 在途 592-734）。
 
-当前基线（2026-10-31）：walk 带 **66.2-66.5 冷**，部署位 md5 `1cb94804`
-（CS2 全家族 + QFALIAS 资产默认 OFF + cstop 模板探针）。
-同机 ground truth：前辈 coopmat 件 **47.19ms**（超越对象，不是老师）。
+## 二、作战序（= §100 P5/P8 + B2 战线的续跑，按 lmxx 71 层架构账排）
 
-════════════════════════════════════════════════════════════════════
-## 一、战略事实（全部实测背书，本窗口钉死）
+lmxx hip-port（71 层完整模型，9070XT 从零重做）实测架构账：~160 发 launch +
+块内融合打穿 + persistent stage（ready-queue，197→179）+ W5 五 wave LDS 共权重
+（读÷5）+ 逐核 roofline map + 微观数值刀；900p 7.6/1080p 10.4ms。其负结果清单
+（C128/C64 persistent 不值、C512 proj 共权重更慢、MAKE_RESIDENT 不复现）与
+前辈 fused.comp 头坑清单（on-chip 测 peak 碎 int32 累加器 27.1 vs 14.8；scale
+必须生产侧预给）= 已付学费，先读再写（军规 6）。
 
-- 模型=**71 层完整 NR**（不是 31 块 Small；Small 适配简单，之后再弄）。
-- A770 16GB = 560GB/s + 262 Int8 TOPS(XMX) ≥ 3080L(448+238)。**零硬件借口。**
-- 前辈 coopmat 版 47.19 = 贴 1267 残差流量屋顶（26.7GB=47.7ms）；其 B1a
-  megakernel 被 **Vulkan coopmat 32KB SLM 死限**作废（§227）。
-- 我们的 ESIMD 栈配额：64KB SLM/WG（chip 现役）+ XMX dpas 30.9-59 TOPS 实测
-  + laws 在途 592-734GB/s。**前辈被禁的形态我们做得起。**
-- lmxx 71 层完整模型的真实形态 = **~160 发 launch**（非 31）+ 六件套
-  （块内融合/上采样折邻块/persistent stage/W5 权重共享/逐核 roofline 审计/微观数值）。
-  其 9070XT 实测 900p 7.6 / 1080p 10.4ms。
-- 我们 66.5 = 屋顶 47.7 + ~19ms latency 泡（s8v8/qkv 有效 100-190GB/s vs 在途上限）。
-- 流量地板账（960×544，golden f32 残差锁死）：
-  lmxx 深度融合 → 残差往返 400→142 次 = 9.5GB+1+0.5 ≈ 11GB = **19.6ms 下界**；
-  层 resident 写读合一 → 71 次 = **~10.5ms 物理地板**。XMX 算力 0.2ms 全藏流量。
-  → **10-12ms 是这套 golden 在 A770 上的物理地板，可达。**
+1. **S2a 读侧 quant 折进 residual-gemm store epilogue**（=§100 P2 未竟的 residual
+   侧+P5 行-max 的合流；104 对相邻已 census：resid 写 1267 → QUANT_WINDOW 读，
+   写读严格相邻）：预期 -12ms。图纸=前辈 gemm_staged_int8_fused.comp（读侧版）+
+   residual_epilogue.glsl 的 image 槽映射（写侧版）；scale 走 publish 预给（军规 2
+   的合法路径：quant 只在 plan 规定处发生=折进 store 不算新增往返，反而消往返）。
+   判官=bench_res 定价 → 三关 → 16 对。**破 47 第一铲。**
+2. **S2b 小 op 折邻块**（lmxx 0.36#8）：unary 32 发/UPSAMPLE 折前后 gemm 边界；
+   wa 供数审计先跑（闭包级 stop，零核内探针）。-3~5ms。
+3. **S3 persistent stage**（lmxx 0.37#3；=§100 R8a/P8 megakernel stage 化）：
+   同层 9-op 周期按 6 层 stage 粒度串 resident 链（B6-1 五件套教训=粒度，不是方向）。
+   -5~8ms。
+4. **S4 W5 权重共享**（lmxx 0.37#5；对症我们 §6.22 旧账 s8v8 SLM 读 5.3x 放大）：
+   gemm 三兄弟单核 2-3x（为关键路径腾 SM；他们负结果 C512 proj 共权重更慢=对照自查）。
+5. **S5 逐核 roofline map 制度化**：RUN_TIMING(第二遍) × 每行 bench 单价，离屋顶
+   >2x 排队修。每窗口一跑。
 
-## 二、腿账 v4（CS2 件实测，关键路径靶序）
+## 三、已关门账（勿回锅，全部实测判决）
+WQ-Cache 缓存前提 | quant 2-row ILP（roofline）| 编码宽化边界表（ffn-3/4/12 赢长链、
+5/6 输短链/故意冗余）| PW32/SPLITC/ACCSLM（GRF 三杀）| take_b 按 id 查（+25；
+QFALIAS 按指针已修但 colslice 扇出算术判死，除非 S2a 的 scale-pregive 改流量）|
+f16-OUT（store 段 <1ms）| 节点合并（0.7µs/节点）| 1267 dtype→f16（golden 锁死，
+军规 2 死刑已判）| B6-1 五件套形态（+1.08）| v5-8x8naive（§100 封存）。
 
-| 腿 | 删除探针帧值 | 串行账(RUN_TIMING 干净件) | 状态 |
-|---|---|---|---|
-| ffn 系（stem -4.7 / main+merge -4.5） | **-9.5** | 11.9 | CS2 已削单核 -10%，残差税在流量 |
-| quant | **-5.8**(核) | 10.3 | 核已 roofline；融合方向=读侧折（见 S2a） |
-| unary | **-5.0** | 4.3 | 向量化已全覆盖；肉在折邻块（S2b） |
-| wa 家族 | **-6.2** | 17.0 | TILE/MERGE 折在带内；供数未审计 |
-| gemm 三兄弟（batched/res/wres/qkv） | ≈0（overlap 隐藏） | 64.7 | S4 W5 权重共享 = 对症（读÷5） |
+## 四、开关表（当前件）
+NR_CHIP_CS(默认ON) | NR_FF9/FF3(ON) | NR_FFN_CHIPRES/TILE/DUAL, MEGA(OFF) |
+NR_WQFUSE/OFF | NR_Q_FUSE_B/OFF + NR_QF_B1 0/1/2 | NR_WB_V3/SPLIT(逃生) |
+NR_GA_TILE/MERGE(ON) | NR_V9B/OFF | NR_*_STOP 家族 + CSTOP 模板 | NR_RUN_TIMING |
+SM_LW | 分支=b1-wblock-resident（origin 已推）。
 
-## 三、开工序（B2 战役，每刀带图纸）
-
-### S2a（本周主刀）读侧 quant 折进 residual gemm —— 目标 -12ms
-- 靶：x120 GEMM_INT8_RESIDUAL 写 1267 → x104 QUANT_WINDOW 读（census 验证严格
-  相邻、维度对上：resid 32ch 行 = qw 64 宽 2-token 窗口行 + gather pad 零行）。
-- 图纸：前辈 `gemm_staged_int8_fused.comp` 头注释（设计+两个坑：on-chip 测 peak
-  碎 int32 累加器 27.1 vs 14.8=禁；scale 由**写侧 publish epilogue 预给**=正解；
-  一 div 不是一 value 一 div）；我们的 pub_vec_v8(3u)（写侧 e4m3 已在 epilogue）
-  + QFALIAS（wire 已证）+ `pack_a_fused_b1`（资产）。
-- 实现路线：residual gemm 的 store epilogue 顺手出 pk(1272)+scale(1273)
-  （前辈"quantising as it goes"读侧反向=写侧版），QUANT_WINDOW no-op。
-  注意 qw 的 gather 几何：折进 gemm store 时按 image 槽写（前辈
-  residual_epilogue.glsl 的 index 映射 VERBATIM 可抄）。
-- 判官：bench_res 先定价 → 三关 → 16 对 → 破 47 第一铲。
-
-### S2b 上采样/小 op 折邻块（目标 -3~5ms）
-- 前辈/lmxx 双图纸：lmxx 0.36#8（upsample 折下一块首层，-0.17/-0.25ms 实测，
-  且"ViT/downsample 候选无增益不折"=负面清单）；前辈 publish/residual epilogue 系。
-- 我们靶：unary 腿 32 发（POOL2/UPSAMPLE_ADD 已向量化）→ 折进前后 gemm 的
-  load/store 边界；wa 供数审计先跑（NR_WA_STOP 细分）。
-
-### S3 persistent stage（目标 -5~8ms）
-- lmxx 0.37#3 复刻：每层 9-op 周期的相邻 op 串成**一个 cgraph 子图节点**
-  （我们的 cgraph 就是 ready-queue；B6-1 教训=五件套形态太大，按他们 stage=6 层
-  粒度重切；节点税 ~0.7µs 已测=nodetax，合并本身不值钱，值钱的是**融合边界内
-  的 LDS 交接**）。
-- 前置：S2a/S2b 把该折的折完，S3 只做"多 op 一核"的结构壳。
-
-### S4 W5 权重共享治 s8v8（目标：gemm 三兄弟单核 2-3x，为关键路径腾 SM）
-- 我们的旧账 §6.22：s8v8 每 kb 每 subgroup SLM 读 32KB vs unique 6KB = 5.3x 放大
-  ——与 lmxx W5 的问题完全同构；他们实测读÷5、48.8→37µs、8KB 双缓冲。
-- 图纸：lmxx `results/vit-qkv-20260929` 记录 + 我们 bench_batched（现成）。
-  注意他们负结果：C512 proj 共权重更慢（不是所有权重共享都赚）。
-
-### S5 逐核 roofline map 制度化
-- 每窗口跑一次 RUN_TIMING（第二遍）× 每行配 bench 单价，离屋顶 >2x 的行排队。
-- 本表已建（§6.30 干净版）。
-
-## 四、已关门账（勿回锅）
-- WQ-Cache 缓存前提（160/160 STALE）；quant 2-row ILP（roofline）；编码宽化边界表
-  （ffn-3/4/12 赢长链、ffn-5/6 输短链/故意冗余）；PW32/SPLITC/ACCSLM（GRF 三杀）；
-  qfuse_take_b 按 id 查（+25，QFALIAS 按指针已修但 colslice 扇出形态算术判死——
-  除非 scale 预给设计改变流量，见 S2a）；f16-OUT（store 段 <1ms cstop2 实测）；
-  节点合并（0.7µs/节点）；1267 dtype 改 f16（golden 锁死）；B6-1 五件套形态（+1.08）。
-- 前辈负结果清单同样有效：C128/C64 persistent、C512 proj 共权重、MAKE_RESIDENT spike。
-
-## 五、开关表（当前件）
-NR_CHIP_CS=0 退 CS2 | NR_FF9=0 | NR_FF3=0 | NR_FFN_CHIPRES/TILE/DUAL/MEGA |
-NR_WQFUSE=1(实验) | NR_Q_FUSE_B=1(QFALIAS 实验) | NR_QF_B1=0/1/2(pack 形态/归因) |
-NR_WB_V3 / NR_WB_SPLIT（v4full 逃生）| NR_GA_TILE / NR_GA_MERGE | NR_V9B=1(证物) |
-NR_*_STOP 家族（time-only，模板化的走 CSTOP）| NR_RUN_TIMING=1 | SM_LW（mega 阶梯）
-
-## 六、文档索引
-- 本蓝图 = 战略与军规（改动需明说）
-- notes/b1-blueprint.md §6.19-6.30 = 刀账明细（历史战果与判决）
-- notes/lmxx-architecture-comparison.md = 架构对照全文（三套账+勘误链）
-- src/gpu/*.comp 头注释 = 前辈坑清单（读侧折/scale 预给/32KB 死限）
-- refs/lmxxf-src（c5556c7）= lmxx 3080 分支；hip-port=71 层完整模型架构账
-- .workbuddy/memory/2026-10-31.md = 本窗口流水（交接卡四份）
+## 五、文档索引
+- 本文件 = B2 战线入口（军规补条+作战序+关门账）
+- **notes/section100-blueprint.md = 军规原文+P1-P8 全史+理论地板推导（最高权威）**
+- notes/b1-blueprint.md = B1 战线明细（§6.19-6.30 刀账）
+- notes/lmxx-architecture-comparison.md = 三套架构对照+勘误链（14:5x 版）
+- src/gpu/*.comp 头注释 = 前辈坑清单 | refs/lmxxf-src/Development/hip-port/CHANGELOG.md
+  = 71 层模型架构演化账 | .workbuddy/memory/ = 流水
