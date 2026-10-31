@@ -1027,17 +1027,26 @@ int xmx_graph_run(int id) {
             if (!pgq[0])
                 for (int t = 0; t < 4; ++t)
                     pgq[t] = new sycl::queue(*GD, sycl::property::queue::in_order{});
+            // DEVICE-side wave edges: each wave's ops wait() the PREVIOUS wave's
+            // events on their own stream (enqueue dependency, no host round-trip --
+            // the host-wait version cost 691 syncs = the 156ms disaster).
             sycl::queue* mainq = g_curq;
+            std::vector<sycl::event> prev;
             for (auto& wv : pw->second) {
+                std::vector<sycl::event> cur;
                 int t = 0;
                 for (int i : wv) {
-                    g_pg_slot = t % pgk; g_curq = pgq[g_pg_slot];
+                    g_pg_slot = t % pgk;
+                    sycl::queue* qq = pgq[g_pg_slot & 3]; g_curq = qq;
+                    if (!prev.empty()) qq->submit([&](sycl::handler& hh){ hh.depends_on(prev); hh.single_task([]{}); });   // device-side edge
                     g_graphs[id][i]();
+                    cur.push_back(qq->single_task([]{}));      // marker event (in_order: after all prior work here)
                     ++t;
                 }
-                for (int u = 0; u < pgk; ++u) pgq[u]->wait();   // wave barrier
+                prev = std::move(cur);
             }
             g_curq = mainq; g_pg_slot = 0;
+            for (int u = 0; u < 4; ++u) pgq[u]->wait();   // ONE host sync per frame
             if (getenv("NR_PG_STATS")) {
                 size_t mx = 0, sum = 0;
                 for (auto& wv : pw->second) { mx = wv.size() > mx ? wv.size() : mx; sum += wv.size(); }
