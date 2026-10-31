@@ -1,0 +1,159 @@
+﻿icx -> bench_s8v8_tile.exe  ()
+built bench_s8v8_tile.exe; running from E:/WorkBuddy/2026-10-09-04-20-55/oneapi:
+device: Intel(R) Arc(TM) A770 Graphics
+
+== shape (M=2040 N=128 K=256 b=8) Mp=2048 wg=32 ==
+  shipped gemm_b           raw  ms=  0.0970  GB/s=  173.0  vs560= 30.9% vs734= 23.6%  GF/s=   11029  diff=0(ref) SLM=18KB
+  shipped gemm_b_pub       pub  ms=  0.1103  GB/s=  114.1  vs560= 20.4% vs734= 15.5%  GF/s=    9696  diff=0(ref) SLM=18KB
+  d1                       raw  ms=  0.0943  GB/s=  178.0  vs560= 31.8% vs734= 24.2%  GF/s=   11346  diff=0  SLM=12KB
+  d1                       pub  ms=  0.0739  GB/s=  170.4  vs560= 30.4% vs734= 23.2%  GF/s=   14482  diff=0  SLM=12KB
+  d3                       raw  ms=  0.1003  GB/s=  167.2  vs560= 29.9% vs734= 22.8%  GF/s=   10662  diff=0  SLM=24KB
+  d3                       pub  ms=  0.1169  GB/s=  107.7  vs560= 19.2% vs734= 14.7%  GF/s=    9151  diff=0  SLM=24KB
+  bk64_d1                  raw  ms=  0.0919  GB/s=  182.6  vs560= 32.6% vs734= 24.9%  GF/s=   11641  diff=0  SLM=24KB
+  bk64_d1                  pub  ms=  0.1104  GB/s=  114.0  vs560= 20.3% vs734= 15.5%  GF/s=    9686  diff=0  SLM=24KB
+  bk64_d2                  raw  ms=  0.0929  GB/s=  180.6  vs560= 32.2% vs734= 24.6%  GF/s=   11511  diff=0  SLM=36KB
+  bk64_d2                  pub  ms=  0.1130  GB/s=  111.3  vs560= 19.9% vs734= 15.2%  GF/s=    9463  diff=0  SLM=36KB
+  bn128_nt64               raw  ms=  0.0931  GB/s=  180.2  vs560= 32.2% vs734= 24.5%  GF/s=   11485  diff=0  SLM=24KB
+  bn128_nt64               pub  ms=  0.1123  GB/s=  112.1  vs560= 20.0% vs734= 15.3%  GF/s=    9525  diff=0  SLM=24KB
+  bn128_nt64_bk64_d1       raw  ms=  0.0839  GB/s=  200.1  vs560= 35.7% vs734= 27.3%  GF/s=   12755  diff=0  SLM=32KB
+  bn128_nt64_bk64_d1       pub  ms=  0.1009  GB/s=  124.7  vs560= 22.3% vs734= 17.0%  GF/s=   10596  diff=0  SLM=32KB
+  bn128_nt64_bk64_d2       raw  ms=  0.0933  GB/s=  179.8  vs560= 32.1% vs734= 24.5%  GF/s=   11459  diff=0  SLM=48KB
+  bn128_nt64_bk64_d2       pub  ms=  0.1047  GB/s=  120.2  vs560= 21.5% vs734= 16.4%  GF/s=   10217  diff=0  SLM=48KB
+  bn128_ser_d2             raw  ms=  0.0939  GB/s=  268.1  vs560= 47.9% vs734= 36.5%  GF/s=   11396  diff=0  SLM=24KB
+  bn128_ser_d2             pub  ms=  0.1193  GB/s=  175.8  vs560= 31.4% vs734= 24.0%  GF/s=    8967  diff=0  SLM=24KB
+  bn128_ser_d3             raw  ms=  0.0929  GB/s=  270.8  vs560= 48.4% vs734= 36.9%  GF/s=   11511  diff=0  SLM=32KB
+  bn128_ser_d3             pub  ms=  0.1231  GB/s=  170.3  vs560= 30.4% vs734= 23.2%  GF/s=    8687  diff=0  SLM=32KB
+  bn128_ser_bk64_d1        raw  ms=  0.0836  GB/s=  300.9  vs560= 53.7% vs734= 41.0%  GF/s=   12787  diff=0  SLM=32KB
+  bn128_ser_bk64_d1        pub  ms=  0.1172  GB/s=  179.0  vs560= 32.0% vs734= 24.4%  GF/s=    9127  diff=0  SLM=32KB
+  bn128_naive              raw  ms=  0.0876  GB/s=  191.5  vs560= 34.2% vs734= 26.1%  GF/s=   12209  diff=0  SLM=24KB
+  bn128_naive              pub  ms=  0.1197  GB/s=  105.1  vs560= 18.8% vs734= 14.3%  GF/s=    8936  diff=0  SLM=24KB
+
+== shape (M=32640 N=128 K=64 b=2) Mp=32640 wg=510 ==
+  shipped gemm_b           raw  ms=  0.1410  GB/s=  296.2  vs560= 52.9% vs734= 40.4%  GF/s=    7583  diff=0(ref) SLM=18KB
+  shipped gemm_b_pub       pub  ms=  0.2085  GB/s=  120.2  vs560= 21.5% vs734= 16.4%  GF/s=    5129  diff=0(ref) SLM=18KB
+  d1                       raw  ms=  0.1440  GB/s=  290.2  vs560= 51.8% vs734= 39.5%  GF/s=    7430  diff=0  SLM=12KB
+  d1                       pub  ms=  0.2064  GB/s=  121.5  vs560= 21.7% vs734= 16.6%  GF/s=    5183  diff=0  SLM=12KB
+  d3                       raw  ms=  0.1445  GB/s=  289.2  vs560= 51.6% vs734= 39.4%  GF/s=    7403  diff=0  SLM=24KB
+  d3                       pub  ms=  0.2089  GB/s=  120.0  vs560= 21.4% vs734= 16.4%  GF/s=    5121  diff=0  SLM=24KB
+  bk64_d1                  raw  ms=  0.1443  GB/s=  289.6  vs560= 51.7% vs734= 39.5%  GF/s=    7413  diff=0  SLM=24KB
+  bk64_d1                  pub  ms=  0.2080  GB/s=  120.5  vs560= 21.5% vs734= 16.4%  GF/s=    5142  diff=0  SLM=24KB
+  bk64_d2                  raw  ms=  0.1444  GB/s=  289.4  vs560= 51.7% vs734= 39.4%  GF/s=    7408  diff=0  SLM=36KB
+  bk64_d2                  pub  ms=  0.2343  GB/s=  107.0  vs560= 19.1% vs734= 14.6%  GF/s=    4565  diff=0  SLM=36KB
+  bn128_nt64               raw  ms=  0.1450  GB/s=  288.1  vs560= 51.5% vs734= 39.3%  GF/s=    7376  diff=0  SLM=24KB
+  bn128_nt64               pub  ms=  0.2143  GB/s=  117.0  vs560= 20.9% vs734= 15.9%  GF/s=    4992  diff=0  SLM=24KB
+  bn128_nt64_bk64_d1       raw  ms=  0.1451  GB/s=  287.9  vs560= 51.4% vs734= 39.2%  GF/s=    7371  diff=0  SLM=32KB
+  bn128_nt64_bk64_d1       pub  ms=  0.1999  GB/s=  125.4  vs560= 22.4% vs734= 17.1%  GF/s=    5351  diff=0  SLM=32KB
+  bn128_nt64_bk64_d2       raw  ms=  0.1414  GB/s=  295.6  vs560= 52.8% vs734= 40.3%  GF/s=    7566  diff=0  SLM=48KB
+  bn128_nt64_bk64_d2       pub  ms=  0.2014  GB/s=  124.5  vs560= 22.2% vs734= 17.0%  GF/s=    5312  diff=0  SLM=48KB
+  bn128_ser_d2             raw  ms=  0.1374  GB/s=  304.1  vs560= 54.3% vs734= 41.4%  GF/s=    7784  diff=0  SLM=24KB
+  bn128_ser_d2             pub  ms=  0.2549  GB/s=   98.3  vs560= 17.6% vs734= 13.4%  GF/s=    4196  diff=0  SLM=24KB
+  bn128_ser_d3             raw  ms=  0.1390  GB/s=  300.7  vs560= 53.7% vs734= 41.0%  GF/s=    7697  diff=0  SLM=32KB
+  bn128_ser_d3             pub  ms=  0.2707  GB/s=   92.6  vs560= 16.5% vs734= 12.6%  GF/s=    3951  diff=0  SLM=32KB
+  bn128_ser_bk64_d1        raw  ms=  0.1380  GB/s=  302.7  vs560= 54.1% vs734= 41.2%  GF/s=    7749  diff=0  SLM=32KB
+  bn128_ser_bk64_d1        pub  ms=  0.2501  GB/s=  100.2  vs560= 17.9% vs734= 13.7%  GF/s=    4276  diff=0  SLM=32KB
+  bn128_naive              raw  ms=  0.1347  GB/s=  310.2  vs560= 55.4% vs734= 42.3%  GF/s=    7941  diff=0  SLM=24KB
+  bn128_naive              pub  ms=  0.2522  GB/s=   99.4  vs560= 17.8% vs734= 13.5%  GF/s=    4241  diff=0  SLM=24KB
+
+== shape (M=640 N=64 K=256 b=8) Mp=640 wg=5 ==
+  shipped gemm_b           raw  ms=  0.0247  GB/s=  132.7  vs560= 23.7% vs734= 18.1%  GF/s=    6796  diff=0(ref) SLM=18KB
+  shipped gemm_b_pub       pub  ms=  0.0360  GB/s=   72.7  vs560= 13.0% vs734=  9.9%  GF/s=    4655  diff=0(ref) SLM=18KB
+  d1                       raw  ms=  0.0618  GB/s=   53.0  vs560=  9.5% vs734=  7.2%  GF/s=    2716  diff=0  SLM=12KB
+  d1                       pub  ms=  0.0715  GB/s=   36.7  vs560=  6.6% vs734=  5.0%  GF/s=    2348  diff=0  SLM=12KB
+  d3                       raw  ms=  0.0272  GB/s=  120.5  vs560= 21.5% vs734= 16.4%  GF/s=    6171  diff=0  SLM=24KB
+  d3                       pub  ms=  0.0845  GB/s=   31.0  vs560=  5.5% vs734=  4.2%  GF/s=    1986  diff=0  SLM=24KB
+  bk64_d1                  raw  ms=  0.0223  GB/s=  147.0  vs560= 26.3% vs734= 20.0%  GF/s=    7526  diff=0  SLM=24KB
+  bk64_d1                  pub  ms=  0.0710  GB/s=   36.9  vs560=  6.6% vs734=  5.0%  GF/s=    2362  diff=0  SLM=24KB
+  bk64_d2                  raw  ms=  0.0260  GB/s=  125.8  vs560= 22.5% vs734= 17.1%  GF/s=    6443  diff=0  SLM=36KB
+  bk64_d2                  pub  ms=  0.0380  GB/s=   68.9  vs560= 12.3% vs734=  9.4%  GF/s=    4413  diff=0  SLM=36KB
+  bn128_nt64               raw   -- N/A (N%BN or K%BK) --
+  bn128_nt64               pub   -- N/A (N%BN or K%BK) --
+  bn128_nt64_bk64_d1       raw   -- N/A (N%BN or K%BK) --
+  bn128_nt64_bk64_d1       pub   -- N/A (N%BN or K%BK) --
+  bn128_nt64_bk64_d2       raw   -- N/A (N%BN or K%BK) --
+  bn128_nt64_bk64_d2       pub   -- N/A (N%BN or K%BK) --
+  bn128_ser_d2             raw   -- N/A (N%BN or K%BK) --
+  bn128_ser_d2             pub   -- N/A (N%BN or K%BK) --
+  bn128_ser_d3             raw   -- N/A (N%BN or K%BK) --
+  bn128_ser_d3             pub   -- N/A (N%BN or K%BK) --
+  bn128_ser_bk64_d1        raw   -- N/A (N%BN or K%BK) --
+  bn128_ser_bk64_d1        pub   -- N/A (N%BN or K%BK) --
+  bn128_naive              raw   -- N/A (N%BN or K%BK) --
+  bn128_naive              pub   -- N/A (N%BN or K%BK) --
+
+== shape (M=8160 N=128 K=128 b=4) Mp=8192 wg=128 ==
+  shipped gemm_b           raw  ms=  0.1096  GB/s=  229.7  vs560= 41.0% vs734= 31.3%  GF/s=    9760  diff=0(ref) SLM=18KB
+  shipped gemm_b_pub       pub  ms=  0.1533  GB/s=  109.4  vs560= 19.5% vs734= 14.9%  GF/s=    6975  diff=0(ref) SLM=18KB
+  d1                       raw  ms=  0.1354  GB/s=  185.8  vs560= 33.2% vs734= 25.3%  GF/s=    7898  diff=0  SLM=12KB
+  d1                       pub  ms=  0.1439  GB/s=  116.6  vs560= 20.8% vs734= 15.9%  GF/s=    7435  diff=0  SLM=12KB
+  d3                       raw  ms=  0.1117  GB/s=  225.4  vs560= 40.2% vs734= 30.7%  GF/s=    9578  diff=0  SLM=24KB
+  d3                       pub  ms=  0.1474  GB/s=  113.8  vs560= 20.3% vs734= 15.5%  GF/s=    7256  diff=0  SLM=24KB
+  bk64_d1                  raw  ms=  0.1077  GB/s=  233.6  vs560= 41.7% vs734= 31.8%  GF/s=    9930  diff=0  SLM=24KB
+  bk64_d1                  pub  ms=  0.1437  GB/s=  116.7  vs560= 20.8% vs734= 15.9%  GF/s=    7440  diff=0  SLM=24KB
+  bk64_d2                  raw  ms=  0.1139  GB/s=  221.0  vs560= 39.5% vs734= 30.1%  GF/s=    9394  diff=0  SLM=36KB
+  bk64_d2                  pub  ms=  0.1531  GB/s=  109.6  vs560= 19.6% vs734= 14.9%  GF/s=    6985  diff=0  SLM=36KB
+  bn128_nt64               raw  ms=  0.1128  GB/s=  223.1  vs560= 39.8% vs734= 30.4%  GF/s=    9481  diff=0  SLM=24KB
+  bn128_nt64               pub  ms=  0.1485  GB/s=  112.9  vs560= 20.2% vs734= 15.4%  GF/s=    7200  diff=0  SLM=24KB
+  bn128_nt64_bk64_d1       raw  ms=  0.1060  GB/s=  237.3  vs560= 42.4% vs734= 32.3%  GF/s=   10086  diff=0  SLM=32KB
+  bn128_nt64_bk64_d1       pub  ms=  0.1355  GB/s=  123.8  vs560= 22.1% vs734= 16.9%  GF/s=    7892  diff=0  SLM=32KB
+  bn128_nt64_bk64_d2       raw  ms=  0.1067  GB/s=  235.9  vs560= 42.1% vs734= 32.1%  GF/s=   10027  diff=0  SLM=48KB
+  bn128_nt64_bk64_d2       pub  ms=  0.1385  GB/s=  121.1  vs560= 21.6% vs734= 16.5%  GF/s=    7720  diff=0  SLM=48KB
+  bn128_ser_d2             raw  ms=  0.1100  GB/s=  305.0  vs560= 54.5% vs734= 41.6%  GF/s=    9723  diff=0  SLM=24KB
+  bn128_ser_d2             pub  ms=  0.1642  GB/s=  153.3  vs560= 27.4% vs734= 20.9%  GF/s=    6515  diff=0  SLM=24KB
+  bn128_ser_d3             raw  ms=  0.1045  GB/s=  240.9  vs560= 43.0% vs734= 32.8%  GF/s=   10237  diff=0  SLM=32KB
+  bn128_ser_d3             pub  ms=  0.1647  GB/s=  101.9  vs560= 18.2% vs734= 13.9%  GF/s=    6494  diff=0  SLM=32KB
+  bn128_ser_bk64_d1        raw  ms=  0.1045  GB/s=  240.9  vs560= 43.0% vs734= 32.8%  GF/s=   10237  diff=0  SLM=32KB
+  bn128_ser_bk64_d1        pub  ms=  0.1604  GB/s=  104.6  vs560= 18.7% vs734= 14.2%  GF/s=    6667  diff=0  SLM=32KB
+  bn128_naive              raw  ms=  0.1008  GB/s=  249.6  vs560= 44.6% vs734= 34.0%  GF/s=   10607  diff=0  SLM=24KB
+  bn128_naive              pub  ms=  0.1634  GB/s=  102.7  vs560= 18.3% vs734= 14.0%  GF/s=    6544  diff=0  SLM=24KB
+
+== shape (M=8160 N=384 K=128 b=1) Mp=8192 wg=384 ==
+  shipped gemm_b           raw  ms=  0.0945  GB/s=  177.6  vs560= 31.7% vs734= 24.2%  GF/s=    8490  diff=0(ref) SLM=18KB
+  shipped gemm_b_pub       pub  ms=  0.1319  GB/s=   79.5  vs560= 14.2% vs734= 10.8%  GF/s=    6083  diff=0(ref) SLM=18KB
+  d1                       raw  ms=  0.0952  GB/s=  176.2  vs560= 31.5% vs734= 24.0%  GF/s=    8425  diff=0  SLM=12KB
+  d1                       pub  ms=  0.1194  GB/s=   87.8  vs560= 15.7% vs734= 12.0%  GF/s=    6720  diff=0  SLM=12KB
+  d3                       raw  ms=  0.0986  GB/s=  170.1  vs560= 30.4% vs734= 23.2%  GF/s=    8132  diff=0  SLM=24KB
+  d3                       pub  ms=  0.1350  GB/s=   77.7  vs560= 13.9% vs734= 10.6%  GF/s=    5942  diff=0  SLM=24KB
+  bk64_d1                  raw  ms=  0.0923  GB/s=  181.8  vs560= 32.5% vs734= 24.8%  GF/s=    8692  diff=0  SLM=24KB
+  bk64_d1                  pub  ms=  0.1207  GB/s=   86.9  vs560= 15.5% vs734= 11.8%  GF/s=    6644  diff=0  SLM=24KB
+  bk64_d2                  raw  ms=  0.0960  GB/s=  174.7  vs560= 31.2% vs734= 23.8%  GF/s=    8352  diff=0  SLM=36KB
+  bk64_d2                  pub  ms=  0.1245  GB/s=   84.2  vs560= 15.0% vs734= 11.5%  GF/s=    6444  diff=0  SLM=36KB
+  bn128_nt64               raw  ms=  0.0930  GB/s=  180.4  vs560= 32.2% vs734= 24.6%  GF/s=    8623  diff=0  SLM=24KB
+  bn128_nt64               pub  ms=  0.1270  GB/s=   82.6  vs560= 14.7% vs734= 11.3%  GF/s=    6317  diff=0  SLM=24KB
+  bn128_nt64_bk64_d1       raw  ms=  0.0890  GB/s=  188.6  vs560= 33.7% vs734= 25.7%  GF/s=    9017  diff=0  SLM=32KB
+  bn128_nt64_bk64_d1       pub  ms=  0.1159  GB/s=   90.4  vs560= 16.2% vs734= 12.3%  GF/s=    6919  diff=0  SLM=32KB
+  bn128_nt64_bk64_d2       raw  ms=  0.0905  GB/s=  185.3  vs560= 33.1% vs734= 25.3%  GF/s=    8862  diff=0  SLM=48KB
+  bn128_nt64_bk64_d2       pub  ms=  0.1183  GB/s=   88.6  vs560= 15.8% vs734= 12.1%  GF/s=    6779  diff=0  SLM=48KB
+  bn128_ser_d2             raw  ms=  0.0948  GB/s=  221.2  vs560= 39.5% vs734= 30.1%  GF/s=    8462  diff=0  SLM=24KB
+  bn128_ser_d2             pub  ms=  0.1411  GB/s=  104.0  vs560= 18.6% vs734= 14.2%  GF/s=    5683  diff=0  SLM=24KB
+  bn128_ser_d3             raw  ms=  0.0939  GB/s=  178.8  vs560= 31.9% vs734= 24.4%  GF/s=    8547  diff=0  SLM=32KB
+  bn128_ser_d3             pub  ms=  0.1442  GB/s=   72.7  vs560= 13.0% vs734=  9.9%  GF/s=    5564  diff=0  SLM=32KB
+  bn128_ser_bk64_d1        raw  ms=  0.0909  GB/s=  184.5  vs560= 32.9% vs734= 25.1%  GF/s=    8821  diff=0  SLM=32KB
+  bn128_ser_bk64_d1        pub  ms=  0.1372  GB/s=   76.4  vs560= 13.6% vs734= 10.4%  GF/s=    5847  diff=0  SLM=32KB
+  bn128_naive              raw  ms=  0.0892  GB/s=  188.2  vs560= 33.6% vs734= 25.6%  GF/s=    8996  diff=0  SLM=24KB
+  bn128_naive              pub  ms=  0.1378  GB/s=   76.1  vs560= 13.6% vs734= 10.4%  GF/s=    5821  diff=0  SLM=24KB
+
+== shape (M=130560 N=384 K=128 b=1) Mp=130560 wg=6120 ==
+  shipped gemm_b           raw  ms=  0.5665  GB/s=  472.0  vs560= 84.3% vs734= 64.3%  GF/s=   22658  diff=0(ref) SLM=18KB
+  shipped gemm_b_pub       pub  ms=  0.8647  GB/s=  193.3  vs560= 34.5% vs734= 26.3%  GF/s=   14843  diff=0(ref) SLM=18KB
+  d1                       raw  ms=  0.5633  GB/s=  474.7  vs560= 84.8% vs734= 64.7%  GF/s=   22783  diff=0  SLM=12KB
+  d1                       pub  ms=  0.8564  GB/s=  195.1  vs560= 34.8% vs734= 26.6%  GF/s=   14987  diff=0  SLM=12KB
+  d3                       raw  ms=  0.5731  GB/s=  466.5  vs560= 83.3% vs734= 63.6%  GF/s=   22394  diff=0  SLM=24KB
+  d3                       pub  ms=  0.8642  GB/s=  193.4  vs560= 34.5% vs734= 26.3%  GF/s=   14852  diff=0  SLM=24KB
+  bk64_d1                  raw  ms=  0.5536  GB/s=  483.0  vs560= 86.2% vs734= 65.8%  GF/s=   23182  diff=0  SLM=24KB
+  bk64_d1                  pub  ms=  0.8379  GB/s=  199.4  vs560= 35.6% vs734= 27.2%  GF/s=   15317  diff=0  SLM=24KB
+  bk64_d2                  raw  ms=  0.5786  GB/s=  462.1  vs560= 82.5% vs734= 63.0%  GF/s=   22180  diff=0  SLM=36KB
+  bk64_d2                  pub  ms=  1.1050  GB/s=  151.2  vs560= 27.0% vs734= 20.6%  GF/s=   11615  diff=0  SLM=36KB
+  bn128_nt64               raw  ms=  0.5582  GB/s=  479.0  vs560= 85.5% vs734= 65.3%  GF/s=   22992  diff=0  SLM=24KB
+  bn128_nt64               pub  ms=  0.8652  GB/s=  193.2  vs560= 34.5% vs734= 26.3%  GF/s=   14834  diff=0  SLM=24KB
+  bn128_nt64_bk64_d1       raw  ms=  0.5513  GB/s=  485.1  vs560= 86.6% vs734= 66.1%  GF/s=   23283  diff=0  SLM=32KB
+  bn128_nt64_bk64_d1       pub  ms=  0.8331  GB/s=  200.6  vs560= 35.8% vs734= 27.3%  GF/s=   15405  diff=0  SLM=32KB
+  bn128_nt64_bk64_d2       raw  ms=  0.5536  GB/s=  483.0  vs560= 86.2% vs734= 65.8%  GF/s=   23182  diff=0  SLM=48KB
+  bn128_nt64_bk64_d2       pub  ms=  0.8316  GB/s=  201.0  vs560= 35.9% vs734= 27.4%  GF/s=   15434  diff=0  SLM=48KB
+  bn128_ser_d2             raw  ms=  0.5496  GB/s=  608.2  vs560=108.6% vs734= 82.9%  GF/s=   23353  diff=0  SLM=24KB
+  bn128_ser_d2             pub  ms=  1.1550  GB/s=  202.6  vs560= 36.2% vs734= 27.6%  GF/s=   11112  diff=0  SLM=24KB
+  bn128_ser_d3             raw  ms=  0.5504  GB/s=  485.8  vs560= 86.7% vs734= 66.2%  GF/s=   23318  diff=0  SLM=32KB
+  bn128_ser_d3             pub  ms=  1.1621  GB/s=  143.8  vs560= 25.7% vs734= 19.6%  GF/s=   11044  diff=0  SLM=32KB
+  bn128_ser_bk64_d1        raw  ms=  0.5420  GB/s=  493.4  vs560= 88.1% vs734= 67.2%  GF/s=   23681  diff=0  SLM=32KB
+  bn128_ser_bk64_d1        pub  ms=  1.1654  GB/s=  143.4  vs560= 25.6% vs734= 19.5%  GF/s=   11013  diff=0  SLM=32KB
+  bn128_naive              raw  ms=  0.5476  GB/s=  488.3  vs560= 87.2% vs734= 66.5%  GF/s=   23438  diff=0  SLM=24KB
+  bn128_naive              pub  ms=  1.2381  GB/s=  135.0  vs560= 24.1% vs734= 18.4%  GF/s=   10366  diff=0  SLM=24KB
