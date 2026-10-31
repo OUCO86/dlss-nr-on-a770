@@ -43,7 +43,7 @@ namespace esimd = sycl::ext::intel::esimd;
 // HS = LW x 1KB): LW=32 -> 64KB (1 WG/SM), LW=16 -> 32KB (2 WG/SM). The occupancy
 // hypothesis for the chip's frame-vs-isolated gap (P8-n: latency chain, NOT the
 // round-trip -- the mega removed 100MB of it and the marginal stayed flat).
-template <int LW, bool WSTAGE = false>
+template <int LW, bool WSTAGE = false, int CSTOP = 0>
 static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                                     const half* dPp, float* Cout, int M, int Mp,
                                     const void* dSkip = nullptr, const float* cp = nullptr,
@@ -83,7 +83,7 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
             // ---- v3c: A operand -> SLM (pack_a16 map), NOT GRF: frees 4 x 256B
             // registers -- the 16-live-GRF spill suspect (v9b ">8 accs" family) ----
             uint ea = FFC_EA_OFF + lid * 1024u;
-            if (cstop == 4) { tr0 = tiles; continue; }   // EMPTY-SHELL probe (after slm_init/barrier-free point): launch+WG floor
+            if constexpr (CSTOP == 4) { tr0 = tiles; continue; }   // EMPTY-SHELL probe (after slm_init/barrier-free point): launch+WG floor
             #pragma unroll
             for (int r = 0; r < 8 && ours; ++r) {
                 esimd::simd<half,32> v((half)0.f);
@@ -133,7 +133,7 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
             uint hs = FFC_EA_OFF + (unsigned)LW * 1024u + lid * 1024u;   // the HS area follows EA (LW-scaled)   // per-thread 1KB hidden stage (this chunk)
             esimd::simd<float,64> p00(0.f), p01(0.f), p10(0.f), p11(0.f);   // out cols 0..15
             esimd::simd<float,64> q00(0.f), q01(0.f), q10(0.f), q11(0.f);   // out cols 16..31
-            if (cstop == 1) { tr0 = tiles; continue; }   // expand-only stop (after the HS stores above)
+            if constexpr (CSTOP == 1) { tr0 = tiles; continue; }   // expand-only stop (after the HS stores above)
             const esimd::simd<half,8> z8((half)0.f);
             for (int c = 0; c < 4; ++c) {
                 for (int tl = 0; tl < 2; ++tl) {
@@ -228,7 +228,7 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                 // (v3: NO barrier here -- HS is this thread's private 1KB; the
                 // in-order ESIMD pipeline orders the stores before the loads.
                 // The v2 barriers were for the SHARED per-subgroup stage, gone now.)
-                if (cstop == 3) { tr0 = tiles; continue; }   // after ONE tl-iter of expand+encode (quarter probe)
+                if constexpr (CSTOP == 3) { tr0 = tiles; continue; }   // after ONE tl-iter of expand+encode (quarter probe)
                 #pragma unroll
                 for (int kc2 = 0; kc2 < 2; ++kc2) {
                     uint kcg = (uint)(c * 2 + kc2);
@@ -266,7 +266,7 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
             // NR_CS_STOP segment attribution (TIME-ONLY diagnostic; host-captured
             // param cstop -- ESIMD kernels ban non-const statics, section 96):
             // =1 stop after EXPAND, =2 stop before the projection's dpas block.
-            if (cstop >= 2) { tr0 = tiles; continue; }
+            if constexpr (CSTOP >= 2) { tr0 = tiles; continue; }
             size_t outb = (size_t)(tr * 16) * cin;
             #pragma unroll
             for (int r = 0; r < 8; ++r) {

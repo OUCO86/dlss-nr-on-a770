@@ -12,6 +12,7 @@
 #include <functional>
 #include <algorithm>
 #include "ffn_chip_kernel.hpp"
+namespace esimd = sycl::ext::intel::esimd;
 #include "pack_device.hpp"
 using namespace sycl;
 
@@ -48,22 +49,65 @@ int main(){ try {
       for(int it=0;it<11;++it){ event e=fn(); e.wait();
         double t=double(e.get_profiling_info<info::event_profiling::command_end>()-e.get_profiling_info<info::event_profiling::command_start>());
         best=std::min(best,t/1e6);} return best;};
-    double t_off = timeit([&]{ return ffnc::launch_ffn_chip<16,false>(q,dAp,dEp,dPp,o1,(int)M,(int)Mp,dSkip,dCos,false,true,0); });
-    double t_on  = timeit([&]{ return ffnc::launch_ffn_chip<16,true>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true,0); });
-    double t_lw8 = timeit([&]{ return ffnc::launch_ffn_chip<8,false>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true,0); });
-    double t_lw32= timeit([&]{ return ffnc::launch_ffn_chip<32,false>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true,0); });
-    double t_cs1 = timeit([&]{ return ffnc::launch_ffn_chip<16,false>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true,1); });
-    double t_cs3 = timeit([&]{ return ffnc::launch_ffn_chip<16,false>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true,3); });
-    double t_cs4 = timeit([&]{ return ffnc::launch_ffn_chip<16,false>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true,4,0); });
-    double t_p256 = timeit([&]{ return ffnc::launch_ffn_chip<16,false>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true,0,256); });
-    double t_p512 = timeit([&]{ return ffnc::launch_ffn_chip<16,false>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true,0,512); });
-    double t_p1024= timeit([&]{ return ffnc::launch_ffn_chip<16,false>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true,0,1024); });
+    double t_off = timeit([&]{ return ffnc::launch_ffn_chip<16,false>(q,dAp,dEp,dPp,o1,(int)M,(int)Mp,dSkip,dCos,false,true); });
+    double t_on  = timeit([&]{ return ffnc::launch_ffn_chip<16,true>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true); });
+    double t_lw8 = timeit([&]{ return ffnc::launch_ffn_chip<8,false>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true); });
+    double t_lw32= timeit([&]{ return ffnc::launch_ffn_chip<32,false>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true); });
+    double t_cs1 = timeit([&]{ return ffnc::launch_ffn_chip<16,false,1>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true); });
+    double t_cs3 = timeit([&]{ return ffnc::launch_ffn_chip<16,false,3>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true); });
+    double t_cs4 = timeit([&]{ return ffnc::launch_ffn_chip<16,false,4>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true); });
+    double t_c5  = timeit([&]{ return ffnc::launch_ffn_chip<16,false,5>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true); });
+    double t_p1024= timeit([&]{ return ffnc::launch_ffn_chip<16,false>(q,dAp,dEp,dPp,o2,(int)M,(int)Mp,dSkip,dCos,false,true); });
+    // cs5: the SAME nd_range grid but NO slm_init and NO body -- isolates the
+    // launch-config floor (grid dispatch) from the SLM-carveout floor.
+    int tiles2=((Mp/16)+15)/16;
+    double t_cs5 = timeit([&]{ return q.parallel_for(nd_range(range((size_t)tiles2*16u),range(16u)),[=](nd_item<1> it){
+        float* o=(float*)o2; o[it.get_global_id(0)]=0.f; }); });
+    // cs6: plain range() form (no nd_range, no SLM): the raw launch floor.
+    double t_cs6 = timeit([&]{ return q.parallel_for(range((size_t)tiles2*16u),[=](item<1> it){
+        float* o=(float*)o2; o[it.get_id(0)]=0.f; }); });
+    // cs7 ladder: the SAME grid, EMPTY body, slm_init of increasing size --
+    // is the 1.28ms floor the CARVEOUT CONFIG (size-dependent) or the mere
+    // PRESENCE of slm_init (size-independent)? Decides the cure.
+    double t_s2k = timeit([&]{ return q.parallel_for(nd_range(range((size_t)tiles2*16u),range(16u)),[=](nd_item<1> it) SYCL_ESIMD_KERNEL { esimd::slm_init<2048u>(); float* o=(float*)o2; o[it.get_global_id(0)]=0.f; }); });
+    double t_s8k = timeit([&]{ return q.parallel_for(nd_range(range((size_t)tiles2*16u),range(16u)),[=](nd_item<1> it) SYCL_ESIMD_KERNEL { esimd::slm_init<8192u>(); float* o=(float*)o2; o[it.get_global_id(0)]=0.f; }); });
+    double t_s16k= timeit([&]{ return q.parallel_for(nd_range(range((size_t)tiles2*16u),range(16u)),[=](nd_item<1> it) SYCL_ESIMD_KERNEL { esimd::slm_init<16384u>(); float* o=(float*)o2; o[it.get_global_id(0)]=0.f; }); });
+    double t_s32k= timeit([&]{ return q.parallel_for(nd_range(range((size_t)tiles2*16u),range(16u)),[=](nd_item<1> it) SYCL_ESIMD_KERNEL { esimd::slm_init<32768u>(); float* o=(float*)o2; o[it.get_global_id(0)]=0.f; }); });
+    double t_s48k= timeit([&]{ return q.parallel_for(nd_range(range((size_t)tiles2*16u),range(16u)),[=](nd_item<1> it) SYCL_ESIMD_KERNEL { esimd::slm_init<49152u>(); float* o=(float*)o2; o[it.get_global_id(0)]=0.f; }); });
+    double t_s64k= timeit([&]{ return q.parallel_for(nd_range(range((size_t)tiles2*16u),range(16u)),[=](nd_item<1> it) SYCL_ESIMD_KERNEL { esimd::slm_init<65536u>(); float* o=(float*)o2; o[it.get_global_id(0)]=0.f; }); });
+    printf("  slm_init floor ladder (empty body, %d WGs): 2K=%.4f 8K=%.4f 16K=%.4f 32K=%.4f 48K=%.4f 64K=%.4f ms\n",
+      tiles2, t_s2k,t_s8k,t_s16k,t_s32k,t_s48k,t_s64k);
+    // cs8: the GRF-FOOTPRINT hypothesis -- same 64KB slm + grid, but the body
+    // DECLARES and lightly touches 16 accumulator registers (8x simd<float,64>).
+    // If THIS jumps, the shell floor = register pressure / SPILL (the section
+    // 6.8 ledger noted chip scratch=1024-1312B/thread), not slm, not dispatch.
+    double t_g16 = timeit([&]{ return q.parallel_for(nd_range(range((size_t)tiles2*16u),range(16u)),[=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+        esimd::slm_init<65536u>();
+        esimd::simd<float,64> a0(0.f),a1(0.f),a2(0.f),a3(0.f),b0(0.f),b1(0.f),b2(0.f),b3(0.f);
+        a0+=1.f;a1+=1.f;a2+=1.f;a3+=1.f;b0+=1.f;b1+=1.f;b2+=1.f;b3+=1.f;
+        float s=esimd::hmax<float,float,64>(a0)+esimd::hmax<float,float,64>(a1)+esimd::hmax<float,float,64>(a2)+esimd::hmax<float,float,64>(a3)
+               +esimd::hmax<float,float,64>(b0)+esimd::hmax<float,float,64>(b1)+esimd::hmax<float,float,64>(b2)+esimd::hmax<float,float,64>(b3);
+        float* o=(float*)o2; if(s==1234.5f) o[it.get_global_id(0)]=s; }); });
+    double t_g8 = timeit([&]{ return q.parallel_for(nd_range(range((size_t)tiles2*16u),range(16u)),[=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+        esimd::slm_init<65536u>();
+        esimd::simd<float,64> a0(0.f),a1(0.f),a2(0.f),a3(0.f);
+        a0+=1.f;a1+=1.f;a2+=1.f;a3+=1.f;
+        float s=esimd::hmax<float,float,64>(a0)+esimd::hmax<float,float,64>(a1)+esimd::hmax<float,float,64>(a2)+esimd::hmax<float,float,64>(a3);
+        float* o=(float*)o2; if(s==1234.5f) o[it.get_global_id(0)]=s; }); });
+    double t_g4 = timeit([&]{ return q.parallel_for(nd_range(range((size_t)tiles2*16u),range(16u)),[=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+        esimd::slm_init<65536u>();
+        esimd::simd<float,64> a0(0.f),a1(0.f);
+        a0+=1.f;a1+=1.f;
+        float s=esimd::hmax<float,float,64>(a0)+esimd::hmax<float,float,64>(a1);
+        float* o=(float*)o2; if(s==1234.5f) o[it.get_global_id(0)]=s; }); });
+    printf("  GRF footprint ladder (64KB slm, %d WGs): 0acc=%.4f 4acc=%.4f 8acc=%.4f 16acc=%.4f ms\n",
+      tiles2, t_s64k, t_g4, t_g8, t_g16);
     std::vector<float> a((size_t)Mp*cin),b((size_t)Mp*cin);
     q.memcpy(a.data(),o1,(size_t)Mp*cin*4).wait(); q.memcpy(b.data(),o2,(size_t)Mp*cin*4).wait();
     size_t d=0; for(size_t i=0;i<a.size();++i) if(memcmp(&a[i],&b[i],4)) ++d;
     double bytes=(double)M*cin*2 /*A in*/ + (double)M*cin*2 /*skip*/ + (double)M*cin*4 /*out*/ + 2.0*cin*hidden*2; // DRAM-class traffic
-    printf("M=%u: LW16 %.4f | WSTAGE %.4f | LW8 %.4f | LW32 %.4f | cs1(A-only) %.4f | cs3(quarter-exp) %.4f | cs4(shell) %.4f | pers256 %.4f | pers512 %.4f | pers1024 %.4f ms | diff %zu %s\n",
-      M,t_off,t_on,t_lw8,t_lw32,t_cs1,t_cs3,t_cs4,t_p256,t_p512,t_p1024,d,d?"NOT-EXACT":"EXACT");
+    printf("M=%u: LW16 %.4f | WSTAGE %.4f | LW8 %.4f | LW32 %.4f | cs1(A-only) %.4f | cs3(quarter-exp) %.4f | cs4(shell) %.4f | cs5(no-q-chain) %.4f | cs5(nd-noSLM) %.4f | cs6(plain) %.4f ms | diff %zu %s\n",
+      M,t_off,t_on,t_lw8,t_lw32,t_cs1,t_cs3,t_cs4,t_c5,t_cs5,t_cs6,d,d?"NOT-EXACT":"EXACT");
   }
   return 0;
   } catch (std::exception& e) { printf("EXC: %s\n", e.what()); return 2; }

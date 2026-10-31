@@ -1620,10 +1620,9 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
             if (chipres_m) {
                 static bool fjoin = !getenv("NR_FFN_JOIN") || atoi(getenv("NR_FFN_JOIN")) != 0;
                 static bool ff3 = !getenv("NR_FF3") || atoi(getenv("NR_FF3")) != 0;
-                static int cstop = getenv("NR_CS_STOP") ? atoi(getenv("NR_CS_STOP")) : 0;
                 static bool ff9 = !getenv("NR_FF9") || atoi(getenv("NR_FF9")) != 0;
-                CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, Araw, dEp, dPp, (float*)Cout, (int)M, Mp, skp, cp, half_skip, fjoin, ff3, ff9, cstop),
-                                 ffnc::launch_ffn_chip<16>(*GQ, Araw, dEp, dPp, (float*)Cout, (int)M, Mp, skp, cp, half_skip, fjoin, ff3, ff9, cstop));
+                CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, Araw, dEp, dPp, (float*)Cout, (int)M, Mp, skp, cp, half_skip, fjoin, ff3, ff9),
+                                 ffnc::launch_ffn_chip<16>(*GQ, Araw, dEp, dPp, (float*)Cout, (int)M, Mp, skp, cp, half_skip, fjoin, ff3, ff9));
                 return;
             }
             float* dC2 = (float*)pool_get((size_t)Mp * cin * 4);
