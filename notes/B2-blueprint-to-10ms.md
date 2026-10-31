@@ -70,7 +70,21 @@ lmxx hip-port（71 层完整模型，9070XT 从零重做）实测架构账：~16
    判官=bench_res 定价 → 三关 → 16 对。**破 47 第一铲。**
 2. **S2b 小 op 折邻块**（lmxx 0.36#8）：unary 32 发/UPSAMPLE 折前后 gemm 边界；
    wa 供数审计先跑（闭包级 stop，零核内探针）。-3~5ms。
-3. **★ RES8 字节面 = 现主刀（10-31 20:3x 定价完毕，用户批准 PSNR 口径）**：
+3. ~~RES8 字节面~~ **10-31 20:4x 两刀合判（数字见关门账）**：
+   (a) 流量前提被静态 plan census 推翻：§6.22 的"1267=26.7GB=47.7ms 屋顶"把
+   每次调用按整面计数——实际每 op 只碰金字塔切片（M=32640×N=64=4.17MB，不是
+   66.8MB）。真实 1267 触量 = W500MB+R1.16GB；全帧计数 5.2GB（含 window_block
+   等约 +2.6GB）≈ 8GB = **14ms 地板，不是 47.7**。帧 66ms vs 地板 14ms =
+   **帧不是流量 bound，是 latency/staging bound**（laws 100-190 vs 592-734 一致）。
+   前辈 47.19 同 regime——"贴屋顶"叙事作废。(b) RES8 数值：真实 1267 面 pow2
+   行-scale e4m3 往返 = 面内 SNR 32.5dB；120 层残差链仿真（同噪声流对照）=
+   **17dB << 40dB 批准线** → 字节面在大环流面上数值死刑（lmxx 的 E4M3 skip 面
+   成立因为那是单次 publish 无累加的面，我们 1267 是累加流）。
+   ★ 重定向后的大刀 = **S6 块驻留+全核 roofline 化**（把 8GB 从 ~120GB/s 有效
+   推到 500+GB/s = 帧 66→~15-20ms）：persistent stage 化同层周期、
+   中间量出核前穿 LDS/寄存器、每核对着 bench 单价+RUN_TIMING 离屋顶 >2x 排队修。
+   s8d2（2.5x 小 M 家族）与 ffn-12/CS2 是这个战役的第一批砖。
+3. 旧版 RES8 立项记录（保留备查）：
    1267 残差面 f16→**行-scale E4M3 字节**（lmxx 3080L 路线 A 同款：核名 b8/b8d、
    `residual scale f32[] + E4M3 bytes`）。bench_res8 实测：写 0.555→0.417、
    读 0.606→0.402 ms/触（解码 ALU 免费）；帧 W122+R278 冷回放净省 73.5ms，
@@ -98,6 +112,8 @@ lmxx hip-port（71 层完整模型，9070XT 从零重做）实测架构账：~16
    >2x 排队修。每窗口一跑。
 
 ## 三、已关门账（勿回锅，全部实测判决）
+RES8 字节面（1267 累加链 17dB<40dB 线，20:4x 仿真判死）| §6.22 整面流量计数法
+（每 op 按整面计=16x 高估；真实 8GB/帧=14ms 地板，帧=latency bound）|
 WQ-Cache 缓存前提 | quant 2-row ILP（roofline）| 编码宽化边界表（ffn-3/4/12 赢长链、
 5/6 输短链/故意冗余）| PW32/SPLITC/ACCSLM（GRF 三杀）| take_b 按 id 查（+25；
 QFALIAS 按指针已修但 colslice 扇出算术判死，除非 S2a 的 scale-pregive 改流量）|
