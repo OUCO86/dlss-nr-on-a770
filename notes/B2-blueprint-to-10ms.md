@@ -112,7 +112,15 @@ lmxx hip-port（71 层完整模型，9070XT 从零重做）实测架构账：~16
    >2x 排队修。每窗口一跑。
 
 ## 三、已关门账（勿回锅，全部实测判决）
-RES8 字节面（1267 累加链 17dB<40dB 线，20:4x 仿真判死）| §6.22 整面流量计数法
+RES8 字节面（两度判死钉死：(1) 数值 17dB<40dB；(2) 质量放开后 in-kernel 实测
+bench_res8cmp gemm_b_res8 vs gemm_b_res = 0.76x/0.61x/0.60x/0.49x（SNR 35.4dB 达标
+但核反而慢）——根因=这些 gemm 核离 DRAM 屋顶 10-19 倍（32640x64x64 写 4.2MB=7.5µs
+roof vs 实测 108µs），字节减半省的是本来就只占 <10% 的 store 腿，encode/hmax/SLM
+别名 tile 往返的 ALU 反而净亏。字节面=死路，与画质无关，与"核不贴屋顶"有关。）|
+★ 同一测量钉死真靶 = gemm 三兄弟跑在 XMX 的 1% 与 DRAM 屋顶的 5-10%：density
+campaign（blade-4 已证 22ms 先例：砍标量 store/pub 群）。下一刀序=bench_res 家族
+单核解剖：gemm_b_res 108µs/发 vs 前辈同 op ~50µs（47ms 帧反推）= 2x 差距在
+epilogue 的 256 标量 fma（golden 锁）+ dpas 短 K；batched pub 尾同刑。| §6.22 整面流量计数法
 （每 op 按整面计=16x 高估；真实 8GB/帧=14ms 地板，帧=latency bound）|
 WQ-Cache 缓存前提 | quant 2-row ILP（roofline）| 编码宽化边界表（ffn-3/4/12 赢长链、
 5/6 输短链/故意冗余）| PW32/SPLITC/ACCSLM（GRF 三杀）| take_b 按 id 查（+25；

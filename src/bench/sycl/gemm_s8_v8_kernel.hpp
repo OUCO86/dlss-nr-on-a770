@@ -709,22 +709,38 @@ static inline sycl::event gemm_b_pub_slm(sycl::queue& q, const int8_t* Ap, const
 // stays verbatim under RES8=false (NR_RES8=0 escape, bit-exact old chain).
 // skip-decode (RES8SKIP): 64B byte load -> bit-trick e4m3->f32 (lmxx's composite:
 // mantissa<<20 | (e+120)<<23, subnormal band folded) -> *row scale -> f32.
-static inline esimd::simd<float, 64> res8_decode(const int8_t* p, float s) {
-    esimd::simd<int8_t, 64> b8 = esimd::block_load<int8_t, 64>(p, esimd::overaligned_tag<16>{});
-    esimd::simd<uint32_t, 64> b = esimd::convert<uint32_t>(b8) & 255u;
-    esimd::simd<uint32_t, 64> sgn = (b >> 7) << 31;
-    esimd::simd<uint32_t, 64> e = (b >> 3) & 15u, m = b & 7u;
-    esimd::simd<uint32_t, 64> f32b = ((e + 120u) << 23) | (m << 20);
-    esimd::simd<uint32_t, 64> sv = f32b | sgn;
-    return sv.template bit_cast_view<float>() * esimd::simd<float, 64>(s);
+template <int N>
+static inline esimd::simd<float, N> res8_decode(const int8_t* p, float s) {
+    esimd::simd<int8_t, N> b8 = esimd::block_load<int8_t, N>(p, esimd::overaligned_tag<16>{});
+    esimd::simd<uint32_t, N> b = esimd::convert<uint32_t>(b8) & 255u;
+    esimd::simd<uint32_t, N> sgn = (b >> 7) << 31;
+    esimd::simd<uint32_t, N> e = (b >> 3) & 15u, m = b & 7u;
+    esimd::simd<uint32_t, N> isn = (e != 0u);                       // 1 normal / 0 subnormal
+    esimd::simd<uint32_t, N> nb = ((e + 120u) << 23) | (m << 20);
+    esimd::simd<uint32_t, N> sb = m << 14;                          // m * 2^-9 as f32 bits
+    esimd::simd<uint32_t, N> fb = (nb * isn) | (sb * (1u - isn));
+    esimd::simd<uint32_t, N> signedv = fb | sgn;
+    esimd::simd<float, N> v = signedv.template bit_cast_view<float>();
+    return v * esimd::simd<float, N>(s);
 }
-template <bool RES8, bool RES8SKIP>
+// encode: a value ALREADY snapped to the e4m3 grid (e4m3_vec_v8 output) -> byte code.
+template <int N>
+static inline esimd::simd<int8_t, N> res8_encode(esimd::simd<float, N> g) {
+    esimd::simd<int32_t, N> b = g.template bit_cast_view<int32_t>();
+    esimd::simd<int32_t, N> eb = (b >> 23) & 255, mb = (b >> 20) & 7;
+    esimd::simd<int32_t, N> sgn = (b >> 31) << 7;
+    esimd::simd<int32_t, N> isn = (eb >= 121);                      // 1 normal band
+    esimd::simd<int32_t, N> norm = ((eb - 120) << 3) | mb;
+    esimd::simd<float, N> ag = esimd::abs(g);
+    esimd::simd<int32_t, N> sub = esimd::convert<int32_t>(esimd::rnde<float>(ag * esimd::simd<float, N>(512.f)));
+    esimd::simd<int32_t, N> code = (norm * isn) | (sub * (1 - isn));
+    return esimd::convert<int8_t>((code | sgn) & 255);
+}
 static inline sycl::event gemm_b_res(sycl::queue& q, const int8_t* Ap, const int8_t* Bp,
                                      void* Cout, const float* as, const float* bs,
                                      const void* skip, const float* cos,
                                      int M, int Mp, int N, int K,
-                                     bool narrow, bool half_skip, unsigned epi,
-                                     float* rowScales = nullptr) {
+                                     bool narrow, bool half_skip, unsigned epi) {
     int wg = (Mp / BM) * (N / BN);
     size_t apb = (size_t)Mp * K, bpb = (size_t)N * K;
     return q.submit([&](handler& h) {
@@ -838,6 +854,143 @@ static inline sycl::event gemm_b_res(sycl::queue& q, const int8_t* Ap, const int
                     size_t out = (size_t)rr1 * N + gc;
                     if (narrow) esimd::convert<half>(pub).copy_to((half*)Cout + out);
                     else        pub.copy_to((float*)Cout + out);
+                }
+            }
+        });
+    });
+}
+
+// gemm_b_res8 -- RES8-ALL writer leg (10-31, the quality-sacrifice blade the user
+// ordered ON the 71-layer model): same proven main loop as gemm_b_res, but the
+// epilogue stages the pub tile to SLM (the pub_slm pattern; the 32KB tile aliases
+// the dead operand region after the loop's final barrier), ONE barrier, then each
+// thread reads its 16 rows' FULL 64-wide row from SLM, computes the row absmax,
+// picks the pow2 scale s = 2^ceil(log2(peak/448)) (peak/s in [224,448]), snaps
+// v/s to the e4m3 grid (e4m3_vec_v8 = the shipped chain) and writes 16 BYTES at
+// (row*N + gc) + the row scale (wi_col==0 writes scales[row]). DRAM per call:
+// M*N f16 (131KB) -> M*N bytes + M*4 scales (67.6KB) = HALF. Buffer allocation
+// UNCHANGED (the plan's 66.8MB stays; the kernels just touch half of it).
+// Readers switch to res8_decode (window-resid skip / QUANT_WINDOW gather / FFN
+// skip / plain QUANT) -- paired atomically per plane by the NR_RES8 recorder gate.
+static inline sycl::event gemm_b_res8(sycl::queue& q, const int8_t* Ap, const int8_t* Bp,
+                                      int8_t* Cout8, float* rowScales,
+                                      const float* as, const float* bs,
+                                      const int8_t* skip8, const float* skipScales,
+                                      const float* cos,
+                                      int M, int Mp, int N, int K) {
+    int wg = (Mp / BM) * (N / BN);
+    size_t apb = (size_t)Mp * K, bpb = (size_t)N * K;
+    return q.submit([&](handler& h) {
+        h.parallel_for(nd_range(range((size_t)wg * NT), range(NT)), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+            esimd::slm_init<32768>();   // the 128x64 f32 tile (32KB) aliases the 18KB operand region post-barrier (the pub_slm pattern)
+            int loc = (int)it.get_group(0);
+            int lid = (int)it.get_local_id(0);
+            int NB = N / BN;
+            int wg_row = loc / NB, wg_col = loc % NB;
+            int wi_row = lid / 4, wi_col = lid % 4;
+            const int8_t* apb = Ap + (size_t)(wg_row * (K / BK)) * 8 * 512;
+            const int8_t* bp = Bp + (size_t)wg_col * (BN / 8) * 256;
+            const int SLM_B_BASE = 3 * SLM_A;
+            auto load_block = [=](int buf, int kb) SYCL_ESIMD_FUNCTION {
+                esimd::simd<int8_t, 128> av = esimd::block_load<int8_t, 128>(
+                    apb + (size_t)kb * SLM_A + lid * 128, esimd::overaligned_tag<16>{});
+                esimd::slm_block_store(buf * SLM_A + lid * 128, av, esimd::overaligned_tag<16>{});
+                esimd::simd<int8_t, 64> bv = esimd::block_load<int8_t, 64>(
+                    bp + (size_t)kb * N * 32 + lid * 64, esimd::overaligned_tag<16>{});
+                esimd::slm_block_store(SLM_B_BASE + buf * SLM_B + lid * 64, bv, esimd::overaligned_tag<16>{});
+            };
+            auto load_grf = [=](int buf, esimd::simd<int8_t,256>& a0, esimd::simd<int8_t,256>& a1,
+                                esimd::simd<int8_t,256>& b0, esimd::simd<int8_t,256>& b1) SYCL_ESIMD_FUNCTION {
+                uint32_t offA = buf * SLM_A + wi_row * 512;
+                uint32_t offB = SLM_B_BASE + buf * SLM_B + wi_col * 512;
+                a0 = esimd::slm_block_load<int8_t, 256>(offA + 0, esimd::overaligned_tag<16>{});
+                a1 = esimd::slm_block_load<int8_t, 256>(offA + 256, esimd::overaligned_tag<16>{});
+                b0 = esimd::slm_block_load<int8_t, 256>(offB + 0, esimd::overaligned_tag<16>{});
+                b1 = esimd::slm_block_load<int8_t, 256>(offB + 256, esimd::overaligned_tag<16>{});
+            };
+            esimd::simd<int8_t, 256> a0, a1, b0, b1;
+            esimd::simd<int32_t, 64> c00(0), c01(0), c10(0), c11(0);
+            load_block(0, 0);
+            if (K / BK > 1) load_block(1, 1);
+            esimd::barrier();
+            int kb_n = K / BK;
+            for (int b = 0; b < kb_n; ++b) {
+                int cur = b % 3;
+                if (b + 2 < kb_n) load_block((b + 2) % 3, b + 2);
+                load_grf(cur, a0, a1, b0, b1);
+                c00 = esimd::xmx::dpas<8, 8, int32_t>(c00, b0, a0);
+                c01 = esimd::xmx::dpas<8, 8, int32_t>(c01, b1, a0);
+                c10 = esimd::xmx::dpas<8, 8, int32_t>(c10, b0, a1);
+                c11 = esimd::xmx::dpas<8, 8, int32_t>(c11, b1, a1);
+                esimd::barrier();
+            }
+            // ---- RES8 epilogue part 1: deq + skip-decode + fma + e4m3 publish ->
+            // the f32 tile in SLM (the pub_slm map VERBATIM: thread (wi_row,wi_col)
+            // owns rows wi_row*16+{0..15} x cols wi_col*16+{0..15}).
+            int gr = wg_row * BM + wi_row * 16, gc = wg_col * BN + wi_col * 16;
+            esimd::simd<float, 16> cs = esimd::block_load<float, 16>(bs + gc, esimd::overaligned_tag<16>{});
+            esimd::simd<float, 16> cc = esimd::block_load<float, 16>(cos + gc, esimd::overaligned_tag<16>{});
+            esimd::simd<float, 8> csl = cs.template select<8,1>(0), csh = cs.template select<8,1>(8);
+            esimd::simd<float, 8> ccl = cc.template select<8,1>(0), cch = cc.template select<8,1>(8);
+            for (int r = 0; r < 8; ++r) {
+                int rr0 = gr + r, rr1 = gr + 8 + r;
+                if (rr0 < M) {
+                    float rs = as[rr0];
+                    esimd::simd<float, 8> f0 = esimd::convert<float>(c00.select<8,1>(r*8).read()) * rs * csl;
+                    esimd::simd<float, 8> f1 = esimd::convert<float>(c01.select<8,1>(r*8).read()) * rs * csh;
+                    float sks = skipScales[rr0];
+                    esimd::simd<float,16> skk = res8_decode<16>(skip8 + (size_t)rr0*N + gc, sks);
+                    esimd::simd<float, 8> sk0 = skk.template select<8,1>(0), sk1 = skk.template select<8,1>(8);
+                    esimd::simd<float,8> t0, t1;
+                    for (int e = 0; e < 8; ++e) { t0[e] = sk0[e]*ccl[e] + f0.read()[e]; t1[e] = sk1[e]*cch[e] + f1.read()[e]; }
+                    esimd::simd<float,16> tt; tt.template select<8,1>(0) = t0; tt.template select<8,1>(8) = t1;
+                    esimd::simd<float,16> pub = pub_vec_v8<16>(1u, tt);
+                    esimd::slm_block_store<uint32_t,8>(uint32_t(((wi_row*16 + r) * BN + gc % BN)) * 4u, pub.template select<8,1>(0).template bit_cast_view<uint32_t>(), esimd::overaligned_tag<16>{});
+                    esimd::slm_block_store<uint32_t,8>(uint32_t(((wi_row*16 + r) * BN + gc % BN + 8)) * 4u, pub.template select<8,1>(8).template bit_cast_view<uint32_t>(), esimd::overaligned_tag<16>{});
+                }
+                if (rr1 < M) {
+                    float rs = as[rr1];
+                    esimd::simd<float, 8> g0 = esimd::convert<float>(c10.select<8,1>(r*8).read()) * rs * csl;
+                    esimd::simd<float, 8> g1 = esimd::convert<float>(c11.select<8,1>(r*8).read()) * rs * csh;
+                    float sks = skipScales[rr1];
+                    esimd::simd<float,16> skk = res8_decode<16>(skip8 + (size_t)rr1*N + gc, sks);
+                    esimd::simd<float, 8> sk0 = skk.template select<8,1>(0), sk1 = skk.template select<8,1>(8);
+                    esimd::simd<float,8> t0, t1;
+                    for (int e = 0; e < 8; ++e) { t0[e] = sk0[e]*ccl[e] + g0.read()[e]; t1[e] = sk1[e]*cch[e] + g1.read()[e]; }
+                    esimd::simd<float,16> tt; tt.template select<8,1>(0) = t0; tt.template select<8,1>(8) = t1;
+                    esimd::simd<float,16> pub = pub_vec_v8<16>(1u, tt);
+                    esimd::slm_block_store<uint32_t,8>(uint32_t(((wi_row*16 + 8 + r) * BN + gc % BN)) * 4u, pub.template select<8,1>(0).template bit_cast_view<uint32_t>(), esimd::overaligned_tag<16>{});
+                    esimd::slm_block_store<uint32_t,8>(uint32_t(((wi_row*16 + 8 + r) * BN + gc % BN + 8)) * 4u, pub.template select<8,1>(8).template bit_cast_view<uint32_t>(), esimd::overaligned_tag<16>{});
+                }
+            }
+            esimd::barrier();
+            // ---- part 2: the 128 tile rows over all 32 threads (4/thread, NO
+            // wi_col redundancy -- the 4x-encode was the 0.5x bug). slm offsets
+            // are BYTES (the §36 rule): row*BN*4.
+            #pragma unroll 1
+            for (int rr = 0; rr < 4; ++rr) {
+                int row = lid * 4 + rr;                    // tile-local row
+                int grow = wg_row * BM + row;
+                if (grow >= M) break;
+                esimd::simd<float, 64> v = esimd::slm_block_load<float, 64>(uint32_t(row * BN) * 4u, esimd::overaligned_tag<16>{});
+                float peak = esimd::hmax<float,float,64>(esimd::abs(v));
+                if (peak > 0.f) {
+                    // s = 2^ceil(log2(peak/448)); scalar bit-reinterp via memcpy (the
+                    // 1-wide SIMD bit_cast_view is not instantiable -- named-temp rule)
+                    float r0 = esimd::div_ieee<float,1>(esimd::simd<float,1>(peak), esimd::simd<float,1>(448.f))[0];
+                    int32_t rb; __builtin_memcpy(&rb, &r0, 4);
+                    int32_t le = ((rb >> 23) & 255) - 127;         // floor(log2(r0))
+                    uint32_t man = (uint32_t)rb & 0x7FFFFFu;
+                    int32_t k = le + (man ? 1 : 0);                // ceil(log2(r0))
+                    uint32_t sbits = (uint32_t)(k + 127) << 23;    // 2^k (k in [-126,126])
+                    float s; __builtin_memcpy(&s, &sbits, 4);
+                    rowScales[grow] = s;
+                    esimd::simd<float,64> g = e4m3_vec_v8<64>(v * esimd::div_ieee<float,64>(esimd::simd<float,64>(1.f), esimd::simd<float,64>(s)));
+                    esimd::block_store<int8_t,64>(Cout8 + (size_t)grow*N, res8_encode<64>(g), esimd::overaligned_tag<16>{});
+                } else {
+                    rowScales[grow] = 1.f;
+                    esimd::simd<int8_t,64> z((int8_t)0);
+                    esimd::block_store<int8_t,64>(Cout8 + (size_t)grow*N, z, esimd::overaligned_tag<16>{});
                 }
             }
         });
