@@ -1210,6 +1210,207 @@ static void skip_chains_apply(std::vector<std::function<void()>>& cmds,
     std::fflush(stdout);
 }
 
+// ==================== NR_RES_BYTE: the byte-GRID probe (2026-11-02, 字节网格铲) =========
+// The open fact DS-takeover §32 named: can the residual / one-phase-intermediate planes live
+// on a ONE-BYTE grid without breaking the picture? RES8 (10-31) never measured that -- its
+// "17 dB" came from a throwaway 120-layer chain simulation whose script is NOT in-tree
+// (grep: only the retelling survives), and the two in-tree RES8 instruments
+// (src/bench/sycl/bench_res8.cpp = timing only; bench_res8cmp.cpp:75 = 10log10(sum ref^2 /
+// sum err^2), a RELATIVE power SNR on synthetic data, 35.4 dB) never touched the 1301 face.
+// So the 17 dB-vs-40 dB "death" mixed calibers -- exactly the trap §33 caught.
+//
+// This probe measures the grid's VALUES on the real chain: one extra closure per writer site
+// quantizes the plane it just wrote to (int8 | e4m3) + a POWER-OF-TWO scale at a chosen
+// granularity, and stores the DECODED value back into the f16 plane (quantize-dequantize).
+// With pow2 scales the decoded value is EXACTLY representable in f16 (int8: 8 significant
+// bits, e4m3: 4 -- both inside f16's 11), so every downstream reader sees precisely the
+// numbers a real byte plane + its decode leg would hand it. The quality verdict transfers;
+// the traffic verdict does NOT come from this probe (it is a separate, already-measured fact:
+// bench_res8 write 0.555->0.417 / read 0.606->0.402 ms/touch, but folded into the gemm
+// epilogue the byte form measured 0.49-0.76x = SLOWER, commit 6c0a295 -- because those gemms
+// run 10-19x from their DRAM roof).
+//
+// Layer rule kept (军规 4/9): the switch is at the closure/plan layer and is read ONCE into a
+// static at record time; the shipped kernels' bodies are untouched, no runtime branch inside
+// any of them. Unset (default) => this code is never entered => shipped path verbatim.
+//   NR_RES_BYTE=s8row : the accumulating residual planes -> int8 + per-ROW pow2 scale
+//                       (writers: xmx_rec_gemm_int8_residual -> 1267,
+//                        xmx_rec_gemm_window_int8_residual -> 1270)
+//   NR_RES_BYTE=e4m3w : same planes -> the SHIPPED e4m3 grid (qr_e4m3 = +-448 sat_cast clamp
+//                       + round-half-even, publish_kernel.hpp:24 -- the lmxx 0.10 black-block
+//                       cure we already had) + per-WINDOW pow2 scale
+//   NR_RES_BYTE=s8mid : only the one-phase FFN intermediates (xmx_rec_gemm_int8_batched
+//                       outputs = 1274/1275, planes that get requantized anyway) -> int8 + scale
+//   NR_RES_GRAN=<rows>: rows sharing ONE scale = the experiment variable (default 1 for
+//                       s8row/s8mid, 64 for e4m3w = one 8x8 token window)
+static int rb_mode() {
+    static int m = [](){
+        const char* s = getenv("NR_RES_BYTE");
+        if (!s || !*s) return 0;
+        if (!strcmp(s, "s8row")) return 1;
+        if (!strcmp(s, "e4m3w")) return 2;
+        if (!strcmp(s, "s8mid")) return 3;
+        return -1;                       // unknown spelling -> loud, never silent
+    }();
+    return m;
+}
+static unsigned rb_gran() {
+    static unsigned g = [](){
+        const char* s = getenv("NR_RES_GRAN");
+        if (s && *s) { int v = atoi(s); return (v > 0) ? (unsigned)v : 1u; }
+        return rb_mode() == 2 ? 64u : 1u;
+    }();
+    return g;
+}
+static int rb_sites = 0;                 // record-time census (BOTH recordings count)
+// NR_RES_SITES=<comma list> restricts which writer families get snapped (residual / wres /
+// batched). The 2026-11-02 plane census needs this to separate the two verdicts: buffer 1270
+// (window residual) sits 0.00% OFF the e4m3 grid while 1267 (the accumulating residual) sits
+// 98.4% off it -- without site selection one number would have covered both and lied.
+static bool rb_site_ok(const char* site) {
+    static const char* sel = getenv("NR_RES_SITES");
+    if (!sel || !*sel) return true;
+    const size_t L = strlen(site);
+    for (const char* p = sel; *p; ) {
+        if (!strncmp(p, site, L) && (p[L] == ',' || p[L] == '\0')) return true;
+        while (*p && *p != ',') ++p;
+        while (*p == ',') ++p;
+    }
+    return false;
+}
+static long long rb_elems = 0;
+static int rb_refused = 0, rb_scratch_skip = 0;
+// NR_RES_LIVE=1 = the LIVENESS WITNESS: after the snap the plane is multiplied by 0.5. If a
+// site's plane is on the live path to buffer 1301 the face MUST change; if the snap alone left
+// the face bit-EXACT and the witness changes it, the snap was a genuine no-op ON A LIVE PLANE.
+// If neither changes the face, the SITE IS DEAD -- which is NOT the same finding, and the
+// 2026-11-02 s8mid round needed exactly this distinction.
+static float rb_live() {
+    static float v = getenv("NR_RES_LIVE") ? 0.5f : 1.0f;
+    return v;
+}
+static const char* rb_mode_name() {
+    static const char* n[] = { "(off)", "s8row", "e4m3w", "s8mid", "(REFUSED:unknown spelling)" };
+    const int m = rb_mode();
+    return n[(m >= 1 && m <= 3) ? m : (m == 0 ? 0 : 4)];
+}
+// MODE 1 = int8 + pow2 scale; MODE 2 = e4m3 grid + pow2 scale (the +-448 clamp lives in
+// qr_e4m3). Coverage = rows x cols CONTIGUOUS from the plane base, exactly how the recorder
+// hands the plane out (`void* Cout = ic->second.p`): every tier writes ITS pyramid slice from
+// the same base at its own row width (the C=64 tier's 32640x64 and the C=1024 tier's 256x1024
+// are the same memory seen at different widths), so rows is capped by the buffer's bytes.
+// Re-snapping an already-snapped value is IDEMPOTENT on both grids (pow2 scale ratios keep
+// every significant bit; rint() of an exact integer is itself; qr_e4m3 is exact on an
+// e4m3x pow2 value) => overlapping slice coverage cannot double-count the damage.
+// (this file's recorders live inside extern "C", and a template needs C++ linkage -- the
+// probe kernel is therefore wrapped; it is NOT a shipped op, nothing outside this shovel sees it)
+extern "C++" {
+template <int MODE>
+static void rb_qdq(sycl::half* p, unsigned rows, unsigned cols, unsigned gran, float post) {
+    const unsigned groups = (rows + gran - 1u) / gran;
+    GQ->parallel_for(sycl::range<1>(groups), [=](sycl::item<1> it) {
+        const unsigned r0 = (unsigned)it.get_id(0) * gran;
+        const unsigned r1 = (r0 + gran < rows) ? r0 + gran : rows;
+        // one scale per (gran rows x cols) window
+        float peak = 0.f;
+        for (unsigned r = r0; r < r1; ++r) {
+            sycl::half* row = p + (size_t)r * cols;
+            for (unsigned c = 0; c < cols; ++c) {
+                float v = (float)row[c]; v = v < 0.f ? -v : v;
+                if (v > peak) peak = v;
+            }
+        }
+        // pow2 scale = 2^ceil(log2(peak/FULL)) -- the RES8 form VERBATIM
+        // (gemm_s8_v8_kernel.hpp:830, host twin bench_res8cmp.cpp:48-49), bit-trick so no
+        // libdevice ilogb/ldexp enters a device kernel.
+        float sc = 1.f;
+        if (peak > 0.f) {
+            const float t = peak / (MODE == 1 ? 127.f : 448.f);
+            const uint32_t bb = sycl::bit_cast<uint32_t>(t);
+            int e = (int)((bb >> 23) & 0xFFu) - 127;
+            if ((bb & 0x7FFFFFu) != 0u) ++e;                // ceil, not floor
+            sc = sycl::bit_cast<float>((uint32_t)(e + 127) << 23);
+        }
+        const float inv = 1.f / sc;                          // pow2 -> the divide is exact
+        for (unsigned r = r0; r < r1; ++r) {
+            sycl::half* row = p + (size_t)r * cols;
+            for (unsigned c = 0; c < cols; ++c) {
+                float v = (float)row[c] * inv;               // pow2 -> no fdiv noise
+                if (MODE == 1) {
+                    v = sycl::rint(v);
+                    v = v < -127.f ? -127.f : (v > 127.f ? 127.f : v);
+                } else {
+                    v = qr_e4m3(v);                          // +-448 clamp + round-even
+                }
+                row[c] = (sycl::half)(v * sc * post);       // decode back, exact in f16
+            }
+        }
+    });
+}
+} // extern "C++" (the probe template)
+// push the probe closure immediately AFTER the writer closure (record time; the frozen graph
+// runs closures in push order, so this lands between the writer and every reader of the plane)
+static void rb_push(int cbuf, unsigned rows, unsigned cols, const char* site) {
+    const int m = rb_mode();
+    if (m <= 0) return;                                    // default: never entered
+    const bool want_mid = (m == 3);
+    const bool is_batched = (strcmp(site, "batched") == 0);
+    if (want_mid != is_batched) return;                    // s8row/e4m3w = residual planes only
+    if (!rb_site_ok(site)) return;                         // NR_RES_SITES family filter
+    auto it = g_bufs.find(cbuf);
+    if (it == g_bufs.end() || !it->second.p) return;
+    if (it->second.esz != 2) {                             // not an f16 plane -> wrong geometry
+        std::printf("[res-byte] %s buf=%d esz=%zu REFUSED (not an f16 plane)\n",
+                    site, cbuf, it->second.esz);
+        return;
+    }
+    const size_t bytes = it->second.bytes;
+    // The plan's FIRST recording (the scratch the dump made, begin@3922 -> abort@5295) recreates
+    // the same buffer ids as TINY placeholders (buf 1268 = 256 B there, 66,846,720 B in the
+    // captured recording) -- those closures never run (xmx_abort clears g_cmds), so a placeholder
+    // is counted, not printed 160 times. The captured recording gets the real geometry.
+    if (bytes < 4096) { ++rb_scratch_skip; return; }
+    const size_t maxrows = bytes / ((size_t)cols * 2u);
+    if (rows > maxrows) rows = (unsigned)maxrows;           // 军规 10: never touch beyond the alloc
+    if (rows == 0) {
+        static std::vector<std::string> seen;
+        const std::string key = std::string(site) + ":" + std::to_string(cbuf) + ":" + std::to_string(cols);
+        if (std::find(seen.begin(), seen.end(), key) == seen.end()) {
+            seen.push_back(key);
+            std::printf("[res-byte] %s buf=%d cols=%u bytes=%zu REFUSED (no whole row fits)\n",
+                        site, cbuf, cols, bytes);
+        }
+        ++rb_refused; return;
+    }
+    const unsigned gran = rb_gran();
+    const int mode = m;
+    const float post = rb_live();
+    sycl::half* p = (sycl::half*)it->second.p;
+    g_cmd_names.push_back("res_qdq");
+    pgraph_extra(cbuf);                                    // touches exactly this plane
+    pg_push([=]() {
+        if (mode == 1) rb_qdq<1>(p, rows, cols, gran, post);
+        else           rb_qdq<2>(p, rows, cols, gran, post);
+    });
+    ++rb_sites; rb_elems += (long long)rows * cols;
+    if (rb_sites <= 14)
+        std::printf("[res-byte] push site=%s buf=%d rows=%u cols=%u bytes=%zu gran=%u\n",
+                    site, cbuf, rows, cols, bytes, gran);
+}
+static void rb_report(int graphid) {
+    const int m = rb_mode();
+    if (m == 0) return;
+    std::printf("[res-byte] graph=%d mode=%s gran=%u live=%g sites='%s' sites_pushed=%d elems=%lld "
+                "refused=%d scratch_placeholders=%d (record-time census: BOTH recordings push, "
+                "only the captured graph runs)\n",
+                graphid, rb_mode_name(), rb_gran(), rb_live(),
+                getenv("NR_RES_SITES") ? getenv("NR_RES_SITES") : "*",
+                rb_sites, rb_elems, rb_refused, rb_scratch_skip);
+    if (m < 0) std::printf("[res-byte] NR_RES_BYTE='%s' UNKNOWN -- nothing applied\n",
+                           getenv("NR_RES_BYTE"));
+    std::fflush(stdout);
+}
+
 // int xmx_graph_capture(void) -> id ; int xmx_graph_run(int id) -> passes ; destroy(id)
 // Route (a) step 1 (section 64): the plan says which graph ran "as the number it had
 // that once" (nr_replay.c:505-507 -- r->graph = the capture's return, run/destroy use
@@ -1231,6 +1432,7 @@ int xmx_graph_capture(void) {
     // NR_SKIP_CHAINS: whole-chain no-ops, applied to the frozen closure list BEFORE the
     // graph is stored (default empty => this function is never entered; see the block above).
     skip_chains_apply(g_cmds, g_cmd_names, (int)g_graphs.size());
+    rb_report((int)g_graphs.size());      // NR_RES_BYTE census (no-op when the switch is unset)
     g_graphs.push_back(std::move(g_cmds)); g_graph_names.push_back(std::move(g_cmd_names));
     g_graph_touch.push_back(std::move(g_cmds_touch)); g_cmds_touch.clear();
     g_cmds.clear();
@@ -3112,6 +3314,16 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
         });
         pool_put(dAp); pool_put(dC);   // dBp is cache-owned (the whole batched weight)
     });
+    // NR_RES_BYTE grid probe on the one-phase FFN intermediates (1274/1275). The plane row is
+    // contiguous ONLY in the frame's own geometry (sc==N, ldc==N*batch: group g lands at
+    // columns g*N of the same token row -- :3282 `out = g*sc + r*ldc_ + col`). Anything else
+    // would QDQ the wrong elements -> REFUSE loudly (never silently mis-quantize).
+    if (rb_mode() == 3) {
+        if (sc == N && ldc_r == N * batch) rb_push(c, (unsigned)Mp, ldc_r, "batched");
+        else std::printf("[res-byte] batched buf=%d REFUSED: sc=%u N=%u ldc=%u batch=%u "
+                         "(row not contiguous -- s8mid geometry not priced)\n",
+                         c, sc, N, ldc_r, batch);
+    }
     return 0;
 }
 // int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_scale,
@@ -3496,6 +3708,7 @@ int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale,
         pgraph_extra(s6f.be); pgraph_extra(s6f.bp);      // the two extra weight reads
         pgraph_extra(s6f.bse); pgraph_extra(s6f.bsp);    // and the two scale arrays
         pg_push([s6f]() { s6_ffn_run(s6f); });
+        rb_push(c, (unsigned)Mp, N, "residual");               // NR_RES_BYTE grid probe
         return 0;
     }
     pg_push([=]() {
@@ -3518,6 +3731,7 @@ int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale,
                          narrow, half_skip, epi);
         pool_put(dAp);   // dBp is cache-owned (the weight)
     });
+    rb_push(c, (unsigned)Mp, N, "residual");               // NR_RES_BYTE grid probe
     return 0;
 }
 // int xmx_rec_gemm_window_int8_residual(a,b,c,a_scale,b_scale,skip,cosine,
@@ -3683,6 +3897,7 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
                                 narrow, half_skip, epi, across, top, left, height, width);
         pool_put(dAp);   // dBp is cache-owned (the weight)
     });
+    rb_push(c, M, N, "wres");                             // NR_RES_BYTE grid probe (1270 plane)
     return 0;
 }
 // int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
