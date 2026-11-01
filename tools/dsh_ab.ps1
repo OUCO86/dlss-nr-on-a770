@@ -26,8 +26,9 @@ $out  = 'E:\DSH\out'
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 
 function MedMs([string]$dll, [string]$envspec, [string]$tag) {
-  foreach ($kv in @('NR_B_WIDE','NR_G32_PUB','NR_Q_FUSE','NR_Q_FUSE_B','NR_QW_FUSE','NR_B6','NR_RUN_TIMING','NR_WQFUSE','NR_CHIP_CS','NR_FF9','NR_FF3','NR_RES8','NR_PGRAPH')) {
-    Remove-Item "env:${kv}" -ErrorAction SilentlyContinue      # A/B 两侧都清场
+  # v3: 清所有 NR_* 环境变量（写死名单必然漏新开关 => B 侧开关会漏进下一对 A 腿、delta 恒 0）
+  foreach ($n in @(Get-ChildItem env: | Where-Object { $_.Name -like 'NR_*' } | ForEach-Object { $_.Name })) {
+    Remove-Item "env:${n}" -ErrorAction SilentlyContinue
   }
   if ($envspec) {
     foreach ($pair in ($envspec -split ';')) {

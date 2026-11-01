@@ -811,3 +811,39 @@ CROSS 18/18 逐位同。**⇒ 新判官没把跳块铲救活**（§33 的"≥35d
    （与 RES8 旧账 98.73% 几乎同数），但那混了**别的档位的旧视图 + 毒化行**（1267/1274 里 peak=65504、
    1267 有 520,336 个 NaN 元素）；只有**该站点自己的 rows×cols + 该站点选的 scale** 才是实现会用到的格。
    本轮翻案靠的就是"写者几何下 snap 后面字节 0 改动"这一条，不是靠静态占用率。
+
+## 35. 折叠铲交数（2026-11-02 05:3x）：**这把刀的机制仓内早有（NR_Q_FUSE_B）；修了它的形门，仍判负——并证到它的上限就是中性**
+产物：`src/bench/sycl/libxmx_sycl.cpp`（**41 行增 / 3 行删 / 6 hunk**：`NR_BG_FOLD` 别名 :385、
+`bg_b1_ok()` 形门 + census :1400-1419、capture 打印 :1421-1425、record 期 b1 判定 :3072-3076、
+run 期形选择 :3134、`NR_BG_FOLD_LIVE` 活性见证 :3137-3145）；新件 `out\libxmx_new.dll` = **460FC367…**
+（出货件 `out\libxmx.dll` **E2D5E574 未动**；`oneapi\libxmx_sycl.dll` 门跑期间临时 stage、**已复原 E2D5E574**）；
+`E:\DSH\s6\{bgfold.md, bgfold_ab.ps1, bgfold_gates.ps1}`。未 commit。
+**★ 先记一条"别重复造"的事实**：用户描述的"pub epilogue 直出 pk/sc + 后置 QUANT 整发 no-op"，
+**仓内已有实现 = `qfuse_take_b`（libxmx_sycl.cpp:383-417）+ 消费者的 `pack_a_fused_b/b1`（:3099-3107）**：
+take 在 record 期把相邻 QUANT 闭包**整发** `[](){}`（:413，全动/全不动 §31 合规），
+消费者读生产者的 f16 面**直出 fragment 序 int8 + scale**。默认 OFF 的历史标注是
+"A/B 00:45 end-to-end **NEUTRAL**（batched fused pack +8ms eats the quant −12）"。
+刀 B 普查（2ef0c51）另已判定：**80 个幸存 QUANT 里 72 个全过形状 guard，只因这条 take 挂在默认 OFF 后**。
+**〔真正的增量 = 逮到形门写错】** `pack_a_fused_b1`（单读形，`pack_device.hpp:558-613`）**本来就能吃 col-slice**
+（`:605-606` 有 sa==64/128 的编译期 select 偏移），但调用侧形门写的是 `lda_e<=512 && sa==0u`（:3104）
+⇒ **frame 上多数 col-slice 站点被踢回每形重读整行的 `pack_a_fused_b`**（= 历史 +25ms 的病根，注释自己点名）。
+已改成 record 期 `bg_b1_ok()`（lda∈{64,128,256,512} && (sa==0 || (kb_n==1 && sa∈{64,128} && (batch−1)·sa+K≤lda))，
+**不满足就退回每形，绝不越界读**）。census：每录音 **72/72 消费者全折叠，形 split = 36 b1 / 36 每形**。
+**〔三关〕** 默认侧两独立进程 1301 = **249A46F3… 金标**、passes 691、帧 62.97-63.13；
+折叠侧 **1301 逐位 EXACT（四进程全等）+ passes 691**；**活性见证 `NR_BG_FOLD_LIVE=1`（a_scale×0.5）⇒ 1301 MISMATCH**
+⇒ 折叠路真喂画面、非哑火；**39 门两侧 39 GREEN / 0 RED**（无红点需解释）。
+**〔16 对〕** A=E2D5E574 默认 / B=新件 + 只 B 侧 `NR_BG_FOLD=1`：
+**B 赢 0/16，均值 +1.780ms，中位 +1.800，sd 0.499，SE 0.125，95% CI [+1.535,+2.025]** ⇒ **判负、不转正**。
+**〔归因（谁吃回去了）〕** 消掉的 QUANT+pack 两腿帧上只值 **A−C = −0.15ms**（C = 折叠 + `NR_QF_B1=2` 连折叠 pack 也跳
+⇒ 两腿全没，帧不动）；新增的折叠 pack 收 **+2.11ms（B−C）**；形 split 头寸 **1.0-1.3ms（F vs B）**。
+⇒ **净 = +1.96ms ≈ 16 对实测 +1.78**；**即使 36 站点全修成 b1，最好也只到 +0.5…+0.9ms ⇒ 过不了 −0.5ms 出货线**。
+**这就是"上限=中性"的定量证明，不是不想修**（军规 7：机制+开关保留，默认 OFF，下铲可复用）。
+**〔第三次独立同判〕** 消腿 ≠ 省时间：QFALIAS（4d1ac63，删 pack+144 quant 仍 +8.9）、跳块铲（§33）、本铲（A−C=−0.15ms）。
+同一根因：**今天 cgraph 里这些腿藏在 overlap 下，帧 = latency/staging-bound**。
+⇒ **字节落位（R1/R4）唯一的兑现位置是 S6 块驻留——那个 f16 面根本不存在的时候**。
+下一铲序因此不变：**S6-1b 整块 11 发→2 发**，把 fragment 序字节落位**做在块内**（而不是在块边界加一趟）。
+**〔仪器 bug 记账（用户的脚本我没动）〕** ① `run_gates.sh` 的 `GATEPY`（.workbuddy 那个 python env）**已不存在**
+⇒ 门跑要用 DSH 自带 python（新驱动 `E:\DSH\s6\bgfold_gates.ps1`，39 门名单照抄）。
+② **`ab.ps1:29` 的清场名单缺本铲/上铲的新开关**（`NR_BG_FOLD`/`NR_BG_FOLD_LIVE`/`NR_RES_*`/`NR_SKIP_*`）
+⇒ B 侧开关会漏进下一对 A 腿（两侧同折叠 ⇒ delta 恒 0）。本轮用自建 `bgfold_ab.ps1`（同协议 + 55 个 NR_* 全清）。
+**建议把 ab.ps1 名单补全**（照你上次修 NR_S6_FFN 那次）。

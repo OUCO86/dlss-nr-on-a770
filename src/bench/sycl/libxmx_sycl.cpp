@@ -382,7 +382,7 @@ static bool qfuse_take_gather(int a, int a_scale, unsigned M, unsigned C,
 }
 static bool qfuse_take_b(int a, int a_scale, unsigned M, unsigned K, unsigned lda_e,
                          unsigned sa, unsigned scale_stride, size_t my_cmd, QuantFused& out){
-    static bool qfuse_b = getenv("NR_Q_FUSE_B") != nullptr;   // A/B 00:45: end-to-end
+    static bool qfuse_b = getenv("NR_Q_FUSE_B") != nullptr || getenv("NR_BG_FOLD") != nullptr;
     if (!qfuse_b) return false;                                // NEUTRAL (batched fused
     if (!qfuse_on() || scale_stride != 0u) return false;       // pack +8ms eats the
                                                         // quant -12; kept as a probe
@@ -1397,7 +1397,32 @@ static void rb_push(int cbuf, unsigned rows, unsigned cols, const char* site) {
         std::printf("[res-byte] push site=%s buf=%d rows=%u cols=%u bytes=%zu gran=%u\n",
                     site, cbuf, rows, cols, bytes, gran);
 }
+// ==================== NR_BG_FOLD: the take_b fold's form gate + census ====================
+// The fold mechanism itself is the shipped qfuse_take_b (consumer reads the producer's f16
+// plane and emits fragment-order int8 + scale; the QUANT closure is no-op'd WHOLE -- 全动或全
+// 不动, 31). What was wrong with it is the FORM gate: `lda<=512 && sa==0` left every
+// col-slice site (sa==K, the frame's majority) on pack_a_fused_b, which re-reads the whole
+// lda-wide row for the peak ONCE PER GROUP -- the historical +25ms disease the b1 comment
+// names (pack_device.hpp:550-557). b1 (single read) already supports those shapes with
+// COMPILE-TIME select offsets (pack_device.hpp:604-607); the gate just never let them in.
+static long g_bfold_sites = 0, g_bfold_b1 = 0, g_bfold_b = 0;
+static bool bg_b1_ok(unsigned K, unsigned lda, unsigned sa, unsigned batch) {
+    if (!K || (K % 32u) || batch == 0u) return false;
+    // b1 loads the row as ONE block of lda halfs and only ever dispatches lda in
+    // {64,128,256,512} (the else branch reads a full 512) -- anything else is out of range.
+    if (lda != 64u && lda != 128u && lda != 256u && lda != 512u) return false;
+    const unsigned kb_n = K / 32u;
+    if (sa == 0u) return K <= lda;                       // shared-A: the row IS the gemm row
+    if (kb_n == 1u && (sa == 64u || sa == 128u) &&
+        (batch - 1u) * sa + K <= lda) return true;        // col-slice, constexpr offsets only
+    return false;
+}
 static void rb_report(int graphid) {
+    // the fold census prints even when NR_RES_BYTE is off (they are independent shovels)
+    if (getenv("NR_BG_FOLD") || getenv("NR_Q_FUSE_B"))
+        std::printf("[bg-fold] graph=%d folded_consumers=%d  b1_single_read=%d  b_per_group=%d "
+                    "live_witness=%d\n", graphid, (int)g_bfold_sites, (int)g_bfold_b1,
+                    (int)g_bfold_b, getenv("NR_BG_FOLD_LIVE") ? 1 : 0);
     const int m = rb_mode();
     if (m == 0) return;
     std::printf("[res-byte] graph=%d mode=%s gran=%u live=%g sites='%s' sites_pushed=%d elems=%lld "
@@ -3044,6 +3069,11 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
         printf("[gemmB-REC] a=%d AP=%p a_scale=%d M=%u K=%u lda=%u sa=%u ss=%u\n", a, it0==g_bufs.end()?(void*)0:it0->second.p, a_scale, M, K, lda_, sa, scale_stride); }
     const bool fused_b = !v9b_will && qfuse_take_b(a, a_scale, M, K, lda_, sa, scale_stride, g_cmds.size(), qfb);
     sycl::half* a16b = fused_b ? (sycl::half*)g_bufs[qfb.src].p : nullptr;
+    // NR_BG_FOLD: which fused-pack FORM this consumer will use, decided at RECORD time
+    // (auditable + printable), and only shapes the b1 kernel can serve with COMPILE-TIME
+    // slice offsets get b1; anything else keeps the per-group form (never a silent wrong read).
+    const bool b1_form = fused_b && bg_b1_ok(K, lda_, sa, batch);
+    if (fused_b) { ++g_bfold_sites; if (b1_form) ++g_bfold_b1; else ++g_bfold_b; }
     pg_push([=]() {
         const unsigned lda_e = lda ? lda : K, ldb_e = ldb ? ldb : K;
         // R8a shape-merge (section 92): ONE dispatch per stage for the whole op -- the
@@ -3101,10 +3131,18 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
             if (qfmode == 2) { /* TIME-ONLY attribution: skip the fused pack entirely
                 (output WRONG by design) -> isolates the pack kernel's cost from
                 the quant-dissolve bookkeeping */ }
-            else if (qfmode == 1 && lda_e <= 512 && sa == 0u)
+            else if (qfmode == 1 && b1_form)
                 packdev::pack_a_fused_b1(*GQ, a16b, dAp, (float*)ias->second.p, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch);
             else
-                packdev::pack_a_fused_b(*GQ, a16b, dAp, (float*)ias->second.p, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch); }
+                packdev::pack_a_fused_b(*GQ, a16b, dAp, (float*)ias->second.p, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch);
+            // NR_BG_FOLD_LIVE=1 = the liveness witness the fold needs: scale the a_scale array
+            // the fused pack just wrote by 0.5. If the fold path is really what feeds the
+            // frame, 1301 MUST move; if it stays EXACT the fold is a dud, not a win.
+            if (qfmode != 2 && getenv("NR_BG_FOLD_LIVE")) {
+                float* sc_p = (float*)ias->second.p;
+                GQ->parallel_for(sycl::range((size_t)M), [=](sycl::item<1> i) {
+                    sc_p[i.get_id(0)] = sc_p[i.get_id(0)] * 0.5f; });
+            } }
         else { bgp++; if (getenv("NR_BPACK_TRACE") && bgp <= 8) printf("[bpack] gather M=%u N=%u K=%u b=%u sa=%u lda=%u\n", M, N, K, batch, (unsigned)sa, lda_e);
             // P8-a: the 128-bit vector gather when the strides are 16-aligned (the
             // frame: lda=K mult32, sa in {0,128,256} -- and the operand buffers are
