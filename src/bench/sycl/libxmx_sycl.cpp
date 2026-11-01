@@ -2682,7 +2682,9 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
         // frame's own strides that pass is 0.3929 / 0.2055 ms per call = 31.9 / 30.5 GB/s =
         // 5.7% / 5.4% of the 560 GB/s roof, i.e. 4.2x / 3.0x the GEMM it follows. The fused
         // kernel (s8v8::gemm32_b_pub, moved verbatim from the byte-exact bench form in
-        // src/bench/sycl/gemm32_tile.cpp) prices 0.0701 / 0.0447 => -6.1 ms/frame serial.
+        // src/bench/sycl/gemm32_tile.cpp) prices 0.0701 / 0.0447 ms/call IN THE BENCH. Against the
+        // branch the frame actually runs (wide-merge, 0.1185 / 0.1001) that is -1.05 ms/frame
+        // SERIAL; the frame A/B over 48 pairs measured -0.466 ms (see the reachability note).
         // Evidence + protocol: src/bench/sycl/gemm32_tile_run.txt (STEP 0 / STEP 1 rows).
         // NOT REACHABLE FOR THE FRAME AS IT STANDS (probe-verified 2026-11-01): the branch
         // above this one at :2478-2503 (P8-b wide-merge, DEFAULT ON, escape NR_B_WIDE=0)
