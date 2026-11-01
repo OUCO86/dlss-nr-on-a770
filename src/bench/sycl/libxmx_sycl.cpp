@@ -46,6 +46,7 @@
 #include "gemm_f16_v2_kernel.hpp"
 #include "gemm_f16_v3_kernel.hpp"
 #include "pack_device.hpp"
+#include "s6_ffn_block_kernel.hpp"   // S6-1a block-resident FFN chain (NR_S6_FFN; body verbatim from s6_ffn_block2.cpp:68-400)
 #include "pre_kernel.hpp"
 #include "post_kernel.hpp"
 #include <cstring>
@@ -499,6 +500,226 @@ static int8_t* cached_pack_b_i8(int bufid, const int8_t* B, int N, int K) {
     g_wcache[wk] = p;
     return p;
 }
+// ==================== S6-1a: block-resident FFN chain (NR_S6_FFN) ====================
+// What this is: the frame's FFN closure is SIX recorder ops per block --
+//   QUANT(1270->1272/1273)  ->  BATCHED expand (1272 x W -> 1274)  ->
+//   QUANT(1274->1272/1273)  ->  BATCHED proj   (1272 x W -> 1275)  ->
+//   QUANT(1275->1272/1273)  ->  RESIDUAL       (1272 x W -> 1267, skip=1270)
+// (plan_960x544.c:5337/5340/5342/5345/5347/5349 for the C=64 M=32640 family and
+// :4055/4057/4059/4061/4063/4065 for C=128 M=8160; the captured region is 5308..6643).
+// The three pk/sc scratch round trips and the 1274/1275 planes are pure chain-internal
+// traffic -- ffn2::fused keeps them in SLM, so ONE workgroup owning T tokens runs the
+// whole closure and only the 1270 read / 1267 write survive.
+//
+// WIRING RULE (the user's, 2026-11-01): the pairing is done at RECORD time by a strict
+// adjacency state machine over the three recorder sites. When a chain completes, the SIX
+// closures are NOT dropped -- the first FIVE are replaced by no-ops and the residual's
+// own closure executes the fused kernel. Partial no-oping is forbidden: the split legs
+// read pk/dC scratch that the fused leg never writes, so a half-fused chain reads junk.
+// passes therefore stays at 691 (the closure COUNT is unchanged; only bodies change),
+// while the captured cgraph's NODE count drops (a no-op closure emits zero device ops).
+//
+// Switch: NR_S6_FFN=1 enables it; DEFAULT OFF. NR_S6_FFN unset/0 = the exact shipped
+// path, bitwise unchanged (every guard below is dead until s6_on() returns true).
+// Military rules 4/9: no runtime diagnostic branch was added inside the kernel; the
+// switch lives at closure level only.
+//
+// Families wired (the two the stage-2 bench proved byte-exact, E:/DSH/s6/stage2.md):
+//   S1 C=64  HID=256 M=32640  x8  chains/frame   Shape<32,64,256,false,4,2>
+//   S2 C=128 HID=512 M=8160   x12 chains/frame   Shape<16,128,512,false,4,2>
+// NOT wired: the C=256 M=2040 family (its projection is xmx_rec_gemm f16, not
+// xmx_rec_gemm_int8_batched, so the three-site pairing cannot see it) and C=512 M=640.
+struct S6Chain {
+    int stage = 0;                 // 0 idle | 1 Q1 | 2 expand | 3 Q2 | 4 proj | 5 Q3 (awaiting residual)
+    size_t cq1 = 0, cb1 = 0, cq2 = 0, cb2 = 0, cq3 = 0;   // g_cmds indices of the five future no-ops
+    int src = 0, pk = 0, sc = 0;   // op1 quant operands (recorder buffer ids)
+    int be = 0, ce = 0, bse = 0;   // expand: weight id, hidden plane id, b_scale id
+    int bp = 0, cp = 0, bsp = 0;   // proj:   weight id, out plane id,    b_scale id
+    int ldb_e = 0; size_t sb_e = 0;   // expand B gather strides (the wide repack)
+    int ldb_p = 0; size_t sb_p = 0;   // proj B gather strides
+    int Np = 0, Kp = 0, batchp = 0;   // proj plan tuple (the diag pack's parameters)
+    unsigned M = 0, C = 0, HID = 0;
+    int fam = -1;                  // 0 = S1, 1 = S2
+};
+static S6Chain g_s6;
+static long g_s6_fires = 0;      // cumulative chains fused (host-side counter, record time)
+static long g_s6_fires_gen = 0;  // chains fused in the CURRENT recording
+static bool s6_on() {
+    static bool v = getenv("NR_S6_FFN") ? (atoi(getenv("NR_S6_FFN")) != 0) : false;
+    return v;
+}
+static void s6_reset() { g_s6 = S6Chain(); }
+static int s6_family(unsigned C, unsigned HID) {
+    if (C == 64u  && HID == 256u)  return 0;
+    if (C == 128u && HID == 512u)  return 1;
+    return -1;
+}
+// the plan's producer->quant adjacency (section 9: gap min 2 / max 4). In the CAPTURED
+// region the six ops of a chain are CONSECUTIVE recorder steps (the OP_*_INIT / OP_BUF
+// lines between them create no closure), so gap==1; the <=4 tolerance is the census bound.
+static bool s6_gap(size_t a, size_t b) { return b > a && (b - a) <= 4u; }
+// QUANT leg. A quant ALWAYS (re)arms a candidate -- the chain start is the block's input
+// quant, and any other quant in between breaks the chain (conservative: fresh candidate).
+static void s6_note_quant(size_t cmd, int source, int packed, int scale, unsigned M, unsigned K) {
+    if (!s6_on()) return;
+    S6Chain& g = g_s6;
+    if (g.stage == 2 && source == g.ce && packed == g.pk && scale == g.sc &&
+        M == g.M && K == g.HID && s6_gap(g.cb1, cmd)) { g.stage = 3; g.cq2 = cmd; return; }
+    if (g.stage == 4 && source == g.cp && packed == g.pk && scale == g.sc &&
+        M == g.M && K == g.C && s6_gap(g.cb2, cmd)) { g.stage = 5; g.cq3 = cmd; return; }
+    S6Chain c; c.stage = 1; c.cq1 = cmd; c.src = source; c.pk = packed; c.sc = scale;
+    c.M = M; c.C = K; g = c;
+}
+// BATCHED leg #1 = the FFN expand: N=128 wide groups, sa=0 (A broadcast), epi3, narrow,
+// ldc = N*batch = HID, and the group weight slices are CONTIGUOUS along N (sb == N*ldb)
+// -- exactly the condition that makes the wide pack of the whole HID one legal repack.
+static void s6_take_expand(size_t cmd, int a, int b, int c, int a_scale, int b_scale,
+                           unsigned M, unsigned N, unsigned K, unsigned batch,
+                           unsigned sa, unsigned sb, unsigned sc_stride,
+                           unsigned lda, unsigned ldb, unsigned ldc,
+                           unsigned scale_stride, unsigned flags) {
+    if (!s6_on()) return;
+    S6Chain& g = g_s6;
+    if (g.stage != 1 || !s6_gap(g.cq1, cmd)) return;
+    const unsigned epi = (flags >> 8) & 0xFu;
+    const bool narrow = (flags & 0x1000u) != 0u;
+    const unsigned ldb_ = ldb ? ldb : K;
+    if (a != g.pk || a_scale != g.sc || M != g.M || K != g.C) return;
+    if (N != 128u || batch < 2u) return;
+    if (epi != 3u || !narrow) return;
+    if (sa != 0u || scale_stride != 0u) return;
+    if (ldb_ != K || sb != (size_t)N * K) return;
+    if (sc_stride != N || ldc != N * batch) return;
+    const int fam = s6_family(g.C, N * batch);
+    if (fam < 0) return;
+    g.stage = 2; g.cb1 = cmd; g.be = b; g.ce = c; g.bse = b_scale;
+    g.HID = N * batch; g.fam = fam; g.ldb_e = (int)ldb_; g.sb_e = sb;
+}
+// BATCHED leg #2 = the FFN projection: the P8-b wide-merge form (N=32 groups, sa=K,
+// lda=K*batch, sb=N*K, sc=N, ldc=N*batch, scale_stride=0, epi1, narrow) with
+// N*batch == C and K*batch == HID. Same guards the shipped wide_ok branch uses.
+static void s6_take_proj(size_t cmd, int a, int b, int c, int a_scale, int b_scale,
+                         unsigned M, unsigned N, unsigned K, unsigned batch,
+                         unsigned sa, unsigned sb, unsigned sc_stride,
+                         unsigned lda, unsigned ldb, unsigned ldc,
+                         unsigned scale_stride, unsigned flags) {
+    if (!s6_on()) return;
+    S6Chain& g = g_s6;
+    if (g.stage != 3 || !s6_gap(g.cq2, cmd)) return;
+    const unsigned epi = (flags >> 8) & 0xFu;
+    const bool narrow = (flags & 0x1000u) != 0u;
+    const unsigned lda_ = lda ? lda : K, ldb_ = ldb ? ldb : K, ldc_ = ldc ? ldc : N;
+    if (a != g.pk || a_scale != g.sc || M != g.M) return;
+    if (N != 32u || (N * batch) != g.C || (K * batch) != g.HID) return;
+    if (epi != 1u || !narrow) return;
+    if (sa != K || lda_ != K * batch || sb != (size_t)N * K) return;
+    if (sc_stride != N || ldc_ != N * batch || scale_stride != 0u) return;
+    g.stage = 4; g.cb2 = cmd; g.bp = b; g.cp = c; g.bsp = b_scale;
+    g.ldb_p = (int)ldb_; g.sb_p = sb; g.Np = (int)N; g.Kp = (int)K; g.batchp = (int)batch;
+}
+// the frozen operand set the fused closure needs (pointers resolved AT RECORD TIME, the
+// same convention every other recorder closure in this file uses).
+struct S6Fuse {
+    int fam = -1;
+    unsigned M = 0, C = 0, HID = 0;
+    sycl::half* dIn = nullptr; sycl::half* dOut = nullptr;
+    const int8_t* BexpRaw = nullptr; const float* bsExp = nullptr;
+    const int8_t* BprojRaw = nullptr; const float* bsProj = nullptr;
+    const int8_t* BresRaw = nullptr;  const float* bsRes = nullptr;
+    const float* cos = nullptr;
+    int be = 0, bp = 0, bres = 0;      // weight buffer ids (cache keys)
+    int bse = 0, bsp = 0;              // expand/proj b_scale buffer ids
+    int ldb_e = 0; size_t sb_e = 0;
+    int ldb_p = 0; size_t sb_p = 0;
+    int Np = 0, Kp = 0, batchp = 0;    // proj plan tuple (the diag pack's parameters)
+};
+// RESIDUAL leg = the chain's last op. On a match the five earlier closures become no-ops
+// and THIS closure runs the fused kernel. Returns false (and resets the candidate) unless
+// every field of the six-op tuple agrees.
+static bool s6_take_residual(size_t cmd, int a, int b, int c, int a_scale, int b_scale,
+                             int skip, int cosine, unsigned M, unsigned N, unsigned K,
+                             unsigned flags, S6Fuse& out) {
+    if (!s6_on()) return false;
+    S6Chain g = g_s6; s6_reset();
+    if (g.stage != 5 || !s6_gap(g.cq3, cmd)) return false;
+    const unsigned epi = (flags >> 8) & 0xFu;
+    const bool narrow = (flags & 0x1000u) != 0u;
+    const bool half_skip = (flags & 0x40000u) != 0u;
+    if (a != g.pk || a_scale != g.sc || M != g.M || N != g.C || K != g.C) return false;
+    if (epi != 1u || !narrow || !half_skip) return false;
+    if (skip != g.src) return false;
+    if (g.fam < 0) return false;
+    auto P = [&](int id) -> void* { auto it = g_bufs.find(id); return it == g_bufs.end() ? nullptr : it->second.p; };
+    out.fam = g.fam; out.M = g.M; out.C = g.C; out.HID = g.HID;
+    out.dIn = (sycl::half*)P(g.src); out.dOut = (sycl::half*)P(c);
+    out.BexpRaw = (const int8_t*)P(g.be); out.bsExp = (const float*)P(g.bse);
+    out.BprojRaw = (const int8_t*)P(g.bp); out.bsProj = (const float*)P(g.bsp);
+    out.BresRaw = (const int8_t*)P(b);    out.bsRes = (const float*)P(b_scale);
+    out.cos = (const float*)P(cosine);
+    out.be = g.be; out.bp = g.bp; out.bres = b; out.bse = g.bse; out.bsp = g.bsp;
+    out.ldb_e = g.ldb_e; out.sb_e = g.sb_e;
+    out.ldb_p = g.ldb_p; out.sb_p = g.sb_p;
+    out.Np = g.Np; out.Kp = g.Kp; out.batchp = g.batchp;
+    if (!out.dIn || !out.dOut || !out.BexpRaw || !out.bsExp || !out.BprojRaw ||
+        !out.bsProj || !out.BresRaw || !out.bsRes || !out.cos) return false;
+    // THE RULE: all six or none. Five no-ops + one fused launch.
+    g_cmds[g.cq1] = [](){}; g_cmds[g.cb1] = [](){}; g_cmds[g.cq2] = [](){};
+    g_cmds[g.cb2] = [](){}; g_cmds[g.cq3] = [](){};
+    ++g_s6_fires; ++g_s6_fires_gen;
+    // RECORD-TIME host witness (env-gated, like the NR_*_TRACE family): prints nothing
+    // on the device, adds no op to the stream, and lives at closure level -- the kernel
+    // itself is untouched (military rules 4/9).
+    if (getenv("NR_S6_TRACE"))
+        std::printf("[s6-fire #%ld] fam=%d M=%u C=%u HID=%u cmds %zu..%zu  src=%d pk=%d sc=%d"
+                    " -> out=%d skip=%d  w(e/p/r)=%d/%d/%d\n",
+                    g_s6_fires, g.fam, g.M, g.C, g.HID, g.cq1, cmd,
+                    g.src, g.pk, g.sc, c, skip, g.be, g.bp, b);
+    return true;
+}
+// the fused chain's weight packs (cache-owned, same g_wcache convention as the split
+// legs). Bexp = the wide (HID x K) pack of the batched expand weight; Bproj = the SAME
+// block-diagonal wide pack the shipped P8-b branch uses (same WKey, so the two paths
+// share one block); Bres = cached_pack_b_i8, exactly the residual's own pack.
+static int8_t* s6_pack_bexp_wide(const S6Fuse& f) {
+    WKey wk{ f.be, (int)f.HID, (int)f.C, 30001 };
+    auto it = g_wcache.find(wk);
+    if (it != g_wcache.end()) return (int8_t*)it->second;
+    int8_t* p = (int8_t*)sycl::malloc_device((size_t)f.HID * f.C, *GQ);
+    packdev::gather_pack_b_b(*GQ, f.BexpRaw, p, (int)f.HID, (int)f.C, f.ldb_e, 0, 1);
+    g_wcache[wk] = p;
+    return p;
+}
+static int8_t* s6_pack_bproj_wide(const S6Fuse& f) {
+    WKey wk{ f.bp, f.Np, f.Kp, 10000 + f.batchp };   // identical key/layout as P8-b
+    auto it = g_wcache.find(wk);
+    if (it != g_wcache.end()) return (int8_t*)it->second;
+    int8_t* p = (int8_t*)sycl::malloc_device((size_t)f.C * f.HID, *GQ);
+    packdev::gather_pack_b_diag_b(*GQ, f.BprojRaw, p, f.Np, f.Kp, f.ldb_p,
+                                  f.sb_p, f.batchp);
+    g_wcache[wk] = p;
+    return p;
+}
+static void s6_ffn_run(const S6Fuse& f) {
+    ffn2::Args a;
+    a.dIn = f.dIn; a.dOut = f.dOut;
+    a.Bexp = s6_pack_bexp_wide(f); a.bsExp = f.bsExp;
+    a.Bproj = s6_pack_bproj_wide(f); a.bsProj = f.bsProj;
+    a.BprojH = nullptr;
+    a.Bres = cached_pack_b_i8(f.bres, f.BresRaw, (int)f.C, (int)f.C);
+    a.bsRes = f.bsRes; a.cos = f.cos;
+    a.M = (int)f.M; a.NP = 0;
+    a.dpk1 = nullptr; a.dsc1 = nullptr; a.dHid = nullptr; a.dpk2 = nullptr; a.dsc2 = nullptr;
+    a.dOut1275 = nullptr; a.dpk3 = nullptr; a.dsc3 = nullptr;
+    if (f.fam == 0) {
+        using S = ffn2::Shape<32, 64, 256, false, 4, 2>;
+        static_assert(S::T == 32 && S::SLM <= 32768u, "S6 S1 shape/slm drift");
+        ffn2::fused<S, false, S::NPH>(*GQ, a);
+    } else {
+        using S = ffn2::Shape<16, 128, 512, false, 4, 2>;
+        static_assert(S::T == 16 && S::SLM <= 32768u, "S6 S2 shape/slm drift");
+        ffn2::fused<S, false, S::NPH>(*GQ, a);
+    }
+}
 static sycl::half* cached_pack_b_f16(int bufid, const sycl::half* B, int K, int N) {
     WKey wk{bufid, K, N, 0};
     auto it = g_wcache.find(wk);
@@ -826,10 +1047,12 @@ int xmx_begin(void) { ++g_gen; g_recording = true; g_cmds.clear();
     // this was invisible, but it is a real cross-recording hazard. Clear at both ends.
     g_quant_pk.clear(); g_fused_quant.clear();
     g_pending_fold_slot = SIZE_MAX; g_fold_slot.clear();
+    s6_reset();   // S6: the chain candidate's cmd indices are RECORD-scoped
     return 0; }
 int xmx_abort(void) { g_recording = false; g_cmds.clear(); g_cmds_touch.clear();
     g_quant_pk.clear(); g_fused_quant.clear();
     g_pending_fold_slot = SIZE_MAX; g_fold_slot.clear();
+    s6_reset();
     return 0; }
 
 // int xmx_graph_capture(void) -> id ; int xmx_graph_run(int id) -> passes ; destroy(id)
@@ -855,6 +1078,7 @@ int xmx_graph_capture(void) {
     g_cmds.clear();
     g_quant_pk.clear(); g_fused_quant.clear();          // record-scoped registries die
     g_pending_fold_slot = SIZE_MAX; g_fold_slot.clear(); // with the stream (10-27 audit)
+    s6_reset();                                          // S6 chain candidate: ditto
     g_recording = false;
     return (int)g_graphs.size() - 1;
 }
@@ -2421,6 +2645,14 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
     const unsigned epi = (flags >> 8) & 0xFu;
     const bool narrow = (flags & 0x1000u) != 0u;
     const int Mp = l0_ceil_bm(M);
+    // S6-1a (NR_S6_FFN): the FFN expand / projection legs of a chain. No-op unless the
+    // env switch is on AND the tuple matches a chain already armed by an adjacent QUANT.
+    // The closure pushed below is the one the state machine may later replace with a
+    // no-op -- the plan's op stream and the passes count stay intact.
+    s6_take_expand(g_cmds.size(), a, b, c, a_scale, b_scale, M, N, K, batch,
+                   sa, sb, sc, lda, ldb, ldc, scale_stride, flags);
+    s6_take_proj(g_cmds.size(), a, b, c, a_scale, b_scale, M, N, K, batch,
+                 sa, sb, sc, lda, ldb, ldc, scale_stride, flags);
     g_cmd_names.push_back(__func__);
     pgraph_ids({a,b,c,a_scale,b_scale});   // PGRAPH touch-set (conservative: every operand id)
         flop_note("batched",M,N,K,batch);
@@ -3094,6 +3326,20 @@ int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale,
     QuantFused qfr; const bool fused_r = qfuse_take(a, a_scale, M, K, qfr);
     sycl::half* a16r = fused_r ? (sycl::half*)g_bufs[qfr.src].p : nullptr;
     if (fused_r) pgraph_extra(qfr.src);   // PGRAPH: the fused gather reads the RAW plane
+    // S6-1a (NR_S6_FFN): this is the chain's LAST leg. On a full six-op adjacency match
+    // the FIVE earlier closures of the chain are replaced by no-ops (inside
+    // s6_take_residual -- all six or none, never a partial no-op) and THIS closure runs
+    // the fused block-resident kernel instead of the split pack+gemm. The switch is
+    // closure-level only; the kernel body carries no runtime diagnostic branch.
+    S6Fuse s6f;
+    const bool s6fire = s6_take_residual(g_cmds.size(), a, b, c, a_scale, b_scale,
+                                         skip, cosine, M, N, K, flags, s6f);
+    if (s6fire) {
+        pgraph_extra(s6f.be); pgraph_extra(s6f.bp);      // the two extra weight reads
+        pgraph_extra(s6f.bse); pgraph_extra(s6f.bsp);    // and the two scale arrays
+        pg_push([s6f]() { s6_ffn_run(s6f); });
+        return 0;
+    }
     pg_push([=]() {
         // device pack (section 92): Araw/Braw are already on device -- pack in place,
         // no download/upload round-trip (same conversion as gemm_int8, packdev gate).
@@ -5161,6 +5407,10 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
             }
             qr_launch_esimd(*GQ, *GD, a, pk, sc, M, K);
         });
+        // S6-1a (NR_S6_FFN): a REAL quantize closure can arm / advance an FFN chain.
+        // The dissolved ones (g_fused_quant memcpy legs, NR_Q_STOP branches) never get
+        // here -- a chain containing one simply never completes (conservative).
+        s6_note_quant(g_cmds.size() - 1, source, packed, scale, M, K);
         if (qfuse_on())   // register for a downstream gemm to dissolve us (P2 fusion)
             { QuantFused qf2{ g_cmds.size()-1, source, scale, M, K };
               qf2.pkp = (void*)pk; qf2.scp = (void*)sc;
@@ -5172,6 +5422,7 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
                                             // POINTER is the real wire.)
         return 0;
     }
+    s6_note_quant(g_cmds.size(), source, packed, scale, M, K);   // S6-1a (see above)
     pg_push([=]() {
         qr_launch(*GQ, *GD, qr_kernel(), a, pk, sc, M, K, 0u, 0u, 0u, 0u, 0u, nullptr, nullptr);
         if (getenv("NR_PK_DUMP")) { static int pdSP=0; if(pdSP<1){pdSP++;
