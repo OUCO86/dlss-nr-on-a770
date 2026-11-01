@@ -1066,6 +1066,150 @@ int xmx_abort(void) { g_recording = false; g_cmds.clear(); g_cmds_touch.clear();
     s6_reset();
     return 0; }
 
+// ==================== NR_SKIP_CHAINS: whole-block-chain skip (2026-11-02, B2 跳块铲) ====
+// What this is: a quality-for-speed blade on the SHIPPED engine. The frame's captured graph
+// is 52 QUANT_WINDOW-anchored block chains (tools/chain_scan.py -> E:/DSH/s6/chain_map.csv;
+// chain k = the k-th xmx_rec_quant_window closure in graph order, running to its terminating
+// xmx_rec_gemm_int8_residual closure). NR_SKIP_CHAINS=<comma separated chain numbers> turns
+// a whole chain into no-ops at CAPTURE time -- the same "all legs or none" rule S6-1a uses
+// (libxmx_sycl.cpp:514-520): a half-skipped chain reads pk/dC scratch and a chain-internal
+// skip face that its own skipped legs never wrote, so partial skip is forbidden.
+//
+// WHY A WHOLE-CHAIN NO-OP IS RESIDUAL-CONNECTED (the correctness point): every chain's
+// terminal leg is c = A*B + skip with out=1267 (the one global residual face) and skip = a
+// CHAIN-INTERNAL face (1270 / 1279 / 1281 / 1283 / 1288 / 1297, chosen by tier). Killing all
+// closures of a chain leaves 1267 exactly as the previous surviving writer left it, and the
+// next chain's QUANT_WINDOW + attention-residual legs read 1267 fresh. That is the identity
+// block: the residual stream stays connected, no face goes stale, no pyramid tier is jumped.
+//
+// REFUSED chains (hard guard, printed not guessed): a chain that does NOT terminate at
+// xmx_rec_gemm_int8_residual (k=51, the last decoder block -- its attention leg feeds the
+// network head) or whose range contains an op outside the pure-block family set (the
+// tier-transition chains k=3,9,17,25,33,41,47 carry the UNARY+GEMM patch-merge legs; no-oping
+// one would leave the NEXT tier reading a face of the wrong geometry). The 8-bit census:
+// 44 of 52 chains are skippable (C64 x6, C128 x10, C256 x14, C512 x14).
+//
+// Composition with S6-1a (NR_S6_FFN default ON): S6 rewrote five chain legs into no-ops at
+// RECORD time and made the residual closure run the fused kernel. This pass runs at CAPTURE
+// time, i.e. after S6, and kills whatever body the residual closure now carries -- so a
+// skipped chain is dead in both forms, and the FFN fusion is not bypassed, it is subsumed.
+//
+// Military rules 4/9: the switch is closure-level only (bodies replaced before the device
+// ops are recorded), it adds NO runtime branch inside any kernel, and with an empty/absent
+// NR_SKIP_CHAINS the code path is not entered at all -- the shipped binary behaves verbatim.
+// passes stays 691 (a no-op closure emits zero device ops; the closure COUNT is unchanged),
+// and the captured cgraph's node count drops by the killed launches. NR_SKIP_MAP=1 prints the
+// full 52-chain segmentation for cross-checking against chain_map.csv (host-side, record time).
+static const std::vector<int>& skip_chain_set() {
+    static std::vector<int> v = [](){
+        std::vector<int> out;
+        const char* s = getenv("NR_SKIP_CHAINS");
+        if (s) {
+            const char* p = s;
+            while (*p) {
+                char* e = nullptr;
+                long n = strtol(p, &e, 10);
+                if (e != p) { out.push_back((int)n); p = e; }
+                else ++p;
+            }
+        }
+        return out;
+    }();
+    return v;
+}
+static bool sc_is(const char* n, const char* w) { return n && strcmp(n, w) == 0; }
+static bool sc_open(const char* n) { return sc_is(n, "xmx_rec_quant_window"); }
+static bool sc_term(const char* n) { return sc_is(n, "xmx_rec_gemm_int8_residual"); }
+static bool sc_head(const char* n) {
+    return sc_is(n, "xmx_rec_ffn") || sc_is(n, "xmx_rec_ffn_stem") ||
+           sc_is(n, "xmx_rec_ffn_merge") || sc_is(n, "xmx_rec_window_block") ||
+           sc_is(n, "xmx_rec_unary2");
+}
+// the pure-block op families (chain_map.csv `pure` column): anything else inside a chain
+// range means the chain carries a tier-transition leg -> not skippable.
+static bool sc_pure(const char* n) {
+    static const char* k[] = { "xmx_rec_quant_window", "xmx_rec_gemm_int8_qkv",
+        "xmx_rec_window_attention", "xmx_rec_quant", "xmx_rec_gemm_window_int8_residual",
+        "xmx_rec_gemm_int8_batched", "xmx_rec_gemm", "xmx_rec_gemm_int8",
+        "xmx_rec_gemm_int8_residual" };
+    for (const char* w : k) if (sc_is(n, w)) return true;
+    return false;
+}
+static void skip_chains_apply(std::vector<std::function<void()>>& cmds,
+                              const std::vector<const char*>& names, int graphid) {
+    const std::vector<int>& want = skip_chain_set();
+    const bool mapmode = getenv("NR_SKIP_MAP") != nullptr;
+    if (want.empty() && !mapmode) return;
+    // 军规 13 alignment: the plan records TWICE (scratch BEGIN@3922 -> ABORT@5295, then the
+    // captured graph BEGIN@5308 -> GRAPH_CAPTURE@6644). xmx_abort drops g_cmds but NOT
+    // g_cmd_names, so names can carry the aborted recording's prefix. The graph region is
+    // the TAIL of the name list; slice it by offset and print the offset so the mapping is
+    // auditable (both recordings are the same 691-op stream, so run_timing never noticed).
+    if (names.size() < cmds.size()) {
+        std::printf("[skip-chains] graph=%d REFUSED: cmds=%zu names=%zu (names shorter)\n",
+                    graphid, cmds.size(), names.size());
+        std::fflush(stdout);
+        return;
+    }
+    const size_t off = names.size() - cmds.size();
+    if (off && (off % cmds.size()) != 0) {
+        std::printf("[skip-chains] graph=%d REFUSED: name offset %zu not a whole recording\n",
+                    graphid, off);
+        std::fflush(stdout);
+        return;
+    }
+    auto nm = [&](size_t i) { return names[i + off]; };
+    struct Ch { size_t a; size_t b; bool term; };
+    std::vector<Ch> ch;
+    const size_t n = cmds.size();
+    for (size_t i = 0; i < n; ++i) {
+        if (!sc_open(nm(i))) continue;
+        Ch c{ i, n - 1, false };
+        for (size_t j = i; j < n; ++j) {
+            if (j > i && (sc_open(nm(j)) || sc_head(nm(j)))) { c.b = j - 1; break; }
+            if (sc_term(nm(j))) { c.b = j; c.term = true; break; }
+        }
+        ch.push_back(c);
+        i = c.b;
+    }
+    std::printf("[skip-chains] graph=%d closures=%zu names=%zu name_offset=%zu chains=%zu "
+                "NR_SKIP_CHAINS='%s'\n", graphid, n, names.size(), off, ch.size(),
+                getenv("NR_SKIP_CHAINS") ? getenv("NR_SKIP_CHAINS") : "");
+    if (mapmode) {
+        for (size_t k = 0; k < ch.size(); ++k) {
+            int pure = 1;
+            for (size_t i = ch[k].a; i <= ch[k].b; ++i) if (!sc_pure(nm(i))) { pure = 0; break; }
+            std::printf("[skip-map] chain=%2zu closures %3zu..%3zu n=%2zu term=%d pure=%d\n",
+                        k, ch[k].a, ch[k].b, ch[k].b - ch[k].a + 1, (int)ch[k].term, pure);
+        }
+    }
+    size_t noops = 0, skipped = 0, refused = 0;
+    for (int wk : want) {
+        if (wk < 0 || (size_t)wk >= ch.size()) {
+            std::printf("[skip-chains] chain=%d OUT OF RANGE (valid 0..%zu) -- ignored\n",
+                        wk, ch.size() - 1);
+            ++refused; continue;
+        }
+        const Ch& c = ch[wk];
+        int pure = 1;
+        for (size_t i = c.a; i <= c.b; ++i) if (!sc_pure(nm(i))) { pure = 0; break; }
+        if (!c.term || !pure) {
+            std::printf("[skip-chains] chain=%d REFUSED closures %zu..%zu (n=%zu term=%d pure=%d): "
+                        "tier-transition / head-adjacent -- skipping would leave the next tier "
+                        "or the head reading a stale face\n",
+                        wk, c.a, c.b, c.b - c.a + 1, (int)c.term, pure);
+            ++refused; continue;
+        }
+        for (size_t i = c.a; i <= c.b; ++i) { cmds[i] = [](){}; ++noops; }
+        ++skipped;
+        std::printf("[skip-chains] chain=%d SKIPPED closures %zu..%zu (%zu no-ops): %s .. %s\n",
+                    wk, c.a, c.b, c.b - c.a + 1, nm(c.a), nm(c.b));
+    }
+    std::printf("[skip-chains] graph=%d chains_skipped=%zu refused=%zu closures_noop=%zu "
+                "passes=%zu (unchanged)\n", graphid, skipped, refused, noops, n);
+    std::fflush(stdout);
+}
+
 // int xmx_graph_capture(void) -> id ; int xmx_graph_run(int id) -> passes ; destroy(id)
 // Route (a) step 1 (section 64): the plan says which graph ran "as the number it had
 // that once" (nr_replay.c:505-507 -- r->graph = the capture's return, run/destroy use
@@ -1084,6 +1228,9 @@ static int fence_host_wait(void);   // defined in the fence block; graph_run cal
 #endif
 int xmx_graph_capture(void) {
     if (!g_recording) FAILMSG("not recording");
+    // NR_SKIP_CHAINS: whole-chain no-ops, applied to the frozen closure list BEFORE the
+    // graph is stored (default empty => this function is never entered; see the block above).
+    skip_chains_apply(g_cmds, g_cmd_names, (int)g_graphs.size());
     g_graphs.push_back(std::move(g_cmds)); g_graph_names.push_back(std::move(g_cmd_names));
     g_graph_touch.push_back(std::move(g_cmds_touch)); g_cmds_touch.clear();
     g_cmds.clear();
