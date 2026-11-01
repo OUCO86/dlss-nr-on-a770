@@ -7,7 +7,7 @@
 param(
   [string]$Dll  = 'E:\DSH\out\libxmx.dll',
   [string]$Tag  = 'cur',
-  [int]$runLines    = 4,
+  [int]$runsOut    = 4,
   [string]$Gold = 'E:\DSH\dumps\bk.1301.bin'
 )
 $ErrorActionPreference = 'Continue'
@@ -22,11 +22,11 @@ Pop-Location
 $raw | Out-File -Encoding utf8 "E:\DSH\logs\walk_$Tag.txt"
 $dev   = ($raw | Select-String 'device ' | Select-Object -First 1)
 $ext   = ($raw | Select-String 'extent ' | Select-Object -First 1)
-$runLines  = $raw | Select-String 'run \d+: .*passes' | ForEach-Object { $_.ToString().Trim() }
+$runsOut  = $raw | Select-String 'run \d+: .*passes' | ForEach-Object { $_.ToString().Trim() }
 $walk  = $raw | Select-String 'walk run' | ForEach-Object { $_.ToString().Trim() }
 Write-Output "dll   : $Dll"
 Write-Output $dev; Write-Output $ext
-Write-Output ("runs  : " + ($runLines -join ' | '))
+Write-Output ("runs  : " + ($runsOut -join ' | '))
 Write-Output ("walk  : " + ($walk -join ' | '))
 $dump = "E:\DSH\dumps\$Tag.1301.bin"
 if (Test-Path $dump) {
