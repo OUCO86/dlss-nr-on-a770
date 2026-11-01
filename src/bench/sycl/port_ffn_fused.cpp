@@ -163,27 +163,41 @@ static inline esimd::simd<float, N> e4m3_dec(esimd::simd<int8_t, N> raw) {
 // ============================ the port ============================
 namespace port {
 
-template <int C_, int HID_>
+// C1 (11-01 16:xx): the geometry is now a SWEEP KNOB, not a constant.
+//   Geo<C, HID, TG, G, WM, KNIFE>  -- the six slots spillcheck_port.py's label() already expects.
+//   TG = token rows per group (16 = faithful R7; C1 does NOT open the 32-token rung),
+//   G  = token-groups per work-group  => LW = W*G*WM work-items/WG  (the occupancy knob),
+//   WM = waves per work-item (1 = faithful),
+//   KNIFE = 1 -> C1's SLM knife: NO `out` copy in SLM; PHASE 4's row peak reads the f16 values
+//                back from the GLOBAL 1275 plane (one extra global read pass per row, in exchange
+//                for TG*C*2 bytes per group of SLM). KNIFE = 0 -> the B-stage SLM layout (anchor).
+//   W=C/16 and the 16x16 tile stay faithful. The old static_assert(LW==16) is gone; the 32KB
+//   "occupancy cliff" and the 64KB SLM cap are reported as FITS/CLIFF, not asserted, so the sweep
+//   can walk past the cliff on purpose and still be refused by the cap.
+template <int C_, int HID_, int TG_, int G_, int WM_, int KNIFE_>
 struct Geo {
-    static constexpr int C = C_, HID = HID_;
+    static constexpr int C = C_, HID = HID_, TG = TG_, G = G_, WM = WM_, KN = KNIFE_;
     static constexpr int W = C / 16;            // their WAVES = C/16 (their :15) -- faithful
-    static constexpr int G = 16 / W;            // D1: token-groups per work-group
-    static constexpr int LW = W * G;            // = 16 ESIMD work-items (=waves) per WG
+    static constexpr int LW = W * G * WM;       // ESIMD work-items (=waves) per WG
     static constexpr int KB_C = C / 32, KB_H = HID / 32;   // R6: K step 32
-    static constexpr int RPI = 16 / W;          // rows per work-item in the requant passes
+    static constexpr int RPI = TG / W;          // rows per work-item in the requant passes
+    static_assert(TG == 16, "R7 faithful: 16-token groups (C1 keeps them; no 32-token rung)");
+    static_assert(WM == 1, "C1 keeps 1 wave per work-item (faithful)");
+    static_assert(TG % W == 0, "requant passes split TG rows over the W waves");
     // ---- SLM, per token-group (bytes). R3: the hidden plane NEVER touches global. ----
     static constexpr uint32_t O_HIDF = 0;                       // e4m3 bytes -> int8, fragment order
-    static constexpr uint32_t SZ_HIDF = 16u * (uint32_t)HID;
-    static constexpr uint32_t O_OUT = O_HIDF + SZ_HIDF;         // contract out f16 (16 x C)
-    static constexpr uint32_t SZ_OUT = 16u * (uint32_t)C * 2u;
+    static constexpr uint32_t SZ_HIDF = (uint32_t)TG * (uint32_t)HID;
+    static constexpr uint32_t SZ_OUT = (KN == 0) ? ((uint32_t)TG * (uint32_t)C * 2u) : 0u; // C1 knife
+    static constexpr uint32_t O_OUT = O_HIDF + SZ_HIDF;         // contract out f16 (TG x C), KN==0 only
     static constexpr uint32_t O_PK = O_OUT + SZ_OUT;            // out int8, fragment order (P6 A)
-    static constexpr uint32_t SZ_PK = 16u * (uint32_t)C;
+    static constexpr uint32_t SZ_PK = (uint32_t)TG * (uint32_t)C;
     static constexpr uint32_t O_SC = O_PK + SZ_PK;              // scH @ +0 | scO @ +64
     static constexpr uint32_t SZ_SC = 128u;
     static constexpr uint32_t PG = O_SC + SZ_SC;                // per-group span
     static constexpr uint32_t SLM = ((PG * (uint32_t)G + 15u) / 16u) * 16u;
-    static_assert(LW == 16, "D1: LW must be 16 work-items/WG (port.md A-phase)");
-    static_assert(PG * (uint32_t)G <= 32768u, "D2: over the 32KB occupancy cliff");
+    static constexpr uint32_t CAP = 65536u;       // A-stage: the 64KB SLM cap per WG (hard)
+    static constexpr uint32_t CLIFF = 32768u;     // A-stage: the 32KB occupancy cliff (soft)
+    static constexpr bool FITS = (PG * (uint32_t)G <= CAP);
 };
 
 struct Args {
@@ -198,7 +212,13 @@ struct Args {
     const float*  cos;
     const half*   dIn;      // skip connection
     half*         dOut;     // 1267 plane
-    int M, NGRP;            // NGRP = 16-token groups (multiple of G)
+    int M, NGRP;            // NGRP = 16-token groups, PADDED to a multiple of G (host rule)
+    // ---- anti-DCE sink (C1): per-phase fragments stored under a RUNTIME flag the compiler
+    // cannot fold (it is a kernel argument read from memory). The flag is 0 at run time, so the
+    // stores never execute, but every phase's accumulator/result lanes stay live even when the
+    // launch is truncated by NPHASE -- which is what the per-phase timings rely on.
+    int sinkFlag;
+    int32_t* dSink;         // [NGRPpad*W][5 phases][64 int32]
     // ---- bench-only taps; exist ONLY in the DUMP=true instantiation ----
     half*   dHid;           // pub values as f16 (proves the e4m3 transient == 现路 hidden f16)
     int8_t* dfrag1;         // the e4m3 BYTES phase 1 wrote, dumped as stored (fragment order)
@@ -213,13 +233,24 @@ struct Args {
 template <class S, bool DUMP, int NPHASE>
 static sycl::event fused(sycl::queue& q, const Args& a) {
     constexpr int C = S::C, HID = S::HID, W = S::W, G = S::G, LW = S::LW;
-    constexpr int KB_C = S::KB_C, KB_H = S::KB_H, RPI = S::RPI;
+    constexpr int KB_C = S::KB_C, KB_H = S::KB_H, RPI = S::RPI, TG = S::TG, KN = S::KN;
     constexpr uint32_t PG = S::PG;
     const int ngrp = a.NGRP;
     return q.submit([&](handler& h) {
         h.parallel_for(nd_range(range((size_t)(ngrp / G) * (size_t)LW), range((size_t)LW)),
                        [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
             esimd::slm_init<S::SLM>();
+#ifdef PORT_SINKS
+            const bool sf = (a.sinkFlag != 0);     // diagnostic build: per-phase anti-DCE sinks ON
+#else
+            // Default: the sink STORES are compiled away. C1 measured why -- they are NOT needed
+            // here (every phase ends in an SLM or global store, and SLM is WG-shared, so the
+            // compiler cannot prove it is unread => no phase can be DCE'd), and paying for them
+            // is expensive: grf_count is already pinned at 128, so widening the dpas accumulators'
+            // live range spills (private 3328->3584, scratch instructions 61->174, chain +64%).
+            // Build with -DPORT_SINKS to get the sink cross-check (C1-3 in s6/port_C1.md).
+            const bool sf = false;
+#endif
             const int t    = (int)it.get_local_id(0);
             const int gidx = t / W, w = t % W;              // their "wave" (their :52)
             const int grp  = (int)it.get_group(0) * G + gidx;
@@ -305,6 +336,13 @@ static sycl::event fused(sycl::queue& q, const Args& a) {
                            esimd::block_load<float, 16>(a.bsExp + (w*4+2)*16, esimd::overaligned_tag<16>{}));
                 store_tile(q3_00, q3_01, q3_10, q3_11, (w*4+3)*16,
                            esimd::block_load<float, 16>(a.bsExp + (w*4+3)*16, esimd::overaligned_tag<16>{}));
+                // ---- PHASE 1 sink (expand / = 现路 P2): all 16 accumulator fragments are live ----
+                if (sf) {
+                    esimd::simd<int32_t, 64> z =
+                        ((((q0_00 + q0_01) + (q0_10 + q0_11)) + ((q1_00 + q1_01) + (q1_10 + q1_11))) +
+                         (((q2_00 + q2_01) + (q2_10 + q2_11)) + ((q3_00 + q3_01) + (q3_10 + q3_11))));
+                    z.copy_to(a.dSink + ((size_t)grp * W + (size_t)w) * 320);
+                }
             }
             group_barrier(gr);              // R5
             if (NPHASE <= 1) return;
@@ -316,6 +354,7 @@ static sycl::event fused(sycl::queue& q, const Args& a) {
             // published values = "行峰值在 f16 舍入之后取", identical values, f16/e4m3 are the same
             // lattice points here).
             {
+                esimd::simd<int32_t, 32> s2(0);            // PHASE 2 sink accumulator
                 for (int i = 0; i < RPI; ++i) {
                     const int r = w * RPI + i;
                     esimd::simd<float, 32> mx(esimd::simd<float, 32>(0.f));
@@ -344,6 +383,7 @@ static sycl::event fused(sycl::queue& q, const Args& a) {
                                        esimd::simd<float, 32>(127.f));
                         esimd::simd<int8_t, 32> o = esimd::convert<int8_t>(esimd::convert<int>(q));
                         esimd::slm_block_store(fo, o, esimd::overaligned_tag<16>{});
+                        if (sf) { esimd::simd<int32_t, 32> oi = esimd::convert<int32_t>(o); s2 = s2 + oi; }
                         if (DUMP) {
                             esimd::block_store<int8_t, 32>(a.dpk2 + (size_t)(r0 + r)*HID + kb*32, o,
                                                            esimd::overaligned_tag<16>{});
@@ -353,6 +393,7 @@ static sycl::event fused(sycl::queue& q, const Args& a) {
                     }
                     if (DUMP) a.dsc2[r0 + r] = scale;
                 }
+                if (sf) s2.copy_to(a.dSink + ((size_t)grp * W + (size_t)w) * 320 + 64);
             }
             group_barrier(gr);              // R5
             if (NPHASE <= 2) return;
@@ -389,26 +430,41 @@ static sycl::event fused(sycl::queue& q, const Args& a) {
                     esimd::simd<float, 16> pub = s8v8::pub_vec_v8<16>(
                         1u, esimd::convert<float>(acc) * rs * cs);
                     esimd::simd<half, 16> hh = esimd::convert<half>(pub);
-                    esimd::slm_block_store(OUTP + (uint32_t)r*(C*2u) + (uint32_t)col*2u, hh,
-                                           esimd::overaligned_tag<16>{});
+                    if (KN == 0) esimd::slm_block_store(OUTP + (uint32_t)r*(C*2u) + (uint32_t)col*2u, hh,
+                                                        esimd::overaligned_tag<16>{});
                     hh.copy_to(a.dOut1275 + (size_t)(r0 + r)*C + col);   // their :98 (the 1275 plane)
                 };
                 for (int r = 0; r < 8; ++r) {
                     row(c00, c01, r, r,     rssA[r]);
                     row(c10, c11, r, r + 8, rssB[r]);
                 }
+                // ---- PHASE 3 sink (contract / = 现路 P4) ----
+                if (sf) {
+                    esimd::simd<int32_t, 64> z = (c00 + c01) + (c10 + c11);
+                    z.copy_to(a.dSink + ((size_t)grp * W + (size_t)w) * 320 + 128);
+                }
             }
             group_barrier(gr);              // R5
             if (NPHASE <= 3) return;
 
             // ==================== PHASE 4: out row peak -> pkO (T1; = 现路 P5q) ====================
+            // C1 KNIFE (KN==1): the f16 row is NOT copied into SLM by PHASE 3; the row peak and the
+            // requant read it back from the GLOBAL 1275 plane (their :98 output, which this kernel
+            // already writes). Cost: one extra global read pass over TG*C f16 per group. Payoff:
+            // -TG*C*2 bytes of SLM per group (S1 2048B, S2 4096B) -> the occupancy knob below.
+            // Cross-wave read-after-write inside the WG is ordered by the R5 group_barrier above
+            // (the 1275 plane is written by all W waves of this group and read back row-wise).
             {
+                esimd::simd<int32_t, 32> s4(0);            // PHASE 4 sink accumulator
                 for (int i = 0; i < RPI; ++i) {
                     const int r = w * RPI + i;
+                    const half* rowp = a.dOut1275 + (size_t)(r0 + r) * C;
                     esimd::simd<float, 16> mx(esimd::simd<float, 16>(0.f));
                     for (int c = 0; c < C/16; ++c) {
-                        esimd::simd<half, 16> h = esimd::slm_block_load<half, 16>(
-                            OUTP + (uint32_t)r*(C*2u) + (uint32_t)c*32u, esimd::overaligned_tag<16>{});
+                        esimd::simd<half, 16> h = (KN == 0)
+                            ? esimd::slm_block_load<half, 16>(
+                                  OUTP + (uint32_t)r*(C*2u) + (uint32_t)c*32u, esimd::overaligned_tag<16>{})
+                            : esimd::block_load<half, 16>(rowp + c*16, esimd::overaligned_tag<16>{});
                         mx = esimd::max(mx, esimd::abs(esimd::convert<float>(h)));
                     }
                     float peak = esimd::hmax<float, float, 16>(mx);
@@ -418,8 +474,10 @@ static sycl::event fused(sycl::queue& q, const Args& a) {
                     esimd::slm_block_store(SCB + 64u + (uint32_t)r*4u, esimd::simd<float, 1>(scale),
                                            esimd::overaligned_tag<16>{});
                     for (int kb = 0; kb < KB_C; ++kb) {
-                        esimd::simd<half, 32> h = esimd::slm_block_load<half, 32>(
-                            OUTP + (uint32_t)r*(C*2u) + (uint32_t)kb*64u, esimd::overaligned_tag<16>{});
+                        esimd::simd<half, 32> h = (KN == 0)
+                            ? esimd::slm_block_load<half, 32>(
+                                  OUTP + (uint32_t)r*(C*2u) + (uint32_t)kb*64u, esimd::overaligned_tag<16>{})
+                            : esimd::block_load<half, 32>(rowp + kb*32, esimd::overaligned_tag<16>{});
                         esimd::simd<float, 32> q = esimd::div_ieee<float, 32>(esimd::convert<float>(h),
                                                                               esimd::simd<float, 32>(scale));
                         q = esimd::min(esimd::max(esimd::rnde<float, 32>(q), esimd::simd<float, 32>(-127.f)),
@@ -427,6 +485,7 @@ static sycl::event fused(sycl::queue& q, const Args& a) {
                         esimd::simd<int8_t, 32> o = esimd::convert<int8_t>(esimd::convert<int>(q));
                         esimd::slm_block_store<int8_t, 32>(PKO + (uint32_t)kb*512u + (uint32_t)r*32u, o,
                                                            esimd::overaligned_tag<16>{});
+                        if (sf) { esimd::simd<int32_t, 32> oi = esimd::convert<int32_t>(o); s4 = s4 + oi; }
                         if (DUMP) {
                             esimd::block_store<int8_t, 32>(a.dpk3 + (size_t)(r0 + r)*C + kb*32, o,
                                                            esimd::overaligned_tag<16>{});
@@ -436,6 +495,7 @@ static sycl::event fused(sycl::queue& q, const Args& a) {
                     }
                     if (DUMP) a.dsc3[r0 + r] = scale;
                 }
+                if (sf) s4.copy_to(a.dSink + ((size_t)grp * W + (size_t)w) * 320 + 192);
             }
             group_barrier(gr);              // R5
             if (NPHASE <= 4) return;
@@ -489,6 +549,11 @@ static sycl::event fused(sycl::queue& q, const Args& a) {
                     res_row(v10, r + 8, colb,     cs0, cc0, rosB[r]);
                     res_row(v11, r + 8, colb + 8, cs1, cc1, rosB[r]);
                 }
+                // ---- PHASE 5 sink (residual gemm / = 现路 P6) ----
+                if (sf) {
+                    esimd::simd<int32_t, 64> z = (r00 + r01) + (r10 + r11);
+                    z.copy_to(a.dSink + ((size_t)grp * W + (size_t)w) * 320 + 256);
+                }
             }
         });
     });
@@ -518,8 +583,10 @@ static void retile_b(queue& q, const int8_t* src, int8_t* dst, int N, int K) {
 }
 
 // ============================ host ============================
-struct Stat { double msm, msM, med; };
-static Stat timeit(std::function<event()> f, size_t groups = 3, size_t reps = 15, int gap_ms = 60) {
+// C1 protocol: 5 groups x 15 reps, 60 ms between groups; msM = median of the group minimums,
+// msm = global min, msX = global max, med = global median (event-profiling GPU time).
+struct Stat { double msm, msM, msX, med; };
+static Stat timeit(std::function<event()> f, size_t groups = 5, size_t reps = 15, int gap_ms = 60) {
     f().wait();
     std::vector<double> gmin, all;
     for (size_t gi = 0; gi < groups; ++gi) {
@@ -534,8 +601,9 @@ static Stat timeit(std::function<event()> f, size_t groups = 3, size_t reps = 15
         gmin.push_back(lo);
     }
     std::sort(all.begin(), all.end());
-    Stat st; st.msM = gmin[gmin.size()/2]; st.msm = *std::min_element(all.begin(), all.end());
-    st.med = all[all.size()/2]; return st;
+    std::sort(gmin.begin(), gmin.end());
+    Stat st; st.msM = gmin[gmin.size()/2]; st.msm = all.front();
+    st.msX = all.back(); st.med = all[all.size()/2]; return st;
 }
 
 static int gfails = 0;
@@ -583,21 +651,33 @@ static uint8_t host_e4m3(uint16_t hb) {
     return (uint8_t)((sg << 7) | (e4 << 3) | (m3 & 7u));
 }
 
-template <int C_, int HID_>
+// C1: one (shape, G, KNIFE) configuration per call; the geometry comes in as the type S.
+// Padding rule: a work-group carries G token-groups (and the cull is WG-uniform), so every
+// buffer the kernel touches by ROW must cover ceil(ngrp/G)*G groups = Mpad rows. The 现路
+// control leg and all 13 diffs stay on the REAL M rows.
+template <class S>
 static bool run_shape(const char* tag, int M, int N_e, int b_e, int N_p, int K_p, int b_p) {
-    constexpr int C = C_, HID = HID_;
+    constexpr int C = S::C, HID = S::HID, W = S::W, G = S::G, LW = S::LW, KN = S::KN;
     device dev;
     for (auto& d : device::get_devices(info::device_type::gpu))
         if (d.get_backend() == backend::ext_oneapi_level_zero &&
             d.get_info<info::device::name>().find("Arc") != std::string::npos) { dev = d; break; }
     if (dev.get_backend() != backend::ext_oneapi_level_zero) { printf("no L0 Arc\n"); return false; }
     queue q(dev, property::queue::enable_profiling{});
+    printf("[dev] local_mem_size=%u B  max_work_group_size=%u  max_compute_units=%u  sub_dev=%u\n",
+           dev.get_info<info::device::local_mem_size>(), dev.get_info<info::device::max_work_group_size>(),
+           dev.get_info<info::device::max_compute_units>(),
+           dev.get_info<info::device::partition_max_sub_devices>());
 
-    using S = port::Geo<C, HID>;
     const int ngrp = M / 16;
-    if (M % 16 || ngrp % S::G) { printf("%s: M/16 not a multiple of G -- geometry illegal\n", tag); return false; }
-    printf("\n############ %s: M=%d C=%d HID=%d | W=%d G=%d LW=%d ngrp=%d WG=%d SLM=%uB ############\n",
-           tag, M, C, HID, S::W, S::G, S::LW, ngrp, ngrp / S::G, S::SLM);
+    if (M % 16) { printf("%s: M not a multiple of 16 -- geometry illegal\n", tag); return false; }
+    const int ngrpP = ((ngrp + G - 1) / G) * G;
+    const int Mpad  = ngrpP * 16;
+    const int nWG   = ngrpP / G;
+    printf("\n############ %s: M=%d C=%d HID=%d | W=%d G=%d LW=%d KN=%d | ngrp=%d->%d WG=%d "
+           "SLM=%uB %s%s | threads=%d ############\n",
+           tag, M, C, HID, W, G, LW, KN, ngrp, ngrpP, nWG, S::SLM, (S::SLM > S::CLIFF ? ">32KB" : "<=32KB"),
+           (S::SLM > S::CLIFF ? "*" : ""), nWG * LW);
 
     std::mt19937 rng(5);
     std::uniform_real_distribution<float> du(-1.5f, 1.5f);
@@ -618,11 +698,13 @@ static bool run_shape(const char* tag, int M, int N_e, int b_e, int N_p, int K_p
         hWEW[(size_t)(g*N_e + n)*C + k] = hWE[(size_t)g*N_e*C + (size_t)n*C + k];
 
     auto mk = [&](size_t bytes){ void* p = malloc_device(bytes, q); q.memset(p, 0, bytes).wait(); return p; };
-    half* dIn  = (half*)mk((size_t)M*C*2);
+    // Mpad-sized rows where the PORT kernel touches them (dIn is read by PHASE 5 up to Mpad rows;
+    // dPK/dSC feed retile_a/pScA up to Mpad rows). 现路 planes stay M/Mp-sized below.
+    half* dIn  = (half*)mk((size_t)Mpad*C*2);
     half* dO1  = (half*)mk((size_t)M*C*2);          // 现路 1267
-    half* dO2  = (half*)mk((size_t)M*C*2);          // port 1267
-    int8_t* dPK  = (int8_t*)mk((size_t)M*(size_t)HID);
-    float* dSC   = (float*)mk((size_t)M*4);
+    half* dO2  = (half*)mk((size_t)Mpad*C*2);       // port 1267
+    int8_t* dPK  = (int8_t*)mk((size_t)Mpad*(size_t)HID);
+    float* dSC   = (float*)mk((size_t)Mpad*4);
     half* dH     = (half*)mk((size_t)M*(size_t)HID*2);
     half* dOt    = (half*)mk((size_t)M*C*2);        // 现路 1275
     int8_t* dApE = (int8_t*)mk((size_t)b_e*Mp*C);
@@ -677,12 +759,13 @@ static bool run_shape(const char* tag, int M, int N_e, int b_e, int N_p, int K_p
     ops[0](); q.wait();
     q.memcpy(cpk1.data(), dPK, nC); q.memcpy(csc1.data(), dSC, (size_t)M*4); q.wait();
     // ---- R1/R2: the port's faces, built ONCE in setup from the producer's own outputs ----
-    int8_t* pPkA  = (int8_t*)mk(nC);
-    float*  pScA  = (float*)mk((size_t)M*4);
+    const size_t nCp = (size_t)Mpad*C, nHp = (size_t)Mpad*HID;   // PADDED allocations (kernel rows)
+    int8_t* pPkA  = (int8_t*)mk(nCp);
+    float*  pScA  = (float*)mk((size_t)Mpad*4);
     int8_t* pWExp = (int8_t*)mk((size_t)HID*C);
     int8_t* pWPrj = (int8_t*)mk((size_t)C*HID);
     q.memcpy(pScA, dSC, (size_t)M*4);
-    retile_a(q, dPK, pPkA, M, C);
+    retile_a(q, dPK, pPkA, Mpad, C);
     retile_b(q, dBpEW, pWExp, HID, C);
     retile_b(q, dBpP,  pWPrj, C,  HID);
     q.wait();
@@ -700,19 +783,26 @@ static bool run_shape(const char* tag, int M, int N_e, int b_e, int N_p, int K_p
     port::Args fa;
     fa.pkA = pPkA; fa.scA = pScA; fa.Wexp = pWExp; fa.bsExp = dSE;
     fa.Wproj = pWPrj; fa.bsProj = dSP; fa.Bres = dBpR; fa.bsRes = dSR; fa.cos = dCos;
-    fa.dIn = dIn; fa.dOut = dO2; fa.M = M; fa.NGRP = ngrp;
-    half* pH = (half*)mk(nH*2);
-    int8_t* pFR1 = (int8_t*)mk(nH); half* pDEC = (half*)mk(nH*2);
-    int8_t* pPK2 = (int8_t*)mk(nH); float* pSC2 = (float*)mk((size_t)M*4); int8_t* pFR2 = (int8_t*)mk(nH);
-    half* pOUT = (half*)mk(nC*2);
-    int8_t* pPK3 = (int8_t*)mk(nC); float* pSC3 = (float*)mk((size_t)M*4); int8_t* pFR3 = (int8_t*)mk(nC);
+    fa.dIn = dIn; fa.dOut = dO2; fa.M = M; fa.NGRP = ngrpP;
+    int32_t* pSink = (int32_t*)mk((size_t)ngrpP * W * 320 * 4);
+    const int sinkOn = getenv("PORT_SINK") ? atoi(getenv("PORT_SINK")) : 0;
+    fa.sinkFlag = sinkOn;                           // 0 = branch never taken, but the compiler
+                                                    // cannot fold it (kernel arg) => no phase DCE.
+                                                    // 1 = the sinks really store (DCE cross-check).
+    half* pH = (half*)mk(nHp*2);
+    int8_t* pFR1 = (int8_t*)mk(nHp); half* pDEC = (half*)mk(nHp*2);
+    int8_t* pPK2 = (int8_t*)mk(nHp); float* pSC2 = (float*)mk((size_t)Mpad*4); int8_t* pFR2 = (int8_t*)mk(nHp);
+    half* pOUT = (half*)mk(nCp*2);
+    int8_t* pPK3 = (int8_t*)mk(nCp); float* pSC3 = (float*)mk((size_t)Mpad*4); int8_t* pFR3 = (int8_t*)mk(nCp);
     fa.dHid = pH; fa.dfrag1 = pFR1; fa.ddec = pDEC;
     fa.dpk2 = pPK2; fa.dsc2 = pSC2; fa.dfrag2 = pFR2;
     fa.dOut1275 = pOUT; fa.dpk3 = pPK3; fa.dsc3 = pSC3; fa.dfrag3 = pFR3;
-    q.memset(pH, 0xA5, nH*2); q.memset(pFR1, 0xA5, nH); q.memset(pDEC, 0xA5, nH*2);
-    q.memset(pPK2, 0xA5, nH); q.memset(pSC2, 0xA5, (size_t)M*4);
-    q.memset(pFR2, 0xA5, nH); q.memset(pOUT, 0xA5, nC*2); q.memset(pPK3, 0xA5, nC);
-    q.memset(pSC3, 0xA5, (size_t)M*4); q.memset(pFR3, 0xA5, nC); q.memset(dO2, 0xA5, nC*2);
+    fa.dSink = pSink;
+    q.memset(pH, 0xA5, nHp*2); q.memset(pFR1, 0xA5, nHp); q.memset(pDEC, 0xA5, nHp*2);
+    q.memset(pPK2, 0xA5, nHp); q.memset(pSC2, 0xA5, (size_t)Mpad*4);
+    q.memset(pFR2, 0xA5, nHp); q.memset(pOUT, 0xA5, nCp*2); q.memset(pPK3, 0xA5, nCp);
+    q.memset(pSC3, 0xA5, (size_t)Mpad*4); q.memset(pFR3, 0xA5, nCp); q.memset(dO2, 0xA5, nCp*2);
+    q.memset(pSink, 0, (size_t)ngrpP * W * 320 * 4);
     q.wait();
     printf("-- port fused launch --\n");
     port::fused<S, true, 5>(q, fa).wait();
@@ -781,27 +871,85 @@ static bool run_shape(const char* tag, int M, int N_e, int b_e, int N_p, int K_p
     ok &= diffsc((const float*)csc3.data(), (const float*)fsc3.data(), M, "sc3", "PHASE 4 row peak");
     ok &= diffbytes(cres.data(), fres.data(), nC*2, C, "1267-FINAL", "PHASE 5 residual", 2);
 
-    Stat st = timeit([&]{ return port::fused<S, false, 5>(q, fa); });
-    printf("-- port fused GPU msM=%.4f msm=%.4f med=%.4f (B stage: NOT the criterion) --\n", st.msM, st.msm, st.med);
+    // ---- C1: per-phase timing by NPHASE truncation (compile-time => work-group-uniform, the
+    // R5 barriers stay legal). Each phase has its own anti-DCE sink, so a truncated launch still
+    // computes the WHOLE phase. Phases: 1 expand(=现路 P2) / 2 T1 requant / 3 contract(=P4) /
+    // 4 outquant(=P5q) / 5 residual(=P6).
+    Stat t1 = timeit([&]{ return port::fused<S, false, 1>(q, fa); });
+    Stat t2 = timeit([&]{ return port::fused<S, false, 2>(q, fa); });
+    Stat t3 = timeit([&]{ return port::fused<S, false, 3>(q, fa); });
+    Stat t4 = timeit([&]{ return port::fused<S, false, 4>(q, fa); });
+    Stat t5 = timeit([&]{ return port::fused<S, false, 5>(q, fa); });
+    const double ph[5] = { t1.msM, t2.msM - t1.msM, t3.msM - t2.msM,
+                           t4.msM - t3.msM, t5.msM - t4.msM };
+    const double fExp = 2.0 * (double)M * (double)HID * (double)C;   // expand: N=HID, K=C
+    const double fCon = 2.0 * (double)M * (double)C * (double)HID;   // contract: N=C, K=HID
+    const double fRes = 2.0 * (double)M * (double)C * (double)C;     // residual: N=C, K=C
+    auto tops = [](double flops, double ms) { return (ms > 1e-9) ? flops / ms / 1e9 : 0.0; };
+    printf("-- phase msM: expand=%.4f requant=%.4f contract=%.4f outquant=%.4f res=%.4f "
+           "(chain=%.4f) [sink=%d] --\n", ph[0], ph[1], ph[2], ph[3], ph[4], t5.msM, sinkOn);
+    printf("-- TOPS: P2expand=%.3f P4contract=%.3f P6res=%.3f CHAIN=%.3f (FLOPs %.3f/%.3f/%.3f) --\n",
+           tops(fExp, ph[0]), tops(fCon, ph[2]), tops(fRes, ph[4]),
+           tops(fExp + fCon + fRes, t5.msM), fExp/1e6, fCon/1e6, fRes/1e6);
+    // machine-readable sweep row (grf/spill/scratch come from spillcheck_port.py afterwards)
+    printf("ROW;%s;%d;%d;%d;%u;%d;%.4f;%.4f;%.4f;%.4f;%d;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f\n",
+           tag, LW, G, KN, S::SLM, ok ? 0 : 1, t5.msM, t5.msm, t5.msX, t5.med, nWG * LW,
+           tops(fExp, ph[0]), tops(fCon, ph[2]), tops(fRes, ph[4]), tops(fExp + fCon + fRes, t5.msM),
+           ph[0], ph[1], ph[2], ph[3], ph[4]);
     printf("%s %s\n", ok ? "GATE PASS" : "GATE FAIL", tag);
 
     free(dIn,q); free(dO1,q); free(dO2,q); free(dPK,q); free(dSC,q); free(dH,q); free(dOt,q);
     free(dApE,q); free(dApP,q); free(dApR,q); free(dBpE,q); free(dBpEW,q); free(dBpP,q); free(dBpR,q);
     free(dSE,q); free(dSP,q); free(dSR,q); free(dCos,q);
     free(dWER,q); free(dWPR,q); free(dWRR,q); free(dWEW,q);
-    free(pPkA,q); free(pScA,q); free(pWExp,q); free(pWPrj,q);
+    free(pPkA,q); free(pScA,q); free(pWExp,q); free(pWPrj,q); free(pSink,q);
     free(pH,q); free(pFR1,q); free(pDEC,q);
     free(pPK2,q); free(pSC2,q); free(pFR2,q); free(pOUT,q);
     free(pPK3,q); free(pSC3,q); free(pFR3,q);
     return ok;
 }
 
+// ---- C1 rung dispatch: one (shape, G, KNIFE) configuration per process ----
+template <int C_, int HID_, int G_, int KN_>
+static bool rung(const char* tag, int M, int N_e, int b_e, int N_p, int K_p, int b_p) {
+    using S = port::Geo<C_, HID_, 16, G_, 1, KN_>;
+    if constexpr (!S::FITS) {
+        printf("SKIPROW;%s;LW%d;G%d;KN%d;SLM=%u;PG=%u x G=%d = %u > CAP %u\n",
+               tag, S::LW, G_, KN_, S::SLM, S::PG, G_, S::PG * (uint32_t)G_, S::CAP);
+        return true;
+    } else return run_shape<S>(tag, M, N_e, b_e, N_p, K_p, b_p);
+}
+
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    const int which = getenv("PORT_SHAPES") ? atoi(getenv("PORT_SHAPES")) : 3;
+    const int shape = getenv("PORT_SHAPE") ? atoi(getenv("PORT_SHAPE")) : 1;
+    const int g     = getenv("PORT_G") ? atoi(getenv("PORT_G")) : (shape == 1 ? 4 : 2);
+    const int kn    = getenv("PORT_KN") ? atoi(getenv("PORT_KN")) : 1;
     bool ok = true;
-    if (which & 1) ok &= run_shape<64, 256>("S1 C=64 M=32640", 32640, 128, 2, 32, 128, 2);
-    if (which & 2) ok &= run_shape<128, 512>("S2 C=128 M=8160", 8160, 128, 4, 32, 128, 4);
-    printf("\n==== PORT B: %s (fails=%d) ====\n", ok ? "diff=0 on every checkpoint" : "SEE DIFF LINES", gfails);
+    if (shape == 1) {
+        const char* tg = "S1-C64H256";  int M = 32640, Ne = 128, be = 2, Np = 32, Kp = 128, bp = 2;
+        if      (g == 4  && kn == 0) ok = rung<64,256,4,0>(tg,M,Ne,be,Np,Kp,bp);
+        else if (g == 8  && kn == 0) ok = rung<64,256,8,0>(tg,M,Ne,be,Np,Kp,bp);
+        else if (g == 4  && kn == 1) ok = rung<64,256,4,1>(tg,M,Ne,be,Np,Kp,bp);
+        else if (g == 8  && kn == 1) ok = rung<64,256,8,1>(tg,M,Ne,be,Np,Kp,bp);
+        else if (g == 16 && kn == 1) ok = rung<64,256,16,1>(tg,M,Ne,be,Np,Kp,bp);
+        else if (g == 16 && kn == 0) ok = rung<64,256,16,0>(tg,M,Ne,be,Np,Kp,bp);
+        else if (g == 32 && kn == 1) ok = rung<64,256,32,1>(tg,M,Ne,be,Np,Kp,bp);   // LW=128
+        else if (g == 32 && kn == 0) ok = rung<64,256,32,0>(tg,M,Ne,be,Np,Kp,bp);   // LW=128
+        else printf("S1: no such rung (G=%d KN=%d)\n", g, kn);
+    } else {
+        const char* tg = "S2-C128H512"; int M = 8160, Ne = 128, be = 4, Np = 32, Kp = 128, bp = 4;
+        if      (g == 2 && kn == 0) ok = rung<128,512,2,0>(tg,M,Ne,be,Np,Kp,bp);
+        else if (g == 4 && kn == 0) ok = rung<128,512,4,0>(tg,M,Ne,be,Np,Kp,bp);
+        else if (g == 2 && kn == 1) ok = rung<128,512,2,1>(tg,M,Ne,be,Np,Kp,bp);
+        else if (g == 4 && kn == 1) ok = rung<128,512,4,1>(tg,M,Ne,be,Np,Kp,bp);
+        else if (g == 8 && kn == 1) ok = rung<128,512,8,1>(tg,M,Ne,be,Np,Kp,bp);
+        else if (g == 8 && kn == 0) ok = rung<128,512,8,0>(tg,M,Ne,be,Np,Kp,bp);
+        else if (g == 16 && kn == 1) ok = rung<128,512,16,1>(tg,M,Ne,be,Np,Kp,bp);  // LW=128
+        else if (g == 16 && kn == 0) ok = rung<128,512,16,0>(tg,M,Ne,be,Np,Kp,bp);  // LW=128
+        else printf("S2: no such rung (G=%d KN=%d)\n", g, kn);
+    }
+    printf("\n==== PORT C1 shape=%d G=%d KN=%d: %s (fails=%d) ====\n",
+           shape, g, kn, ok ? "diff=0 on every checkpoint" : "SEE DIFF LINES", gfails);
     return ok ? 0 : 1;
 }
