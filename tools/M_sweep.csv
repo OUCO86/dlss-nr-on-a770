@@ -1,0 +1,35 @@
+# M_sweep.csv -- mixed-chain (M1/M2/M3) bench shovel, 2026-11-01. Full ledger: s6/port_M.md
+# Column conventions (from s6/spillcheck_M.py, the JIT-cache route, per INSTANTIATION -- the four
+# M switches are template parameters so they are carried in the mangled name: P4F=/PK=/SP=/BAR=):
+#   grf = grf_count; private = private_size BYTES; spill = spill_size BYTES;
+#   scratch = scratch BYTES; any scratch INSTRUCTION count is written in the note as scratch_instr.
+#   (Correction made mid-shovel: the first read of the ledger put M1-V1's 2048/2304 in the private
+#    column -- it is in the scratch column. private/spill stayed 0. See port_M.md section 4.)
+#   diff = checkpoints byte-identical to block3's reference (9 = ffn2 chain taps vs c2ref_<shape>.bin;
+#          13 = the ffn3 zero-pack leg incl. pk1-face / pk2-frag / pk3-frag).
+#   msM/msm/msX/med = CHAIN WALL (host, one launch): one process per shape, nosink, min-of-15 x 5
+#          groups, 60ms between groups. GPU msM in the note. Phases < 0.05ms are never priced by
+#          truncation subtraction (military rule 20) -- port_M.md section 5 gives cum + intervals.
+stage,shape,slm_bytes,grf,private,spill,scratch,diff,msM,msm,msX,med,note
+M0-block3-1a(ledger),S1,31744,128,0,0,0,13/13,0.4647,,,, "the promoted 1a control (stage-2 ledger gives msM only); GPU 0.3876; cum nosink .0316/.0754/.2590/.2972/.3222/.3876"
+M0-block3-1a(ledger),S2,31744,128,0,0,0,13/13,0.3787,,,, "GPU 0.3223; cum nosink .0215/.0569/.2659/.2616/.2802/.3556"
+split-anchor(present 8 legs),S1,18432,128,0,0,0,13/13,0.8139,0.8016,0.8332,0.8515,"recorder's real launch sequence wall; re-measured 20:12 in this shovel = 0.8171 (same tier)"
+split-anchor(present 8 legs),S2,18432,128,0,0,0,13/13,0.5898,0.6136,0.6410,0.6802,"re-measured in C2 at 0.6316"
+port-kernel-best(C1 LW16),S1,21504,128,3328,0,,13/13,0.6019,,,, "the port kernel's own best rung; scratch_instr 61 (that file's ledger did not print scratch bytes). Its private/scratch are ITS defect, not ours"
+port-kernel-best(C1 LW16),S2,21504,128,6464,0,,13/13,0.4210,,,, "scratch_instr 182"
+M1-V0-1a-P4-control,S1,31744,128,0,0,0,9/9,0.4549,0.4479,0.5521,0.5793,"the 1a P4 rebuilt inside block4 (P4F=0) = the apples-to-apples control; GPU msM 0.3895; cum nosink .0318/.0755/.2940/.2970/.3228/.4219; P4 interval 0.0030 (<0.05 => interval only); P3 interval 0.2184"
+M1-V0-1a-P4-control,S2,31744,128,0,0,0,9/9,0.3814,0.3805,0.3850,0.4926,"GPU msM 0.3223; cum nosink .0217/.0565/.2670/.2615/.2794/.3220; P3 interval 0.2105"
+M1-V1-port-16x16-4acc,S1,31744,128,0,0,2304,9/9,1.0102,0.9996,1.0181,1.0308,"RED on two counts. (a) RED LINE: scratch 2304B + scratch_instr 41 in the NOSINK pricing kernel (DUMP=0 P=6 SINK=0); P=4 rung 2048B/40, P=5 rung 2048B/35, gate kernel DUMP=1 2304B/43. (b) PRICE: P4 interval 0.4425ms = 2.4 TOPS (act 8/64) vs the 1a form's 0.003-0.042. diff still 9/9 => the FORM is bit-exact, the perf/ledger are not"
+M1-V1-labeled-rerun,S1,31744,128,0,0,2304,9/9,0.9968,0.9933,1.0037,1.0137,"same form re-measured with the switches in the mangled name (P4F=1): scratch per rung P4 2048/35, P5 2048/32, P6 2304/35, DUMP=1 2304/38; GPU msM 0.8769; P4 interval 0.4497 = 2.4 TOPS; cum nosink .0294/.0764/.2603/.7100/.7294/.8762"
+M1-V1-port-16x16-4acc,S2,31744,128,0,0,0,9/9,0.7095,0.7062,0.7110,0.8288,"labeled run (P4F=1) on S2: GPU msM 0.6470; P4 interval 0.3141ms = 3.4 TOPS (act 8/64); cum nosink .0225/.0557/.2679/.5820/.6208/.6462. S2 does NOT spill scratch, yet still loses +86% => the loss is structural (live threads x K-chain depth), not just the spill"
+M1-V3-deepK-8x8-1acc,S1,31744,128,0,0,0,,0.8916,0.8702,0.9017,0.9115,"ledger CLEAN; P4 interval 0.2816ms = 3.8 TOPS (act 32/64); GPU msM 0.7579; cum nosink .0302/.0770/.2967/.5782/.6126/.7585"
+M1-V3-deepK-8x8-1acc,S2,31744,128,0,0,0,,0.6819,0.6696,0.6893,0.8045,"labeled (P4F=3): GPU msM 0.6264; P4 interval 0.2530ms = 4.2 TOPS (act 32/64); cum nosink .0234/.0549/.2786/.5317/.5698/.6099"
+M1-V2-deepK-8x16-2acc,S1,31744,128,0,0,0,,0.8979,0.8954,0.9051,0.9380,"ledger CLEAN; P4 interval 0.3317ms = 3.2 TOPS (act 16/64); GPU msM 0.7653; cum nosink .0296/.0766/.2603/.5920/.6331/.7675"
+M1-VERDICT,S1+S2,31744,128,0,0,0,9/9,0.4549,0.4479,0.5521,0.5793,"M1 = NO-GO, P4 stays the 1a form. 1a's P4 ALREADY is the contract form (A = SLM fragment-order int8, B = 512B blocks, scales in the epilogue); the only deltas are wave height 16-vs-8 and K-chain depth 8-vs-2, and both lose monotonically: act 8/16/32/64 -> P4 interval 0.45/0.33/0.28/0.003-0.042 (S1) and 0.31/0.25/-/<0.05 (S2). The port's 39.6-55.2 TOPS comes from ITS geometry (LW=16, 21504B SLM, 3 WG/slice, 48 live threads/slice), which our 64-thread/31104B block chain cannot host; the small-WG whole-block variant IS S6-1b, falsified by the 64KB SLM cap (section 29)"
+M2-V1-peak-fold-only,S1,31744,128,0,0,0,9/9,0.4593,0.4515,0.5493,0.5756,"PK=1 SP=0: the peak scan is gone but the P3 interval only moved 0.2188 -> 0.2164 => the scan was NOT the expensive half; GPU 0.4216 (the P6 rung jumped 0.066->0.100 between the two builds = cross-process noise band, not priced)"
+M2-V1-peak-fold-only,S2,31744,128,0,0,0,9/9,0.3713,0.3674,0.3750,0.4897,"P3 interval 0.2105 -> 0.1964; GPU 0.3068 vs base 0.3223"
+M2b-peak-fold+row-split(FINAL),S1,31744,128,0,0,0,9/9+13/13,0.3828,0.3820,0.3834,0.4978,"PK=1 SP=1 (S1 2 parts/row, S2 4 parts/row, P3 act 64/64). P3 interval 0.2184 -> 0.1245 (cum .2940 -> .2050); GPU msM 0.3225; cum nosink .0289/.0805/.2050/.2445/.2698/.3221. Ledger: 13/13 instances grf 128, private/spill/scratch 0, slm 31744 (bucket unchanged; the peak slots alias the dead OUT region => SLM increment = 0 bytes, vs the spec's <=256/512B budget)"
+M2b-peak-fold+row-split(FINAL),S2,31744,128,0,0,0,9/9+13/13,0.2573,0.2561,0.2575,0.2635,"P3 interval 0.2105 -> 0.0615 (cum .2670 -> .1194); GPU msM 0.1985; cum nosink .0223/.0579/.1194/.1478/.1625/.1982. TARGET MET (<=0.30) with 0.143 to spare; S1 misses by 0.053 (0.3828 vs 0.33)"
+M2b-1aR1-leg(zero pack),S1,31744,128,0,0,0,13/13,0.4113,0.4086,0.4126,0.4186,"the R1 chain under M2b (was 0.4900); all-in with the producer leg 0.5261 -- still a loss vs 1a, as section 26 established"
+M2b-1aR1-leg(zero pack),S2,31744,128,0,0,0,13/13,0.2726,0.2711,0.2758,0.2793,"was 0.3959; all-in 0.3871"
+M-FLAKY-M2b,S2,31744,128,0,0,0,0/9-FAIL,0.2573,0.2561,0.2575,0.2635,"ONE cold process (first DUMP launch after 6 smoke launches) differed from block3: hid 8067/8355840 (first row=3 byte=6 A=00 B=80), pk2 11585, sc2 107, out1275 131600, pk3 104455, sc3 842, 1267-FINAL 245603. Same binary, next process: 9/9. In-process M_REPEAT then: m2b S2 0/48, m2b S1 0/48, base (= the shipped 1a code) S2 0/40 => non-deterministic, and it corrupts a P2 product (hid) that M2b never touched. Prime suspect: esimd::barrier() fences on the ENTRY side only (memory.hpp:12045-12048) -- no acquire after crossing. Discriminator built but NOT yet run: s6_ffn_block4_m2c.exe = M2b with all 21 phase barriers replaced by sycl::group_barrier (M_BAR=1)"
