@@ -171,3 +171,7 @@ SM_LW | 分支=b1-wblock-resident（origin 已推）。
 - notes/lmxx-architecture-comparison.md = 三套架构对照+勘误链（14:5x 版）
 - src/gpu/*.comp 头注释 = 前辈坑清单 | refs/lmxxf-src/Development/hip-port/CHANGELOG.md
   = 71 层模型架构演化账 | .workbuddy/memory/ = 流水
+21. **`OUT_OF_DEVICE_MEMORY(39)` 不等于字节不够**：越界读设备指针同样报 39。
+    "失败点还能单块分配 1074MB" 这类 memprobe 数只证明**字节池没满**，不证明**本次请求合法**。
+    查序固定：**先算 请求字节 vs 分配字节**（`std::vector<T>(n)` = n 个 T，不是 n 字节；拷贝长度一律 `size()*sizeof(T)`，
+    且分配处与拷贝处必须出自**同一表达式**），再谈配额/驱动。正案：2026-11-01 C2 的 `scB`（分配 130,560B、请求 522,240B = 4.0x）被误判成"staging 配额"。
