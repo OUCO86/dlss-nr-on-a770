@@ -31,8 +31,10 @@ def elfs_in(d):
     return out
 
 def label(name):
-    # <ns>L5fusedINS_<n>(Geo|Shape)ILi..ELi..(E..)EELb(DUMP)ELi(NPHASE)E...
-    mm = re.search(r'(\w+)L5fusedINS_\d+(Geo|Shape)I((?:Li-?\d+E|Lb[01]E)+)', name)
+    # <ns>L5fusedINS_[<其他命名空间前缀>*]<n>(Geo|Shape)I[J]Li..ELi..(E..)EELb(DUMP)ELi(NPHASE)E...
+    # 2026-11-01 修：跨命名空间模板实参（ffn3::fused<ffn2::Shape<...>>）以前匹配不到，
+    # 会被静默归入 other（C2-7"台账没拿到"有一半是这个）。前缀链与可选 J 现在都允许。
+    mm = re.search(r'(\w+)L5fusedINS_(?:(?:\d+\w+)*)\d+(Geo|Shape)IJ?((?:Li-?\d+E|Lb[01]E)+)', name)
     if mm:
         ns, kind, argstr = mm.groups()
         args = [x if x != '' else y for x, y in
