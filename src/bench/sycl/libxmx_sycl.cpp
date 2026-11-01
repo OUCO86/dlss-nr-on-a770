@@ -519,10 +519,19 @@ static int8_t* cached_pack_b_i8(int bufid, const int8_t* B, int N, int K) {
 // passes therefore stays at 691 (the closure COUNT is unchanged; only bodies change),
 // while the captured cgraph's NODE count drops (a no-op closure emits zero device ops).
 //
-// Switch: NR_S6_FFN=1 enables it; DEFAULT OFF. NR_S6_FFN unset/0 = the exact shipped
-// path, bitwise unchanged (every guard below is dead until s6_on() returns true).
+// Switch: NR_S6_FFN -- PROMOTED TO DEFAULT ON on 2026-11-01 (user's go, after the
+// stage-3 三关 + 帧夹逼). Escape hatch kept: NR_S6_FFN=0 (any atoi()==0 value) = the
+// exact pre-S6 shipped path, bitwise unchanged -- every guard below is dead when
+// s6_on() returns false, so the OFF side of the switch is the old code verbatim.
+// WHY ON BY DEFAULT (the only price quoted here is the shipped in-process frame A/B):
+// 48 pairs, mean -2.950 ms/frame, fused side faster on 48/48, 95% CI [-3.190, -2.710]
+// (three 16-pair shots: -2.683 / -3.032 / -3.134) -- ledger: notes/s6-stage3.md 步骤 4.
+// Gate/walk/determinism on the promoted default: notes/s6-promote.md (2026-11-01).
+// Do NOT re-price this blade off off-path accounts (bench wall / RUN_TIMING serial
+// totals) -- they are not the frame number and must not be cited as the shipping price.
 // Military rules 4/9: no runtime diagnostic branch was added inside the kernel; the
-// switch lives at closure level only.
+// switch lives at closure level only. NR_S6_TRACE stays presence-gated (default OFF):
+// it is a record-time host witness, it prints nothing on the device and adds no op.
 //
 // Families wired (the two the stage-2 bench proved byte-exact, E:/DSH/s6/stage2.md):
 //   S1 C=64  HID=256 M=32640  x8  chains/frame   Shape<32,64,256,false,4,2>
@@ -545,7 +554,9 @@ static S6Chain g_s6;
 static long g_s6_fires = 0;      // cumulative chains fused (host-side counter, record time)
 static long g_s6_fires_gen = 0;  // chains fused in the CURRENT recording
 static bool s6_on() {
-    static bool v = getenv("NR_S6_FFN") ? (atoi(getenv("NR_S6_FFN")) != 0) : false;
+    // Default flipped OFF -> ON at the S6-1a promotion (2026-11-01). unset => fused;
+    // NR_S6_FFN=0 => the escape hatch (exact pre-S6 shipped path). Read once per process.
+    static bool v = getenv("NR_S6_FFN") ? (atoi(getenv("NR_S6_FFN")) != 0) : true;
     return v;
 }
 static void s6_reset() { g_s6 = S6Chain(); }

@@ -8,9 +8,11 @@
 //     Bench accounts: E:/DSH/s6/stage1.md (stage 1), E:/DSH/s6/stage2.md (stage 2).
 //     Blueprint + red lines: notes/DS-takeover-2026-11-01.md sections 16 / 17 / 21.
 //
-// SWITCH: NR_S6_FFN=1 (default OFF). The switch is CLOSURE-LEVEL ONLY in the recorder
-// (military rules 4/9): no runtime diagnostic branch was added inside the kernel. The
-// shipped call site instantiates fused<S, false, S::NPH>, so every `if (DUMP)` folds
+// SWITCH: NR_S6_FFN -- DEFAULT ON since the S6-1a promotion (2026-11-01); the escape
+// hatch NR_S6_FFN=0 selects the pre-S6 split path. The switch is CLOSURE-LEVEL ONLY in
+// the recorder (military rules 4/9): no runtime diagnostic branch was added inside this
+// kernel -- the kernel body below is byte-identical either way, only the call site differs.
+// The shipped call site instantiates fused<S, false, S::NPH>, so every `if (DUMP)` folds
 // to false and every `if (NPHASE <= k) return;` folds to false -- the code below is
 // identical to the timed bench leg (s6_ffn_block2.cpp:709-710).
 //
