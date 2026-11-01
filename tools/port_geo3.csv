@@ -1,0 +1,6 @@
+﻿lw,mode,slm_kb,ngroups,iters,status,rep_wall_ms,rep_gpu_ms,reps_ok
+256,2,32,510,200,HANG,,,0
+256,3,32,510,200,HANG,,,0
+256,3,8,510,200,HANG,,,0
+512,0,8,255,200,HANG,,,0
+512,0,32,255,200,HANG,,,0

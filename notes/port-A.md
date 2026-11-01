@@ -45,3 +45,33 @@
 总线程预算固定 130560（= 2040×64 安全区同量级），iters=200。
 
 （状态：编译中 → 结果见下）
+
+## A 阶段结果（D1 几何存活探针）—— 数据落盘 `port_geo.csv` / `port_geo2.csv` / `port_geo3.csv`
+
+协议：每配置**独立进程**、进程内 3 次、每次 20s 看门狗（HANG 即 `_exit(3)`）、
+每次之后跑 **canary**（1 task + dpas）确认 GPU 没被卡死；总线程预算固定 130560（=2040x64 安全区量级）、iters=200。
+
+| LW (SYCL local size) | SLM 8/16/32/48/64KB x {0 SLM-only, 1 +CTA barrier, 2 +dpas, 3 both} | 结论 |
+|---|---|---|
+| 64  | 全 20 格 | **ALIVE**（gpu 1.7-3.2ms / 200 iters / 2040 WG） |
+| 128 | 全 20 格 | **ALIVE**（gpu 2.1-3.7ms / 200 iters / 1020 WG） |
+| 256 | mode 0/1 @ 8,16,32KB + mode 2/3 @16,32KB | **HANG**（首轮还见过 FAIL 0xC0000409 = failfast/DEVICE_LOST） |
+| 512 | 见 port_geo3.csv | HANG（重负载）；light/iters=0 见下 |
+
+**读数与旧账更正**：
+1. `LW>=128 + barrier = 死锁区` 这条旧账**错**：**128 线程 + CTA barrier + dpas + 64KB SLM 全活**；
+   墙在 **256**（与本工具链 §39 "~128 live ESIMD threads" 一致 —— 那是 **GRF/线程数** 的墙，不是 barrier 的墙）。
+2. `max_work_group_size=1024` 的上报值对 ESIMD **不成立**（256 就死）。
+3. barrier 与 dpas 单独都不致命：LW=128 下 mode1(barrier)=2.95ms vs mode3(barrier+dpas)=3.74ms vs mode2(dpas only) —— 增量是算力，不是挂死。
+4. **他们的 wave 数（C/16 = 4/8/16 个 ESIMD work-item/组）远在安全区内** ⇒ B 阶段几何**照搬他们的 wave 数**，
+   不需要为"线程数"偏离；偏离只发生在 **每 WG 装几个 16-token 组**（SLM 帽 64KB、占用崖 32KB 决定）与 **grid 的组序映射**。
+
+**D1 定案（B 阶段用的几何）**：
+- 1 ESIMD work-item = 1 个他们的 wave（32 lanes，跑 16x16 tile，SIMD16）；
+- W = C/16（4/8/16，忠实）；每组 16 token（忠实 R7）；
+- G = 每 WG 的 token 组数 = **16/W**（⇒ LW = W*G = **16 work-items/WG**，SLM ~25KB < 32KB 占用崖）：
+  C=64 G=4 / C=128 G=2 / C=256 G=1。
+- 为什么 LW=16 而不是把 LW 拉到 64/128：SLM。hidden int8 fragment map = 16 token x HID = **4C x 16 = 16KB** 每 WG 固定
+  （C=64:4KB x G … 见 B 的 SLM 账），LW=64 ⇒ G=16 ⇒ hidden 64KB + out 32KB = 96KB **超 64KB 帽**。
+  这是 **D 类偏离 #1**（下面 B 节逐条列）。
+
