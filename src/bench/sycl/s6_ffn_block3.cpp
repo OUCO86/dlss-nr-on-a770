@@ -1,4 +1,4 @@
-﻿// s6_ffn_block2.cpp -- S6-1a STAGE 2: split-K occupancy fix (P4/P6) + two more frame
+// s6_ffn_block2.cpp -- S6-1a STAGE 2: split-K occupancy fix (P4/P6) + two more frame
 // chain families. Stage 1 (s6_ffn_block.cpp) proved the 6-op C=64 closure byte-exact
 // (nine checkpoints diff=0) and located the loss: P4/P6 run on 16/64 threads.
 //
@@ -879,6 +879,45 @@ static void memprobe(queue& q, const char* where) {
     fflush(stdout);
 }
 
+// ================= S6-1b step-0 fix: the D2H route =================
+// C2-6: a 2,088,960-byte q.memcpy into PAGEABLE host memory threw
+// UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY(39) at a moment when a 1074 MB SINGLE device
+// allocation still succeeded => the exhausted pool is the driver's pinned/host-staging
+// quota (Level Zero stages pageable copies through pinned device-visible memory), NOT the
+// device-local byte budget. Fix (no judgement change): land every snapshot in a
+// sycl::malloc_host() buffer (driver-managed host USM = the copy target itself, no extra
+// staging) in 1 MB chunks, then a plain host memcpy into the caller's std::vector.
+// If malloc_host itself fails, fall back to chunked direct copies (1 MB each, so a single
+// staging request never asks for 2 MB+).
+static int g_d2h_host = 0, g_d2h_chunk = 0;      // path counters for the ledger
+static void d2h(queue& q, void* dst, const void* src, size_t bytes, const char* what) {
+    if (!bytes) return;
+    char* d = (char*)dst; const char* s = (const char*)src;
+    const size_t CH = 1u << 20;
+    for (size_t off = 0; off < bytes; off += CH) {
+        size_t n = std::min(CH, bytes - off);
+        void* st = nullptr;
+        try { st = sycl::malloc_host(n, q); }
+        catch (const std::exception& e) { printf("  [d2h %s] malloc_host(%zu) threw: %s\n", what, n, e.what()); }
+        bool done = false;
+        if (st) {
+            try { q.memcpy(st, s + off, n).wait(); memcpy(d + off, st, n); done = true; ++g_d2h_host; }
+            catch (const sycl::exception& e) {
+                printf("  [d2h %s] host-USM copy(%zu @%zu) threw code=%d -- chunked fallback\n",
+                       what, n, off, e.code() ? e.code().value() : -1);
+            }
+            sycl::free(st, q);
+        }
+        if (!done) {
+            q.memcpy(d + off, s + off, n).wait(); ++g_d2h_chunk;
+        }
+    }
+}
+static void d2h_report() {
+    printf("[d2h] host-USM chunks = %d | chunked-pageable fallbacks = %d\n", g_d2h_host, g_d2h_chunk);
+    fflush(stdout);
+}
+
 static int run_all() {
     device dev;
     for (auto& d : device::get_devices(info::device_type::gpu))
@@ -1187,8 +1226,10 @@ static int run_all() {
         // pulled across first because the fragment-order checkpoints read them.
         const size_t faceBytes = faceBytes0;
         std::vector<uint8_t> hApE((size_t)b_e*faceBytes), hApP((size_t)Mp*HID), hApR(faceBytes);
-        q.memcpy(hApE.data(), dApE, hApE.size()); q.memcpy(hApP.data(), dApP, hApP.size());
-        q.memcpy(hApR.data(), dApR, hApR.size()); q.wait();
+        d2h(q, hApE.data(), dApE, hApE.size(), "hApE");
+        d2h(q, hApP.data(), dApP, hApP.size(), "hApP");
+        d2h(q, hApR.data(), dApR, hApR.size(), "hApR");
+        d2h_report();
         free(dApE,q); dApE=nullptr; free(dApP,q); dApP=nullptr; free(dApR,q); dApR=nullptr;
         free(dO1,q); dO1=nullptr; free(dO2,q); dO2=nullptr; fa.dOut=nullptr;
         free(dPK,q); free(dSC,q); free(dH,q); free(dOt,q);
@@ -1281,13 +1322,25 @@ static int run_all() {
             }
             csvrow(shid, "split_producer_quant_rowmajor", q1, 0.0, "op1 quant (row-major pk) -- the pre-R1 producer half 1");
             csvrow(shid, "split_producer_retile_a", ra, 0.0, "the pure pack_a permutation -- the leg R1 deletes");
-            // gate: the producer's face must be the 鐜拌矾 pk plane in fragment order, byte for byte
+            // gate: the producer's face must be the 现路 pk plane in fragment order, byte for byte
             std::vector<uint8_t> hFaceB(faceBytes0), hFaceA(faceBytes0);
-            std::vector<float> hScB((size_t)Mp*4), hScT((size_t)Mp*4);
+            // *** C2-6 RE-QUALIFIED (this run): the OOM(39) was NOT the host-pinned/staging quota.
+            // scB/scT are device buffers of Mp FLOATS = Mp*4 BYTES (130,560 B for S1), but the old
+            // host side was `std::vector<float> h(Mp*4)` = 4x too many floats and the copy asked for
+            // h.size()*4 = 522,240 bytes => an OUT-OF-RANGE device read past a 130,560-byte USM
+            // allocation. Level Zero reports that as UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY(39) while a
+            // 1074 MB single alloc still succeeds -- exactly the C2-6 signature. The 2.09 MB faceB /
+            // faceA copies through this same route are FINE (see the d2h ledger below).
+            std::vector<float> hScB((size_t)Mp), hScT((size_t)Mp);
             try {
-                printf("  D2H faceB/faceA: bytes = Mp*C = %d*%d = %zu; scB/scT = Mp*4 = %zu\n", Mp, C, faceBytes0, (size_t)Mp*4);
-                q.memcpy(hFaceB.data(), faceB, faceBytes0); q.memcpy(hFaceA.data(), faceA, faceBytes0); q.wait();
-                q.memcpy(hScB.data(), scB, hScB.size()*4); q.memcpy(hScT.data(), scT, hScT.size()*4); q.wait();
+                printf("  D2H faceB/faceA: bytes = Mp*C = %d*%d = %zu; scB/scT = Mp floats = %zu bytes  (route = malloc_host 1MB chunks)\n",
+                       Mp, C, faceBytes0, (size_t)Mp*4);
+                d2h(q, hFaceB.data(), faceB, faceBytes0, "faceB");
+                d2h(q, hFaceA.data(), faceA, faceBytes0, "faceA");
+                d2h(q, hScB.data(), scB, hScB.size()*4, "scB");
+                d2h(q, hScT.data(), scT, hScT.size()*4, "scT");
+                d2h_report();
+                memprobe(q, "after STEP2 gate D2H");
             } catch (const sycl::exception& e) {
                 printf("THREW at the STEP2 D2H: %s (code=%d)\n", e.what(), e.code() ? e.code().value() : -1);
                 memprobe(q, "at STEP2 D2H throw");
@@ -1309,11 +1362,17 @@ static int run_all() {
             ffn3::fused<S, true, S::NPH-1, 0>(q, f3).wait();
             std::vector<uint8_t> ghid(nH*2), gpk2(nH), gpk2f((size_t)Mp*HID), gs2((size_t)M*4),
                                  gout(nC*2), gpk3(nC), gpk3f(faceBytes0), gs3((size_t)M*4), gres(nC*2);
-            q.memcpy(ghid.data(), gHID, nH*2); q.memcpy(gpk2.data(), gPK2, nH);
-            q.memcpy(gpk2f.data(), gPK2F, (size_t)Mp*HID); q.memcpy(gs2.data(), gSC2, (size_t)M*4);
-            q.memcpy(gout.data(), gOUT, nC*2); q.memcpy(gpk3.data(), gPK3, nC);
-            q.memcpy(gpk3f.data(), gPK3F, faceBytes0); q.memcpy(gs3.data(), gSC3, (size_t)M*4);
-            q.memcpy(gres.data(), dO3, nC*2); q.wait();
+            d2h(q, ghid.data(),  gHID,  nH*2,          "ghid");
+            d2h(q, gpk2.data(),  gPK2,  nH,            "gpk2");
+            d2h(q, gpk2f.data(), gPK2F, (size_t)Mp*HID,"gpk2f");
+            d2h(q, gs2.data(),   gSC2,  (size_t)M*4,   "gs2");
+            d2h(q, gout.data(),  gOUT,  nC*2,          "gout");
+            d2h(q, gpk3.data(),  gPK3,  nC,            "gpk3");
+            d2h(q, gpk3f.data(), gPK3F, faceBytes0,    "gpk3f");
+            d2h(q, gs3.data(),   gSC3,  (size_t)M*4,   "gs3");
+            d2h(q, gres.data(),  dO3,   nC*2,          "gres");
+            d2h_report();
+            memprobe(q, "after STEP2 tap D2H");
             printf("-- C2 ffn3 diff (13 checkpoints, vs the 鐜伴摼 + the split control) --\n");
             ok3 &= diffbytes(ghid.data(),  Rhid.data(),  nH*2,        HID, "hid");
             ok3 &= diffbytes(gpk2.data(),  Rpk2.data(),  nH,          HID, "pk2");
