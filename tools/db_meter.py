@@ -373,6 +373,51 @@ def print_tile_metrics(label, m):
                  t['grad'], t['mad'], t['maxabs'], t['shift']))
 
 
+# ===================== judge40 铲（2026-11-02）：块退化探针并入一栏 =====================
+# §45 缺口二：军规 33 的 (a)(b) 两栏抓不住 **T1 型灾难**（被眼睛否决的 T1 在 per-tile dB / 色偏 /
+# 塌陷三栏上比被接受的 T2 还好看）。tools/block_collapse.py 按"块内塌陷 + 误差场成片/台阶化"
+# 建模（逐通道 R/G/B/A + RGB，尺度 16/32/64/128）。db_meter 跑画质判据时自动带上这一栏。
+# 判决权仍在用户眼睛（军规 33 (d)）：BLOCK-REJECT => 不许转正；BLOCK-WARN => 必须实机。
+BLOCK_KEYS = ('C1_A_ts64_lt05_pct', 'C1_A_ts128_lt05_pct', 'C1_RGB_ts64_lt05_pct',
+              'C1_RGB_ts128_lt05_pct', 'C2_levels_frac_min', 'C2_nzfrac_min',
+              'C3_p64_A_x_ratio', 'C3_p64_A_y_ratio', 'C3_p64_R_x_ratio', 'C3_p128_A_x_ratio',
+              'C4_A_ts64_blockiness', 'C4_A_ts128_blockiness', 'C4_A_ts16_segconst',
+              'C4_A_ts64_maxblockmad', 'C4_RGB_ts128_blockiness',
+              'C5_A_rms', 'C5_A_rho64', 'C5_A_rho128', 'C5_A_coh_len', 'C5_A_L_int',
+              'C5_RGB_rho64', 'C5_RGB_rho128', 'C5_RGB_coh_len', 'C5_A_rel')
+
+
+def block_probe_report(label, gb, tb):
+    """返回 block_collapse.probe() 的扁平字典；无 numpy / 无工具 => None（调用方必须显式打未测）。"""
+    try:
+        import numpy as _np
+    except ImportError:
+        print("%-26s 块退化探针(block_collapse): **未测（无 numpy）** => 这一栏不许当绿" % label)
+        return None
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import block_collapse as _bc
+    except ImportError as e:
+        print("%-26s 块退化探针: 导入失败(%s) => **未测**" % (label, e))
+        return None
+    G = _np.frombuffer(memoryview(gb), dtype='<f4').reshape(_bc.H, _bc.W, 4)
+    T = _np.frombuffer(memoryview(tb), dtype='<f4').reshape(_bc.H, _bc.W, 4)
+    r = _bc.probe(G, T)
+    print("%-26s 块退化探针(judge40): %s" % (label, r['verdict_block']))
+    print("%-26s   C1 块内方差坍缩(<0.5 块占比%%): A@64=%.2f A@128=%.2f RGB@64=%.2f RGB@128=%.2f | "
+          "C2 levels_min=%.4f nz_min=%.4f | C3 网格比 p64: A x=%.3f y=%.3f R x=%.3f | p128 A x=%.3f"
+          % ('', r['C1_A_ts64_lt05_pct'], r['C1_A_ts128_lt05_pct'], r['C1_RGB_ts64_lt05_pct'],
+             r['C1_RGB_ts128_lt05_pct'], r['C2_levels_frac_min'], r['C2_nzfrac_min'],
+             r['C3_p64_A_x_ratio'], r['C3_p64_A_y_ratio'], r['C3_p64_R_x_ratio'], r['C3_p128_A_x_ratio']))
+    print("%-26s   C4 误差场台阶化(A): blk@64=%.3f blk@128=%.3f seg@16=%.3f mad64=%.2f | RGB blk@128=%.3f | "
+          "C5 A(rms=%.3f rel=%.3f): rho64=%.3f rho128=%.3f coh_len=%.0f L_int=%.1f | RGB: rho64=%.3f rho128=%.3f coh=%.0f"
+          % ('', r['C4_A_ts64_blockiness'], r['C4_A_ts128_blockiness'], r['C4_A_ts16_segconst'],
+             r['C4_A_ts64_maxblockmad'], r['C4_RGB_ts128_blockiness'],
+             r['C5_A_rms'], r['C5_A_rel'], r['C5_A_rho64'], r['C5_A_rho128'], r['C5_A_coh_len'],
+             r['C5_A_L_int'], r['C5_RGB_rho64'], r['C5_RGB_rho128'], r['C5_RGB_coh_len']))
+    return r
+
+
 def verdict(corr_min):
     if corr_min != corr_min:      # nan
         return 'CORR-NAN?'
@@ -391,7 +436,7 @@ def db_verdict(dbr):
         return 'dB-OK(>=35)'
     return 'dB-BELOW35'
 
-def report(label, gold, test, s, peak_override=None, gb=None, tb=None, tile=TILE_DEFAULT):
+def report(label, gold, test, s, peak_override=None, gb=None, tb=None, tile=TILE_DEFAULT, block=True):
     rng = s['rng_rgb']
     peaks = [s['gmax'][c] - s['gmin'][c] for c in range(4)]
     if peak_override:
@@ -467,6 +512,20 @@ def report(label, gold, test, s, peak_override=None, gb=None, tb=None, tile=TILE
     elif tile:
         print("%-26s 军规33 per-tile: 调用方没传原始 buffer => 未测" % label)
     row['_tile'] = m
+    # ---- judge40 铲：块退化探针（C1 塌陷 / C2 等级 / C3 网格 / C4 误差场台阶 / C5 误差场相关）----
+    bm = None
+    if block and gb is not None and tb is not None:
+        bm = block_probe_report(label, gb, tb)
+        if bm is not None:
+            for k in BLOCK_KEYS:
+                row['blk_' + k] = bm[k]
+            row['blk_verdict'] = bm['verdict_block']
+        else:
+            row['blk_verdict'] = 'NOT-MEASURED(无 numpy/无工具)'
+    elif block:
+        print("%-26s 块退化探针: 调用方没传原始 buffer => 未测" % label)
+        row['blk_verdict'] = 'NOT-MEASURED(no buffer)'
+    row['_block'] = bm
     return row, rng
 
 def selftest(gold_path):
@@ -508,6 +567,8 @@ def main():
     ap.add_argument('--no-tile', dest='tile', default=None, action='store_const', const=0,
                     help='关掉 per-tile 三样（不许用它出转正结论）')
     ap.add_argument('--tile-csv', default=None, help='最差块逐条导出 CSV')
+    ap.add_argument('--no-block', dest='block', action='store_false', default=True,
+                    help='关掉 judge40 块退化探针（不许用它出转正结论）')
     ap.add_argument('--selftest', action='store_true')
     a = ap.parse_args()
     if a.selftest:
@@ -532,7 +593,7 @@ def main():
         tb = load(t)
         s = stats(gb, tb)
         row, rng = report(os.path.basename(t), a.gold, t, s, a.peak_override,
-                          gb=gb, tb=tb, tile=a.tile)
+                          gb=gb, tb=tb, tile=a.tile, block=a.block)
         row['md5'] = file_md5(t)
         if first:
             print("          golden per-channel range/sigma: " +
@@ -545,7 +606,8 @@ def main():
         if a.cross and prev is not None:
             s2 = stats(prev[1], tb)
             r2, _ = report("[CROSS %s vs %s]" % (os.path.basename(prev[0]), os.path.basename(t)),
-                           prev[0], t, s2, a.peak_override, gb=prev[1], tb=tb, tile=a.tile)
+                           prev[0], t, s2, a.peak_override, gb=prev[1], tb=tb, tile=a.tile,
+                           block=a.block)
             rows.append(r2)
         prev = (t, tb)
     def mn(key):
@@ -583,6 +645,14 @@ def main():
                  'A-MUST-SCREEN' if (avals and min(avals) < A_CORR_MUST_SCREEN) else 'A-ok'))
     else:
         print("SUMMARY 军规33: per-tile **未测** => 这一栏缺了就不许下转正结论（军规 33）")
+    # ---- judge40 铲：块退化探针汇总 ----
+    bc = {}
+    for r in rows:
+        v = r.get('blk_verdict', 'NOT-MEASURED')
+        k = v.split('(')[0].split('[')[0].strip()
+        bc[k] = bc.get(k, 0) + 1
+    print("SUMMARY judge40 块退化探针: " + '  '.join("%s=%d" % kv for kv in sorted(bc.items())) +
+          "  （BLOCK-REJECT => 不许转正；BLOCK-WARN => 必须实机；眼睛一票否决权不变）")
     if a.tile_csv:
         import csv
         cols = ['label', 'rank_by', 'y', 'x', 'w', 'h', 'db', 'dbA', 'grad', 'tgrad', 'keep',

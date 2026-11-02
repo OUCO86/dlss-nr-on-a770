@@ -1,0 +1,30 @@
+﻿probe,statistic,T1,T2,golden_self,new_self,threshold,verdict,note
+C1 块内方差坍缩比,A 通道 <0.5 块占比% @64,4.167,2.5,0,0,>=3.0 => REJECT,SEPARATES(1.67x),T1 4.17 / T2 2.50
+C1 块内方差坍缩比,A 通道 <0.5 块占比% @128,10.71,3.571,0,0,>=6.0 => REJECT,SEPARATES(3.0x) 主判据,T1 10.71 / T2 3.57：余量最大的一栏
+C1 块内方差坍缩比,A 通道 <0.5 块占比% @16,0.4412,0.9804,0,0,只记录（不可作判据）,NO-SEPARATION(反序),T1 0.44 < T2 0.98 => 小尺度上反向
+C1 块内方差坍缩比,RGB 联合 <0.5 块占比% @64,0,0,0,0,>=3.0 => REJECT,NO-SEPARATION,两侧都 0：T1 塌的是 A 不是 RGB
+C1 块内方差坍缩比,RGB 联合 var 比 min @64,0.9857,0.829,1,1,只记录,NO-SEPARATION(反序),T1 0.986 > T2 0.829 => 与眼睛反序（复现 §45 的漏判机理）
+C2 块内有效等级数,levels/像素 min（量化 1e-4）,0.9651,0.959,0.9631,0.959,<0.5 => REJECT,NO-SEPARATION,0.9651 vs 0.9590：没有块退化成常数 => 等级数对 T1 全盲
+C2 块内有效等级数,相邻差非零比例 min,0.9999,1,1,1,<0.5 => REJECT,NO-SEPARATION,0.9999 vs 1.0000：同上
+C3 块边界台阶能量,A 通道 p=64 x 边界/非边界比,1.005,0.9788,1,1,>3.0 => REJECT,NO-SEPARATION,1.005 vs 0.979：T1 的方块不在 64/128 网格上（1270 面被重采样）
+C3 块边界台阶能量,A 通道 p=128 y 边界/非边界比,1.017,1.02,1,1,>3.0 => REJECT,NO-SEPARATION,1.017 vs 1.020
+C3 块边界台阶能量,R 通道 p=64 x 边界/非边界比,0.9989,0.9916,1,1,>3.0 => REJECT,NO-SEPARATION,0.999 vs 0.992
+C4 误差场分段常数度,A blockiness @64,1.292,0.7702,nan,nan,>=1.20 => REJECT,SEPARATES(1.68x),T1 1.292 / T2 0.770
+C4 误差场分段常数度,A blockiness @128,1.508,0.7874,nan,nan,>=1.20 => REJECT,SEPARATES(1.92x) 主判据,T1 1.508 / T2 0.787
+C4 误差场分段常数度,A segconst @16（块内方差/全图方差）,0.1809,0.3767,nan,nan,<=0.25 => REJECT,SEPARATES(2.08x),T1 0.181 / T2 0.377：误差成片 = 方块
+C4 误差场分段常数度,A maxblockmad @64（/golden rms=0.45 vs 0.32）,14.34,10.18,0,0,>=0.40*golden_rms => REJECT,SEPARATES(1.41x),T1 14.34 / T2 10.18
+C4 误差场分段常数度,RGB blockiness @128,0.328,0.2309,nan,nan,>=1.20 => REJECT,NO-SEPARATION,T1 0.328 / T2 0.231：RGB 上无分离力，阈值靠合成对照定
+C5 误差场空间自相关,A rho(lag64),0.5497,0.3088,nan,nan,>=0.45 => REJECT,SEPARATES(1.78x) 主判据,T1 0.550 / T2 0.309；合成 iid（同 rms）= -0.0004
+C5 误差场空间自相关,A rho(lag128),0.3733,0.1842,nan,nan,>=0.28 => REJECT,SEPARATES(2.03x),T1 0.373 / T2 0.184
+C5 误差场空间自相关,A coh_len（rho>=0.5 的最大 lag）,64,1,0,0,>=48 => REJECT,SEPARATES(64x) 主判据,T1 64 / T2 1
+C5 误差场空间自相关,A 积分相关长度 L_int,79.44,51.9,0,0,>=65 => REJECT,SEPARATES(1.53x),T1 79.4 / T2 51.9：余量最薄的一栏
+C5 误差场空间自相关,A rho(lag256),0.1564,0.1553,nan,nan,只记录,NO-SEPARATION,T1 0.156 / T2 0.155：x/y 平均后失败（纯 x 方向 T1 0.565 vs T2 0.212 分得开 => 台阶只在 x 上长）
+C5 误差场空间自相关,RGB rho(lag64) 三通道最大,0.2532,0.3616,nan,nan,>=0.55 => REJECT,NO-SEPARATION(反序),T1 0.253 < T2 0.362
+C5 误差场空间自相关,A rms（误差幅度本身）,7.168,6.92,0,0,只记录,NO-SEPARATION,T1 7.17 vs T2 6.92 => 幅度分不开，这正是 §45 缺口二的机理
+SYNTH 合成对照,C1_A@64 <0.5 占比%：A 通道 64x64 块均值化,100,0,0,0,>=3.0,MUST-FIRE => 已红(100%),列义: T1=正对照(SYNTH-A-blockmean64(必须红)) T2=负对照(SYNTH-A-iid-rms7.17(必须不红)) gself=self nself=同负对照 | 正对照：真方块必须红
+SYNTH 合成对照,C4_A blk@128：A 通道 128 块间随机台阶,2.038e+07,0.007156,nan,0.007156,>=1.20,MUST-FIRE => 已红,列义: T1=正对照(SYNTH-A-step128(必须红)) T2=负对照(SYNTH-A-iid-rms7.17(必须不红)) gself=self nself=同负对照 | 台阶化（块与块之间跳变）必须红
+SYNTH 合成对照,C5_A rho64：A 通道 128 块间随机台阶,0.5267,-0.0003918,nan,-0.0003918,>=0.45,MUST-FIRE => 已红,列义: T1=正对照(SYNTH-A-step128(必须红)) T2=负对照(SYNTH-A-iid-rms7.17(必须不红)) gself=self nself=同负对照 | 误差在 64px 上仍相关 = 成片
+SYNTH 合成对照,C5_A rho64：A iid 噪声 rms=7.17（与 T1 的 A 误差同幅度）,0.2905,-0.0003918,nan,-0.0003918,>=0.45,MUST-NOT-FIRE => 未红,列义: T1=正对照(SYNTH-A-blockmean64(必须红)) T2=负对照(SYNTH-A-iid-rms7.17(必须不红)) gself=self nself=同负对照 | 负对照：探针测的是块化不是幅度（军规33 三栏失败的地方）
+SYNTH 合成对照,C1_RGB@64 <0.5 占比%：RGB 三通道 64x64 块均值化,100,0,0,0,>=3.0,MUST-FIRE => 已红(100%),列义: T1=正对照(SYNTH-RGB-blockmean64(必须红)) T2=负对照(SYNTH-RGB-iid-rms0.40(必须不红)) gself=self nself=同负对照 | 正对照：RGB 版彩色方块
+SYNTH 合成对照,C5_RGB rho64：RGB iid 噪声 rms=0.40（与 T2 的 RGB 误差同幅度）,0.0003496,0.001013,nan,0.001013,>=0.55,MUST-NOT-FIRE => 未红,列义: T1=正对照(SYNTH-RGB-blockmean64(必须红)) T2=负对照(SYNTH-RGB-iid-rms0.40(必须不红)) gself=self nself=同负对照 | 负对照：散点噪声不红
+探针总判决,verdict_block（3 族命中规则）,BLOCK-REJECT(3/3 族命中) F1_塌陷[C1_A@64: 4.17% 块 var(test)/var(golden)<0.5 (阈 3.0%); C1_A@128: 10.71% 块 var(test)/var(golden)<0.5 (阈 6.0%)] || F2_相关[C5_A_rho64=0.550>=0.45; C5_A_rho128=0.373>=0.28; C5_A_coh_len=64>=48; C5_A_L_int=79.4>=65] || F3_台阶[C4_A_blk64=1.292>=1.20; C4_A_blk128=1.508>=1.20; C4_A_seg16=0.181<=0.25(误差成片); C4_A_maxblockmad/sigma_golden=0.45>=0.40],block-ok,EXACT(no error field),EXACT(no error field),F1 塌陷 / F2 相关 / F3 台阶 三族：>=2 族命中=REJECT；1 族=WARN(必须实机)；0 族=block-ok；任一通道 C1<0.5 占比>=25% = 无条件 REJECT,HAS-TEETH: T1 红(3/3 族) / T2 不红(0 族) / 两侧自比 0 假阳(EXACT) / 合成双向正确,眼睛一票否决权不变（军规 33 (d)）；本探针是附加门，不是替代门

@@ -12,7 +12,7 @@ GATEPY="${GATEPY:-C:/Users/wangz/.dsh/dsh-runtimes/dsh-primary-runtime/dependenc
 export SYCL_CACHE_PERSISTENT=1
 export SYCL_CACHE_DIR="E:/DSH/sycl-cache"
 export DSH_ONEAPI="$RUNDIR"
-GATES="gate_libxmx_sycl gate_unary gate_gemm_s8 gate_gemm_s8rq gate_chain_s1 gate_cosine gate_qkv_v gate_qkv_qk gate_softmax gate_cosine_i8 gate_softmax_i8 gate_qkv_v_i8 gate_requant_i8 gate_chain_scores gate_chain_qkv gate_gemm_s8rq32 gate_chain_attnv gate_graph gate_gemm_int8_residual gate_gemm_int8_qkv gate_window_int8_residual gate_quant_window gate_unary_kinds gate_gemm_f16 gate_gemm_f16_residual gate_ffn gate_ffn_stem gate_ffn_merge gate_gemm_f16_qkv_window gate_gemm_f16_window_residual_pool gate_window_block gate_window_block_head gate_merge_heads gate_window_attention gate_vit_softmax gate_global_attention gate_gemm_int8_batched gate_gemm_int8 gate_coexist"
+GATES="gate_libxmx_sycl gate_unary gate_gemm_s8 gate_gemm_s8rq gate_chain_s1 gate_cosine gate_qkv_v gate_qkv_qk gate_softmax gate_cosine_i8 gate_softmax_i8 gate_qkv_v_i8 gate_requant_i8 gate_chain_scores gate_chain_qkv gate_gemm_s8rq32 gate_chain_attnv gate_graph gate_gemm_int8_residual gate_gemm_int8_qkv gate_window_int8_residual gate_quant_window gate_unary_kinds gate_gemm_f16 gate_gemm_f16_residual gate_ffn gate_ffn_stem gate_ffn_merge gate_gemm_f16_qkv_window gate_gemm_f16_window_residual_pool gate_window_block gate_window_block_head gate_merge_heads gate_window_attention gate_vit_softmax gate_global_attention gate_gemm_int8_batched gate_gemm_int8 gate_coexist gate_skip_graph"
 [ -n "${GATE_ONLY:-}" ] && GATES="$GATE_ONLY"
 green=0; red=0; reds=""
 for x in $GATES; do
