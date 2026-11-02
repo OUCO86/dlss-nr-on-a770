@@ -236,6 +236,143 @@ def stats(gb, tb):
     except ImportError:
         return stats_py(gb, tb)
 
+# ============================ 军规 33（2026-11-02，promote2 铲）============================
+# 全局标量（corr / dB / 均值分位数）看不见**局部结构灾难**：T1（1270 面降 e4m3）机器读数
+# corr_min 0.9828 / 32.34 dB 全在可接受带，实机却是"彩色大方块"。唯一预警 = A 通道 corr 0.614。
+# 所以任何改数值/改面的铲必须再看三样：
+#   (a) per-tile 最差 dB（64x64 分块，报 min / p1 / p5，不是均值也不是 p99.9）
+#   (b) 平坦区异常检测（低梯度块里 |d| 突增 = 色块/台阶前兆）
+#   (c) 逐通道 corr，A/alpha 单独成判（A corr < 0.9 => 必须实机，不许因 RGB 高就放行）
+# 另加一条本铲自用：**成片色偏探针**（每块逐通道均值偏移 / golden sigma）——"彩色方块"就是它。
+TILE_DEFAULT = 64
+A_CORR_MUST_SCREEN = 0.90      # A 通道单判门槛
+FLAT_FRAC = 0.20               # 梯度最低的前 20% 块算"平坦区"
+TILE_CSV_ROWS = 25             # 最差块打印/导出条数
+
+
+def tile_metrics(gb, tb, rng, peaks, tile=TILE_DEFAULT):
+    """按 tile x tile 分块（边缘允许残缺块）统计最差 dB / 平坦区 / 成片色偏。
+       返回 None = 没有 numpy（调用方必须显式打印"未测"，不许静默绿）。"""
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    G = np.frombuffer(memoryview(gb), dtype='<f4').reshape(H, W, 4).astype('f8')
+    T = np.frombuffer(memoryview(tb), dtype='<f4').reshape(H, W, 4).astype('f8')
+    D = G - T
+    gsd = [float(G[:, :, c].std()) for c in range(4)]
+    tiles = []
+    for y in range(0, H, tile):
+        y2 = min(H, y + tile)
+        for x in range(0, W, tile):
+            x2 = min(W, x + tile)
+            g = G[y:y2, x:x2, :3]
+            d = D[y:y2, x:x2, :3]
+            rmse = float(np.sqrt(np.mean(d * d)))
+            db = float('inf') if rmse == 0.0 else 20.0 * math.log10(rng / rmse)
+            da = D[y:y2, x:x2, 3]
+            rmse_a = float(np.sqrt(np.mean(da * da)))
+            dba = float('inf') if rmse_a == 0.0 else 20.0 * math.log10(peaks[3] / rmse_a)
+            gx = float(np.abs(g[:, 1:, :] - g[:, :-1, :]).mean()) if (x2 - x) > 1 else 0.0
+            gy = float(np.abs(g[1:, :, :] - g[:-1, :, :]).mean()) if (y2 - y) > 1 else 0.0
+            grad = gx + gy
+            # 块内**结构保持率**（军规 33 的"彩色大方块"= 块内方差塌陷/台阶化）：
+            # 用 test 自己的梯度能量 / golden 的梯度能量。塌陷 => 该块变成一片纯色 = 眼睛能看见的方块。
+            gt = T[y:y2, x:x2, :3]
+            tgx = float(np.abs(gt[:, 1:, :] - gt[:, :-1, :]).mean()) if (x2 - x) > 1 else 0.0
+            tgy = float(np.abs(gt[1:, :, :] - gt[:-1, :, :]).mean()) if (y2 - y) > 1 else 0.0
+            tgrad = tgx + tgy
+            keep = (tgrad / grad) if grad > 0 else float('nan')
+            shift = max(abs(float(np.mean(D[y:y2, x:x2, c])) / gsd[c]) if gsd[c] > 0 else 0.0
+                        for c in range(3))
+            tiles.append({'y': y, 'x': x, 'w': x2 - x, 'h': y2 - y, 'db': db, 'dbA': dba,
+                          'grad': grad, 'tgrad': tgrad, 'keep': keep,
+                          'mad': float(np.mean(np.abs(d))),
+                          'maxabs': float(np.max(np.abs(d))), 'shift': shift})
+    fin = sorted(t['db'] for t in tiles if t['db'] == float('inf') or t['db'] < float('inf'))
+    def q(vals, p):
+        if not vals:
+            return float('inf')      # 全部块逐位全同 => 分位数记 inf，不许记 nan
+        return vals[min(len(vals) - 1, int(p * (len(vals) - 1)))]
+    ntile = len(tiles)
+    nflat = max(1, int(FLAT_FRAC * ntile))
+    flat = sorted(tiles, key=lambda t: t['grad'])[:nflat]
+    sharp = sorted(tiles, key=lambda t: -t['grad'])[:nflat]
+    gmad = float(np.mean(np.abs(D[:, :, :3])))
+    flat_mad = float(np.mean([t['mad'] for t in flat]))
+    sharp_mad = float(np.mean([t['mad'] for t in sharp]))
+    fin_dbs = [t['db'] for t in tiles if t['db'] != float('inf')]
+    keeps = sorted(t['keep'] for t in tiles if t['keep'] == t['keep'])
+    worst = sorted(tiles, key=lambda t: (t['db'], -t['shift']))[:TILE_CSV_ROWS]
+    worst_keep = sorted(tiles, key=lambda t: t['keep'])[:TILE_CSV_ROWS]
+    return {'tile': tile, 'ntiles': ntile,
+            'keep_min': (keeps[0] if keeps else float('nan')),
+            'keep_p1': q(keeps, 0.01), 'keep_p5': q(keeps, 0.05), 'keep_p50': q(keeps, 0.50),
+            'n_keep_lt08': sum(1 for k in keeps if k < 0.8),
+            'n_keep_lt06': sum(1 for k in keeps if k < 0.6),
+            'n_keep_lt04': sum(1 for k in keeps if k < 0.4),
+            'n_keep_gt16': sum(1 for k in keeps if k > 1.6),
+            'worst_keep': worst_keep,
+            'db_min': (fin_dbs[0] if fin_dbs else float('inf')),
+            'db_p1': q(fin_dbs, 0.01), 'db_p5': q(fin_dbs, 0.05),
+            'db_p50': q(fin_dbs, 0.50), 'db_max': (fin_dbs[-1] if fin_dbs else float('inf')),
+            'n_exact_tiles': sum(1 for t in tiles if t['db'] == float('inf')),
+            'n_below40': sum(1 for t in fin_dbs if t < 40.0),
+            'n_below35': sum(1 for t in fin_dbs if t < 35.0),
+            'n_below30': sum(1 for t in fin_dbs if t < 30.0),
+            'n_below25': sum(1 for t in fin_dbs if t < 25.0),
+            'n_below20': sum(1 for t in fin_dbs if t < 20.0),
+            'dbA_min': min((t['dbA'] for t in tiles if t['dbA'] != float('inf')),
+                           default=float('inf')),
+            'flat_grad_max': flat[-1]['grad'], 'flat_db_min': min(t['db'] for t in flat),
+            'flat_mad': flat_mad, 'sharp_mad': sharp_mad, 'global_mad': gmad,
+            'flat_over_global': (flat_mad / gmad if gmad > 0 else float('nan')),
+            'flat_over_sharp': (flat_mad / sharp_mad if sharp_mad > 0 else float('nan')),
+            'shift_max': max(t['shift'] for t in tiles),
+            'n_shift_gt1': sum(1 for t in tiles if t['shift'] > 1.0),
+            'n_shift_gt05': sum(1 for t in tiles if t['shift'] > 0.5),
+            'worst': worst}
+
+
+def print_tile_metrics(label, m):
+    if m is None:
+        print("%-26s 军规33 per-tile: **未测（无 numpy）** => 这一栏不许当绿" % label)
+        return
+    print("%-26s 军规33 per-tile(%d): dB@range min=%s p1=%s p5=%s p50=%s max=%s | "
+          "块数=%d(其中逐位全同=%d) <40:%d <35:%d <30:%d <25:%d <20:%d"
+          % (label, m['tile'], '%.2f' % m['db_min'], '%.2f' % m['db_p1'], '%.2f' % m['db_p5'],
+             '%.2f' % m['db_p50'], '%.2f' % m['db_max'], m['ntiles'], m['n_exact_tiles'],
+             m['n_below40'], m['n_below35'], m['n_below30'], m['n_below25'], m['n_below20']))
+    print("%-26s   平坦区(最低20%%梯度, grad<=%.4f): dB_min=%s mean|d|=%.4f | 陡峭区 mean|d|=%.4f "
+          "| 平坦/全域=%.3f 平坦/陡峭=%.3f  %s"
+          % ('', m['flat_grad_max'], ('inf' if m['flat_db_min'] == float('inf') else '%.2f' % m['flat_db_min']),
+             m['flat_mad'], m['sharp_mad'], m['flat_over_global'], m['flat_over_sharp'],
+             'FLAT-ANOMALY(平坦区误差反而大 = 色块/台阶前兆)'
+             if (m['flat_over_global'] > 1.5 and m['flat_over_sharp'] > 1.5) else 'flat-ok'))
+    print("%-26s   成片色偏(每块逐通道均值偏移/golden sigma): max=%.3f  >1.0sigma 的块=%d  >0.5sigma=%d  %s"
+          % ('', m['shift_max'], m['n_shift_gt1'], m['n_shift_gt05'],
+             'BLOCK-TINT RISK' if m['n_shift_gt1'] > 0 else 'no coherent block tint'))
+    print("%-26s   ★结构保持率(块内梯度 test/golden, 彩色方块=塌陷): min=%s p1=%s p5=%s p50=%s | "
+          "<0.8:%d <0.6:%d <0.4:%d(块内结构塌光=眼睛可见方块) >1.6:%d(凭空长出结构=锯齿)  %s"
+          % ('', '%.3f' % m['keep_min'], '%.3f' % m['keep_p1'], '%.3f' % m['keep_p5'],
+             '%.3f' % m['keep_p50'], m['n_keep_lt08'], m['n_keep_lt06'], m['n_keep_lt04'],
+             m['n_keep_gt16'],
+             'BLOCK-COLLAPSE RISK' if m['n_keep_lt06'] > 0 else 'no block collapse'))
+    print("%-26s   塌陷最狠 5 块: %s"
+          % ('', '  '.join('(y=%d,x=%d keep=%.3f dB=%s)'
+                           % (t['y'], t['x'], t['keep'],
+                              'inf' if t['db'] == float('inf') else '%.1f' % t['db'])
+                           for t in m['worst_keep'][:5])))
+    print("%-26s   A 通道单判: dB@range(min over tiles)=%s | 最差 %d 块:"
+          % ('', ('inf' if m['dbA_min'] == float('inf') else '%.2f' % m['dbA_min']), len(m['worst'])))
+    for t in m['worst'][:10]:
+        print("        tile y=%3d x=%3d %dx%d  dB=%8s  dB_A=%8s  grad=%.4f  mean|d|=%.4f  max|d|=%.4f  shift=%.3f"
+              % (t['y'], t['x'], t['w'], t['h'],
+                 'inf' if t['db'] == float('inf') else '%.2f' % t['db'],
+                 'inf' if t['dbA'] == float('inf') else '%.2f' % t['dbA'],
+                 t['grad'], t['mad'], t['maxabs'], t['shift']))
+
+
 def verdict(corr_min):
     if corr_min != corr_min:      # nan
         return 'CORR-NAN?'
@@ -254,7 +391,7 @@ def db_verdict(dbr):
         return 'dB-OK(>=35)'
     return 'dB-BELOW35'
 
-def report(label, gold, test, s, peak_override=None):
+def report(label, gold, test, s, peak_override=None, gb=None, tb=None, tile=TILE_DEFAULT):
     rng = s['rng_rgb']
     peaks = [s['gmax'][c] - s['gmin'][c] for c in range(4)]
     if peak_override:
@@ -309,13 +446,34 @@ def report(label, gold, test, s, peak_override=None):
           % ('', f(row['mad_sig_RGB']), f(row['p999_sig_RGB']),
              f(row['worst1_dBrange_p99'], 6, 2), f(row['worst1_dBrange_mean'], 6, 2),
              f(row['worst1_dB01_p99'], 6, 2), f(row['worst1_dB01_mean'], 6, 2)))
+    # ---- 军规 33：A 通道单独成判 + per-tile 三样 ----
+    ca = row['corr_A']
+    row['A_gate'] = ('A-CORR-NAN' if ca != ca else
+                     ('A-CORR-MUST-SCREEN(<%.2f)' % A_CORR_MUST_SCREEN if ca < A_CORR_MUST_SCREEN
+                      else 'A-gate-ok'))
+    print("%-26s A 通道单判: corr_A=%s => %s" % ('', f(row['corr_A'], 6, 4), row['A_gate']))
+    m = None
+    if tile and gb is not None and tb is not None:
+        m = tile_metrics(gb, tb, rng, peaks, tile)
+        print_tile_metrics(label, m)
+        if m is not None:
+            for k in ('db_min', 'db_p1', 'db_p5', 'db_p50', 'db_max', 'dbA_min', 'n_exact_tiles',
+                      'n_below40', 'n_below35', 'n_below30', 'n_below25', 'n_below20',
+                      'keep_min', 'keep_p1', 'keep_p5', 'keep_p50',
+                      'n_keep_lt08', 'n_keep_lt06', 'n_keep_lt04', 'n_keep_gt16',
+                      'flat_db_min', 'flat_mad', 'flat_over_global', 'flat_over_sharp',
+                      'shift_max', 'n_shift_gt1', 'n_shift_gt05'):
+                row['tile_' + k] = m[k]
+    elif tile:
+        print("%-26s 军规33 per-tile: 调用方没传原始 buffer => 未测" % label)
+    row['_tile'] = m
     return row, rng
 
 def selftest(gold_path):
     gb = load(gold_path)
     print("== self-test 1: bk vs bk ==")
     s = stats(gb, gb)
-    r, rng = report('bk-vs-bk', gold_path, gold_path, s)
+    r, rng = report('bk-vs-bk', gold_path, gold_path, s, gb=gb, tb=gb)
     print("   expect inf/IDENTICAL/corr=1 -> dBrange_RGB=%s corr_luma=%.6f ident=%s"
           % ('inf' if r['dBrange_RGB'] == float('inf') else '%.2f' % r['dBrange_RGB'],
              r['corr_luma'], r['identical']))
@@ -333,7 +491,7 @@ def selftest(gold_path):
         for i in range(len(tb)):
             tb[i] = tb[i] + rs.gauss(0.0, 0.5571)
     s2 = stats(gb, tb)
-    r2, _ = report('synth-noise-0.5571', gold_path, '(in-memory)', s2)
+    r2, _ = report('synth-noise-0.5571', gold_path, '(in-memory)', s2, gb=gb, tb=tb)
     print("   golden RGB sigma=%.4f range=%.4f -> dB scale offset = %.2f"
           % (s2['sd_rgb'], s2['rng_rgb'], 20.0 * math.log10(s2['rng_rgb'])))
     return r, r2
@@ -345,12 +503,19 @@ def main():
     ap.add_argument('--csv', default=None)
     ap.add_argument('--cross', action='store_true')
     ap.add_argument('--peak-override', type=float, default=None)
+    ap.add_argument('--tile', type=int, default=TILE_DEFAULT,
+                    help='军规33 per-tile 分块边长（默认 64；544 不整除 => 边缘残缺块）')
+    ap.add_argument('--no-tile', dest='tile', default=None, action='store_const', const=0,
+                    help='关掉 per-tile 三样（不许用它出转正结论）')
+    ap.add_argument('--tile-csv', default=None, help='最差块逐条导出 CSV')
     ap.add_argument('--selftest', action='store_true')
     a = ap.parse_args()
     if a.selftest:
         gp = a.gold or r'E:\DSH\dumps\bk.1301.bin'
         selftest(gp)
         return
+    if a.tile is None:
+        a.tile = TILE_DEFAULT
     if not a.gold or not a.tests:
         ap.error('need GOLD and at least one TEST dump (or --selftest)')
     print("judge: corr>=%.2f SAFE | %.2f..%.2f on-screen-accept | <%.2f REJECTED ; "
@@ -366,7 +531,8 @@ def main():
     for t in a.tests:
         tb = load(t)
         s = stats(gb, tb)
-        row, rng = report(os.path.basename(t), a.gold, t, s, a.peak_override)
+        row, rng = report(os.path.basename(t), a.gold, t, s, a.peak_override,
+                          gb=gb, tb=tb, tile=a.tile)
         row['md5'] = file_md5(t)
         if first:
             print("          golden per-channel range/sigma: " +
@@ -379,7 +545,7 @@ def main():
         if a.cross and prev is not None:
             s2 = stats(prev[1], tb)
             r2, _ = report("[CROSS %s vs %s]" % (os.path.basename(prev[0]), os.path.basename(t)),
-                           prev[0], t, s2, a.peak_override)
+                           prev[0], t, s2, a.peak_override, gb=prev[1], tb=tb, tile=a.tile)
             rows.append(r2)
         prev = (t, tb)
     def mn(key):
@@ -393,14 +559,57 @@ def main():
              ('inf' if mn('dBrange_RGB') == float('inf') else '%.2f' % mn('dBrange_RGB')),
              ('inf' if mn('worst1_dBrange_p99') == float('inf') else '%.2f' % mn('worst1_dBrange_p99')),
              '%.4f' % mn('corr_min_RGB'), verdict(mn('corr_min_RGB'))))
+    # 军规 33 汇总：最差 per-tile dB + A 通道单判 + 平坦区/色偏计数
+    tmin = [r['tile_db_min'] for r in rows if 'tile_db_min' in r and r['tile_db_min'] != float('inf')]
+    avals = [r['corr_A'] for r in rows if r.get('corr_A') == r.get('corr_A')]
+    if tmin:
+        print("SUMMARY 军规33: per-tile dB@range 最差=%.2f  p1 最差=%.2f  p5 最差=%.2f | "
+              "<30dB 块最多=%d  <20dB 块最多=%d | 平坦区异常帧=%d  成片色偏块>1sigma 最多=%d | "
+              "结构保持率 min=%.3f  <0.6 塌陷块最多=%d  <0.4=%d | "
+              "corr_A 最低=%.4f => %s"
+              % (min(tmin),
+                 min(r['tile_db_p1'] for r in rows if 'tile_db_p1' in r),
+                 min(r['tile_db_p5'] for r in rows if 'tile_db_p5' in r),
+                 max(r['tile_n_below30'] for r in rows if 'tile_n_below30' in r),
+                 max(r['tile_n_below20'] for r in rows if 'tile_n_below20' in r),
+                 sum(1 for r in rows if r.get('tile_flat_over_global', 0) > 1.5
+                     and r.get('tile_flat_over_sharp', 0) > 1.5),
+                 max(r.get('tile_n_shift_gt1', 0) for r in rows if 'tile_n_shift_gt1' in r),
+                 min((r.get('tile_keep_min', float('nan')) for r in rows
+                      if r.get('tile_keep_min', None) is not None), default=float('nan')),
+                 max(r.get('tile_n_keep_lt06', 0) for r in rows if 'tile_n_keep_lt06' in r),
+                 max(r.get('tile_n_keep_lt04', 0) for r in rows if 'tile_n_keep_lt04' in r),
+                 min(avals) if avals else float('nan'),
+                 'A-MUST-SCREEN' if (avals and min(avals) < A_CORR_MUST_SCREEN) else 'A-ok'))
+    else:
+        print("SUMMARY 军规33: per-tile **未测** => 这一栏缺了就不许下转正结论（军规 33）")
+    if a.tile_csv:
+        import csv
+        cols = ['label', 'rank_by', 'y', 'x', 'w', 'h', 'db', 'dbA', 'grad', 'tgrad', 'keep',
+                'mad', 'maxabs', 'shift']
+        with open(a.tile_csv, 'w', newline='', encoding='utf-8') as f:
+                w = csv.DictWriter(f, fieldnames=cols, restval='', extrasaction='ignore')
+                w.writeheader()
+                for r in rows:
+                    m = r.get('_tile')
+                    if not m: continue
+                    for (rank, lst) in (('db', m['worst']), ('keep', m['worst_keep'])):
+                        for t in lst:
+                            d = dict(t)
+                            d['label'] = r['label']; d['rank_by'] = rank
+                            w.writerow(d)
+        print("wrote", a.tile_csv, "(worst %d tiles per frame, 两种排名: dB / 结构保持率)" % TILE_CSV_ROWS)
     if a.csv:
         import csv
+        # 修仪器 bug（本次逮到）：--cross 的 CROSS 行没有 row['md5']，旧写法取 rows[0].keys()
+        # => KeyError: 'md5'。改成"所有行的键并集（保序）+ 缺项留空"。
+        cols = list(dict.fromkeys(k for r in rows for k in r.keys() if not k.startswith('_')))
         with open(a.csv, 'w', newline='', encoding='utf-8') as f:
-            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            w = csv.DictWriter(f, fieldnames=cols, restval='', extrasaction='ignore')
             w.writeheader()
             for r in rows:
                 w.writerow(r)
-        print("wrote", a.csv)
+        print("wrote", a.csv, "(%d cols)" % len(cols))
 
 if __name__ == '__main__':
     main()

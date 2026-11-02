@@ -1046,3 +1046,26 @@ T1 的机器读数：**corr_min 0.9828**（R .983 G .992 B .990，luma .991）�
 
 **处置**：**转正件走 A-only**（只带跳 C512，不带栅栏宏）——B 免费但零收益，且给 shipped 源码添噪声；**B 的机器级证据全部留账**。
 
+
+
+## 45. ★★★ T2 转正并部署：跳 C512 全 14 链 = **-4.794 ms/帧（16/16）**，加载位现在是 ABB969FE；同时抓到两处判官缺口
+**部署链**：`out\libxmx.dll` = **ABB969FE4AAF0F94AA03C3F53781EDD0**（3,813,376B）；旧 1a 件三处留底：`out\libxmx.bak-shipped.dll`、`out\libxmx.before-E2D5E5740035.keep`、`out\libxmx.keep-E2D5E5740035.pre-promote`。**一键回退**：`Copy-Item E:\DSH\out\libxmx.keep-E2D5E5740035.pre-promote E:\DSH\out\libxmx.dll -Force`（回退后 walk 要显式 `-Gold E:\DSH\dumps\bk.1301.pre-skip-1a.bin`）。`oneapi\libxmx_sycl.dll` 同步为 ABB969FE（旧件留 `.E2D5E574.keep`）。`out\DEPLOY.md5.txt` 已追加完整判据摘要。
+**A-only**（按改令：栅栏宏不入件，§44 已证它是机器级空操作）。基线 = `08e8b62`（§41 证 4/4 稳定），**不含 §40 别名手术**。
+
+**判据（全过）**
+- **8/8 独立进程 distinct md5 = 1 = `DD49827DD33A7EF07C2C17892F18970D`**，且与 §33 的 `skip_C512a/b`、§41 的 `t2_skipc512_a..d` **同一 md5** ⇒ env 开关 / 编译期默认 / 转正件**三条路径逐位一致**。
+- **金标换代**：旧 `bk.1301.bin`(249A46F3) 改名保留 = `bk.1301.pre-skip-1a.bin`（画质对照）；新金标 `bk.1301.skip.bin` + 软拷贝 `bk.1301.bin`；`dumps\GOLDEN.md` 写清两代表格、照抄可用的命令、以及"旧件必须显式 `-Gold …pre-skip-1a.bin` 否则假红"。
+- **16 对（正式）**：A=E2D5E574 vs B=cand_skip ⇒ **mean −4.794、median −4.750、sd 0.529、CI95[−5.074,−4.514]、B 赢 16/16**。与 §41 的 −5.133 同向同量级（少赚 0.34ms，远小于失败线 1.5ms）。
+- **转正件与用户实机验收过的 `test_skip_c512.dll` 逐字节只差 6B**（0x110、0x166724 各 3B，时间戳类字段，`s6/cmp_dll.py`）⇒ **机器上就是那只被眼睛验收过的件**，所以第二次 16 对（隔离栅栏净价）取消。
+- **39 门 = 39 GREEN / 0 RED，一字未改门**。
+
+**★ 缺口一（必须补）：39 门里没有任何一扇在测跳块路径。** 只有 `gate_graph`(28 打印) 与 `gate_coexist`(14 打印) 出现 `[skip-chains]`，而那里小图只有 1 条链、请求的 18..32 全部 `OUT OF RANGE … ignored` ⇒ `chains_skipped=0 refused=14 closures_noop=0 passes=1 (unchanged)`；其余 37 门连 `skip_chains_apply` 都没打印。
+⇒ **"跳块会让整链门红"从未发生，因为门里根本没有跳块类**。**下一铲补第 40 门**：整图 52 链 + skip 后对新金标逐位（现在它只活在 walk 里）。
+
+**★ 缺口二（更要紧）：新做的 per-tile 画质表抓不住 T1 型灾难。**
+`tools/db_meter.py` 已加：per-tile 64×64（min/p1/p5/p50 + <40/<35/<30/<25/<20 块数）、平坦区异常、成片色偏（每块逐通道均值偏移/sigma）、**结构保持率**（块内梯度 test/golden）、**A 通道单判**（corr_A<0.90 ⇒ MUST-SCREEN）；并修了 `--cross + --csv` 的 `KeyError:'md5'` bug；自测仍过（bk vs bk = inf；sigma=0.5571 合成噪声 27.88/5.08 vs 期望 27.89/5.09）。
+新件 vs 旧金标：corr R .965 G .991 B .988 **A .773**、dB@range 30.80；135 块 dB **min 28.85 / p1 28.41 / p5 30.09 / p50 29.36**；**<20dB 块 = 0**；平坦区无异常（平坦/陡峭 = 0.87）；色偏 max 0.375 sigma（>1 sigma 块 0）；结构保持率 min 0.906（<0.6 块 0）；**CROSS（两独立进程）= IDENTICAL/inf**。
+**但牙齿对照（`tools/judge_teeth.csv`）：同一套指标跑"被否决的 T1"与"被接受的 T2"** ⇒ T1 dB min **34.80**、色偏 0.316 sigma、塌陷 0 块；T2 dB min **28.85**、色偏 0.375 sigma、塌陷 0 块 ⇒ **per-tile dB / 色偏 / 塌陷三样对 T1、T2 没有分离力，甚至方向相反**；唯一与眼睛同序的仍是 **corr_A（T1 0.614 < T2 0.773）**。
+⇒ **结论：军规 33 的 (a)(b) 两栏目前不是 T1 型灾难的探测器**；要抓它需要一把按**"块内常量化 / 台阶化"**建模的探针（T1 的"彩色大方块"= 每块退化成常数），**先拿 T1 的 dump 标定再上**。这条排在任何新的画质改动铲之前。
+
+**栅栏审计收尾（§44 的机器级判据落地）**：`tools/barrier_audit.py` 现在出 **`verdict_source` / `verdict_machine` 两栏**，未做 ISA 对照的核一律 `not-measured`；机器级判据草案写死：REUSE/HANDOFF 再分「**跨已发射栅栏区间重叠** = 真竞态候选」与「**同一区间内重叠** = 只算源码级」。BEFORE/AFTER 两份 csv 已入库（`tools/barrier_audit_before.csv` / `_after.csv`）：`ffn2::fused` source RACE(WG0/SG12) -> DM_BAR=1 后 source OK(WG12/SG0)，其余 9 核一字未变；反证仍 PASS。
