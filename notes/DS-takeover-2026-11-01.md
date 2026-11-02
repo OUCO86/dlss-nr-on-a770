@@ -916,3 +916,37 @@ take 在 record 期把相邻 QUANT 闭包**整发** `[](){}`（:413，全动/全
 **军规候补 28**：`SYCL_ESIMD_KERNEL` ⊥ `reqd_sub_group_size` ⇒ **ESIMD 核没有宽度属性刀**，要动宽度只能动显式 SIMD 契约（几何铲）。
 **军规候补 29**：JIT 台账里**一个核有两个实例**（`RoundedRangeKernel` 包装形 + 裸闭包形），**任何按名字去重的仪器必须把 simd 计入 key**，否则只报半个实例（本铲两次踩）。
 **下一铲序（代理建议，我已采纳）**：(1) **scratch/private 追因铲**（`pack_a_fused_b1` 176-211 条 = 就在 1a/折叠的活路径上）→ (2) WB 驻留刀（45,056→≤32,768，上限 −3.9）→ (3) GA 融合（−2.3…−5.5）。
+
+## 39. ★ 上游对照：`Uzbekunknown/dlss-nr-on-intel` v0.0.3.1（本地已 clone 到 `E:\DSH\refs\dlss-nr-on-intel`，走 ssh-over-443，github.com 的 HTTPS 在这台机上被 DNS 污染）
+**它就是我们的起点**（`b1-blueprint.md:300-301`：uzbekunknown 移植 = 本地存档 `src/dlss5nr-b580` ⇒ 优化到 ~59ms ⇒ 判定不适合 A770 ⇒ 推翻重写 = 现在的大宽数据核心）。
+**而现在他们把我们当前列 prior art**：`notes/HANDOFF.md:401` "Prior art, found 11-01: **OUCO86/dlss-nr-on-a770** (Apache-2.0) is this code running NR on an A770"；`:184/:316` "An Arc A-series path with **8x8 matrix tiles, from OUCO86's A770 port**: **begun on 11-01 and paused**"、"the 8x8 builds are byte-identical to OUCO86's A770 [builds]"。
+
+### ① "720p 40 帧"（issue #25）的原文与三个限定（`HANDOFF.md:259-300`）
+> "#25, Nuclear Option through DXVK at **720p and 0.4**, **40 fps with NR's picture**, and **two Vulkan games where NR did nothing**."
+- **720p + render scale 0.4 ⇒ 网络跑在 512×288 = 0.147 Mpx ⇒ 比我们 960×544（0.522 Mpx）少 3.5 倍像素**；
+- 同一节里他们自己写 "**Which network it measured is unknown**"，并记录了一个真 bug：speed test 自 346d300 起不标网络，daemon 行是 "**network preset B (dlssnr-b-logical.safetensors), 31 blocks**" ⇒ **他们的发行版带两个网络：A=71 块、B=31 块，工具默认跑 B**；
+- 同一份报告里还有"两个 Vulkan 游戏 NR 根本没生效"。
+⇒ **"40fps@720p" 不是"71 层在 A770 上比我们快"**；它 = **0.4 尺度（3.5x 少像素）+ 网络身份不明（默认是 31 块 preset B）**。
+
+### ② 他们唯一的 A770 满尺度数字 vs 我们归一化
+> "the one speed test (#23) against phase72's Windows table: **32 ms at 640x360 and 0.4** ... **229 at 1920x1080 and 1.0** against [Arc 140V] **381-404**. **The A770 does a megapixel in half the time and loses at the small fields games run at: a fixed ~21 ms a frame**, which only a per-pass profile on such a card can place."
+- 我们（71 块、已含 1a）：**63.5 ms @0.522 Mpx ⇒ 归一到 1920×1080（2.074 Mpx）= 252 ms**；他们 A770 = **229 ms**（网络未标）⇒ **同像素下差 ~10%**，不是数量级。
+- 他们自认 **A770 有 ~21ms/帧的固定开销放不到位置上** ⇒ **与我们 §35 三次独立同判"帧是 latency/staging-bound"完全同一件事**。
+- 他们的 dispatch 数：**1804 → 1664/帧 @720p**（phase32）——**比我们的 691 多**；720p 整帧 490-520ms（Arc 140V）。
+
+### ③ 他们实测的 A 卡硬件账（可交叉验证我们的）
+- A 系只有 **f16 8x8x16 与 int8 8x8x32**；subgroups 8-32；**48 KB shared memory**（他们 Vulkan 口径；我们 Level-Zero 实测 `local_mem_size=65,536`——**两条口径要调和，若将来走 Vulkan 会改 S6-1b 的帽**）；
+- "**runs NR's 8x16x16 at subgroup 32 exactly — NR computes right there, slowly**"；矩阵微基准 8x8x16 = **57-60 TFLOP/s @sg8/16，36-39 @sg32** ⇒ "**subgroup 32 costs these cards ~40%**"（**独立佐证我们 §38：宽度是逐核的，不是全局的**）；
+- 他们的 staged GEMM 在**真实形状**上只有 **5.5-15 TFLOP/s**（B580）/ 3.5-3.8（140V）；消融：**514ms 全帧 = 221 GEMM + 300 其它功** ⇒ **他们的时间也大头在非 GEMM 功**——与我们 §37（WB 矩阵腿已在 92% 屋顶）同构。
+
+### ④ 他们已关闭的刀清单（省我们重复证明）
+`register tiling, operand staging, integer weights, accumulator format, OpenCL, shared-memory bank padding, 256-register mode (~6%, 未采纳), E4M3 weights (~0.14 ms/帧), transposed static weights (更差：598.8 vs 521.8), tile 16x32 最优（32x32/32x16/16x64/8x32 都差）, small-M kernel（未试）`
+⇒ **与我们"关门账"高度重叠**（bank padding、宽寄存器、整数权重、转置/布局、E4M3 小肉）；**唯一他们没试的是 small-M，而那是我们军规 1 明令禁止的**。
+
+### ⑤ ★ 两条能直接搬进我们当前铲的方法（不是数字）
+1. **`ScratchArena` 角色别名表**（phase32）：**按角色规划最大字节、冻结计划、只实体化用过的角色**；并列出**生命周期不相交可共块**的角色配对（projection / branch-value / input-key / query-prob / scores-context / residual），同时明确"**FFN 残差必须活到最后一次 attention 残差**"。⇒ **这正是我们 WB 驻留刀（45,056→≤32,768）与帧内存的现成检查表**（他们靠它 720p 常驻缓冲 5041→2303 MiB，−54%）。
+2. **Q/K 融合**（phase32）：把"先拆 Q/K 到 f16、再读回做 cosine 归一化"融成一步，**保留原舍入点与归约顺序 ⇒ 逐位不变**，**消掉 140 个 dispatch ⇒ 帧 −3.7%**。⇒ **这就是我们 §35"消腿不省时间、消往返才省时间"的正例**，而且它给出了我们该抄的形状：**融合的对象是"拆分流 + 归一化"这种重复读，不是 gemm 本身**。
+3. 反向警告（phase29，他们自己的口径）：**softmax 换 `packHalf2x16` 单核 −13.7%，但全帧只有 −1.1~−1.9%，1080p 无变化** ⇒ 他们白纸黑字写 "**The kernel gain is not a 14% frame gain**"。**这正是我们 §38 宽度刀 0 ms 的同一个教训。**
+
+### ⑥ 资产一条（关系到你暂缓的 31 块）
+**他们发行版直接带 preset B 的权重**：`dlssnr-b-logical.safetensors`（31 块）。⇒ **将来解禁 31 块时，权重不用我们自己从 dll 里抠**。
