@@ -1514,6 +1514,17 @@ int xmx_graph_run(int id) {
                 std::printf("   pass %4d %-32s %8.1f ms\n", ord[i], nm, ms[ord[i]]);
                 if (f) std::fprintf(f, "pass %d %s %.1f\n", ord[i], nm, ms[ord[i]]);
             }
+            // KNIFE2 STEP-0 instrument (2026-11-02, 军规 40): family prices apportioned by
+            // FLOPs are ranking-only (6 negative violation rows = apportionment artifacts).
+            // Dump EVERY closure's second-pass GPU ms so merged-site prices become measured.
+            // Diagnostic path only (NR_RUN_TIMING gated); default replay is untouched.
+            if (f) {
+                for (size_t i = 0; i < ms.size(); i++) {
+                    const char* nm2 = (id < (int)g_graph_names.size() && i < (int)g_graph_names[id].size())
+                                      ? g_graph_names[id][i] : "?";
+                    std::fprintf(f, "rtcsv %zu %s %.4f\n", i, nm2, ms[i]);
+                }
+            }
             // per-op-name totals: which family owns the time
             std::map<std::string, double> byname;
             for (size_t i = 0; i < ms.size(); i++) {
