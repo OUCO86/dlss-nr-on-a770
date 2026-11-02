@@ -1028,3 +1028,21 @@ T1 的机器读数：**corr_min 0.9828**（R .983 G .992 B .990，luma .991）�
 - **T2 已获用户画质批准 ⇒ 待正式转正**（下一把铲做）：冻结新基线 dump（`bk.1301.skip.bin`，4/4 全同）+ 39 门 + **8/8 确定性（军规 31）** + 把 walk/ab 的判据改成对**新基线**比 + 画质判据加 **per-tile 最差 dB / 平坦区异常 / A 通道单判（军规 33）** + 然后部署到加载位（附一键回退）。
 - 正在跑的 `栅栏审计铲`（`a46b1bec`）不受影响：它审的是**源码里的跨 SG 租户与栅栏**；出货位此刻未变，所以它的 8/8 确定性读数仍对 1a 件有效。
 
+
+
+## 44. ★★ 更正 §43：`esimd::barrier()` **在机器级就是 CTA 栅栏** ⇒ 1a 的 "RACE" 重新定性为「源码级可疑 / 机器级同一栅栏」；栅栏硬化 = **免费但什么都不修**
+证据（`4de513f8` 的 DM_BAR 实验，件在 `E:\DSH\builds\`）：
+- `dm_bar.dll`(ECA5A5EB) vs 出货件 `E2D5E574`：**ffn2 两段 `.text` 反汇编 md5 完全相同**（`21DDE963…` / `05303229…`），**`send.gtwy … signal barrier` 都是 8 条** ⇒ 把 12 处 `esimd::barrier()` 换成 `sycl::group_barrier(it.get_group())` **没有产生任何机器码差异**；
+- **反证有牙**：`dm_probe.dll`（DM_BAR=1 再多插 1 条 `esimd::barrier`）⇒ 同一核变 **9 条**、asm 尺寸变 ⇒ **宏确实进了设备编译，不是没生效**；
+- 工具链原文同向：`esimd/memory.hpp:12045` ⇒ `esimd::barrier(){ __esimd_fence(global_coherent_fence|local_barrier); __esimd_barrier(); }`；`esimd/detail/memory_intrin.hpp:651` ⇒ "esimd_barrier, **generic group barrier**"；另有子组级 `experimental/esimd/memory.hpp:42 split_barrier`（**那才是 SG 级**）。
+**读数**：dm_bar 侧 **4/4 独立进程 1301 = 金标 EXACT**、passes 691；**16 对 A=出货 vs B=dm_bar：均值 −0.056 ms/帧、CI[−0.299,+0.187]、9/16** ⇒ **成本带内 ≈ 0**；台账两侧**逐列相同**（`grf 128 / simd 1 / slm 31,744 / spill=private=scratch=0 / scratch 指令 0`）。
+**仪器修正**：`barrier_audit.py` 升级——`S6_BAR()` 按 DM_BAR 两侧分类、**跳过预处理行防假 OK**、1a landmark 改**按锚点正则**定位（硬化补丁在 hpp 顶部加宏块 ⇒ 行号整体 +18，硬编码必错位）、`BARRIER_SRC` 可指别树；反证仍 PASS。verdict 变化：BEFORE `ffn2::fused` = RACE(WG0/SG12)；AFTER `[DM_BAR=0]` 仍 RACE、`[DM_BAR=1]` = OK(WG12/SG0)，**其余 9 核一字未变**。
+⇒ **推论（要重新解释 §40/§41 的竞态）**：既然每道相位边界本来就有 CTA 栅栏，§40 的红就**不是"缺栅栏"**，而是**别名让"读"与"更晚的写"落在同一个 CTA 栅栏区间内仍然重叠**（同一相内没有边界，或 REUSE 的写在读侧同一相）。
+⇒ **给仪器加机器级判据（待做）**：REUSE 条目要再分 **「跨栅栏重叠」= 真竞态** 与 **「同相内重叠」= 需查是否同 SG**；verdict 必须分 **source-level / machine-level 两栏**。
+
+**★ 军规 34（入 B2）**：**任何"源码级"审计/优化结论，必须在机器级复核才算数**——反汇编 `.text` md5、关键指令计数（这里是 `signal barrier` 条数）、台账逐列（含 simd/module_id 去重）。
+  本案形态 = **"源码看着危险、机器上不存在"**；同一台仪器的 verdict 从 RACE 变 OK 只因为改了**写法**而不是改了**语义** ⇒ 若不比 md5，我们就会把一次空操作记成 −0 成本的安全改进。
+  附带再犯记录：旧 `spillcheck` 去重 key `(lab,grf,slm)` 会把 dm_bar/dm_ctrl/出货件**糊成一行** ⇒ 已改成含 **simd + module_id**（军规 29 的同族）。
+
+**处置**：**转正件走 A-only**（只带跳 C512，不带栅栏宏）——B 免费但零收益，且给 shipped 源码添噪声；**B 的机器级证据全部留账**。
+

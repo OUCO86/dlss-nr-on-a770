@@ -191,3 +191,6 @@ SM_LW | 分支=b1-wblock-resident（origin 已推）。
 33. **画质判据不许只看全局标量**（corr / dB / 均值分位数）。正案：2026-11-02 T1（1270 面降 e4m3）机器读数 **corr_min 0.9828、32.34 dB@range、mean|d|/sigma 0.125、p99.9|d|/sigma 0.613** 全在可接受带，**实机却是"彩色大方块"= 结构性灾难**；因为 1270 是按窗/按块的面，坏的是成片区域，被其余 99% 正确区域稀释。
     任何改数值/改面的铲，画质表必须同时给：**(a) per-tile 最差 dB**（64x64 或 128x128 分块，报 min / p1 / p5，不是只报均值与 p99.9）；**(b) 平坦区异常检测**（大片低梯度区域里 |d| 突增 = 色块/台阶前兆）；**(c) 逐通道 corr，A/alpha 通道单独成判**（A 通道 corr < 0.9 直接进"必须实机"名单，不许因 RGB corr 高就放行）；**(d) 最终以用户实机裁决为准**。
     本次唯一出现的预警信号就是 **A 通道 corr 0.614**。
+34. **源码级审计结论必须在机器级复核才算数**（反汇编 .text md5、关键指令计数、台账逐列含 simd/module_id 去重）。
+    正案：§43 判 1a 融合核 = RACE（只有 SG 级 esimd::barrier），但 DM_BAR=1 把 12 处换成 sycl::group_barrier 后 **ffn2 两段 .text 反汇编 md5 完全相同、signal barrier 都是 8 条** => esimd::barrier() 在机器级本来就是 CTA 栅栏（工具链原文：esimd/memory.hpp:12045 与 esimd/detail/memory_intrin.hpp:651 "generic group barrier"；SG 级另有 experimental/esimd/memory.hpp:42 split_barrier）。反证有牙：dm_probe 多插 1 条 => 变 9 条、asm 尺寸变，证明宏真进设备编译。
+    => 本案形态是"源码看着危险、机器上不存在"：verdict 从 RACE 变 OK 只因改了写法而非语义。若不比 md5，就会把一次空操作记成零成本的安全改进。推论：§40/§41 的竞态不是"缺栅栏"，而是别名让读与更晚的写落在同一个 CTA 栅栏区间内仍重叠；barrier_audit 的 REUSE 条目须再分「跨栅栏重叠=真竞态」与「同相内重叠=需查是否同 SG」，verdict 分 source-level / machine-level 两栏。
