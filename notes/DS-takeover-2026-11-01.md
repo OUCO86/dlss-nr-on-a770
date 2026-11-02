@@ -950,3 +950,16 @@ take 在 record 期把相邻 QUANT 闭包**整发** `[](){}`（:413，全动/全
 
 ### ⑥ 资产一条（关系到你暂缓的 31 块）
 **他们发行版直接带 preset B 的权重**：`dlssnr-b-logical.safetensors`（31 块）。⇒ **将来解禁 31 块时，权重不用我们自己从 dll 里抠**。
+
+## 40. WB 驻留刀：SLM 45,056 -> 32,768、逐位 EXACT、32 对 24/32 赢 均值 -0.365 [-0.567,-0.163] => 带内（留形不吹，不单独转正）
+产物：`E:\DSH\builds\wb_slm_b.dll`、账 `notes/wb-residency.md`、表 `tools/wbslm.csv`、可复跑 `tools/wb_slm_layout.py`（带反证测试）+ `tools/wb_slm_mkcsv.py`。
+**① 先算后改（军规 22）**：regex 从 HEAD 读 map + `slm_init` => AQO/QPO/KTO/VPO/ATO 4,096x5 + PPO 8,192 + SCR 16,384 = **45,056，与台账逐字节对上**；逐相活跃并集峰值只有 **28,672 => 闲置 16,384 可挖**（现路只别名了一处 scrC->PPO）。别名后 = **每 SG 一段 7,168B 私有槽 + 4,096B 连续全局区给 VPO = 32,768B**（S0: accA->QPO->PROBS；S1: accB->SCORES->ATT->PROJ；S2: accC->SCORES 续->ATO->HEAD-A；S3: AQO->KTO；全局: VPO）。每笔"为什么不相交"逐条写死在脚本里。
+**结构地板 = 32,768**：PH1 三块 f32 累加面 3x2048/SG + AQO 1024/SG = 7,168/SG 动不了（两相 QKV 既有形状）；VPO 必须连续（`wbv3::tile8ss` 的 B 侧步长写死 `kc*1024`，helper 被 v3 共用）=> **再省 4,096 要拆 helper 或拆累加面，那是另一把刀**。§37 的"省 12,288"正是这把刀的天花板。
+**② 台账前后（key 含 simd，两实例分开；基线用全新 JIT 缓存跑出货件取得）**：`wbv4::launch_v4full` 与 `wbv4ph::launch_v4ph` 均 grf 128 / simd 1 / **slm 45,056 -> 32,768** / private=spill=scratch=0 / scratch 指令 0 => **没有拿 scratch 换 SLM**（§38 红线守住），也没上任何 `reqd_sub_group_size`（军规 28）。
+**③ 三关与单价**：walk 默认侧（无 env）两个独立进程 **1301 EXACT = 249A46F3...**、**passes 691**；基线同场也 EXACT/691。16 对跑两轮：run1 12/16 赢 -0.284；run2 12/16 赢 -0.446；**合并 32 对 = 24/32 赢、均值 -0.365 ms/帧、95% CI [-0.567,-0.163]（不含 0 => 方向真实）**。
+**④ 判决 = 带内**：未到 -0.5 转正线 => 留形不吹；质量代价为零（逐位 EXACT）。
+**驻留 1->2 的证据（不是"应该更快了"）**：(a) 同仪器 slm_size 45,056->32,768；(b) §29 实测曲线（24,640/驻2、36,928/驻1）=> 32,768 落在**驻 2** 侧（65,536 // 32,768 = 2；口径写死 **Level-Zero local_mem_size = 65,536**，不用上游 Vulkan 48KB）；(c) 帧侧 -0.37 与 CI 咬合。
+**但只兑现 §37 上限（-1.7/帧）的约 21%** => 教训：**§24/§29 的 +184% 曲线是"无 dpas 的 stub 价"**；真核矩阵腿已在 92% 屋顶 => **驻留那笔钱的真价约 -0.3...-0.45 ms/帧**。
+**军规 30（本铲挖出，仪器有牙）**：别名槽合法 = **生命周期不相交 + 跨 SG 读的租户与更晚写者之间必须有 WG 级栅栏**。第一版把 ATO 别名进 S3（与 KTO 同槽）**字节账全对，但 1301 全帧 MISMATCH**（6.56M/8.36M 字节差、x/y 全域平坦）——根因 = **跨 SG 读竞态**：KTO 在 P3 被别的 SG 读，而全核只有一个 group_barrier（PH2_2->P3），P3..P6 只有 SG 级 esimd::barrier => 快 SG 在 P6 写自己的 ATO 会覆盖慢 SG 未读完的 KTO。修法 = ATO 移进 S2（全程本 SG 私有）+ 两条 static_assert 钉死。规则已写进 `tools/wb_slm_layout.py`（XSG_READ / GROUP_BARRIERS），并用 `E:\DSH\s6\t_negcheck.py` 反证：把 ATO 塞回 S3，检查器必须报竞态 => **PASS**。
+上游 ScratchArena 角色配对与本铲槽表同类（projection<-attended/proj = S1；query/probability = S0；input/key<-KTO = S3），红线"残差活到最后一次残差"对应 PROJ 活到 P7。
+**处置**：不单独跑三关转正；与下一把（M2/M2b + att 相）合并成一次三关落地，省一轮 39 门 + 16 对的机时。

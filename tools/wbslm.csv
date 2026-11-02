@@ -1,0 +1,5 @@
+variant,slm_before,slm_after,grf,simd,private,scratch,scrInstr,exact,pairs,mean,wins,ci,note
+wb_slm_b,45056,32768,128,1,0,0,0,1301 EXACT,32,-0.365,24,"[-0.567,-0.163]","wbv4::launch_v4full passes=691 slm 45056->32768 驻留 1->2 (Level-Zero 帽 65,536) 每轮均值=[-0.284, -0.446]"
+wb_slm_b,45056,32768,128,1,0,0,0,1301 EXACT,32,-0.365,24,"[-0.567,-0.163]","wbv4ph::launch_v4ph passes=691 slm 45056->32768 驻留 1->2 (Level-Zero 帽 65,536) 每轮均值=[-0.284, -0.446]"
+wb_slm_a(废档),45056,32768,128,1,0,0,0,1301 MISMATCH,0,,0,,wbv4::launch_v4full ATO 别名进 S3 => 跨 SG 读竞态（P3..P6 无 group_barrier）；已修成 wb_slm_b
+wb_slm_a(废档),45056,32768,128,1,0,0,0,1301 MISMATCH,0,,0,,wbv4ph::launch_v4ph ATO 别名进 S3 => 跨 SG 读竞态（P3..P6 无 group_barrier）；已修成 wb_slm_b
