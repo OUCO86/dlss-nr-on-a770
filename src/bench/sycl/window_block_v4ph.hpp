@@ -15,32 +15,10 @@ namespace wbv4ph {
 using namespace sycl;
 namespace esimd = sycl::ext::intel::esimd;
 
-// SLM map v2 (wb_slm 驻留刀, 45,056B -> 32,768B; 账与生命周期证明 = tools/wb_slm_layout.py)
-// 旧 map v1（45,056B = AQO|QPO|KTO|VPO|ATO 各 4096 + PPO 8192 + SCR 16384）见 git HEAD。
-// 0..4095            : VPO  连续 4096B 全局区（P5 的 wbv3::tile8ss B 侧步长写死 = kc*1024，不许拆）
-// 4096+sgid*7168     : 每 sub-group 私有 7,168B 槽，四段：
-//   S0 sg+0    2048B : accA(PH1..PH2_0 f32 part0) / QPO(PH2_0..P3) / PROBS(P4..P5)
-//   S1 sg+2048 2048B : accB(PH1..PH2_1) / SCORES(P3..P4) / ATT(P5..P6A) / PROJ(P6B..P7)
-//   S2 sg+4096 2048B : accC(PH1..PH2_2) / SCORES 续(P3..P4) / ATO(P6A..P6B) / HEAD-A(v4ph P7 head)
-//   S3 sg+6144 1024B : AQO(P0..PH1) / KTO(PH2_1..P3)
-//     ★ S3 只准放这两块：KTO 在 P3 被**别的 SG**读，而 P3..P6 之间没有 group_barrier
-//       （只有 SG 级 esimd::barrier），所以更晚写同槽的东西（ATO 第一版放这儿 => 1301 全帧 MISMATCH）
-//       都不许进 S3。要进 S3 必须先在 P3 之后补一个 group_barrier（那是另一把刀）。
-// 只在栅栏点换租户；单位一律「字节」，half-index->byte 的 *2 只出现在表达式末尾一处（军规 25）。
-constexpr uint SG_STRIDE=7168u, SG_BASE=4096u;
-constexpr uint S_VPO=0u;                                       // 连续 4096B
-constexpr uint S_AQO=6144u, S_KTO=6144u;                        // S3（见上：不许有晚写者）
-constexpr uint S_ATO=5120u;                                    // S2 后半：全程只有本 SG 读写
-constexpr uint S_ACCA=0u,  S_QPO=0u,  S_PROBS=0u;               // S0
-constexpr uint S_ACCB=2048u, S_SCORES=2048u, S_SLAB=2048u, S_ATT=2048u, S_PROJ=2048u;  // S1
-constexpr uint S_ACCC=4096u, S_HEADA=4096u;                     // S2 (S_SLAB 覆盖 S1+S2)
-constexpr uint SLM_BYTES=SG_BASE+SG_STRIDE*4u;                  // = 32,768
-static_assert(SLM_BYTES == 32768u, "wb_slm: 必须落在 32KB 占用崖内(<=32768)");
-static_assert(S_SCORES + 4096u <= SG_STRIDE, "wb_slm: SCORES(4096B) 必须整段在 SG 槽内");
-static_assert(S_PROBS + 2048u <= SG_STRIDE, "wb_slm: PROBS(2048B) 必须整段在 SG 槽内");
-static_assert(S_KTO + 1024u <= SG_STRIDE, "wb_slm: KTO 必须在 S3 的 1024B 内");
-static_assert(S_ATO >= S_ACCC && S_ATO + 1024u <= S_ACCC + 2048u, "wb_slm: ATO 必须在 S2 内(禁入 S3:KTO 跨 SG 读)");
-static_assert(S_HEADA >= S_ACCC && S_HEADA + 1024u <= S_ACCC + 2048u, "wb_slm: HEAD-A 必须在 S2 内");
+// SLM map (bytes): AQO 0..4096 | QPO 4096..8192 | KTO 8192..12288 | VPO 12288..16384 |
+//                  ATO 16384..20480 | PPO 20480..28672 | SCR 28672..45056 (4SG x 4KB)
+constexpr uint S_AQO=0, S_QPO=4096, S_KTO=8192, S_VPO=12288, S_ATO=16384, S_PPO=20480, S_SCR=28672;
+constexpr uint SCR_SG=4096;
 
 inline event launch_v4ph(queue& q, const void* Img, bool image_half,
     const half* WqkvPacked, const half* WprojPacked,
@@ -56,12 +34,10 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
     return q.submit([&](handler& h) {
         h.parallel_for(nd_range<1>(range((size_t)windows*LW), range(LW)),
             [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
-            esimd::slm_init<32768>();   // wb_slm: 见上面的 map（32,768B）
+            esimd::slm_init<45056>();
             uint window = (uint)it.get_group(0);
             uint lid = (uint)it.get_local_id(0);
             uint sgid = lid >> 4, lane = lid & 15u;
-            uint sbase = SG_BASE + sgid*SG_STRIDE;   // 本 SG 的 7,168B 槽起点
-            auto sgb = [&](uint s) SYCL_ESIMD_FUNCTION { return SG_BASE + s*SG_STRIDE; };   // 跨 SG 读 KTO / 诊断 dump 用
             uint top = pad_top, left = pad_left;
             if (stop_stage == 0xFFFFu || stop_stage == 0xFFFEu) return;
 
@@ -70,9 +46,9 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
                 uint t = lid;
                 int y = (int)((window / window_cols) * 8u + (t >> 3)) - (int)top;
                 int x = (int)((window % window_cols) * 8u + (t & 7u)) - (int)left;
-                uint strip=(t>>3)&1u, il=t&7u;   // tr=t>>4 == sgid：已折进 sbase 的 S3 基址
-                uint base1 = ((0u*2u+strip)*128u) + il*16u;   // 本 SG 的 A 块 0（half 单位）
-                uint base2 = ((1u*2u+strip)*128u) + il*16u;   // 本 SG 的 A 块 1
+                uint tr=t>>4, strip=(t>>3)&1u, il=t&7u;
+                uint base1 = ((tr*2u+0u)*2u+strip)*128u + il*16u;
+                uint base2 = ((tr*2u+1u)*2u+strip)*128u + il*16u;
                 esimd::simd<float,32> v;
                 if (y >= 0 && y < (int)image_h && x >= 0 && x < (int)image_w) {
                     size_t at = ((size_t)y * image_w + (size_t)x) * 32u;
@@ -84,8 +60,8 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
                     }
                 } else v = esimd::simd<float,32>(0.0f);
                 esimd::simd<half,32> oh = esimd::convert<half>(wbv3::e4m3_vec<32>(v));
-                wbv3::sh16(sbase + S_AQO + base1*2u, oh.template select<16,1>(0).read());
-                wbv3::sh16(sbase + S_AQO + base2*2u, oh.template select<16,1>(16).read());
+                wbv3::sh16(S_AQO + base1*2u, oh.template select<16,1>(0).read());
+                wbv3::sh16(S_AQO + base2*2u, oh.template select<16,1>(16).read());
             }
             esimd::barrier();                       // subgroup: own rows only
 
@@ -95,17 +71,17 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
             // (the subgroup SCR 4KB splits in two; scrC aliases the PPO head,
             // dead until softmax), ONE barrier, phase 2 reload+epilogue+scatter
             // with the per-row chain VERBATIM. JUDGEs all seven EXACT on the twin.
-            uint scrA = sbase + S_ACCA;   // S0
-            uint scrB = sbase + S_ACCB;   // S1
-            uint scrC = sbase + S_ACCC;   // S2（同槽后面装 PROBS）
+            uint scrA = S_SCR + sgid*SCR_SG;
+            uint scrB = S_SCR + sgid*SCR_SG + 2048u;
+            uint scrC = S_PPO + sgid*2048u;
             #pragma unroll
             for (uint part = 0; part < 3u; ++part) {
                 uint scr = (part==0u)? scrA : (part==1u)? scrB : scrC;
                 esimd::simd<float,64> c00(0.f),c01(0.f),c10(0.f),c11(0.f);
-                wbv3::tile8s(c00,c01,c10,c11, sbase + S_AQO,
+                wbv3::tile8s(c00,c01,c10,c11, S_AQO + sgid*1024u,
                              WqkvPacked + (size_t)(part*2u+0u)*256u, 2, 6);
                 esimd::simd<float,64> d00(0.f),d01(0.f),d10(0.f),d11(0.f);
-                wbv3::tile8s(d00,d01,d10,d11, sbase + S_AQO,
+                wbv3::tile8s(d00,d01,d10,d11, S_AQO + sgid*1024u,
                              WqkvPacked + (size_t)(part*2u+1u)*256u, 2, 6);
                 #pragma unroll
                 for (int r = 0; r < 8; ++r) {
@@ -180,10 +156,10 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
                         float sc = wbmega::eh_round(QkvScale[0]);
                         esimd::simd<float,32> qv = wbv3::mulh(wbv3::mulh(hr, recip), sc);
                         esimd::simd<half,32> oh = esimd::convert<half>(wbv3::e4m3_vec<32>(qv));
-                        uint strip=(r>>3)&1u, il=r&7u;   // tr=r>>4 == sgid：已折进 sbase
-                        wbv3::sh16(sbase + S_QPO + (((0u*2u+strip)*128u) + il*16u)*2u,
+                        uint tr=r>>4, strip=(r>>3)&1u, il=r&7u;
+                        wbv3::sh16(S_QPO + (((tr*2u+0u)*2u+strip)*128u + il*16u)*2u,
                                    oh.template select<16,1>(0).read());
-                        wbv3::sh16(sbase + S_QPO + (((1u*2u+strip)*128u) + il*16u)*2u,
+                        wbv3::sh16(S_QPO + (((tr*2u+1u)*2u+strip)*128u + il*16u)*2u,
                                    oh.template select<16,1>(16).read());
                     } else {
                         esimd::simd<float,32> kv = wbv3::mulh(hr, recip);
@@ -205,7 +181,7 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
                                 for (int kq = 0; kq < 8; ++kq)
                                     blk.template select<2,1>(kq * 16 + jl * 2) = vr.template select<2,1>(kq * 2);
                             }
-                            esimd::slm_block_store(sbase + S_KTO + ((kc2 * 2u + js) * 128u) * 2u,
+                            esimd::slm_block_store(S_KTO + (((kc2 * 4u + sgid) * 2u + js) * 128u) * 2u,
                                                    blk, esimd::overaligned_tag<16>{});
                         }
                         esimd::barrier();
@@ -220,17 +196,8 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
             auto dump_region = [&](uint reg) SYCL_ESIMD_FUNCTION {
                 if (DumpKV) { half* d=DumpKV+(size_t)window*4096u;
                     for (uint i=0;i<2048u;i+=64u) d[i+lid]=wbv3::lh16(reg+(i+lid)*2u)[0]; } };
-            // 新布局下 QPO/KTO 不再是连续 4096B 区（每 SG 一段），按逻辑字节序重映射读。
-            auto dump_qpo = [&]() SYCL_ESIMD_FUNCTION {
-                if (!DumpKV) return; half* d = DumpKV+(size_t)window*4096u;
-                for (uint i=0;i<2048u;i+=64u) { uint e=i+lid;
-                    d[e]=wbv3::lh16(sgb(e>>9u) + S_QPO + ((e*2u)&1023u))[0]; } };
-            auto dump_kto = [&]() SYCL_ESIMD_FUNCTION {
-                if (!DumpKV) return; half* d = DumpKV+(size_t)window*4096u;
-                for (uint i=0;i<2048u;i+=64u) { uint e=i+lid; uint b=e*2u;
-                    d[e]=wbv3::lh16(sgb((b>>9u)&3u) + S_KTO + (b>>11u)*512u + ((b>>8u)&1u)*256u + (b&255u))[0]; } };
-            if (stop_stage == 10u) { dump_qpo(); return; }
-            if (stop_stage == 11u) { dump_kto(); return; }
+            if (stop_stage == 10u) { dump_region(S_QPO); return; }
+            if (stop_stage == 11u) { dump_region(S_KTO); return; }
             if (stop_stage == 12u) { dump_region(S_VPO); return; }
             group_barrier(it.get_group());          // KTO/VPO shared for P3/P5
 
@@ -238,27 +205,27 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
             // P8-f (section 100): the A tile is the SAME across all four tc blocks
             // -- hoisted to registers once (the v4 twin; bench_v4full JUDGEs EXACT).
             {
-              uint qb = sbase + S_QPO;   // 本 SG 的 Q 面 1KB（S0 前 1KB）
+              uint qb = S_QPO + sgid*1024u;
               esimd::simd<half,128> aq0 = esimd::slm_block_load<half,128>(qb, esimd::overaligned_tag<16>{});
               esimd::simd<half,128> aq1 = esimd::slm_block_load<half,128>(qb + 256, esimd::overaligned_tag<16>{});
               esimd::simd<half,128> aq2 = esimd::slm_block_load<half,128>(qb + 512, esimd::overaligned_tag<16>{});
               esimd::simd<half,128> aq3 = esimd::slm_block_load<half,128>(qb + 768, esimd::overaligned_tag<16>{});
               for (uint tc = 0; tc < 4u; ++tc) {
                 esimd::simd<float,64> c00(0.f),c01(0.f),c10(0.f),c11(0.f);
-                uint bb = sgb(tc) + S_KTO;   // 逻辑 KTO 块 tc = SG tc 的 K 面（新布局：每 SG 1KB 连续）
+                uint bb = S_KTO + tc*512u;
                 esimd::simd<half,128> b0 = esimd::slm_block_load<half,128>(bb, esimd::overaligned_tag<16>{});
                 esimd::simd<half,128> b1 = esimd::slm_block_load<half,128>(bb + 256, esimd::overaligned_tag<16>{});
                 c00 = esimd::xmx::dpas<8, 8, float>(c00, b0, aq0);
                 c01 = esimd::xmx::dpas<8, 8, float>(c01, b1, aq0);
                 c10 = esimd::xmx::dpas<8, 8, float>(c10, b0, aq1);
                 c11 = esimd::xmx::dpas<8, 8, float>(c11, b1, aq1);
-                esimd::simd<half,128> c0 = esimd::slm_block_load<half,128>(bb + 512, esimd::overaligned_tag<16>{});
-                esimd::simd<half,128> c1 = esimd::slm_block_load<half,128>(bb + 768, esimd::overaligned_tag<16>{});
+                esimd::simd<half,128> c0 = esimd::slm_block_load<half,128>(bb + 2048, esimd::overaligned_tag<16>{});
+                esimd::simd<half,128> c1 = esimd::slm_block_load<half,128>(bb + 2304, esimd::overaligned_tag<16>{});
                 c00 = esimd::xmx::dpas<8, 8, float>(c00, c0, aq2);
                 c01 = esimd::xmx::dpas<8, 8, float>(c01, c1, aq2);
                 c10 = esimd::xmx::dpas<8, 8, float>(c10, c0, aq3);
                 c11 = esimd::xmx::dpas<8, 8, float>(c11, c1, aq3);
-                uint scr = sbase + S_SLAB;
+                uint scr = S_SCR + sgid*SCR_SG;
                 #pragma unroll
                 for (int r = 0; r < 8; ++r) {
                     esimd::simd<float,16> m01;
@@ -275,12 +242,12 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
             esimd::barrier();
             if (stop_stage == 5u) {   // scores rows (map-agnostic row dump, v3 stop=5 form)
                 // FIX (v4full first run): the scratch rows are PER-SUBGROUP blocks
-                // (scr = sbase + S_SLAB + row_in_block*stride); the dump's lid is a GLOBAL
+                // (scr + sgid*SCR_SG + row_in_block*stride); the dump's lid is a GLOBAL
                 // row -- map it. (The judge was wrong, not the kernel: probs, computed
                 // from these same scores, came out EXACT.)
                 if (DumpKV) {
                     uint sg = lid >> 4, rr = lid & 15u;
-                    uint scr = sgb(sg) + S_SLAB;
+                    uint scr = S_SCR + sg*SCR_SG;
                     for (uint c = 0; c < 64; ++c)
                         DumpKV[(size_t)window*4096u + lid*64u + c] =
                             half(esimd::slm_block_load<float,1>(scr + (rr*64u+c)*4u)[0]);
@@ -290,7 +257,7 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
 
             // ===== P4 softmax row-local (NO WGT round-trip) =====
             {
-                uint scr = sbase + S_SLAB;
+                uint scr = S_SCR + sgid*SCR_SG;
                 uint r2 = lane, r = sgid*16u + lane;
                 esimd::simd<float,32> s0 = esimd::slm_block_load<float,32>(scr + r2*64u*4u, esimd::overaligned_tag<16>{});
                 esimd::simd<float,32> s1 = esimd::slm_block_load<float,32>(scr + r2*64u*4u + 128u, esimd::overaligned_tag<16>{});
@@ -325,30 +292,30 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
                 float recip = wbmega::eh_round(wbv3::ef_div(1.0f, trh));
                 esimd::simd<half,32> oh0 = esimd::convert<half>(wbv3::e4m3_vec<32>(wbv3::mulh(esimd::convert<float>(w0), recip)));
                 esimd::simd<half,32> oh1 = esimd::convert<half>(wbv3::e4m3_vec<32>(wbv3::mulh(esimd::convert<float>(w1), recip)));
-                uint strip=(r>>3)&1u, il=r&7u;   // tr=r>>4 == sgid：已折进 sbase
-                wbv3::sh16(sbase + S_PROBS + (((0*2u+strip)*128u) + il*16u)*2u, oh0.template select<16,1>(0).read());
-                wbv3::sh16(sbase + S_PROBS + (((1*2u+strip)*128u) + il*16u)*2u, oh0.template select<16,1>(16).read());
-                wbv3::sh16(sbase + S_PROBS + (((2*2u+strip)*128u) + il*16u)*2u, oh1.template select<16,1>(0).read());
-                wbv3::sh16(sbase + S_PROBS + (((3*2u+strip)*128u) + il*16u)*2u, oh1.template select<16,1>(16).read());
+                uint tr=r>>4, strip=(r>>3)&1u, il=r&7u;
+                wbv3::sh16(S_PPO + (((tr*4u+0u)*2u+strip)*128u + il*16u)*2u, oh0.template select<16,1>(0).read());
+                wbv3::sh16(S_PPO + (((tr*4u+1u)*2u+strip)*128u + il*16u)*2u, oh0.template select<16,1>(16).read());
+                wbv3::sh16(S_PPO + (((tr*4u+2u)*2u+strip)*128u + il*16u)*2u, oh1.template select<16,1>(0).read());
+                wbv3::sh16(S_PPO + (((tr*4u+3u)*2u+strip)*128u + il*16u)*2u, oh1.template select<16,1>(16).read());
             }
             esimd::barrier();
             if (stop_stage == 6u) {   // probs map-dump (v3 stop=6 form)
                 if (DumpKV) for (uint c = 0; c < 64; ++c)
                     DumpKV[(size_t)window*4096u + lid*64u + c] =
-                        wbv3::lh16(sgb(lid>>4u) + S_PROBS + (wbv3::pa16_dest(lid,c,4u) - (lid>>4u)*1024u)*2u)[0];
+                        wbv3::lh16(S_PPO + wbv3::pa16_dest(lid,c,4u)*2u)[0];
                 return;
             }
 
             // ===== P5 attnV rows-owned: 2 tiles per subgroup =====
             for (uint tc = 0; tc < 2u; ++tc) {
                 esimd::simd<float,64> c00(0.f),c01(0.f),c10(0.f),c11(0.f);
-                wbv3::tile8ss(c00,c01,c10,c11, sbase + S_PROBS, S_VPO + tc*512u, 4, 2);
-                wbv3::store16s(sbase + S_SLAB + tc*16u*4u, 32, c00,c01,c10,c11);
+                wbv3::tile8ss(c00,c01,c10,c11, S_PPO + sgid*2048u, S_VPO + tc*512u, 4, 2);
+                wbv3::store16s(S_SCR + sgid*SCR_SG + tc*16u*4u, 32, c00,c01,c10,c11);
             }
             esimd::barrier();
             if (stop_stage == 8u) {   // attended rows (v3 stop=8 form: f32->half)
                 uint sg = lid >> 4, rr = lid & 15u;
-                uint scr = sgb(sg) + S_SLAB;
+                uint scr = S_SCR + sg*SCR_SG;
                 if (DumpKV) for (uint c = 0; c < 32; ++c)
                     DumpKV[(size_t)window*4096u + lid*32u + c] =
                         half(esimd::slm_block_load<float,1>(scr + (rr*32u+c)*4u)[0]);
@@ -357,24 +324,24 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
 
             // ===== P6 attended->ATO (owned rows), outproj rows-owned =====
             {
-                uint scr = sbase + S_SLAB;
+                uint scr = S_SCR + sgid*SCR_SG;
                 uint r2 = lane, r = sgid*16u + lane;
                 esimd::simd<float,32> cv = esimd::slm_block_load<float,32>(scr + r2*32u*4u, esimd::overaligned_tag<16>{});
                 esimd::simd<half,32> oh = esimd::convert<half>(wbv3::e4m3_vec<32>(cv));
-                uint strip=(r>>3)&1u, il=r&7u;   // tr=r>>4 == sgid：已折进 sbase
-                wbv3::sh16(sbase + S_ATO + (((0*2u+strip)*128u) + il*16u)*2u, oh.template select<16,1>(0).read());
-                wbv3::sh16(sbase + S_ATO + (((1*2u+strip)*128u) + il*16u)*2u, oh.template select<16,1>(16).read());
+                uint tr=r>>4, strip=(r>>3)&1u, il=r&7u;
+                wbv3::sh16(S_ATO + (((tr*2u+0u)*2u+strip)*128u + il*16u)*2u, oh.template select<16,1>(0).read());
+                wbv3::sh16(S_ATO + (((tr*2u+1u)*2u+strip)*128u + il*16u)*2u, oh.template select<16,1>(16).read());
             }
             esimd::barrier();
             for (uint tc = 0; tc < 2u; ++tc) {
                 esimd::simd<float,64> c00(0.f),c01(0.f),c10(0.f),c11(0.f);
-                wbv3::tile8s(c00,c01,c10,c11, sbase + S_ATO, WprojPacked + (size_t)tc*256u, 2, 2);
-                wbv3::store16s(sbase + S_SLAB + tc*16u*4u, 32, c00,c01,c10,c11);
+                wbv3::tile8s(c00,c01,c10,c11, S_ATO + sgid*1024u, WprojPacked + (size_t)tc*256u, 2, 2);
+                wbv3::store16s(S_SCR + sgid*SCR_SG + tc*16u*4u, 32, c00,c01,c10,c11);
             }
             esimd::barrier();
             if (stop_stage == 9u) {   // projected rows, FULL f32 (the section-100
                 uint sg = lid >> 4, rr = lid & 15u;   // outproj-order judge vs A2's dC3)
-                uint scr = sgb(sg) + S_SLAB;
+                uint scr = S_SCR + sg*SCR_SG;
                 if (ProjFDump) for (uint c = 0; c < 32; ++c)
                     ProjFDump[(size_t)window*2048u + lid*32u + c] =
                         esimd::slm_block_load<float,1>(scr + (rr*32u+c)*4u)[0];
@@ -394,7 +361,7 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
             // total=sk*cv+acc;` -- same shape as the `if(inimg){...}` here).
             {
                 uint r2 = lane, r = sgid*16u + lane;
-                uint scr = sbase + S_SLAB;
+                uint scr = S_SCR + sgid*SCR_SG;
                 int y = (int)((window / window_cols) * 8u + (r >> 3)) - (int)top;
                 int x = (int)((window % window_cols) * 8u + (r & 7u)) - (int)left;
                 bool inimg = y >= 0 && y < (int)image_h && x >= 0 && x < (int)image_w;

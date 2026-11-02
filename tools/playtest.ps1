@@ -1,4 +1,4 @@
-<# playtest.ps1 — 游戏实机画面验收用的加载位切换器（只在 E:\DSH\out 内动文件）
+﻿<# playtest.ps1 — 游戏实机画面验收用的加载位切换器（只在 E:\DSH\out 内动文件）
    用法:
      powershell -NoProfile -File E:\DSH\playtest.ps1 -List                 # 列出可试的件与 md5
      powershell -NoProfile -File E:\DSH\playtest.ps1 -Use test_1270e4m3.dll # 把它放进加载位 libxmx.dll
