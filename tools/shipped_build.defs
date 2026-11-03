@@ -19,3 +19,9 @@
 # below is what survives: the compiler finally sees a string literal. If you ever drive this from
 # MSYS bash instead, write it as //DT_SKIP_CHAINS_DEF="18,...".
 T_SKIP_CHAINS_DEF=\"18,19,20,21,22,23,24,26,27,28,29,30,31,32\"
+#
+# A5 (2026-11-04): the C=64 attention half fused into ONE launch (att5_fused_kernel.hpp).
+# Compile-time default ON for the load slot; NR_ATT5_FUSE=0 stays as the escape hatch and was
+# proven bit-identical (1301 = DD49827DD33A7EF07C2C17892F18970D EXACT on both sides, knife2b #95).
+# Coverage: 7 of the 8 C64 chains (the eighth has epi=0/narrow=0 and is frozen out).
+T_ATT5_FUSE_DEF=1

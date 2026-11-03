@@ -791,8 +791,17 @@ struct A5Chain {
 };
 static A5Chain g_a5;
 static long g_a5_fires = 0, g_a5_fires_gen = 0;
+// The compile-time default of the A5 fusion (knife2b #95 / the parent's ②).
+// Precedent: T_SKIP_CHAINS_DEF (tools/shipped_build.defs). The load-slot dll is built with
+// /DT_ATT5_FUSE_DEF=1; any other build (bench, older variants) leaves it 0 = today's split
+// path verbatim. The runtime escape hatch stays: NR_ATT5_FUSE=0 forces OFF, =1 forces ON,
+// so both sides can still be A/B-ed in one artifact.
+#ifndef T_ATT5_FUSE_DEF
+#define T_ATT5_FUSE_DEF 0
+#endif
 static bool a5_on() {
-    static bool v = getenv("NR_ATT5_FUSE") ? (atoi(getenv("NR_ATT5_FUSE")) != 0) : false;
+    static bool v = getenv("NR_ATT5_FUSE") ? (atoi(getenv("NR_ATT5_FUSE")) != 0)
+                                          : (T_ATT5_FUSE_DEF != 0);
     return v;
 }
 static void a5_reset() { g_a5 = A5Chain(); }
@@ -4326,6 +4335,14 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
         // fire: with 4 fires the skip machinery saw "name offset 695 not a whole recording" and
         // REFUSED -- so the ON side silently stopped skipping 14 chains (its 1301 came out
         // byte-identical to bk.1301.pre-skip-1a.bin, and the run time went +4.4 ms). knife2b #85.
+        // A5-FOLDRESCUE (knife2b #92/#95): the split 645 dissolves its own producing QUANT (644)
+        // through the shipped mechanism qfuse_take() (@362-376: it rewrites that closure to a no-op
+        // and renames it "quant(FUSED-pack)"). This branch used to return BEFORE that call, so 644
+        // fell back to a real quantize: +0.104 ms/chain x 7 chains = +0.73 ms serial, fingerprint =
+        // rtcsv xmx_rec_quant rows 80 -> 87. Reusing the shipped mechanism is strictly better than
+        // the g_fused_quant idea (that would memcpy f16 bytes into SHARED scratch 1273/1274).
+        QuantFused qfw5;
+        qfuse_take(a, a_scale, M, K, qfw5);
         pg_push([a5f]() { a5_att_run(a5f); });
         return 0;   // the window-residual closure itself became the fused launch
     }

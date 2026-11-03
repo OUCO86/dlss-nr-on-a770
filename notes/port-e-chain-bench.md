@@ -1053,3 +1053,69 @@ A mean 58.872 ms   B mean 57.894 ms   n=16  mean -0.978  sd 0.392  se 0.098  **C
  - **实测层面**：ON 档 `1301 EXACT`（两次独立录制）+ **`NR_SELFREP=1000` 相邻帧逐字节 0 bad**（§88）⇒ **尾巴 1 结案：安全，机制 = 保守的指针冲突模型，不是 id 复用**（§93 的 id 普查只说明 id 不是地址，不能作为推理依据 —— 这也写进账了）。
 **顺带一条对下一铲（§92 的一行 `g_fused_quant[g.att] = a_scale`）的判定**：溶解分支写的是 **共享 scratch（1272/1273 家族）**，而 PGRAPH 会把摸同一地址的 closure 强制串行 ⇒ **不会串数据**；且这条溶解路径本来就是 45 条链的 shipped 默认行为 ⇒ **风险等级低，可以做**。
 **现场**：`out\libxmx.dll` = `oneapi\libxmx_sycl.dll` = **ABB969FE…**；三金标未动；进程 0；工作区 = `M src/gpu/nr_replay.c`（SELFREP 仪器）+ `M src/bench/sycl/libxmx_sycl.cpp`（TOUCHDUMP + ptr 探针，**未 commit**）；件：`att5m = 0FCF9C20…`（功能基座）、`att5n = 6E01CBEB…`（带 touch 诊断）；本盒 GPU ≈ **33 min**（新增仅 1 次 walk）。
+
+
+# §95 **① 捡 644 白工：指纹到手（`xmx_rec_quant` 行数 87→80）、双档 1301 EXACT、SELFREP 1000 bad=0 —— 但出现一次不可复现的崩（run 528，0xC00000FD），正在放大验证**　2026-11-04 06:5x-07:2x
+**改法（比 §92 那一行更对）**：不在 A5 分支里发明登记，而是**复用 shipped 既有机制** —— 645 的正常路在 @4386 调
+ `QuantFused qfw; const bool fused_w = qfuse_take(a, a_scale, M, K, qfw);`
+而 `qfuse_take`（@362-376）的动作正是 **`g_cmds[out.qcmd] = [](){};  g_cmd_names[out.qcmd] = "quant(FUSED-pack)";`** ⇒ 我的分支提前 return 把它跳过了 ⇒ 644 退回真发。
+补丁 `s6/pe_c1_fold2.py`：在 `if (a5fire) {` 之后、`pg_push` 之前补
+ `QuantFused qfw5; qfuse_take(a, a_scale, M, K, qfw5);`
+（**§92 原来设想的 `g_fused_quant[g.att]=a_scale` 作废**：那条会让 644 走 memcpy 分支，把 **f16 的 1277 当 int8 拷进共享 scratch 1273/1274** ⇒ 危险；qfuse_take 是纯 no-op ⇒ 干净。）
+件：功能 **`builds\libxmx_att5o2.dll = 17FBD1B9152054F1A2F9540CC6E01427`**；计时同款 **`builds\libxmx_rt2o2.dll = C18FF1962A690491E0B3670B2F126D18`**（先有一次 att5o/rt2o = 补丁锚点没对上的**空枪**，md5 `CCBE4ACA…`/`E827C617…`，别拿它们读数）。
+### 指纹（rt2o2，两臂各 691 行 rtcsv，`s6/pe_fold_verify.ps1`）
+| 臂 | 总计 ms/帧 | `xmx_rec_quant` **行数** | 该族 ms | A5-fused 行数 |
+|---|---|---|---|---|
+| 默认 | 140.12 | **80** ✓ | 3.73 | 0 |
+| **ON** | **133.05** | **80** ✓（改前是 **87**）| 3.82 | **21**（= 7 链 × 3 条 no-op）|
+⇒ **644 白工已回收**：ON 侧总账从上一铲的 133.68 → **133.05（−0.63 ms 串行）**，与预测的 +0.73 同量级 ✓（两臂不同 build 的 off 总数 135.98 vs 140.12 不可跨 build 比，**只用同 build 的 off/on 差**）。
+### 双档 1301 + 军规 57 计数（att5o2）
+- 默认档 `FOLD_off.1301.bin` = **`DD49827DD33A7EF07C2C17892F18970D` EXACT** ✓
+- ON 档 `FOLD_on.1301.bin` = **同一颗 EXACT** ✓
+- 两侧 `[skip-chains]` 一字不差：`closures=691 names=1382 name_offset=691 chains_skipped=14 refused=0 closures_noop=168 passes=691 (unchanged)` ✓；fires：默认 **0**、ON **14**（7 链 × 2 录制）✓
+### SELFREP 与那次崩
+- 第一次（`FOLD_srep_on`）：**跑到 run 528 进程死**，退出码 **3221225725 = 0xC00000FD（STACK_OVERFLOW）**，日志停在 `run 528: 85.00 ms (691`，没有 SELFREP 行；
+- 第二次（`SREP_on2`）：**1000 帧全跑完，`SELFREP id=1301 runs=1000 compared=989 bad=0 first_bad_run=-1`** ✓；
+- **正在做第三、四次 1000 帧放大**（job `pwsh-4839f2d1a4734feb`，`s6/pe_srep_x3.ps1`）⇒ **若不再复现**：记为"一次未复现的工具侧崩"（注意 SELFREP 每帧多下载 8 MB，run 时长 85 ms vs 裸跑 58 ms ⇒ 仪器本身有额外负载）；**若复现**：按军规 47 当真竞态处理，① 这一铲先扣住。
+**口径提醒**：SELFREP 的每帧时间含 D2H，不能当帧价用（帧价只认 `ab.ps1`）。
+
+
+# §96 **① 收尾：SELFREP 三臂共 3000 帧 bad=0（那次崩未复现）；② A5 已固化成编译期默认 ON（`T_ATT5_FUSE_DEF=1`），三项核验到手**　2026-11-04 07:0x-07:3x
+## ① 的自重复门补测（`s6/pe_srep_x3.ps1`，件 att5o2 + 工具 `nr_replay_sr`）
+| 臂 | 结果 |
+|---|---|
+| `SREP_on2`（第一次复跑） | `runs=1000 compared=989 bad=0` ✓ |
+| `SREPx3_1` | 1000 帧跑完，`bad=0` ✓ |
+| `SREPx3_2` | 1000 帧跑完，`bad=0` ✓ |
+⇒ **合计 3000 帧相邻比对（约 21,000 次融合 launch）0 bad**；§95 里那次 **run 528 的 0xC00000FD 崩未复现**（三次都没再现）⇒ 记为**未复现的工具侧异常**（仪器每帧多下载 8 MB，run 时长 85 ms vs 裸跑 57-58 ms ⇒ 仪器本身有额外负载；**帧价只认 `ab.ps1`，SELFREP 的时间数不作价**）。若它再现，按军规 47 当真竞态处理。
+## ② 固化成编译期默认 ON（军规 59）
+- 源码：`a5_on()` 的默认值改成宏 ⇒ `#ifndef T_ATT5_FUSE_DEF / #define T_ATT5_FUSE_DEF 0 / #endif` + `getenv("NR_ATT5_FUSE") ? atoi!=0 : (T_ATT5_FUSE_DEF != 0)`（`s6/pe_c1_macro.py`）⇒ **bench/其它构建不带宏 = 仍默认 OFF**，只有 load-slot 走 `tools/shipped_build.defs`；
+- `tools/shipped_build.defs` 加 **`T_ATT5_FUSE_DEF=1`** + 出处注释（`s6/pe_c1_defs.py`）；
+- 件：**`builds\libxmx_att5p.dll = 3BAECF2A4B0F49F45E2557CE4808C2CF`**，build 行实到 `/DT_SKIP_CHAINS_DEF=\"18,…,32\"  /DT_ATT5_FUSE_DEF=1` ✓
+**军规 59 的三件核验（我这边能给的读数）**：
+| 核验 | 读数 |
+|---|---|
+| **不设任何 env**（只开 `NR_ATT5_TRACE` 取 witness） | **`fires = 14`（7 链 × 2 录制）** ✓、`chains_skipped=14 refused=0 closures_noop=168 passes=691 (unchanged)` ✓、**1301 EXACT `DD49827D…`** ✓、run 57.11 / 57.12 / 57.10 ms |
+| **逃生门 `NR_ATT5_FUSE=0`** | `fires = 0` ✓、计数同上 ✓、**1301 EXACT** ✓、run 58.28 / 58.14 / 58.22 ms |
+| 两侧帧差 | **−1.1 ms/run**（57.11 vs 58.19）⇒ 与 ① 之后应有的 −1.25…−1.30 相符（walk 的 run 数含冷启动 run0，未计） |
+⇒ **换位（`out\libxmx.dll` ← 这颗）由你执行**；换位后 ① 的 md5 一致性（`out\libxmx.dll` == `oneapi\libxmx_sycl.dll`）由你复核，我不碰那颗。
+## ③ 已开跑
+40 门（att5p stage 进 `oneapi\libxmx_sycl.dll`，先备份 `builds\libxmx_sycl_ABB969FE.bak2.dll`，跑完复原）= job `pwsh-e6f9fc25030e4e46`；随后帧 16 对（A = `out\libxmx.dll` = ABB969FE、unset 全部 NR_*；B = `att5p`、**同样不设 env** ⇒ 靠编译期默认 ON，判读 ≤−1.0 且赢 ≥10/16）。
+
+
+# §97 **③ 交回：40 门（变体 39/40 + 守卫门复原后 GREEN）+ 帧 16 对（编译期默认 ON、两侧都不设 env）= **−1.251 ms/帧，赢 16/16，CI95 [−1.352, −1.151]** ⇒ 与预测 −1.25…−1.30 正中；比上一铲 −0.978 的改进 = **−0.273 ms**，与"捡 644 白工"预测的 +0.31 对得上**　2026-11-04 07:3x-08:0x
+## 40 门（`att5p` stage 进 `oneapi\libxmx_sycl.dll`；先备份 `builds\libxmx_sycl_ABB969FE.bak2.dll`）
+**39 GREEN / 1 RED**，RED 仍是 `gate_skip_graph` 的**工件身份守卫**（它只认 ABB969FE 在 oneapi 槽里；它的实质 1301 检查在变体下 EXACT，见 §89 同一现象）。
+**复原**：`oneapi\libxmx_sycl.dll` = **ABB969FE4AAF0F94AA03C3F53781EDD0** ✓、`out\libxmx.dll` = **ABB969FE…** ✓；复原后单跑该门 ⇒ **GREEN（1/0）** ✓
+## 帧 16 对（A = `out\libxmx.dll`(ABB969FE)，B = `builds\libxmx_att5p.dll`，**两侧都不设任何 NR_\_*** ⇒ 靠编译期默认 ON；ab.ps1 v3 每腿自清）
+```
+deltas: -0.840 -1.650 -1.370 -1.220 -1.100 -1.190 -1.180 -1.230 -1.190 -1.120 -1.380 -1.370 -1.220 -1.090 -1.360 -1.510
+A mean 58.631  B mean 57.380   n=16  mean **-1.251**  sd 0.188  **CI95 [-1.352, -1.151]**  **赢 16/16**  每对 passes 691/691
+判定：**转正**（判据 <=-1.0 且赢 >=10/16 ✓✓）
+```
+**与预测对齐**：上一铲（env 切换、无 fold）= −0.978 [−1.186,−0.769]；这一铲 = −1.251 [−1.352,−1.151] ⇒ **改进 −0.273 ms**，与 §92/§95 预测的"+0.31 ms/帧（0.73 ms 串行 × 0.43）"吻合 ✓；sd 也从 0.392 收到 0.188（同热更稳）。
+**方差口径**：两铲都是 run0 丢弃、run1-3 取中位；CI 只覆盖同热重复性，不含跨盒热漂移。
+## 出处已写进 `out\SHIPPED_BUILD.md` §6（军规 59 要求的"哪个 commit + 哪些 /D"）
+`basis = ABB969FE 基座 + commit d64fa0f（A5 接线/att5_fused_kernel.hpp/NR_SELFREP/TOUCHDUMP）+ 工作区未 commit 的 M libxmx_sycl.cpp（A5-FOLDRESCUE + T_ATT5_FUSE_DEF）与 M tools/shipped_build.defs（T_ATT5_FUSE_DEF=1）`；`/D 全串 = /DT_SKIP_CHAINS_DEF=\"18,…,32\" /DT_ATT5_FUSE_DEF=1`；`件 = builds\libxmx_att5p.dll = 3BAECF2A4B0F49F45E2557CE4808C2CF`；证据（双档 EXACT、三向量计数、SELFREP 3000 帧 0 bad、40 门口径、帧价）都在那一节里。
+**换位由父执行**（我不碰 `out\libxmx.dll`）；换位后建议再跑一次 40 门求 **40/40 GREEN**，并把新 md5 追加进 `out\DEPLOY.md5.txt`。
+**GPU 记账（本盒）**：① 验证 ≈ 16 min（rt 两臂 + 双档 + SELFREP×4）+ ② 三次 walk ≈ 5 min + ③ 40 门 ≈ 13 min + 复原单门 ≈ 0.7 min + 16 对 ≈ 24 min（含 300 s 批间冷却）⇒ **≈ 59 min**，批间均有 ≥60 s，>20 min 批后冷却已做。
