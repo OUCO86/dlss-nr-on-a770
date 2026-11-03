@@ -198,3 +198,4 @@ SM_LW | 分支=b1-wblock-resident（origin 已推）。
 40. **家族价按 FLOPs 分摊只可用于排序，不可当绝对值**。正案：`violation_ms` 现值来自 RUN_TIMING 家族价分摊，出现 6 行负值 = 分摊失真（不是"合并变慢"）。合并类铲的前置仪器 = 691 行全量 RUN_TIMING 逐发 dump（现在只打 top-25）。
 41. **pub 腿代价随 K 变深而塌缩**：浅 K 时 pub/raw = 41-59%（640x512x512: 4.22/10.23），深 K 大 M 时 81-85%（5120x512x512: 17.59/20.79）=> 折叠 epilogue 与胖形状必须同时做，单做一件只兑现一半（与 §47 四腿只有 68% 是 dpas、port-C2 elementwise=61.9% 三面咬合）。
 16b. **军规 16 补条（2026-11-03 实测）**：`.ps1` 里写中文注释会被按 ANSI 解析炸（报"字符串缺少终止符"）。=> **脚本与日志一律纯 ASCII，中文只进 .md**；另外 pwsh 自定义函数名**不得撞内置单字母别名**（`h` = `Get-History`，本次撞过）。原有 16 条（改过 .ps1 必重验 UTF-8 BOM）仍适用于含中文的脚本，但**新写的脚本优先 ASCII，从源头免掉这个坑**。
+16c. **含中文的账本/日志一律用 python 或 rg 核对行数与内容**；`.ps1` 与机器读的 log 保持纯 ASCII；可能被 pwsh 读的 .md 存 UTF-8 带 BOM。根因（实测）：pwsh 的 Get-Content/Select-String 把无 BOM 的 UTF-8 中文按 GBK 读，汉字尾字节吞掉紧随的换行 => 行数被合并（同文件 python 147 个 LF vs pwsh 87 行）；这也是 16b 那条 .ps1 解析炸的根因。

@@ -1216,3 +1216,8 @@ T1 的机器读数：**corr_min 0.9828**（R .983 G .992 B .990，luma .991）�
  ⇒ **修法（下次开工第 0 步）**：把 `patch_testdefs.py` 的编译期默认机制**正式进仓**（或把转正件的构建脚本 + 定义固化成 `tools/build_shipped.ps1`），**让 HEAD 能复现 `ABB969FE` 的语义**；否则**之后每一把刀的逐位门与帧对都不可信**。
 **④ 新坑（已入册，下次别再踩）**：**P8 `.ps1` 写中文注释会被按 ANSI 解析炸**（本次实测报"字符串缺少终止符"）⇒ **脚本与日志一律纯 ASCII，中文只进 .md**；**pwsh 自定义函数名别撞内置单字母别名**（`h` = `Get-History`，本次撞过）。P5 `run_timing.txt` 写在 CWD、`rtcsv` 行只进文件不进 stdout ⇒ `[bwide]` 与 `rtcsv` **不能直接交错**，按 pass 序号对齐、每跑立刻存拷。P6 一进程 = 4 runs ⇒ trace 计数 ÷4。
 **⑤ 现场复原实证**（本会话 **0 个 GPU 进程**，probe 从未跑过、`sycl-cache-k2` 实测 0 文件）：`out\libxmx.dll` 与 `oneapi\libxmx_sycl.dll` = `ABB969FE…`；三金标 `DD49827D / DD49827D / 249A46F3`；`test_*.dll` 未动；`knife2_probe.exe` = `B5A82BE2…`（保留，下次直接用别重编）；`builds\libxmx_rt2.dll` = `9FDD0E93…`；分支 `c516627` porcelain=0；**卡 = 冷**。续跑包全文 = `E:\DSH\s6\knife2b.md`（md5 `8F21EF0A…`）。
+
+### 52b. ★ 新坑 P11（**顺带破了我今天早上的一个疑案**）：本机 `pwsh` 的 `Get-Content`/`Select-String` **把无 BOM 的 UTF-8 中文按 GBK 读** ⇒ 汉字尾字节吞掉紧随的换行 ⇒ **行数被合并**（同一文件 python 数出 147 个 LF，pwsh 只数 87 行）。这正是 P8（`.ps1` 含中文注释解析炸）的根因。
+- **续跑包文件 md5 变化**：`E:\DSH\s6\knife2b.md` 从 `8F21EF0A…` -> **`29E0510B192264F1BE616F4DEEC906D1`**（18,048 B / 147 行）。
+- ★ **破案的旧疑点**：今天 09:3x 我用 `(Get-Content notes\DS-takeover-2026-11-01.md).Count` 得 **407**，而同一文件 `Select-String` 显示 `## 40` 在 **L954** —— 当时我判"计数是仪器读数假象，不是丢内容"。**现在确认根因就是 P11：pwsh 的 GBK 误读把带中文的行成对合并，所以行数偏小**（内容没丢，判读没错，但**当时的"解释"不够准**）。
+- **规矩（16c）**：**含中文的账本/日志一律用 python 或 rg 核对行数与内容**；`.ps1` 与机器读的 log **保持纯 ASCII**；写中文的 .md 若可能被 pwsh 读，**存 UTF-8 带 BOM**（`walk.ps1` 那次就是这么救的）。
