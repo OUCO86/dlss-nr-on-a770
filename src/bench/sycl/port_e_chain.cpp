@@ -99,7 +99,8 @@ int main(int argc, char** argv) {
     using namespace sycl;
     const char* dumpf = argstr(argc, argv, "--dump");
     const char* crossf = argstr(argc, argv, "--cross");
-    const int NSTRESS = argint(argc, argv, "--stress", 0);
+    const int NSTRESS = argint(argc, argv, "--stress", 0) + argint(argc, argv, "--stress0", 0);
+    const bool STRESS_DUMP0 = argint(argc, argv, "--stress0", 0) > 0;   // the SHIPPING form (no taps)
     const bool noprice = argflag(argc, argv, "--noprice") != 0;
 
     device dev;
@@ -348,6 +349,19 @@ int main(int argc, char** argv) {
     CHAIN3();
     printf("-- CHAIN done --\n");
 
+    // ---- the SHIPPING form: DUMP=false on both halves. The taps above exist only to pass the
+    // gate; a DUMP=true launch writes ~90 MB of diagnostic planes, so pricing it would price the
+    // instrument instead of the chain.
+    auto L1n = [&] { PE_ATT::att5::fused<64, 2, 5, false, false>(q, dImg, dBp, dBS, dQS, dBias, dOp,
+                                                                 dBS2, dCos, f1270, fQ, fK, fV,
+                                                                 windows, across, top, left,
+                                                                 image_h, image_w, o).wait(); };
+    auto L3n = [&] { PE_FFN::ffn3::fused<S, false, S::NPH - 1, 0>(q, fa).wait(); };
+    auto CHAIN3n = [&] { L1n(); L2(); L3n(); };
+    // the 2-launch variant: the shipped 1a half (ffn2) quantizes 1270 inside its own P1, so no
+    // producer leg is needed at all -- 11 plan ops -> 2 launches.
+    auto CHAIN2 = [&] { L1n(); PE_FFN::ffn2::fused<S, false, S::NPH, 0>(q, fa).wait(); };
+
     // the two-pass producer face (qr + ffn3::retile_a) = the face the SPLIT path builds
     std::vector<uint8_t> hPkT(nC), hFaceA(faceBytes), hScT((size_t)Mp * 4), hFaceB(faceBytes), hScB((size_t)Mp * 4);
     {
@@ -468,6 +482,22 @@ int main(int argc, char** argv) {
     printf("GATE: %s (%d checkpoints differ)\n", gfails ? "RED" : "GREEN", gfails);
     fflush(stdout);
 
+    // ---- the 2-launch form (shipped 1a half, no producer leg) must also land byte-identical ----
+    {
+        // ffn2's DUMP writes the pk1/sc1 taps: they must be real buffers (a null tap store
+        // faults the device -- measured 2026-11-04 04:1x, 0xC0000409 right after GATE GREEN).
+        int8_t* f2PK1 = mi(nC); float* f2SC1 = mf((size_t)M * 4);
+        PE_FFN::ffn2::Args fa2 = fa; fa2.face = nullptr; fa2.scA = nullptr;
+        fa2.dpk1 = f2PK1; fa2.dsc1 = f2SC1;
+        L1n();
+        PE_FFN::ffn2::fused<S, true, S::NPH, 0>(q, fa2).wait();
+        std::vector<uint8_t> h(nC * 2); snap(h.data(), f1267, h.size());
+        ck(h.data(), Rres.data(), h.size(), C, "CHAIN2-1267", "the 2-launch form's outlet (att fused + ffn2)");
+        std::vector<uint8_t> h2(nC); snap(h2.data(), gPK3, nC);
+        ck(h2.data(), Rpk3.data(), nC, C, "CHAIN2-pk3", "the 2-launch form's own outquant tap");
+        if (STRESS_DUMP0) CHAIN3n(); else CHAIN3();   // restore the 3-launch state for the later sections
+    }
+
     // ------------------------------ LIVENESS ------------------------------
     if (!gfails) {
         std::vector<uint8_t> before(nC * 2), after(nC * 2);
@@ -493,7 +523,7 @@ int main(int argc, char** argv) {
         std::vector<uint8_t> h1270(imgn * 2), h1270b(imgn * 2), hface(faceBytes), hfaceb(faceBytes);
         std::vector<uint8_t> hsc((size_t)Mp * 4), hscb((size_t)Mp * 4), hres(nC * 2), hresb(nC * 2);
         std::vector<uint8_t> hout(nC * 2), houtb(nC * 2), hpk3(nC), hpk3b(nC);
-        CHAIN3();
+        if (STRESS_DUMP0) CHAIN3n(); else CHAIN3();
         snap(h1270b.data(), f1270, h1270b.size()); snap(hfaceb.data(), faceB, faceBytes);
         snap(hscb.data(), scB, hscb.size());       snap(hresb.data(), f1267, hresb.size());
         snap(houtb.data(), gOUT, houtb.size());    snap(hpk3b.data(), gPK3, hpk3b.size());
@@ -505,7 +535,7 @@ int main(int argc, char** argv) {
             q.memset(f1267, 0xA5, nC * 2).wait();
             q.memset(gOUT, 0xA5, nC * 2).wait();
             q.memset(gPK3, 0xA5, nC).wait();
-            CHAIN3();
+            if (STRESS_DUMP0) CHAIN3n(); else CHAIN3();
             snap(h1270.data(), f1270, h1270.size()); snap(hface.data(), faceB, faceBytes);
             snap(hsc.data(), scB, hsc.size());       snap(hres.data(), f1267, hres.size());
             snap(hout.data(), gOUT, hout.size());    snap(hpk3.data(), gPK3, hpk3.size());
@@ -513,8 +543,10 @@ int main(int argc, char** argv) {
             size_t d1 = dbytes(hface.data(), hfaceb.data(), faceBytes);
             size_t d2 = dbytes(hsc.data(), hscb.data(), hsc.size());
             size_t d3 = dbytes(hres.data(), hresb.data(), hres.size());
-            size_t d4 = dbytes(hout.data(), houtb.data(), hout.size());
-            size_t d5 = dbytes(hpk3.data(), hpk3b.data(), hpk3.size());
+            // dout/dpk3 are DUMP-only taps: with --stress0 (the shipping form) the kernel never
+            // writes them, so comparing them would flag the scrub instead of the chain. Skip them.
+            size_t d4 = STRESS_DUMP0 ? 0 : dbytes(hout.data(), houtb.data(), hout.size());
+            size_t d5 = STRESS_DUMP0 ? 0 : dbytes(hpk3.data(), hpk3b.data(), hpk3.size());
             if (d0 || d1 || d2 || d3 || d4 || d5) {
                 ++nbad; if (first_s < 0) { first_s = s; first_row = d3 ? (dbytes3row(hres.data(), hresb.data(), nC, C)) : 0; }
                 printf("STRESS s=%d d1270=%zu dface=%zu dsc=%zu d1267=%zu dout=%zu dpk3=%zu first_row=%zu mod16=%d\n",
@@ -522,8 +554,8 @@ int main(int argc, char** argv) {
                 fflush(stdout);
             }
         }
-        printf("STRESS SUMMARY port_e_chain L1+L2+L3 launches=%d bad=%d first_bad_s=%d\n",
-               NSTRESS, nbad, first_s);
+        printf("STRESS SUMMARY port_e_chain L1+L2+L3 launches=%d bad=%d first_bad_s=%d dump0=%d\n",
+               NSTRESS, nbad, first_s, STRESS_DUMP0 ? 1 : 0);
         fflush(stdout);
     }
 
@@ -548,6 +580,7 @@ int main(int argc, char** argv) {
     }
 
     // ------------------------------ pricing ------------------------------
+
     if (!noprice) {
         Stat c13 = timeit_wall([&] {
             packdev::pack_a_fused_gather(q, dImg, rAp, rAS, (int)M, (int)Mp, (int)C, image_h, image_w, across, pad);
@@ -566,8 +599,12 @@ int main(int argc, char** argv) {
             q.wait();
         });
         Stat c3 = timeit_wall(CHAIN3);
+        Stat c3n = timeit_wall(CHAIN3n);
+        Stat c2 = timeit_wall(CHAIN2);
         printf("CSVROW;S1-C64;REF13;%.4f;%.4f;%.4f;%.4f\n", c13.msm, c13.msM, c13.msX, c13.med);
         printf("CSVROW;S1-C64;CHAIN3;%.4f;%.4f;%.4f;%.4f\n", c3.msm, c3.msM, c3.msX, c3.med);
+        printf("CSVROW;S1-C64;CHAIN3n;%.4f;%.4f;%.4f;%.4f\n", c3n.msm, c3n.msM, c3n.msX, c3n.med);
+        printf("CSVROW;S1-C64;CHAIN2;%.4f;%.4f;%.4f;%.4f\n", c2.msm, c2.msM, c2.msX, c2.med);
         fflush(stdout);
     }
 

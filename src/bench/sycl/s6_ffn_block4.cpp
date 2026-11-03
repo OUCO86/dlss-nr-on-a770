@@ -1622,7 +1622,7 @@ static int run_all() {
                     fflush(stdout);
                     if (!okr) ++nbad;
                 }
-                printf("FLAKY %s: %d of %d DUMP launches differ from block3 (bar=%d) -- %s\n", shid, nbad, nrep,
+                printf("FLAKY %s: %d of %d DUMP launches differ from block3 (bar=%d) -- %s\n", shid, nbad, nrep, RBAR,
                        nbad ? "NON-DETERMINISTIC (a real SLM handoff race, not an index bug)"
                             : "all launches bit-identical to block3");
                 fflush(stdout);
