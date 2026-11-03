@@ -141,6 +141,16 @@ static void pg_push(std::function<void()> f) {
     g_cmds.push_back(std::move(f));
     g_cmds_touch.push_back(g_pg_pending.empty()
         ? std::vector<void*>{ (void*)-1 } : std::move(g_pg_pending));
+    // NR_PG_TOUCHDUMP (knife2b #93): presence-gated record-time dump of every closure's touch
+    // pointers, so "does anybody else read this plane?" becomes a lookup instead of an inference.
+    // Host-print only: no device side effect, no extra op (military rules 4/9).
+    if (getenv("NR_PG_TOUCHDUMP")) {
+        size_t ci = g_cmds.size() - 1;
+        const char* nm = ci < g_cmd_names.size() ? g_cmd_names[ci] : "?";   // names are const char*
+        std::printf("[pgt] cmd=%zu name=%s touch=", ci, nm);
+        for (void* q : g_cmds_touch[ci]) std::printf(" %p", q);
+        std::printf("\n");
+    }
     g_pg_pending.clear();
 }
 static bool pgraph_conflict(const std::vector<void*>& a, const std::vector<void*>& b) {
@@ -950,11 +960,11 @@ static void a5_att_run(const A5Fuse& f) {
         auto SZ = [&](int id) -> size_t { auto it = g_bufs.find(id); return it == g_bufs.end() ? 0 : it->second.bytes; };
         // one line per operand: no format/argument miscount is possible this way
         printf("[a5-op] img_want=%zu plane_want=%zu\n", img, pl);
-        printf("[a5-op] src1267 id=%d bytes=%zu\n", f.src, SZ(f.src));
-        printf("[a5-op] out1270 id=%d bytes=%zu\n", f.out, SZ(f.out));
-        printf("[a5-op] faceQ id=%d bytes=%zu\n", f.q, SZ(f.q));
-        printf("[a5-op] faceK id=%d bytes=%zu\n", f.k, SZ(f.k));
-        printf("[a5-op] faceV id=%d bytes=%zu\n", f.v, SZ(f.v));
+        printf("[a5-op] src1267 id=%d bytes=%zu ptr=%p\n", f.src, SZ(f.src), P(f.src, 1, "ptr-probe-src"));
+        printf("[a5-op] out1270 id=%d bytes=%zu ptr=%p\n", f.out, SZ(f.out), P(f.out, img, "ptr-probe-out1270"));
+        printf("[a5-op] faceQ id=%d bytes=%zu ptr=%p\n", f.q, SZ(f.q), P(f.q, pl, "ptr-probe-faceQ"));
+        printf("[a5-op] faceK id=%d bytes=%zu ptr=%p\n", f.k, SZ(f.k), P(f.k, pl, "ptr-probe-faceK"));
+        printf("[a5-op] faceV id=%d bytes=%zu ptr=%p\n", f.v, SZ(f.v), P(f.v, pl, "ptr-probe-faceV"));
         printf("[a5-op] bias id=%d bytes=%zu (want %zu)\n", f.bias, SZ(f.bias), (size_t)f.heads * 4096u * 4u);
         printf("[a5-op] qkv_scale id=%d bytes=%zu (want %zu)\n", f.qkvsc, SZ(f.qkvsc), (size_t)f.heads * 4u);
         printf("[a5-op] qkv_bscale id=%d bytes=%zu (want %zu)\n", f.bsqkv, SZ(f.bsqkv), (size_t)(3u * f.C) * 4u);

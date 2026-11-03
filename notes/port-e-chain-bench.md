@@ -1002,3 +1002,54 @@ A mean 58.872 ms   B mean 57.894 ms   n=16  mean -0.978  sd 0.392  se 0.098  **C
  3. **不动它**：接受 0.73 ms 串行（0.31 ms/帧）的损失，当前净值仍 −0.98 ms/帧。
 **我的建议顺序**：先 2 再 1（2 是 1 的前提），做完必须重跑：bench 25 检查点门（3 进程）→ 双档 1301 → `NR_SELFREP=1000` → 40 门（记得备份/stage/复原 ABB969FE）→ 16 对复测（预期 −0.98 → **约 −1.3 ms/帧**）。
 **未验假设**：+0.73 ms 的归因来自行计数（80→87）与 `g_fused_quant` 的代码语义，**没有单独跑一次"只补登记不写面"的对照**（那会 RED，正好可以证伪/证实这条链）——留给下一铲，别在没门的情况下试。
+
+
+# §92 **白工的修法收敛成一行（比 §91 的三条更准）；未动手，等批**　2026-11-04 06:4x（纯 host，零 GPU）
+§91 说"要先打开 P10 的 PKT/AS2 写出"——**查完溶解机制后发现不必**。真正的机制：
+- 644 的溶解 = **运行期** `g_fused_quant.find(source)`（@6217-6218），命中就走 memcpy；
+- 那条登记由 **642 的 qkv 折叠在自己的 body 里**写：`g_fused_quant[c] = a_scale`（@3670）；
+- A5 把 642 的 body no-op ⇒ 登记消失 ⇒ 644 退回真发（实测 +0.104 ms/链 × 7 = +0.73 ms 串行）。
+**一行修法**：在 `a5_take_wres()` 里、no-op 之后补
+ `g_fused_quant[g.att] = a_scale;`   // source(=1277 面) -> 该链 644 的 a_scale buf，照 @3670 的约定
+⇒ 644 走溶解分支（一次 2 MB memcpy，拷的是**没人读**的 pk2/sc2）⇒ 预计把 +0.73 ms 压到 ≈+0.07 ms ⇒ **串行 −2.30 → ≈ −2.95 ms ⇒ 帧 −0.98 → ≈ −1.25…−1.30 ms**。
+**前提仍未证**：pk2/sc2 在 ON 档"没人读"是推断（= §82 尾巴 1 的同一族）。**批准后的第一刀不是改代码，而是取证据**：把两档的 `g_cmds_touch`（每 closure 的 touch 指针表）打出来，查 pk2/sc2 的指针除 644/645 外还出现在哪些 closure ⇒ 若出现第三方 ⇒ 这条路作废，回到 §91 的选项 2（打开 P10 写出）。
+**验证链（若动手）**：touch 证据 → bench 25 检查点门（3 进程）→ 双档 1301（默认必须仍 `DD49827D`）→ `NR_SELFREP=1000` bad=0 → 40 门（备份/stage/复原 ABB969FE）→ 16 对复测。
+**现场**：未改任何代码（`pe_c1_foldreg_note.py` 只是草稿，**没有执行**）；`out\libxmx.dll` = `oneapi\libxmx_sycl.dll` = ABB969FE；进程 0；工作区 = `M src/gpu/nr_replay.c`；最优基座 = `builds\libxmx_att5m.dll = 0FCF9C20…`；本盒 GPU ≈ 31 min（已批间冷却）。
+
+
+# §93 **plan 步骤对 scratch id 的引用普查（host，零 GPU）⇒ 尾巴 1 的结论改成"不能靠 id 推断无人读，只能靠 touch set + 实测"**　2026-11-04 06:4x
+工具：`s6/pe_plan_refs.py` 直接扫嵌入 plan 的 C 表（`E:/WorkBuddy/2026-10-09-04-20-55/src/dlss-nr-on-a770/work/plan_960x544.c`，5254 条 OP_ 步骤行）。
+**先证这份 plan 与线上同源**：用它编出的 `builds\nr_replay_sr.exe` 在默认档 1301 = **`DD49827D` = 金标**（§88 牙齿检查）✓ ⇒ 普查对象正确。
+| buffer id | 被多少条 OP_ 步骤行引用 |
+|---|---|
+| 1267 | 403 |
+| 1270 | 29 |
+| 1271 | 23 |
+| **1272 / 1273**（pk/sc scratch） | **979 / 979** |
+| **1274** | 511 |
+| **1275 / 1276 / 1277** | 515 / 243 / 243 |
+| 1268 / 1278 / 1298 | 4 / 4 / 4 |
+| 1303 / 1305 / 1306 / 1307 / 1308 / 1309 | **0**（只在运行期 `[a5-op]` 里出现 ⇒ 它们是**第二次录制/resize 后的实例号**，不在静态步骤表里）|
+**读法与后果**：
+ 1. **pk/sc scratch 是全帧复用的**（979 条步骤引用 1272/1273）⇒ **"这条链的 pk2/sc2 没人读"不能从 id 上推**——同一个 id 在别的链/别的步骤上是有读者的。⇒ §82 尾巴 1 的"643 已 no-op 所以没人读"这种推断**作废**；安全性只能来自两处证据：**(a) PGRAPH `g_cmds_touch` 的逐 closure 指针表**（还没打），**(b) 实测**：1301 逐位（两档 EXACT ✓）+ `NR_SELFREP=1000` 相邻帧 0 bad ✓（§88）——**实测已经过了，但机制账要补 (a)。**
+ 2. 好消息：溶解 644 走的是** shipped 默认的既有路径**（45 条链的 `quant(FUSED-pack)` 本来就在 memcpy 这些共享 scratch）⇒ §92 那一行 `g_fused_quant[g.att] = a_scale;` 不会发明新的共享写，只是把这条链并入既有溶解态 ⇒ **风险等级 = 低**，但 (a) 的证据仍要先补，因为它同时是尾巴 1 的结案材料。
+ 3. `[a5-op]` 里的 1303/1305-1309 **不在静态步骤表**里 ⇒ 它们是第二次录制的实例 ⇒ 说明 **record-time 与 run-time 的 id 解析不是同一套**，这正是 §85 军规 57（三向量同长同序）那条坑的深层原因：**任何按 id 的静态推理都可能对不上运行期实例**。
+**下一铲的顺序（已按此修正）**：先打 `g_cmds_touch`（presence-gated，只打印不改行为）⇒ 确认 pk2/sc2/QKV 三面在 ON 档的读集 ⇒ 再落 §92 的一行登记 ⇒ 然后走完整验证链（bench 门 → 双档 1301 → SELFREP → 40 门 → 16 对）。
+**现场**：仍未改任何代码；`out\libxmx.dll` = `oneapi\libxmx_sycl.dll` = ABB969FE；进程 0；工作区 = `M src/gpu/nr_replay.c`；本盒 GPU ≈ 31 min（无新增）。
+
+
+# §94 **尾巴 1 结案（有证据了）：PGRAPH 的冲突模型是"指针相等即冲突"，所以"别的 closure 也摸同一地址"不是数据危险，而是调度约束；A5 在 ON 档 1301 EXACT + SELFREP 0/1000 = 实测安全**　2026-11-04 06:5x-07:0x（一次 walk + host 分析）
+**仪器**：`libxmx_sycl.cpp` 的 `pg_push` 加 presence-gated 的 `NR_PG_TOUCHDUMP`（record-time 打印每个 closure 的 touch 指针表；**无设备副作用、不加 op**，军规 4/9），并给 `[a5-op]` 的 src1267 / out1270 / faceQ/K/V 补 `ptr=%p` 探针。件 **`builds\libxmx_att5n.dll = 6E01CBEBBA265A454E3822D3E985D2AB`**；**开诊断后 ON 档仍 `1301 EXACT = DD49827D`** ⇒ 诊断不改变行为 ✓
+**读数**（`s6/pe_touch_read.py`，1382 条 `[pgt]` = 691 × 2 录制 ✓ 军规 57 再一次成立）：
+| A5 操作数（运行期实际地址） | 有多少 closure 的 touch 表包含它 |
+|---|---|
+| `src1267` id=1303（66,846,720 B） | 200 |
+| `out1270` id=1271（4,177,920 B） | 28 |
+| `faceQ` id=1308 | 308 |
+| `faceK` id=1307 | 266 |
+**怎么读**（这是 §82 尾巴 1 的正解）：源码注释写死了语义 —— `libxmx_sycl.cpp:118-122`：**"touch tokens = DEVICE POINTERS … same pointer in two closures = conflict (any direction); (void*)-1 = conflict-with-everything (unregistered op -> own wave)"** ⇒ **"很多 closure 摸同一地址"不是"有人在读我的脏数据"，而是 PGRAPH 把它们判为互相冲突、拆进不同 wave**（保守调度）。所以：
+ - **不存在"K 面被别人按图像序读走"的语义风险**：那些 closure 与我们的融合 closure 之间被冲突图强制串行化；
+ - **不做 `pgraph_extra` 申报也不会读到脏数据**（§87 ① 的 A/B 已证 1301 EXACT），代价只是**少一层调度约束**（可能允许更多重叠 ⇒ 也正是它没有把结果改坏的证据）；
+ - **实测层面**：ON 档 `1301 EXACT`（两次独立录制）+ **`NR_SELFREP=1000` 相邻帧逐字节 0 bad**（§88）⇒ **尾巴 1 结案：安全，机制 = 保守的指针冲突模型，不是 id 复用**（§93 的 id 普查只说明 id 不是地址，不能作为推理依据 —— 这也写进账了）。
+**顺带一条对下一铲（§92 的一行 `g_fused_quant[g.att] = a_scale`）的判定**：溶解分支写的是 **共享 scratch（1272/1273 家族）**，而 PGRAPH 会把摸同一地址的 closure 强制串行 ⇒ **不会串数据**；且这条溶解路径本来就是 45 条链的 shipped 默认行为 ⇒ **风险等级低，可以做**。
+**现场**：`out\libxmx.dll` = `oneapi\libxmx_sycl.dll` = **ABB969FE…**；三金标未动；进程 0；工作区 = `M src/gpu/nr_replay.c`（SELFREP 仪器）+ `M src/bench/sycl/libxmx_sycl.cpp`（TOUCHDUMP + ptr 探针，**未 commit**）；件：`att5m = 0FCF9C20…`（功能基座）、`att5n = 6E01CBEB…`（带 touch 诊断）；本盒 GPU ≈ **33 min**（新增仅 1 次 walk）。
