@@ -1,0 +1,64 @@
+rows=398  alive=260  dead=138
+violation_ms paper total = 47.30 ms serial  => frame x0.43 = 20.34 ms
+violation_ms ALIVE total = 35.14 ms serial => frame x0.43 = 15.11 ms
+recovery counted only where the merge still has >=2 alive members = 35.14 ms serial => frame 15.11 ms
+
+--- dead causes ---
+    98    11.90 ms  skip-chain(T2 compile-time default)
+    40     0.26 ms  S6-1a noop (:676-678 five chain legs)
+
+--- per knife group (paper vs alive) ---
+  A1             n= 16 alive= 16  paper=  3.31  alive-price=  3.31  alive-recovery=  3.31 ms serial => frame  1.42 ms
+  A2             n= 16 alive= 16  paper=  3.63  alive-price=  3.63  alive-recovery=  3.63 ms serial => frame  1.56 ms
+  A3             n= 28 alive= 28  paper=  5.14  alive-price=  5.14  alive-recovery=  5.14 ms serial => frame  2.21 ms
+  A4             n= 56 alive= 28  paper= 20.32  alive-price= 15.79  alive-recovery= 15.79 ms serial => frame  6.79 ms
+  B1(knife2)     n= 48 alive= 20  paper=  7.63  alive-price=  3.81  alive-recovery=  3.81 ms serial => frame  1.64 ms
+  B2             n= 36 alive= 16  paper=  1.01  alive-price=  0.95  alive-recovery=  0.95 ms serial => frame  0.41 ms
+  (other)        n=198 alive=136  paper=  6.26  alive-price=  2.50  alive-recovery=  2.50 ms serial => frame  1.07 ms
+
+--- merged targets that go degenerate (<=1 alive member) ---
+  merged=8160x512x128b1           members= 12 alive=0
+  merged=8160x128x512b1           members= 12 alive=0
+  merged=32640x256x64b1           members=  8 alive=0
+  merged=32640x64x256b1           members=  8 alive=0
+  ... 4 degenerate merge targets out of 28
+
+--- 'off-path floor (mechanism to name)' rows, by family ---
+  total unnamed-floor rows = 0
+
+--- per orig-shape breakdown inside the knife groups (alive / dead by cause) ---
+ [A1]
+   2560x768x256b1         n= 16 alive= 16 dead=  0  paper=  3.31  alive=  3.31 ms serial
+ [A2]
+   2560x256x256b1         n= 16 alive= 16 dead=  0  paper=  3.63  alive=  3.63 ms serial
+ [A3]
+   2040x256x256b1         n= 16 alive= 16 dead=  0  paper=  3.01  alive=  3.01 ms serial
+   8160x128x128b1         n= 12 alive= 12 dead=  0  paper=  2.13  alive=  2.13 ms serial
+ [A4]
+   192x1024x4096b1        n=  8 alive=  8 dead=  0  paper=  9.49  alive=  9.49 ms serial
+   640x512x512b1          n= 32 alive=  4 dead= 28  paper=  5.17  alive=  0.65 ms serial
+   192x4096x1024b1        n=  8 alive=  8 dead=  0  paper=  3.64  alive=  3.64 ms serial
+   192x3072x1024b1        n=  8 alive=  8 dead=  0  paper=  2.01  alive=  2.01 ms serial
+ [B1(knife2)]
+   640x256x64b8           n= 16 alive=  2 dead= 14  paper=  4.20  alive=  0.53 ms serial
+   2040x32x128b8          n= 16 alive= 16 dead=  0  paper=  3.27  alive=  3.27 ms serial
+   640x64x256b8           n= 16 alive=  2 dead= 14  paper=  0.16  alive=  0.02 ms serial
+ [B2]
+   2040x128x256b8         n= 16 alive= 16 dead=  0  paper=  0.95  alive=  0.95 ms serial
+   8160x128x128b4         n= 12 alive=  0 dead= 12  paper=  0.31  alive=  0.00 ms serial
+   32640x128x64b2         n=  8 alive=  0 dead=  8  paper= -0.25  alive=  0.00 ms serial
+
+--- MEASURED current price per knife group (rt_per_closure, not apportioned) ---
+  A1           n= 16 alive= 16   measured now =   3.76 ms serial   alive-only =   3.76 ms => frame  1.62 ms   [shape cross-check: 0 comparable, 0 mismatch]
+  A2           n= 16 alive= 16   measured now =   3.87 ms serial   alive-only =   3.87 ms => frame  1.66 ms   [shape cross-check: 16 comparable, 0 mismatch]
+  A3           n= 28 alive= 28   measured now =   9.16 ms serial   alive-only =   9.16 ms => frame  3.94 ms   [shape cross-check: 28 comparable, 0 mismatch]
+  A4           n= 56 alive= 28   measured now =  14.03 ms serial   alive-only =   8.07 ms => frame  3.47 ms   [shape cross-check: 48 comparable, 0 mismatch]
+  B1(knife2)   n= 48 alive= 20   measured now =  10.55 ms serial   alive-only =   4.45 ms => frame  1.92 ms   [shape cross-check: 48 comparable, 0 mismatch]
+  B2           n= 36 alive= 16   measured now =   4.03 ms serial   alive-only =   3.98 ms => frame  1.71 ms   [shape cross-check: 36 comparable, 0 mismatch]
+
+--- dead rows by tier (which chains the T2 skip removed) ---
+   tier=C128         cause=S6-1a noop ( n=22
+   tier=C256         cause=S6-1a noop ( n=2
+   tier=C512         cause=skip-chain(T n=98
+   tier=C64          cause=S6-1a noop ( n=14
+   tier=out-of-chain cause=S6-1a noop ( n=2

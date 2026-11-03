@@ -1,0 +1,399 @@
+closure,plan_line,chain,tier,family,dtype,orig,merged,mech,rt_ms,price_ms,orig_roof_ms,merged_ms,violation_ms,ratio,status,group,alive,cause,merge_group_members,merge_group_alive,merge_still_alive,recovery_alive_ms
+316,5921,25,C512,xmx_rec_gemm_int8_residual,int8,192x1024x4096b1,1536x1024x4096b1,fat-M 上界参照 (8 发合一),0.4442,1.2325,0.2443,0.0461,1.1865,26.75,measured,A4,1,,8,8,1,1.1865
+325,5939,,out-of-chain,xmx_rec_gemm_int8_residual,int8,192x1024x4096b1,1536x1024x4096b1,fat-M 上界参照 (8 发合一),0.4282,1.2325,0.2443,0.0461,1.1865,26.75,measured,A4,1,,8,8,1,1.1865
+334,5957,,out-of-chain,xmx_rec_gemm_int8_residual,int8,192x1024x4096b1,1536x1024x4096b1,fat-M 上界参照 (8 发合一),0.4322,1.2325,0.2443,0.0461,1.1865,26.75,measured,A4,1,,8,8,1,1.1865
+343,5975,,out-of-chain,xmx_rec_gemm_int8_residual,int8,192x1024x4096b1,1536x1024x4096b1,fat-M 上界参照 (8 发合一),0.4360,1.2325,0.2443,0.0461,1.1865,26.75,measured,A4,1,,8,8,1,1.1865
+352,5993,,out-of-chain,xmx_rec_gemm_int8_residual,int8,192x1024x4096b1,1536x1024x4096b1,fat-M 上界参照 (8 发合一),0.4240,1.2325,0.2443,0.0461,1.1865,26.75,measured,A4,1,,8,8,1,1.1865
+361,6011,,out-of-chain,xmx_rec_gemm_int8_residual,int8,192x1024x4096b1,1536x1024x4096b1,fat-M 上界参照 (8 发合一),0.4352,1.2325,0.2443,0.0461,1.1865,26.75,measured,A4,1,,8,8,1,1.1865
+370,6029,,out-of-chain,xmx_rec_gemm_int8_residual,int8,192x1024x4096b1,1536x1024x4096b1,fat-M 上界参照 (8 发合一),0.4235,1.2325,0.2443,0.0461,1.1865,26.75,measured,A4,1,,8,8,1,1.1865
+379,6047,,out-of-chain,xmx_rec_gemm_int8_residual,int8,192x1024x4096b1,1536x1024x4096b1,fat-M 上界参照 (8 发合一),0.4291,1.2325,0.2443,0.0461,1.1865,26.75,measured,A4,1,,8,8,1,1.1865
+314,5917,25,C512,xmx_rec_gemm_int8,int8,192x4096x1024b1,1536x4096x1024b1,fat-M 上界参照 (8 发合一),0.2525,0.5029,0.1153,0.048,0.4549,10.48,measured,A4,1,,8,8,1,0.4549
+323,5935,,out-of-chain,xmx_rec_gemm_int8,int8,192x4096x1024b1,1536x4096x1024b1,fat-M 上界参照 (8 发合一),0.2477,0.5029,0.1153,0.048,0.4549,10.48,measured,A4,1,,8,8,1,0.4549
+332,5953,,out-of-chain,xmx_rec_gemm_int8,int8,192x4096x1024b1,1536x4096x1024b1,fat-M 上界参照 (8 发合一),0.2526,0.5029,0.1153,0.048,0.4549,10.48,measured,A4,1,,8,8,1,0.4549
+341,5971,,out-of-chain,xmx_rec_gemm_int8,int8,192x4096x1024b1,1536x4096x1024b1,fat-M 上界参照 (8 发合一),0.2514,0.5029,0.1153,0.048,0.4549,10.48,measured,A4,1,,8,8,1,0.4549
+350,5989,,out-of-chain,xmx_rec_gemm_int8,int8,192x4096x1024b1,1536x4096x1024b1,fat-M 上界参照 (8 发合一),0.2455,0.5029,0.1153,0.048,0.4549,10.48,measured,A4,1,,8,8,1,0.4549
+359,6007,,out-of-chain,xmx_rec_gemm_int8,int8,192x4096x1024b1,1536x4096x1024b1,fat-M 上界参照 (8 发合一),0.2363,0.5029,0.1153,0.048,0.4549,10.48,measured,A4,1,,8,8,1,0.4549
+368,6025,,out-of-chain,xmx_rec_gemm_int8,int8,192x4096x1024b1,1536x4096x1024b1,fat-M 上界参照 (8 发合一),0.2482,0.5029,0.1153,0.048,0.4549,10.48,measured,A4,1,,8,8,1,0.4549
+377,6043,,out-of-chain,xmx_rec_gemm_int8,int8,192x4096x1024b1,1536x4096x1024b1,fat-M 上界参照 (8 发合一),0.2746,0.5029,0.1153,0.048,0.4549,10.48,measured,A4,1,,8,8,1,0.4549
+233,5761,19,C512,xmx_rec_gemm_int8_qkv,int8,960x1536x512b1,1728x1536x512b1,fat-M 上界参照 (960+768 档),0.2296,0.3614,0.0975,0.0833,0.2781,4.34,measured,,0,skip-chain(T2 compile-time default),16,2,1,0.0
+245,5784,20,C512,xmx_rec_gemm_int8_qkv,int8,960x1536x512b1,1728x1536x512b1,fat-M 上界参照 (960+768 档),0.2274,0.3614,0.0975,0.0833,0.2781,4.34,measured,,0,skip-chain(T2 compile-time default),16,2,1,0.0
+281,5853,23,C512,xmx_rec_gemm_int8_qkv,int8,960x1536x512b1,1728x1536x512b1,fat-M 上界参照 (960+768 档),0.2275,0.3614,0.0975,0.0833,0.2781,4.34,measured,,0,skip-chain(T2 compile-time default),16,2,1,0.0
+293,5876,24,C512,xmx_rec_gemm_int8_qkv,int8,960x1536x512b1,1728x1536x512b1,fat-M 上界参照 (960+768 档),0.2510,0.3614,0.0975,0.0833,0.2781,4.34,measured,,0,skip-chain(T2 compile-time default),16,2,1,0.0
+407,6099,27,C512,xmx_rec_gemm_int8_qkv,int8,960x1536x512b1,1728x1536x512b1,fat-M 上界参照 (960+768 档),0.2679,0.3614,0.0975,0.0833,0.2781,4.34,measured,,0,skip-chain(T2 compile-time default),16,2,1,0.0
+419,6122,28,C512,xmx_rec_gemm_int8_qkv,int8,960x1536x512b1,1728x1536x512b1,fat-M 上界参照 (960+768 档),0.2261,0.3614,0.0975,0.0833,0.2781,4.34,measured,,0,skip-chain(T2 compile-time default),16,2,1,0.0
+455,6191,31,C512,xmx_rec_gemm_int8_qkv,int8,960x1536x512b1,1728x1536x512b1,fat-M 上界参照 (960+768 档),0.2245,0.3614,0.0975,0.0833,0.2781,4.34,measured,,0,skip-chain(T2 compile-time default),16,2,1,0.0
+467,6214,32,C512,xmx_rec_gemm_int8_qkv,int8,960x1536x512b1,1728x1536x512b1,fat-M 上界参照 (960+768 档),0.2308,0.3614,0.0975,0.0833,0.2781,4.34,measured,,0,skip-chain(T2 compile-time default),16,2,1,0.0
+215,5726,17,C256,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,"wide-diag f16 (lda=K*b, sa=K)",0.2333,0.2768,0.0653,0.014,0.2628,19.7,measured,B1(knife2),1,,16,2,1,0.2628
+227,5749,18,C512,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,"wide-diag f16 (lda=K*b, sa=K)",0.2720,0.2768,0.0653,0.014,0.2628,19.7,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+239,5772,19,C512,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,"wide-diag f16 (lda=K*b, sa=K)",0.2477,0.2768,0.0653,0.014,0.2628,19.7,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+251,5795,20,C512,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,"wide-diag f16 (lda=K*b, sa=K)",0.2431,0.2768,0.0653,0.014,0.2628,19.7,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+263,5818,21,C512,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,"wide-diag f16 (lda=K*b, sa=K)",0.2453,0.2768,0.0653,0.014,0.2628,19.7,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+275,5841,22,C512,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,"wide-diag f16 (lda=K*b, sa=K)",0.2415,0.2768,0.0653,0.014,0.2628,19.7,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+287,5864,23,C512,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,"wide-diag f16 (lda=K*b, sa=K)",0.2403,0.2768,0.0653,0.014,0.2628,19.7,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+299,5887,24,C512,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,"wide-diag f16 (lda=K*b, sa=K)",0.2455,0.2768,0.0653,0.014,0.2628,19.7,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+389,6064,,out-of-chain,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,"wide-diag f16 (lda=K*b, sa=K)",0.2323,0.2768,0.0653,0.014,0.2628,19.7,measured,B1(knife2),1,,16,2,1,0.2628
+401,6087,26,C512,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,"wide-diag f16 (lda=K*b, sa=K)",0.2511,0.2768,0.0653,0.014,0.2628,19.7,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+413,6110,27,C512,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,"wide-diag f16 (lda=K*b, sa=K)",0.2391,0.2768,0.0653,0.014,0.2628,19.7,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+425,6133,28,C512,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,"wide-diag f16 (lda=K*b, sa=K)",0.2639,0.2768,0.0653,0.014,0.2628,19.7,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+437,6156,29,C512,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,"wide-diag f16 (lda=K*b, sa=K)",0.2527,0.2768,0.0653,0.014,0.2628,19.7,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+449,6179,30,C512,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,"wide-diag f16 (lda=K*b, sa=K)",0.2556,0.2768,0.0653,0.014,0.2628,19.7,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+461,6202,31,C512,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,"wide-diag f16 (lda=K*b, sa=K)",0.2389,0.2768,0.0653,0.014,0.2628,19.7,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+473,6225,32,C512,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,"wide-diag f16 (lda=K*b, sa=K)",0.2653,0.2768,0.0653,0.014,0.2628,19.7,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+318,5925,,out-of-chain,xmx_rec_gemm_int8_qkv,int8,192x3072x1024b1,1536x3072x1024b1,fat-M 上界参照 (8 发合一),0.2232,0.2891,0.11,0.0374,0.2517,7.73,measured,A4,1,,8,8,1,0.2517
+327,5943,,out-of-chain,xmx_rec_gemm_int8_qkv,int8,192x3072x1024b1,1536x3072x1024b1,fat-M 上界参照 (8 发合一),0.2183,0.2891,0.11,0.0374,0.2517,7.73,measured,A4,1,,8,8,1,0.2517
+336,5961,,out-of-chain,xmx_rec_gemm_int8_qkv,int8,192x3072x1024b1,1536x3072x1024b1,fat-M 上界参照 (8 发合一),0.2146,0.2891,0.11,0.0374,0.2517,7.73,measured,A4,1,,8,8,1,0.2517
+345,5979,,out-of-chain,xmx_rec_gemm_int8_qkv,int8,192x3072x1024b1,1536x3072x1024b1,fat-M 上界参照 (8 发合一),0.2302,0.2891,0.11,0.0374,0.2517,7.73,measured,A4,1,,8,8,1,0.2517
+354,5997,,out-of-chain,xmx_rec_gemm_int8_qkv,int8,192x3072x1024b1,1536x3072x1024b1,fat-M 上界参照 (8 发合一),0.2180,0.2891,0.11,0.0374,0.2517,7.73,measured,A4,1,,8,8,1,0.2517
+363,6015,,out-of-chain,xmx_rec_gemm_int8_qkv,int8,192x3072x1024b1,1536x3072x1024b1,fat-M 上界参照 (8 发合一),0.2160,0.2891,0.11,0.0374,0.2517,7.73,measured,A4,1,,8,8,1,0.2517
+372,6033,,out-of-chain,xmx_rec_gemm_int8_qkv,int8,192x3072x1024b1,1536x3072x1024b1,fat-M 上界参照 (8 发合一),0.2217,0.2891,0.11,0.0374,0.2517,7.73,measured,A4,1,,8,8,1,0.2517
+381,6051,,out-of-chain,xmx_rec_gemm_int8_qkv,int8,192x3072x1024b1,1536x3072x1024b1,fat-M 上界参照 (8 发合一),0.2074,0.2891,0.11,0.0374,0.2517,7.73,measured,A4,1,,8,8,1,0.2517
+219,5734,17,C256,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照,0.2206,0.2568,0.0795,0.0191,0.2377,13.46,measured,A4,1,,32,4,1,0.2377
+231,5757,18,C512,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照,0.2336,0.2568,0.0795,0.0191,0.2377,13.46,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+243,5780,19,C512,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照,0.2164,0.2568,0.0795,0.0191,0.2377,13.46,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+255,5803,20,C512,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照,0.1992,0.2568,0.0795,0.0191,0.2377,13.46,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+267,5826,21,C512,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照,0.2403,0.2568,0.0795,0.0191,0.2377,13.46,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+279,5849,22,C512,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照,0.2234,0.2568,0.0795,0.0191,0.2377,13.46,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+291,5872,23,C512,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照,0.2260,0.2568,0.0795,0.0191,0.2377,13.46,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+303,5895,24,C512,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照,0.2056,0.2568,0.0795,0.0191,0.2377,13.46,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+393,6072,,out-of-chain,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照,0.2204,0.2568,0.0795,0.0191,0.2377,13.46,measured,A4,1,,32,4,1,0.2377
+405,6095,26,C512,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照,0.2274,0.2568,0.0795,0.0191,0.2377,13.46,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+417,6118,27,C512,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照,0.2244,0.2568,0.0795,0.0191,0.2377,13.46,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+429,6141,28,C512,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照,0.2459,0.2568,0.0795,0.0191,0.2377,13.46,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+441,6164,29,C512,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照,0.2183,0.2568,0.0795,0.0191,0.2377,13.46,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+453,6187,30,C512,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照,0.2617,0.2568,0.0795,0.0191,0.2377,13.46,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+465,6210,31,C512,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照,0.2044,0.2568,0.0795,0.0191,0.2377,13.46,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+477,6233,32,C512,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照,0.2010,0.2568,0.0795,0.0191,0.2377,13.46,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+138,5584,10,C256,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,batch 进 grid (16 发 -> 2 发),0.2326,0.2448,0.0731,0.018,0.2269,13.64,measured,A2,1,,16,16,1,0.2269
+148,5603,11,C256,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,batch 进 grid (16 发 -> 2 发),0.2278,0.2448,0.0731,0.018,0.2269,13.64,measured,A2,1,,16,16,1,0.2269
+158,5622,12,C256,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,batch 进 grid (16 发 -> 2 发),0.2683,0.2448,0.0731,0.018,0.2269,13.64,measured,A2,1,,16,16,1,0.2269
+168,5641,13,C256,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,batch 进 grid (16 发 -> 2 发),0.2334,0.2448,0.0731,0.018,0.2269,13.64,measured,A2,1,,16,16,1,0.2269
+178,5660,14,C256,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,batch 进 grid (16 发 -> 2 发),0.2680,0.2448,0.0731,0.018,0.2269,13.64,measured,A2,1,,16,16,1,0.2269
+188,5679,15,C256,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,batch 进 grid (16 发 -> 2 发),0.2351,0.2448,0.0731,0.018,0.2269,13.64,measured,A2,1,,16,16,1,0.2269
+198,5698,16,C256,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,batch 进 grid (16 发 -> 2 发),0.2595,0.2448,0.0731,0.018,0.2269,13.64,measured,A2,1,,16,16,1,0.2269
+208,5717,17,C256,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,batch 进 grid (16 发 -> 2 发),0.2346,0.2448,0.0731,0.018,0.2269,13.64,measured,A2,1,,16,16,1,0.2269
+494,6264,34,C256,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,batch 进 grid (16 发 -> 2 发),0.2250,0.2448,0.0731,0.018,0.2269,13.64,measured,A2,1,,16,16,1,0.2269
+504,6283,35,C256,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,batch 进 grid (16 发 -> 2 发),0.2247,0.2448,0.0731,0.018,0.2269,13.64,measured,A2,1,,16,16,1,0.2269
+514,6302,36,C256,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,batch 进 grid (16 发 -> 2 发),0.2454,0.2448,0.0731,0.018,0.2269,13.64,measured,A2,1,,16,16,1,0.2269
+524,6321,37,C256,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,batch 进 grid (16 发 -> 2 发),0.2405,0.2448,0.0731,0.018,0.2269,13.64,measured,A2,1,,16,16,1,0.2269
+534,6340,38,C256,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,batch 进 grid (16 发 -> 2 发),0.2403,0.2448,0.0731,0.018,0.2269,13.64,measured,A2,1,,16,16,1,0.2269
+544,6359,39,C256,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,batch 进 grid (16 发 -> 2 发),0.2525,0.2448,0.0731,0.018,0.2269,13.64,measured,A2,1,,16,16,1,0.2269
+554,6378,40,C256,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,batch 进 grid (16 发 -> 2 发),0.2241,0.2448,0.0731,0.018,0.2269,13.64,measured,A2,1,,16,16,1,0.2269
+564,6397,41,C256,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,batch 进 grid (16 发 -> 2 发),0.2567,0.2448,0.0731,0.018,0.2269,13.64,measured,A2,1,,16,16,1,0.2269
+221,5738,18,C512,xmx_rec_gemm_int8_qkv,int8,768x1536x512b1,1728x1536x512b1,fat-M 上界参照 (960+768 档),0.2228,0.2891,0.0768,0.0666,0.2225,4.34,measured,,0,skip-chain(T2 compile-time default),16,2,1,0.0
+257,5807,21,C512,xmx_rec_gemm_int8_qkv,int8,768x1536x512b1,1728x1536x512b1,fat-M 上界参照 (960+768 档),0.2418,0.2891,0.0768,0.0666,0.2225,4.34,measured,,0,skip-chain(T2 compile-time default),16,2,1,0.0
+269,5830,22,C512,xmx_rec_gemm_int8_qkv,int8,768x1536x512b1,1728x1536x512b1,fat-M 上界参照 (960+768 档),0.2255,0.2891,0.0768,0.0666,0.2225,4.34,measured,,0,skip-chain(T2 compile-time default),16,2,1,0.0
+305,5899,25,C512,xmx_rec_gemm_int8_qkv,int8,768x1536x512b1,1728x1536x512b1,fat-M 上界参照 (960+768 档),0.2173,0.2891,0.0768,0.0666,0.2225,4.34,measured,,1,,16,2,1,0.2225
+395,6076,26,C512,xmx_rec_gemm_int8_qkv,int8,768x1536x512b1,1728x1536x512b1,fat-M 上界参照 (960+768 档),0.2692,0.2891,0.0768,0.0666,0.2225,4.34,measured,,0,skip-chain(T2 compile-time default),16,2,1,0.0
+431,6145,29,C512,xmx_rec_gemm_int8_qkv,int8,768x1536x512b1,1728x1536x512b1,fat-M 上界参照 (960+768 档),0.2315,0.2891,0.0768,0.0666,0.2225,4.34,measured,,0,skip-chain(T2 compile-time default),16,2,1,0.0
+443,6168,30,C512,xmx_rec_gemm_int8_qkv,int8,768x1536x512b1,1728x1536x512b1,fat-M 上界参照 (960+768 档),0.2331,0.2891,0.0768,0.0666,0.2225,4.34,measured,,0,skip-chain(T2 compile-time default),16,2,1,0.0
+479,6237,33,C512,xmx_rec_gemm_int8_qkv,int8,768x1536x512b1,1728x1536x512b1,fat-M 上界参照 (960+768 档),0.2175,0.2891,0.0768,0.0666,0.2225,4.34,measured,,1,,16,2,1,0.2225
+135,5578,10,C256,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,batch 进 grid (同形 16 发 -> 2 发),0.2141,0.2409,0.1054,0.0339,0.2071,7.11,measured,A1,1,,16,16,1,0.2071
+145,5597,11,C256,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,batch 进 grid (同形 16 发 -> 2 发),0.2257,0.2409,0.1054,0.0339,0.2071,7.11,measured,A1,1,,16,16,1,0.2071
+155,5616,12,C256,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,batch 进 grid (同形 16 发 -> 2 发),0.2399,0.2409,0.1054,0.0339,0.2071,7.11,measured,A1,1,,16,16,1,0.2071
+165,5635,13,C256,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,batch 进 grid (同形 16 发 -> 2 发),0.2309,0.2409,0.1054,0.0339,0.2071,7.11,measured,A1,1,,16,16,1,0.2071
+175,5654,14,C256,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,batch 进 grid (同形 16 发 -> 2 发),0.2195,0.2409,0.1054,0.0339,0.2071,7.11,measured,A1,1,,16,16,1,0.2071
+185,5673,15,C256,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,batch 进 grid (同形 16 发 -> 2 发),0.2171,0.2409,0.1054,0.0339,0.2071,7.11,measured,A1,1,,16,16,1,0.2071
+195,5692,16,C256,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,batch 进 grid (同形 16 发 -> 2 发),0.2207,0.2409,0.1054,0.0339,0.2071,7.11,measured,A1,1,,16,16,1,0.2071
+205,5711,17,C256,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,batch 进 grid (同形 16 发 -> 2 发),0.2441,0.2409,0.1054,0.0339,0.2071,7.11,measured,A1,1,,16,16,1,0.2071
+491,6258,34,C256,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,batch 进 grid (同形 16 发 -> 2 发),0.2145,0.2409,0.1054,0.0339,0.2071,7.11,measured,A1,1,,16,16,1,0.2071
+501,6277,35,C256,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,batch 进 grid (同形 16 发 -> 2 发),0.4187,0.2409,0.1054,0.0339,0.2071,7.11,measured,A1,1,,16,16,1,0.2071
+511,6296,36,C256,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,batch 进 grid (同形 16 发 -> 2 发),0.2175,0.2409,0.1054,0.0339,0.2071,7.11,measured,A1,1,,16,16,1,0.2071
+521,6315,37,C256,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,batch 进 grid (同形 16 发 -> 2 发),0.2138,0.2409,0.1054,0.0339,0.2071,7.11,measured,A1,1,,16,16,1,0.2071
+531,6334,38,C256,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,batch 进 grid (同形 16 发 -> 2 发),0.2365,0.2409,0.1054,0.0339,0.2071,7.11,measured,A1,1,,16,16,1,0.2071
+541,6353,39,C256,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,batch 进 grid (同形 16 发 -> 2 发),0.2196,0.2409,0.1054,0.0339,0.2071,7.11,measured,A1,1,,16,16,1,0.2071
+551,6372,40,C256,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,batch 进 grid (同形 16 发 -> 2 发),0.2151,0.2409,0.1054,0.0339,0.2071,7.11,measured,A1,1,,16,16,1,0.2071
+561,6391,41,C256,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,batch 进 grid (同形 16 发 -> 2 发),0.2149,0.2409,0.1054,0.0339,0.2071,7.11,measured,A1,1,,16,16,1,0.2071
+131,5570,9,C128,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,"wide-diag f16 (lda=K*b, sa=K)",0.2198,0.2206,0.0873,0.0163,0.2042,13.5,measured,B1(knife2),1,,16,16,1,0.2042
+141,5589,10,C256,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,"wide-diag f16 (lda=K*b, sa=K)",0.2258,0.2206,0.0873,0.0163,0.2042,13.5,measured,B1(knife2),1,,16,16,1,0.2042
+151,5608,11,C256,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,"wide-diag f16 (lda=K*b, sa=K)",0.2208,0.2206,0.0873,0.0163,0.2042,13.5,measured,B1(knife2),1,,16,16,1,0.2042
+161,5627,12,C256,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,"wide-diag f16 (lda=K*b, sa=K)",0.2259,0.2206,0.0873,0.0163,0.2042,13.5,measured,B1(knife2),1,,16,16,1,0.2042
+171,5646,13,C256,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,"wide-diag f16 (lda=K*b, sa=K)",0.2271,0.2206,0.0873,0.0163,0.2042,13.5,measured,B1(knife2),1,,16,16,1,0.2042
+181,5665,14,C256,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,"wide-diag f16 (lda=K*b, sa=K)",0.2425,0.2206,0.0873,0.0163,0.2042,13.5,measured,B1(knife2),1,,16,16,1,0.2042
+191,5684,15,C256,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,"wide-diag f16 (lda=K*b, sa=K)",0.2218,0.2206,0.0873,0.0163,0.2042,13.5,measured,B1(knife2),1,,16,16,1,0.2042
+201,5703,16,C256,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,"wide-diag f16 (lda=K*b, sa=K)",0.2224,0.2206,0.0873,0.0163,0.2042,13.5,measured,B1(knife2),1,,16,16,1,0.2042
+487,6250,33,C512,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,"wide-diag f16 (lda=K*b, sa=K)",0.2208,0.2206,0.0873,0.0163,0.2042,13.5,measured,B1(knife2),1,,16,16,1,0.2042
+497,6269,34,C256,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,"wide-diag f16 (lda=K*b, sa=K)",0.2298,0.2206,0.0873,0.0163,0.2042,13.5,measured,B1(knife2),1,,16,16,1,0.2042
+507,6288,35,C256,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,"wide-diag f16 (lda=K*b, sa=K)",0.2266,0.2206,0.0873,0.0163,0.2042,13.5,measured,B1(knife2),1,,16,16,1,0.2042
+517,6307,36,C256,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,"wide-diag f16 (lda=K*b, sa=K)",0.2194,0.2206,0.0873,0.0163,0.2042,13.5,measured,B1(knife2),1,,16,16,1,0.2042
+527,6326,37,C256,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,"wide-diag f16 (lda=K*b, sa=K)",0.2263,0.2206,0.0873,0.0163,0.2042,13.5,measured,B1(knife2),1,,16,16,1,0.2042
+537,6345,38,C256,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,"wide-diag f16 (lda=K*b, sa=K)",0.2523,0.2206,0.0873,0.0163,0.2042,13.5,measured,B1(knife2),1,,16,16,1,0.2042
+547,6364,39,C256,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,"wide-diag f16 (lda=K*b, sa=K)",0.2432,0.2206,0.0873,0.0163,0.2042,13.5,measured,B1(knife2),1,,16,16,1,0.2042
+557,6383,40,C256,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,"wide-diag f16 (lda=K*b, sa=K)",0.2183,0.2206,0.0873,0.0163,0.2042,13.5,measured,B1(knife2),1,,16,16,1,0.2042
+133,5574,9,C128,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,batch 进 grid (16 发 -> 2 发),0.2145,0.2046,0.0728,0.0162,0.1884,12.63,measured,A3,1,,16,16,1,0.1884
+143,5593,10,C256,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,batch 进 grid (16 发 -> 2 发),0.2110,0.2046,0.0728,0.0162,0.1884,12.63,measured,A3,1,,16,16,1,0.1884
+153,5612,11,C256,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,batch 进 grid (16 发 -> 2 发),0.2134,0.2046,0.0728,0.0162,0.1884,12.63,measured,A3,1,,16,16,1,0.1884
+163,5631,12,C256,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,batch 进 grid (16 发 -> 2 发),0.2048,0.2046,0.0728,0.0162,0.1884,12.63,measured,A3,1,,16,16,1,0.1884
+173,5650,13,C256,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,batch 进 grid (16 发 -> 2 发),0.2090,0.2046,0.0728,0.0162,0.1884,12.63,measured,A3,1,,16,16,1,0.1884
+183,5669,14,C256,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,batch 进 grid (16 发 -> 2 发),0.2142,0.2046,0.0728,0.0162,0.1884,12.63,measured,A3,1,,16,16,1,0.1884
+193,5688,15,C256,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,batch 进 grid (16 发 -> 2 发),0.1997,0.2046,0.0728,0.0162,0.1884,12.63,measured,A3,1,,16,16,1,0.1884
+203,5707,16,C256,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,batch 进 grid (16 发 -> 2 发),0.2367,0.2046,0.0728,0.0162,0.1884,12.63,measured,A3,1,,16,16,1,0.1884
+489,6254,33,C512,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,batch 进 grid (16 发 -> 2 发),0.2215,0.2046,0.0728,0.0162,0.1884,12.63,measured,A3,1,,16,16,1,0.1884
+499,6273,34,C256,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,batch 进 grid (16 发 -> 2 发),0.2109,0.2046,0.0728,0.0162,0.1884,12.63,measured,A3,1,,16,16,1,0.1884
+509,6292,35,C256,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,batch 进 grid (16 发 -> 2 发),0.2154,0.2046,0.0728,0.0162,0.1884,12.63,measured,A3,1,,16,16,1,0.1884
+519,6311,36,C256,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,batch 进 grid (16 发 -> 2 发),0.1967,0.2046,0.0728,0.0162,0.1884,12.63,measured,A3,1,,16,16,1,0.1884
+529,6330,37,C256,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,batch 进 grid (16 发 -> 2 发),0.2402,0.2046,0.0728,0.0162,0.1884,12.63,measured,A3,1,,16,16,1,0.1884
+539,6349,38,C256,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,batch 进 grid (16 发 -> 2 发),0.2119,0.2046,0.0728,0.0162,0.1884,12.63,measured,A3,1,,16,16,1,0.1884
+549,6368,39,C256,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,batch 进 grid (16 发 -> 2 发),0.2457,0.2046,0.0728,0.0162,0.1884,12.63,measured,A3,1,,16,16,1,0.1884
+559,6387,40,C256,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,batch 进 grid (16 发 -> 2 发),0.1997,0.2046,0.0728,0.0162,0.1884,12.63,measured,A3,1,,16,16,1,0.1884
+65,5442,3,C64,xmx_rec_gemm_int8_residual,int8,8160x128x128b1,8160x128x128b4,batch 进 grid (12 发 -> 3 发),0.5003,0.2046,,0.0274,0.1772,7.47,measured,A3,1,,12,12,1,0.1772
+76,5464,4,C128,xmx_rec_gemm_int8_residual,int8,8160x128x128b1,8160x128x128b4,batch 进 grid (12 发 -> 3 发),0.4725,0.2046,,0.0274,0.1772,7.47,measured,A3,1,,12,12,1,0.1772
+87,5486,5,C128,xmx_rec_gemm_int8_residual,int8,8160x128x128b1,8160x128x128b4,batch 进 grid (12 发 -> 3 发),0.4843,0.2046,,0.0274,0.1772,7.47,measured,A3,1,,12,12,1,0.1772
+98,5508,6,C128,xmx_rec_gemm_int8_residual,int8,8160x128x128b1,8160x128x128b4,batch 进 grid (12 发 -> 3 发),0.5048,0.2046,,0.0274,0.1772,7.47,measured,A3,1,,12,12,1,0.1772
+109,5530,7,C128,xmx_rec_gemm_int8_residual,int8,8160x128x128b1,8160x128x128b4,batch 进 grid (12 发 -> 3 发),0.4711,0.2046,,0.0274,0.1772,7.47,measured,A3,1,,12,12,1,0.1772
+120,5552,8,C128,xmx_rec_gemm_int8_residual,int8,8160x128x128b1,8160x128x128b4,batch 进 grid (12 发 -> 3 发),0.4726,0.2046,,0.0274,0.1772,7.47,measured,A3,1,,12,12,1,0.1772
+572,6411,41,C256,xmx_rec_gemm_int8_residual,int8,8160x128x128b1,8160x128x128b4,batch 进 grid (12 发 -> 3 发),0.4181,0.2046,,0.0274,0.1772,7.47,measured,A3,1,,12,12,1,0.1772
+583,6433,42,C128,xmx_rec_gemm_int8_residual,int8,8160x128x128b1,8160x128x128b4,batch 进 grid (12 发 -> 3 发),0.4758,0.2046,,0.0274,0.1772,7.47,measured,A3,1,,12,12,1,0.1772
+594,6455,43,C128,xmx_rec_gemm_int8_residual,int8,8160x128x128b1,8160x128x128b4,batch 进 grid (12 发 -> 3 发),0.5021,0.2046,,0.0274,0.1772,7.47,measured,A3,1,,12,12,1,0.1772
+605,6477,44,C128,xmx_rec_gemm_int8_residual,int8,8160x128x128b1,8160x128x128b4,batch 进 grid (12 发 -> 3 发),0.4788,0.2046,,0.0274,0.1772,7.47,measured,A3,1,,12,12,1,0.1772
+616,6499,45,C128,xmx_rec_gemm_int8_residual,int8,8160x128x128b1,8160x128x128b4,batch 进 grid (12 发 -> 3 发),0.4689,0.2046,,0.0274,0.1772,7.47,measured,A3,1,,12,12,1,0.1772
+627,6521,46,C128,xmx_rec_gemm_int8_residual,int8,8160x128x128b1,8160x128x128b4,batch 进 grid (12 发 -> 3 发),0.4691,0.2046,,0.0274,0.1772,7.47,measured,A3,1,,12,12,1,0.1772
+78,5468,5,C128,xmx_rec_gemm_int8_qkv,int8,9216x384x128b1,9216x384x128b4,batch 进 grid (C256 档 6 发),0.2750,0.2168,0.1315,0.052,0.1648,4.17,measured,,1,,6,6,1,0.1648
+89,5490,6,C128,xmx_rec_gemm_int8_qkv,int8,9216x384x128b1,9216x384x128b4,batch 进 grid (C256 档 6 发),0.2509,0.2168,0.1315,0.052,0.1648,4.17,measured,,1,,6,6,1,0.1648
+122,5556,9,C128,xmx_rec_gemm_int8_qkv,int8,9216x384x128b1,9216x384x128b4,batch 进 grid (C256 档 6 发),0.2521,0.2168,0.1315,0.052,0.1648,4.17,measured,,1,,6,6,1,0.1648
+574,6415,42,C128,xmx_rec_gemm_int8_qkv,int8,9216x384x128b1,9216x384x128b4,batch 进 grid (C256 档 6 发),0.2520,0.2168,0.1315,0.052,0.1648,4.17,measured,,1,,6,6,1,0.1648
+607,6481,45,C128,xmx_rec_gemm_int8_qkv,int8,9216x384x128b1,9216x384x128b4,batch 进 grid (C256 档 6 发),0.2722,0.2168,0.1315,0.052,0.1648,4.17,measured,,1,,6,6,1,0.1648
+618,6503,46,C128,xmx_rec_gemm_int8_qkv,int8,9216x384x128b1,9216x384x128b4,batch 进 grid (C256 档 6 发),0.2816,0.2168,0.1315,0.052,0.1648,4.17,measured,,1,,6,6,1,0.1648
+18,5349,,out-of-chain,xmx_rec_gemm_int8_residual,int8,32640x64x64b1,32640x64x64b1,已大 M（军规 1 合规）,0.5831,0.2046,0.1004,0.1004,0.1042,2.04,measured,,1,,10,10,1,0.1042
+29,5373,0,C64,xmx_rec_gemm_int8_residual,int8,32640x64x64b1,32640x64x64b1,已大 M（军规 1 合规）,0.5345,0.2046,0.1004,0.1004,0.1042,2.04,measured,,1,,10,10,1,0.1042
+40,5395,1,C64,xmx_rec_gemm_int8_residual,int8,32640x64x64b1,32640x64x64b1,已大 M（军规 1 合规）,0.5400,0.2046,0.1004,0.1004,0.1042,2.04,measured,,1,,10,10,1,0.1042
+51,5417,2,C64,xmx_rec_gemm_int8_residual,int8,32640x64x64b1,32640x64x64b1,已大 M（军规 1 合规）,0.5602,0.2046,0.1004,0.1004,0.1042,2.04,measured,,1,,10,10,1,0.1042
+640,6545,47,C128,xmx_rec_gemm_int8_residual,int8,32640x64x64b1,32640x64x64b1,已大 M（军规 1 合规）,0.4842,0.2046,0.1004,0.1004,0.1042,2.04,measured,,1,,10,10,1,0.1042
+651,6567,48,C64,xmx_rec_gemm_int8_residual,int8,32640x64x64b1,32640x64x64b1,已大 M（军规 1 合规）,0.5326,0.2046,0.1004,0.1004,0.1042,2.04,measured,,1,,10,10,1,0.1042
+662,6589,49,C64,xmx_rec_gemm_int8_residual,int8,32640x64x64b1,32640x64x64b1,已大 M（军规 1 合规）,0.5367,0.2046,0.1004,0.1004,0.1042,2.04,measured,,1,,10,10,1,0.1042
+673,6611,50,C64,xmx_rec_gemm_int8_residual,int8,32640x64x64b1,32640x64x64b1,已大 M（军规 1 合规）,0.5428,0.2046,0.1004,0.1004,0.1042,2.04,measured,,1,,10,10,1,0.1042
+23,5361,0,C64,xmx_rec_gemm_window_int8_residual,int8,32640x64x64b1,32640x64x64b1,已大 M（军规 1 合规）,0.2551,0.1951,0.1004,0.1004,0.0947,1.94,measured,,1,,10,10,1,0.0947
+645,6555,48,C64,xmx_rec_gemm_window_int8_residual,int8,32640x64x64b1,32640x64x64b1,已大 M（军规 1 合规）,0.2592,0.1951,0.1004,0.1004,0.0947,1.94,measured,,1,,10,10,1,0.0947
+214,5725,17,C256,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照 (8 发合一),0.2211,0.1048,0.0795,0.0191,0.0857,5.49,measured,A4,1,,32,4,1,0.0857
+226,5748,18,C512,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照 (8 发合一),0.2022,0.1048,0.0795,0.0191,0.0857,5.49,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+238,5771,19,C512,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照 (8 发合一),0.1989,0.1048,0.0795,0.0191,0.0857,5.49,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+250,5794,20,C512,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照 (8 发合一),0.2002,0.1048,0.0795,0.0191,0.0857,5.49,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+262,5817,21,C512,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照 (8 发合一),0.1918,0.1048,0.0795,0.0191,0.0857,5.49,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+274,5840,22,C512,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照 (8 发合一),0.1960,0.1048,0.0795,0.0191,0.0857,5.49,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+286,5863,23,C512,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照 (8 发合一),0.2007,0.1048,0.0795,0.0191,0.0857,5.49,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+298,5886,24,C512,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照 (8 发合一),0.1957,0.1048,0.0795,0.0191,0.0857,5.49,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+388,6063,,out-of-chain,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照 (8 发合一),0.1977,0.1048,0.0795,0.0191,0.0857,5.49,measured,A4,1,,32,4,1,0.0857
+400,6086,26,C512,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照 (8 发合一),0.1993,0.1048,0.0795,0.0191,0.0857,5.49,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+412,6109,27,C512,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照 (8 发合一),0.1934,0.1048,0.0795,0.0191,0.0857,5.49,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+424,6132,28,C512,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照 (8 发合一),0.2068,0.1048,0.0795,0.0191,0.0857,5.49,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+436,6155,29,C512,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照 (8 发合一),0.1989,0.1048,0.0795,0.0191,0.0857,5.49,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+448,6178,30,C512,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照 (8 发合一),0.2248,0.1048,0.0795,0.0191,0.0857,5.49,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+460,6201,31,C512,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照 (8 发合一),0.2116,0.1048,0.0795,0.0191,0.0857,5.49,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+472,6224,32,C512,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M 上界参照 (8 发合一),0.2111,0.1048,0.0795,0.0191,0.0857,5.49,measured,A4,0,skip-chain(T2 compile-time default),32,4,1,0.0
+130,5569,9,C128,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,fat-N (A 广播，sa=0),0.2443,0.1692,0.0941,0.1098,0.0594,1.54,measured,B2,1,,16,16,1,0.0594
+140,5588,10,C256,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,fat-N (A 广播，sa=0),0.2472,0.1692,0.0941,0.1098,0.0594,1.54,measured,B2,1,,16,16,1,0.0594
+150,5607,11,C256,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,fat-N (A 广播，sa=0),0.2631,0.1692,0.0941,0.1098,0.0594,1.54,measured,B2,1,,16,16,1,0.0594
+160,5626,12,C256,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,fat-N (A 广播，sa=0),0.2425,0.1692,0.0941,0.1098,0.0594,1.54,measured,B2,1,,16,16,1,0.0594
+170,5645,13,C256,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,fat-N (A 广播，sa=0),0.2404,0.1692,0.0941,0.1098,0.0594,1.54,measured,B2,1,,16,16,1,0.0594
+180,5664,14,C256,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,fat-N (A 广播，sa=0),0.2386,0.1692,0.0941,0.1098,0.0594,1.54,measured,B2,1,,16,16,1,0.0594
+190,5683,15,C256,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,fat-N (A 广播，sa=0),0.2530,0.1692,0.0941,0.1098,0.0594,1.54,measured,B2,1,,16,16,1,0.0594
+200,5702,16,C256,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,fat-N (A 广播，sa=0),0.2401,0.1692,0.0941,0.1098,0.0594,1.54,measured,B2,1,,16,16,1,0.0594
+486,6249,33,C512,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,fat-N (A 广播，sa=0),0.2282,0.1692,0.0941,0.1098,0.0594,1.54,measured,B2,1,,16,16,1,0.0594
+496,6268,34,C256,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,fat-N (A 广播，sa=0),0.2639,0.1692,0.0941,0.1098,0.0594,1.54,measured,B2,1,,16,16,1,0.0594
+506,6287,35,C256,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,fat-N (A 广播，sa=0),0.2446,0.1692,0.0941,0.1098,0.0594,1.54,measured,B2,1,,16,16,1,0.0594
+516,6306,36,C256,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,fat-N (A 广播，sa=0),0.2499,0.1692,0.0941,0.1098,0.0594,1.54,measured,B2,1,,16,16,1,0.0594
+526,6325,37,C256,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,fat-N (A 广播，sa=0),0.2613,0.1692,0.0941,0.1098,0.0594,1.54,measured,B2,1,,16,16,1,0.0594
+536,6344,38,C256,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,fat-N (A 广播，sa=0),0.2434,0.1692,0.0941,0.1098,0.0594,1.54,measured,B2,1,,16,16,1,0.0594
+546,6363,39,C256,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,fat-N (A 广播，sa=0),0.2615,0.1692,0.0941,0.1098,0.0594,1.54,measured,B2,1,,16,16,1,0.0594
+556,6382,40,C256,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,fat-N (A 广播，sa=0),0.2622,0.1692,0.0941,0.1098,0.0594,1.54,measured,B2,1,,16,16,1,0.0594
+61,5434,3,C64,xmx_rec_gemm_int8_batched,int8,8160x128x128b4,8160x512x128b1,fat-N (A 广播，sa=0),0.0021,0.1692,0.1096,0.1434,0.0257,1.18,measured,B2,0,S6-1a noop (:676-678 five chain legs),12,0,0,0.0
+72,5456,4,C128,xmx_rec_gemm_int8_batched,int8,8160x128x128b4,8160x512x128b1,fat-N (A 广播，sa=0),0.0044,0.1692,0.1096,0.1434,0.0257,1.18,measured,B2,0,S6-1a noop (:676-678 five chain legs),12,0,0,0.0
+83,5478,5,C128,xmx_rec_gemm_int8_batched,int8,8160x128x128b4,8160x512x128b1,fat-N (A 广播，sa=0),0.0021,0.1692,0.1096,0.1434,0.0257,1.18,measured,B2,0,S6-1a noop (:676-678 five chain legs),12,0,0,0.0
+94,5500,6,C128,xmx_rec_gemm_int8_batched,int8,8160x128x128b4,8160x512x128b1,fat-N (A 广播，sa=0),0.0020,0.1692,0.1096,0.1434,0.0257,1.18,measured,B2,0,S6-1a noop (:676-678 five chain legs),12,0,0,0.0
+105,5522,7,C128,xmx_rec_gemm_int8_batched,int8,8160x128x128b4,8160x512x128b1,fat-N (A 广播，sa=0),0.0021,0.1692,0.1096,0.1434,0.0257,1.18,measured,B2,0,S6-1a noop (:676-678 five chain legs),12,0,0,0.0
+116,5544,8,C128,xmx_rec_gemm_int8_batched,int8,8160x128x128b4,8160x512x128b1,fat-N (A 广播，sa=0),0.0021,0.1692,0.1096,0.1434,0.0257,1.18,measured,B2,0,S6-1a noop (:676-678 five chain legs),12,0,0,0.0
+568,6403,41,C256,xmx_rec_gemm_int8_batched,int8,8160x128x128b4,8160x512x128b1,fat-N (A 广播，sa=0),0.0022,0.1692,0.1096,0.1434,0.0257,1.18,measured,B2,0,S6-1a noop (:676-678 five chain legs),12,0,0,0.0
+579,6425,42,C128,xmx_rec_gemm_int8_batched,int8,8160x128x128b4,8160x512x128b1,fat-N (A 广播，sa=0),0.0021,0.1692,0.1096,0.1434,0.0257,1.18,measured,B2,0,S6-1a noop (:676-678 five chain legs),12,0,0,0.0
+590,6447,43,C128,xmx_rec_gemm_int8_batched,int8,8160x128x128b4,8160x512x128b1,fat-N (A 广播，sa=0),0.0021,0.1692,0.1096,0.1434,0.0257,1.18,measured,B2,0,S6-1a noop (:676-678 five chain legs),12,0,0,0.0
+601,6469,44,C128,xmx_rec_gemm_int8_batched,int8,8160x128x128b4,8160x512x128b1,fat-N (A 广播，sa=0),0.0021,0.1692,0.1096,0.1434,0.0257,1.18,measured,B2,0,S6-1a noop (:676-678 five chain legs),12,0,0,0.0
+612,6491,45,C128,xmx_rec_gemm_int8_batched,int8,8160x128x128b4,8160x512x128b1,fat-N (A 广播，sa=0),0.0021,0.1692,0.1096,0.1434,0.0257,1.18,measured,B2,0,S6-1a noop (:676-678 five chain legs),12,0,0,0.0
+623,6513,46,C128,xmx_rec_gemm_int8_batched,int8,8160x128x128b4,8160x512x128b1,fat-N (A 广播，sa=0),0.0020,0.1692,0.1096,0.1434,0.0257,1.18,measured,B2,0,S6-1a noop (:676-678 five chain legs),12,0,0,0.0
+31,5377,1,C64,xmx_rec_gemm_int8_qkv,int8,35712x192x64b1,35712x192x64b1,已大 M（军规 1 合规，无合并刀）,0.2974,0.2101,0.1886,0.1886,0.0215,1.11,measured,,1,,2,2,1,0.0215
+653,6571,49,C64,xmx_rec_gemm_int8_qkv,int8,35712x192x64b1,35712x192x64b1,已大 M（军规 1 合规，无合并刀）,0.2965,0.2101,0.1886,0.1886,0.0215,1.11,measured,,1,,2,2,1,0.0215
+63,5438,3,C64,xmx_rec_gemm_int8_batched,int8,8160x32x128b4,8160x128x512b1,wide-diag (已出货，对照),0.0021,0.0423,0.0689,0.0253,0.017,1.67,measured,,0,S6-1a noop (:676-678 five chain legs),12,0,0,0.0
+74,5460,4,C128,xmx_rec_gemm_int8_batched,int8,8160x32x128b4,8160x128x512b1,wide-diag (已出货，对照),0.0021,0.0423,0.0689,0.0253,0.017,1.67,measured,,0,S6-1a noop (:676-678 five chain legs),12,0,0,0.0
+85,5482,5,C128,xmx_rec_gemm_int8_batched,int8,8160x32x128b4,8160x128x512b1,wide-diag (已出货，对照),0.0020,0.0423,0.0689,0.0253,0.017,1.67,measured,,0,S6-1a noop (:676-678 five chain legs),12,0,0,0.0
+96,5504,6,C128,xmx_rec_gemm_int8_batched,int8,8160x32x128b4,8160x128x512b1,wide-diag (已出货，对照),0.0020,0.0423,0.0689,0.0253,0.017,1.67,measured,,0,S6-1a noop (:676-678 five chain legs),12,0,0,0.0
+107,5526,7,C128,xmx_rec_gemm_int8_batched,int8,8160x32x128b4,8160x128x512b1,wide-diag (已出货，对照),0.0020,0.0423,0.0689,0.0253,0.017,1.67,measured,,0,S6-1a noop (:676-678 five chain legs),12,0,0,0.0
+118,5548,8,C128,xmx_rec_gemm_int8_batched,int8,8160x32x128b4,8160x128x512b1,wide-diag (已出货，对照),0.0020,0.0423,0.0689,0.0253,0.017,1.67,measured,,0,S6-1a noop (:676-678 five chain legs),12,0,0,0.0
+570,6407,41,C256,xmx_rec_gemm_int8_batched,int8,8160x32x128b4,8160x128x512b1,wide-diag (已出货，对照),0.0021,0.0423,0.0689,0.0253,0.017,1.67,measured,,0,S6-1a noop (:676-678 five chain legs),12,0,0,0.0
+581,6429,42,C128,xmx_rec_gemm_int8_batched,int8,8160x32x128b4,8160x128x512b1,wide-diag (已出货，对照),0.0020,0.0423,0.0689,0.0253,0.017,1.67,measured,,0,S6-1a noop (:676-678 five chain legs),12,0,0,0.0
+592,6451,43,C128,xmx_rec_gemm_int8_batched,int8,8160x32x128b4,8160x128x512b1,wide-diag (已出货，对照),0.0021,0.0423,0.0689,0.0253,0.017,1.67,measured,,0,S6-1a noop (:676-678 five chain legs),12,0,0,0.0
+603,6473,44,C128,xmx_rec_gemm_int8_batched,int8,8160x32x128b4,8160x128x512b1,wide-diag (已出货，对照),0.0020,0.0423,0.0689,0.0253,0.017,1.67,measured,,0,S6-1a noop (:676-678 five chain legs),12,0,0,0.0
+614,6495,45,C128,xmx_rec_gemm_int8_batched,int8,8160x32x128b4,8160x128x512b1,wide-diag (已出货，对照),0.0021,0.0423,0.0689,0.0253,0.017,1.67,measured,,0,S6-1a noop (:676-678 five chain legs),12,0,0,0.0
+625,6517,46,C128,xmx_rec_gemm_int8_batched,int8,8160x32x128b4,8160x128x512b1,wide-diag (已出货，对照),0.0020,0.0423,0.0689,0.0253,0.017,1.67,measured,,0,S6-1a noop (:676-678 five chain legs),12,0,0,0.0
+217,5730,17,C256,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,"wide-diag (sa=K, lda=K*b; P8-b 放宽 N==32)",0.1743,0.0265,0.0251,0.0168,0.0097,1.58,measured,B1(knife2),1,,16,2,1,0.0097
+229,5753,18,C512,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,"wide-diag (sa=K, lda=K*b; P8-b 放宽 N==32)",0.1780,0.0265,0.0251,0.0168,0.0097,1.58,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+241,5776,19,C512,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,"wide-diag (sa=K, lda=K*b; P8-b 放宽 N==32)",0.1729,0.0265,0.0251,0.0168,0.0097,1.58,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+253,5799,20,C512,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,"wide-diag (sa=K, lda=K*b; P8-b 放宽 N==32)",0.1667,0.0265,0.0251,0.0168,0.0097,1.58,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+265,5822,21,C512,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,"wide-diag (sa=K, lda=K*b; P8-b 放宽 N==32)",0.2016,0.0265,0.0251,0.0168,0.0097,1.58,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+277,5845,22,C512,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,"wide-diag (sa=K, lda=K*b; P8-b 放宽 N==32)",0.1766,0.0265,0.0251,0.0168,0.0097,1.58,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+289,5868,23,C512,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,"wide-diag (sa=K, lda=K*b; P8-b 放宽 N==32)",0.1907,0.0265,0.0251,0.0168,0.0097,1.58,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+301,5891,24,C512,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,"wide-diag (sa=K, lda=K*b; P8-b 放宽 N==32)",0.1752,0.0265,0.0251,0.0168,0.0097,1.58,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+391,6068,,out-of-chain,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,"wide-diag (sa=K, lda=K*b; P8-b 放宽 N==32)",0.1723,0.0265,0.0251,0.0168,0.0097,1.58,measured,B1(knife2),1,,16,2,1,0.0097
+403,6091,26,C512,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,"wide-diag (sa=K, lda=K*b; P8-b 放宽 N==32)",0.1763,0.0265,0.0251,0.0168,0.0097,1.58,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+415,6114,27,C512,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,"wide-diag (sa=K, lda=K*b; P8-b 放宽 N==32)",0.1902,0.0265,0.0251,0.0168,0.0097,1.58,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+427,6137,28,C512,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,"wide-diag (sa=K, lda=K*b; P8-b 放宽 N==32)",0.1934,0.0265,0.0251,0.0168,0.0097,1.58,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+439,6160,29,C512,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,"wide-diag (sa=K, lda=K*b; P8-b 放宽 N==32)",0.1796,0.0265,0.0251,0.0168,0.0097,1.58,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+451,6183,30,C512,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,"wide-diag (sa=K, lda=K*b; P8-b 放宽 N==32)",0.1735,0.0265,0.0251,0.0168,0.0097,1.58,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+463,6206,31,C512,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,"wide-diag (sa=K, lda=K*b; P8-b 放宽 N==32)",0.2075,0.0265,0.0251,0.0168,0.0097,1.58,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+475,6229,32,C512,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,"wide-diag (sa=K, lda=K*b; P8-b 放宽 N==32)",0.2148,0.0265,0.0251,0.0168,0.0097,1.58,measured,B1(knife2),0,skip-chain(T2 compile-time default),16,2,1,0.0
+14,5340,,out-of-chain,xmx_rec_gemm_int8_batched,int8,32640x128x64b2,32640x256x64b1,fat-N (A 广播，sa=0),0.0021,0.1692,0.1403,0.2009,-0.0317,0.84,measured,B2,0,S6-1a noop (:676-678 five chain legs),8,0,0,0.0
+25,5365,0,C64,xmx_rec_gemm_int8_batched,int8,32640x128x64b2,32640x256x64b1,fat-N (A 广播，sa=0),0.0021,0.1692,0.1403,0.2009,-0.0317,0.84,measured,B2,0,S6-1a noop (:676-678 five chain legs),8,0,0,0.0
+36,5387,1,C64,xmx_rec_gemm_int8_batched,int8,32640x128x64b2,32640x256x64b1,fat-N (A 广播，sa=0),0.0021,0.1692,0.1403,0.2009,-0.0317,0.84,measured,B2,0,S6-1a noop (:676-678 five chain legs),8,0,0,0.0
+47,5409,2,C64,xmx_rec_gemm_int8_batched,int8,32640x128x64b2,32640x256x64b1,fat-N (A 广播，sa=0),0.0021,0.1692,0.1403,0.2009,-0.0317,0.84,measured,B2,0,S6-1a noop (:676-678 five chain legs),8,0,0,0.0
+636,6537,47,C128,xmx_rec_gemm_int8_batched,int8,32640x128x64b2,32640x256x64b1,fat-N (A 广播，sa=0),0.0021,0.1692,0.1403,0.2009,-0.0317,0.84,measured,B2,0,S6-1a noop (:676-678 five chain legs),8,0,0,0.0
+647,6559,48,C64,xmx_rec_gemm_int8_batched,int8,32640x128x64b2,32640x256x64b1,fat-N (A 广播，sa=0),0.0020,0.1692,0.1403,0.2009,-0.0317,0.84,measured,B2,0,S6-1a noop (:676-678 five chain legs),8,0,0,0.0
+658,6581,49,C64,xmx_rec_gemm_int8_batched,int8,32640x128x64b2,32640x256x64b1,fat-N (A 广播，sa=0),0.0020,0.1692,0.1403,0.2009,-0.0317,0.84,measured,B2,0,S6-1a noop (:676-678 five chain legs),8,0,0,0.0
+669,6603,50,C64,xmx_rec_gemm_int8_batched,int8,32640x128x64b2,32640x256x64b1,fat-N (A 广播，sa=0),0.0021,0.1692,0.1403,0.2009,-0.0317,0.84,measured,B2,0,S6-1a noop (:676-678 five chain legs),8,0,0,0.0
+0,5311,,out-of-chain,xmx_rec_ffn_stem,f16,522240x32x128b1,,,1.6740,1.7,0.6182,,,,fused-mega-legs,,1,,112,84,1,0.0
+1,5313,,out-of-chain,xmx_rec_window_block,f16,522240x96x32b1,,,4.2602,4.7672,,,,,fused-mega-legs,,1,,112,84,1,0.0
+2,5315,,out-of-chain,xmx_rec_ffn,f16,130560x128x32b1,,,0.7274,0.7,,,,,fused-mega-legs,,1,,112,84,1,0.0
+3,5317,,out-of-chain,xmx_rec_window_block,f16,130560x96x32b1,,,1.1506,1.1918,,,,,fused-mega-legs,,1,,112,84,1,0.0
+4,5319,,out-of-chain,xmx_rec_ffn,f16,130560x128x32b1,,,0.6977,0.7,,,,,fused-mega-legs,,1,,112,84,1,0.0
+5,5321,,out-of-chain,xmx_rec_window_block,f16,136640x96x32b1,,,1.2271,1.2473,1.4549,,,,fused-mega-legs,,1,,112,84,1,0.0
+6,5323,,out-of-chain,xmx_rec_ffn,f16,130560x128x32b1,,,0.7097,0.7,,,,,fused-mega-legs,,1,,112,84,1,0.0
+7,5325,,out-of-chain,xmx_rec_window_block,f16,132736x96x32b1,,,1.1641,1.2117,0.9511,,,,fused-mega-legs,,1,,112,84,1,0.0
+8,5327,,out-of-chain,xmx_rec_ffn,f16,130560x128x32b1,,,0.6733,0.7,,,,,fused-mega-legs,,1,,112,84,1,0.0
+9,5329,,out-of-chain,xmx_rec_window_block,f16,134400x96x32b1,,,1.1874,1.2268,0.9591,,,,fused-mega-legs,,1,,112,84,1,0.0
+12,5333,,out-of-chain,xmx_rec_gemm,f16,32640x64x32b1,,,0.2119,0.2206,,,,,no-merge-map,,1,,112,84,1,0.0
+16,5345,,out-of-chain,xmx_rec_gemm_int8_batched,int8,32640x32x128b2,32640x64x256b1,wide-diag (已出货，对照),0.0020,0.0846,,,,,pending-roof,,0,S6-1a noop (:676-678 five chain legs),8,0,0,0.0
+20,5354,0,C64,xmx_rec_gemm_int8_qkv,int8,32640x192x64b1,,,0.2936,0.192,,,,,no-merge-map,,1,,112,84,1,0.0
+21,5357,0,C64,xmx_rec_window_attention,f16,64x64x32b1020,,,1.0169,0.7282,,,,,fused-mega-legs,,1,,112,84,1,0.0
+27,5369,0,C64,xmx_rec_gemm_int8_batched,int8,32640x32x128b2,32640x64x256b1,wide-diag (已出货，对照),0.0020,0.0846,,,,,pending-roof,,0,S6-1a noop (:676-678 five chain legs),8,0,0,0.0
+32,5379,1,C64,xmx_rec_window_attention,f16,64x64x32b1116,,,0.4638,0.7967,,,,,fused-mega-legs,,1,,112,84,1,0.0
+34,5383,1,C64,xmx_rec_gemm_window_int8_residual,int8,35712x64x64b1,35712x64x64b1,已大 M（军规 1 合规）,0.2728,0.2134,,,,,pending-roof,,1,,2,2,1,0.0
+38,5391,1,C64,xmx_rec_gemm_int8_batched,int8,32640x32x128b2,32640x64x256b1,wide-diag (已出货，对照),0.0020,0.0846,,,,,pending-roof,,0,S6-1a noop (:676-678 five chain legs),8,0,0,0.0
+42,5399,2,C64,xmx_rec_gemm_int8_qkv,int8,33728x192x64b1,,,0.2890,0.1984,,,,,no-merge-map,,1,,112,84,1,0.0
+43,5401,2,C64,xmx_rec_window_attention,f16,64x64x32b1054,,,0.4301,0.7525,,,,,fused-mega-legs,,1,,112,84,1,0.0
+45,5405,2,C64,xmx_rec_gemm_window_int8_residual,int8,33728x64x64b1,33728x64x64b1,已大 M（军规 1 合规）,0.2646,0.2016,,,,,pending-roof,,1,,2,2,1,0.0
+49,5413,2,C64,xmx_rec_gemm_int8_batched,int8,32640x32x128b2,32640x64x256b1,wide-diag (已出货，对照),0.0020,0.0846,,,,,pending-roof,,0,S6-1a noop (:676-678 five chain legs),8,0,0,0.0
+53,5421,3,C64,xmx_rec_gemm_int8_qkv,int8,34560x192x64b1,,,0.2967,0.2033,,,,,no-merge-map,,1,,112,84,1,0.0
+54,5423,3,C64,xmx_rec_window_attention,f16,64x64x32b1080,,,0.4187,0.771,,,,,fused-mega-legs,,1,,112,84,1,0.0
+56,5427,3,C64,xmx_rec_gemm_window_int8_residual,int8,34560x64x64b1,34560x64x64b1,已大 M（军规 1 合规）,0.2665,0.2066,,,,,pending-roof,,1,,2,2,1,0.0
+59,5430,3,C64,xmx_rec_gemm,f16,8160x128x64b1,,,0.1769,0.2206,,,,,no-merge-map,,1,,112,84,1,0.0
+67,5446,4,C128,xmx_rec_gemm_int8_qkv,int8,8640x384x128b1,8640x384x128b4,batch 进 grid (C256 档 6 发),0.2528,0.2033,0.1255,,,,pending-roof,,1,,6,6,1,0.0
+68,5448,4,C128,xmx_rec_window_attention,f16,64x64x32b540,,,0.3256,0.3855,,,,,fused-mega-legs,,1,,112,84,1,0.0
+70,5452,4,C128,xmx_rec_gemm_window_int8_residual,int8,8640x128x128b1,8640x128x128b4,batch 进 grid,0.2453,0.2066,,,,,pending-roof,,1,,6,6,1,0.0
+79,5470,5,C128,xmx_rec_window_attention,f16,64x64x32b576,,,0.3168,0.4112,,,,,fused-mega-legs,,1,,112,84,1,0.0
+81,5474,5,C128,xmx_rec_gemm_window_int8_residual,int8,9216x128x128b1,9216x128x128b4,batch 进 grid,0.2577,0.2203,,,,,pending-roof,,1,,6,6,1,0.0
+90,5492,6,C128,xmx_rec_window_attention,f16,64x64x32b576,,,0.3233,0.4112,,,,,fused-mega-legs,,1,,112,84,1,0.0
+92,5496,6,C128,xmx_rec_gemm_window_int8_residual,int8,9216x128x128b1,9216x128x128b4,batch 进 grid,0.2451,0.2203,,,,,pending-roof,,1,,6,6,1,0.0
+100,5512,7,C128,xmx_rec_gemm_int8_qkv,int8,8640x384x128b1,8640x384x128b4,batch 进 grid (C256 档 6 发),0.2521,0.2033,0.1255,,,,pending-roof,,1,,6,6,1,0.0
+101,5514,7,C128,xmx_rec_window_attention,f16,64x64x32b540,,,0.3134,0.3855,,,,,fused-mega-legs,,1,,112,84,1,0.0
+103,5518,7,C128,xmx_rec_gemm_window_int8_residual,int8,8640x128x128b1,8640x128x128b4,batch 进 grid,0.2427,0.2066,,,,,pending-roof,,1,,6,6,1,0.0
+111,5534,8,C128,xmx_rec_gemm_int8_qkv,int8,8640x384x128b1,8640x384x128b4,batch 进 grid (C256 档 6 发),0.2463,0.2033,0.1255,,,,pending-roof,,1,,6,6,1,0.0
+112,5536,8,C128,xmx_rec_window_attention,f16,64x64x32b540,,,0.3167,0.3855,,,,,fused-mega-legs,,1,,112,84,1,0.0
+114,5540,8,C128,xmx_rec_gemm_window_int8_residual,int8,8640x128x128b1,8640x128x128b4,batch 进 grid,0.2418,0.2066,,,,,pending-roof,,1,,6,6,1,0.0
+123,5558,9,C128,xmx_rec_window_attention,f16,64x64x32b576,,,0.3603,0.4112,,,,,fused-mega-legs,,1,,112,84,1,0.0
+125,5562,9,C128,xmx_rec_gemm_window_int8_residual,int8,9216x128x128b1,9216x128x128b4,batch 进 grid,0.2550,0.2203,,,,,pending-roof,,1,,6,6,1,0.0
+128,5565,9,C128,xmx_rec_gemm,f16,2040x256x128b1,,,0.1916,0.2206,,,,,no-merge-map,,1,,112,84,1,0.0
+136,5580,10,C256,xmx_rec_window_attention,f16,64x64x32b320,,,0.2976,0.2285,0.1095,,,,fused-mega-legs,,1,,112,84,1,0.0
+146,5599,11,C256,xmx_rec_window_attention,f16,64x64x32b320,,,0.2765,0.2285,0.1095,,,,fused-mega-legs,,1,,112,84,1,0.0
+156,5618,12,C256,xmx_rec_window_attention,f16,64x64x32b320,,,0.2613,0.2285,0.1095,,,,fused-mega-legs,,1,,112,84,1,0.0
+166,5637,13,C256,xmx_rec_window_attention,f16,64x64x32b320,,,0.2542,0.2285,0.1095,,,,fused-mega-legs,,1,,112,84,1,0.0
+176,5656,14,C256,xmx_rec_window_attention,f16,64x64x32b320,,,0.2872,0.2285,0.1095,,,,fused-mega-legs,,1,,112,84,1,0.0
+186,5675,15,C256,xmx_rec_window_attention,f16,64x64x32b320,,,0.2679,0.2285,0.1095,,,,fused-mega-legs,,1,,112,84,1,0.0
+196,5694,16,C256,xmx_rec_window_attention,f16,64x64x32b320,,,0.2658,0.2285,0.1095,,,,fused-mega-legs,,1,,112,84,1,0.0
+206,5713,17,C256,xmx_rec_window_attention,f16,64x64x32b320,,,0.3063,0.2285,0.1095,,,,fused-mega-legs,,1,,112,84,1,0.0
+212,5721,17,C256,xmx_rec_gemm,f16,640x512x256b1,,,0.1867,0.2768,,,,,no-merge-map,,1,,112,84,1,0.0
+222,5740,18,C512,xmx_rec_window_attention,f16,64x64x32b192,,,0.2760,0.1371,,,,,fused-mega-legs,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+224,5744,18,C512,xmx_rec_gemm_window_int8_residual,int8,768x512x512b1,,,0.2351,0.2938,,,,,no-merge-map,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+234,5763,19,C512,xmx_rec_window_attention,f16,64x64x32b240,,,0.2515,0.1713,,,,,fused-mega-legs,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+236,5767,19,C512,xmx_rec_gemm_window_int8_residual,int8,960x512x512b1,,,0.2437,0.3672,,,,,no-merge-map,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+246,5786,20,C512,xmx_rec_window_attention,f16,64x64x32b240,,,0.2591,0.1713,,,,,fused-mega-legs,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+248,5790,20,C512,xmx_rec_gemm_window_int8_residual,int8,960x512x512b1,,,0.2688,0.3672,,,,,no-merge-map,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+258,5809,21,C512,xmx_rec_window_attention,f16,64x64x32b192,,,0.1378,0.1371,,,,,fused-mega-legs,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+260,5813,21,C512,xmx_rec_gemm_window_int8_residual,int8,768x512x512b1,,,0.2464,0.2938,,,,,no-merge-map,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+270,5832,22,C512,xmx_rec_window_attention,f16,64x64x32b192,,,0.2601,0.1371,,,,,fused-mega-legs,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+272,5836,22,C512,xmx_rec_gemm_window_int8_residual,int8,768x512x512b1,,,0.2349,0.2938,,,,,no-merge-map,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+282,5855,23,C512,xmx_rec_window_attention,f16,64x64x32b240,,,0.1385,0.1713,,,,,fused-mega-legs,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+284,5859,23,C512,xmx_rec_gemm_window_int8_residual,int8,960x512x512b1,,,0.2487,0.3672,,,,,no-merge-map,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+294,5878,24,C512,xmx_rec_window_attention,f16,64x64x32b240,,,0.2541,0.1713,,,,,fused-mega-legs,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+296,5882,24,C512,xmx_rec_gemm_window_int8_residual,int8,960x512x512b1,,,0.2457,0.3672,,,,,no-merge-map,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+306,5901,25,C512,xmx_rec_window_attention,f16,64x64x32b192,,,0.1372,0.1371,,,,,fused-mega-legs,,1,,112,84,1,0.0
+308,5905,25,C512,xmx_rec_gemm_window_int8_residual,int8,768x512x512b1,,,0.2610,0.2938,,,,,no-merge-map,,1,,112,84,1,0.0
+312,5911,25,C512,xmx_rec_gemm,f16,192x1024x512b1,,,0.2225,0.3322,,,,,no-merge-map,,1,,112,84,1,0.0
+319,5927,,out-of-chain,xmx_rec_global_attention,int8,192x192x32b32,,,1.4094,1.4625,0.056,,,,fused-mega-legs,,1,,112,84,1,0.0
+321,5931,,out-of-chain,xmx_rec_gemm_int8_residual,int8,192x1024x1024b1,1536x1024x1024b1,fat-M 上界参照,0.2487,0.3081,0.1051,,,,pending-roof,,1,,8,8,1,0.0
+328,5945,,out-of-chain,xmx_rec_global_attention,int8,192x192x32b32,,,1.4125,1.4625,0.056,,,,fused-mega-legs,,1,,112,84,1,0.0
+330,5949,,out-of-chain,xmx_rec_gemm_int8_residual,int8,192x1024x1024b1,1536x1024x1024b1,fat-M 上界参照,0.2391,0.3081,0.1051,,,,pending-roof,,1,,8,8,1,0.0
+337,5963,,out-of-chain,xmx_rec_global_attention,int8,192x192x32b32,,,1.4267,1.4625,0.056,,,,fused-mega-legs,,1,,112,84,1,0.0
+339,5967,,out-of-chain,xmx_rec_gemm_int8_residual,int8,192x1024x1024b1,1536x1024x1024b1,fat-M 上界参照,0.2431,0.3081,0.1051,,,,pending-roof,,1,,8,8,1,0.0
+346,5981,,out-of-chain,xmx_rec_global_attention,int8,192x192x32b32,,,1.4509,1.4625,0.056,,,,fused-mega-legs,,1,,112,84,1,0.0
+348,5985,,out-of-chain,xmx_rec_gemm_int8_residual,int8,192x1024x1024b1,1536x1024x1024b1,fat-M 上界参照,0.2411,0.3081,0.1051,,,,pending-roof,,1,,8,8,1,0.0
+355,5999,,out-of-chain,xmx_rec_global_attention,int8,192x192x32b32,,,1.4104,1.4625,0.056,,,,fused-mega-legs,,1,,112,84,1,0.0
+357,6003,,out-of-chain,xmx_rec_gemm_int8_residual,int8,192x1024x1024b1,1536x1024x1024b1,fat-M 上界参照,0.2465,0.3081,0.1051,,,,pending-roof,,1,,8,8,1,0.0
+364,6017,,out-of-chain,xmx_rec_global_attention,int8,192x192x32b32,,,1.4237,1.4625,0.056,,,,fused-mega-legs,,1,,112,84,1,0.0
+366,6021,,out-of-chain,xmx_rec_gemm_int8_residual,int8,192x1024x1024b1,1536x1024x1024b1,fat-M 上界参照,0.2620,0.3081,0.1051,,,,pending-roof,,1,,8,8,1,0.0
+373,6035,,out-of-chain,xmx_rec_global_attention,int8,192x192x32b32,,,1.4046,1.4625,0.056,,,,fused-mega-legs,,1,,112,84,1,0.0
+375,6039,,out-of-chain,xmx_rec_gemm_int8_residual,int8,192x1024x1024b1,1536x1024x1024b1,fat-M 上界参照,0.2450,0.3081,0.1051,,,,pending-roof,,1,,8,8,1,0.0
+382,6053,,out-of-chain,xmx_rec_global_attention,int8,192x192x32b32,,,1.4301,1.4625,0.056,,,,fused-mega-legs,,1,,112,84,1,0.0
+384,6057,,out-of-chain,xmx_rec_gemm_int8_residual,int8,192x1024x1024b1,1536x1024x1024b1,fat-M 上界参照,0.2466,0.3081,0.1051,,,,pending-roof,,1,,8,8,1,0.0
+385,6058,,out-of-chain,xmx_rec_gemm,f16,192x512x1024b1,,,0.2286,0.3322,,,,,no-merge-map,,1,,112,84,1,0.0
+396,6078,26,C512,xmx_rec_window_attention,f16,64x64x32b192,,,0.2382,0.1371,,,,,fused-mega-legs,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+398,6082,26,C512,xmx_rec_gemm_window_int8_residual,int8,768x512x512b1,,,0.2534,0.2938,,,,,no-merge-map,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+408,6101,27,C512,xmx_rec_window_attention,f16,64x64x32b240,,,0.2609,0.1713,,,,,fused-mega-legs,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+410,6105,27,C512,xmx_rec_gemm_window_int8_residual,int8,960x512x512b1,,,0.2403,0.3672,,,,,no-merge-map,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+420,6124,28,C512,xmx_rec_window_attention,f16,64x64x32b240,,,0.2553,0.1713,,,,,fused-mega-legs,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+422,6128,28,C512,xmx_rec_gemm_window_int8_residual,int8,960x512x512b1,,,0.2399,0.3672,,,,,no-merge-map,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+432,6147,29,C512,xmx_rec_window_attention,f16,64x64x32b192,,,0.2446,0.1371,,,,,fused-mega-legs,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+434,6151,29,C512,xmx_rec_gemm_window_int8_residual,int8,768x512x512b1,,,0.2369,0.2938,,,,,no-merge-map,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+444,6170,30,C512,xmx_rec_window_attention,f16,64x64x32b192,,,0.1389,0.1371,,,,,fused-mega-legs,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+446,6174,30,C512,xmx_rec_gemm_window_int8_residual,int8,768x512x512b1,,,0.2475,0.2938,,,,,no-merge-map,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+456,6193,31,C512,xmx_rec_window_attention,f16,64x64x32b240,,,0.2499,0.1713,,,,,fused-mega-legs,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+458,6197,31,C512,xmx_rec_gemm_window_int8_residual,int8,960x512x512b1,,,0.2377,0.3672,,,,,no-merge-map,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+468,6216,32,C512,xmx_rec_window_attention,f16,64x64x32b240,,,0.2824,0.1713,,,,,fused-mega-legs,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+470,6220,32,C512,xmx_rec_gemm_window_int8_residual,int8,960x512x512b1,,,0.2650,0.3672,,,,,no-merge-map,,0,skip-chain(T2 compile-time default),112,84,1,0.0
+480,6239,33,C512,xmx_rec_window_attention,f16,64x64x32b192,,,0.2478,0.1371,,,,,fused-mega-legs,,1,,112,84,1,0.0
+482,6243,33,C512,xmx_rec_gemm_window_int8_residual,int8,768x512x512b1,,,0.2423,0.2938,,,,,no-merge-map,,1,,112,84,1,0.0
+483,6244,33,C512,xmx_rec_gemm,f16,640x256x512b1,,,0.2152,0.2768,,,,,no-merge-map,,1,,112,84,1,0.0
+492,6260,34,C256,xmx_rec_window_attention,f16,64x64x32b320,,,0.2647,0.2285,0.1095,,,,fused-mega-legs,,1,,112,84,1,0.0
+502,6279,35,C256,xmx_rec_window_attention,f16,64x64x32b320,,,0.2814,0.2285,0.1095,,,,fused-mega-legs,,1,,112,84,1,0.0
+512,6298,36,C256,xmx_rec_window_attention,f16,64x64x32b320,,,0.2574,0.2285,0.1095,,,,fused-mega-legs,,1,,112,84,1,0.0
+522,6317,37,C256,xmx_rec_window_attention,f16,64x64x32b320,,,0.2589,0.2285,0.1095,,,,fused-mega-legs,,1,,112,84,1,0.0
+532,6336,38,C256,xmx_rec_window_attention,f16,64x64x32b320,,,0.2754,0.2285,0.1095,,,,fused-mega-legs,,1,,112,84,1,0.0
+542,6355,39,C256,xmx_rec_window_attention,f16,64x64x32b320,,,0.2602,0.2285,0.1095,,,,fused-mega-legs,,1,,112,84,1,0.0
+552,6374,40,C256,xmx_rec_window_attention,f16,64x64x32b320,,,0.2656,0.2285,0.1095,,,,fused-mega-legs,,1,,112,84,1,0.0
+562,6393,41,C256,xmx_rec_window_attention,f16,64x64x32b320,,,0.2587,0.2285,0.1095,,,,fused-mega-legs,,1,,112,84,1,0.0
+565,6398,41,C256,xmx_rec_gemm,f16,2040x128x256b1,,,0.2150,0.2206,,,,,no-merge-map,,1,,112,84,1,0.0
+575,6417,42,C128,xmx_rec_window_attention,f16,64x64x32b576,,,0.3271,0.4112,,,,,fused-mega-legs,,1,,112,84,1,0.0
+577,6421,42,C128,xmx_rec_gemm_window_int8_residual,int8,9216x128x128b1,9216x128x128b4,batch 进 grid,0.2686,0.2203,,,,,pending-roof,,1,,6,6,1,0.0
+585,6437,43,C128,xmx_rec_gemm_int8_qkv,int8,8640x384x128b1,8640x384x128b4,batch 进 grid (C256 档 6 发),0.2474,0.2033,0.1255,,,,pending-roof,,1,,6,6,1,0.0
+586,6439,43,C128,xmx_rec_window_attention,f16,64x64x32b540,,,0.3163,0.3855,,,,,fused-mega-legs,,1,,112,84,1,0.0
+588,6443,43,C128,xmx_rec_gemm_window_int8_residual,int8,8640x128x128b1,8640x128x128b4,batch 进 grid,0.2436,0.2066,,,,,pending-roof,,1,,6,6,1,0.0
+596,6459,44,C128,xmx_rec_gemm_int8_qkv,int8,8640x384x128b1,8640x384x128b4,batch 进 grid (C256 档 6 发),0.2509,0.2033,0.1255,,,,pending-roof,,1,,6,6,1,0.0
+597,6461,44,C128,xmx_rec_window_attention,f16,64x64x32b540,,,0.3459,0.3855,,,,,fused-mega-legs,,1,,112,84,1,0.0
+599,6465,44,C128,xmx_rec_gemm_window_int8_residual,int8,8640x128x128b1,8640x128x128b4,batch 进 grid,0.2749,0.2066,,,,,pending-roof,,1,,6,6,1,0.0
+608,6483,45,C128,xmx_rec_window_attention,f16,64x64x32b576,,,0.3209,0.4112,,,,,fused-mega-legs,,1,,112,84,1,0.0
+610,6487,45,C128,xmx_rec_gemm_window_int8_residual,int8,9216x128x128b1,9216x128x128b4,batch 进 grid,0.2415,0.2203,,,,,pending-roof,,1,,6,6,1,0.0
+619,6505,46,C128,xmx_rec_window_attention,f16,64x64x32b576,,,0.3176,0.4112,,,,,fused-mega-legs,,1,,112,84,1,0.0
+621,6509,46,C128,xmx_rec_gemm_window_int8_residual,int8,9216x128x128b1,9216x128x128b4,batch 进 grid,0.2463,0.2203,,,,,pending-roof,,1,,6,6,1,0.0
+629,6525,47,C128,xmx_rec_gemm_int8_qkv,int8,8640x384x128b1,8640x384x128b4,batch 进 grid (C256 档 6 发),0.2461,0.2033,0.1255,,,,pending-roof,,1,,6,6,1,0.0
+630,6527,47,C128,xmx_rec_window_attention,f16,64x64x32b540,,,0.3137,0.3855,,,,,fused-mega-legs,,1,,112,84,1,0.0
+632,6531,47,C128,xmx_rec_gemm_window_int8_residual,int8,8640x128x128b1,8640x128x128b4,batch 进 grid,0.2435,0.2066,,,,,pending-roof,,1,,6,6,1,0.0
+633,6532,47,C128,xmx_rec_gemm,f16,8160x64x128b1,,,0.2611,0.2206,,,,,no-merge-map,,1,,112,84,1,0.0
+638,6541,47,C128,xmx_rec_gemm_int8_batched,int8,32640x32x128b2,32640x64x256b1,wide-diag (已出货，对照),0.0021,0.0846,,,,,pending-roof,,0,S6-1a noop (:676-678 five chain legs),8,0,0,0.0
+642,6549,48,C64,xmx_rec_gemm_int8_qkv,int8,32640x192x64b1,,,0.2922,0.192,,,,,no-merge-map,,1,,112,84,1,0.0
+643,6551,48,C64,xmx_rec_window_attention,f16,64x64x32b1020,,,0.4266,0.7282,,,,,fused-mega-legs,,1,,112,84,1,0.0
+649,6563,48,C64,xmx_rec_gemm_int8_batched,int8,32640x32x128b2,32640x64x256b1,wide-diag (已出货，对照),0.0020,0.0846,,,,,pending-roof,,0,S6-1a noop (:676-678 five chain legs),8,0,0,0.0
+654,6573,49,C64,xmx_rec_window_attention,f16,64x64x32b1116,,,0.4222,0.7967,,,,,fused-mega-legs,,1,,112,84,1,0.0
+656,6577,49,C64,xmx_rec_gemm_window_int8_residual,int8,35712x64x64b1,35712x64x64b1,已大 M（军规 1 合规）,0.2635,0.2134,,,,,pending-roof,,1,,2,2,1,0.0
+660,6585,49,C64,xmx_rec_gemm_int8_batched,int8,32640x32x128b2,32640x64x256b1,wide-diag (已出货，对照),0.0020,0.0846,,,,,pending-roof,,0,S6-1a noop (:676-678 five chain legs),8,0,0,0.0
+664,6593,50,C64,xmx_rec_gemm_int8_qkv,int8,33728x192x64b1,,,0.2972,0.1984,,,,,no-merge-map,,1,,112,84,1,0.0
+665,6595,50,C64,xmx_rec_window_attention,f16,64x64x32b1054,,,0.4174,0.7525,,,,,fused-mega-legs,,1,,112,84,1,0.0
+667,6599,50,C64,xmx_rec_gemm_window_int8_residual,int8,33728x64x64b1,33728x64x64b1,已大 M（军规 1 合规）,0.2673,0.2016,,,,,pending-roof,,1,,2,2,1,0.0
+671,6607,50,C64,xmx_rec_gemm_int8_batched,int8,32640x32x128b2,32640x64x256b1,wide-diag (已出货，对照),0.0020,0.0846,,,,,pending-roof,,0,S6-1a noop (:676-678 five chain legs),8,0,0,0.0
+675,6615,51,C64,xmx_rec_gemm_int8_qkv,int8,34560x192x64b1,,,0.2984,0.2033,,,,,no-merge-map,,1,,112,84,1,0.0
+676,6617,51,C64,xmx_rec_window_attention,f16,64x64x32b1080,,,0.4226,0.771,,,,,fused-mega-legs,,1,,112,84,1,0.0
+678,6621,51,C64,xmx_rec_gemm_window_int8_residual,int8,34560x64x64b1,34560x64x64b1,已大 M（军规 1 合规）,0.2756,0.2066,,,,,pending-roof,,1,,2,2,1,0.0
+679,6622,51,C64,xmx_rec_gemm,f16,32640x32x64b1,,,0.2162,0.2206,,,,,no-merge-map,,1,,112,84,1,0.0
+681,6625,,out-of-chain,xmx_rec_ffn,f16,130560x128x32b1,,,0.4605,0.7,,,,,fused-mega-legs,,1,,112,84,1,0.0
+682,6627,,out-of-chain,xmx_rec_window_block,f16,130560x96x32b1,,,1.1671,1.1918,,,,,fused-mega-legs,,1,,112,84,1,0.0
+683,6629,,out-of-chain,xmx_rec_ffn,f16,130560x128x32b1,,,0.4489,0.7,,,,,fused-mega-legs,,1,,112,84,1,0.0
+684,6631,,out-of-chain,xmx_rec_window_block,f16,136640x96x32b1,,,1.2261,1.2473,1.4549,,,,fused-mega-legs,,1,,112,84,1,0.0
+685,6633,,out-of-chain,xmx_rec_ffn,f16,130560x128x32b1,,,0.4884,0.7,,,,,fused-mega-legs,,1,,112,84,1,0.0
+686,6635,,out-of-chain,xmx_rec_window_block,f16,132736x96x32b1,,,1.1658,1.2117,0.9511,,,,fused-mega-legs,,1,,112,84,1,0.0
+687,6637,,out-of-chain,xmx_rec_ffn,f16,130560x128x32b1,,,0.7663,0.7,,,,,fused-mega-legs,,1,,112,84,1,0.0
+688,6639,,out-of-chain,xmx_rec_window_block,f16,134400x96x32b1,,,1.2117,1.2268,0.9591,,,,fused-mega-legs,,1,,112,84,1,0.0
+689,6641,,out-of-chain,xmx_rec_ffn_merge,f16,522240x128x32b1,,,3.5491,3.7,,,,,fused-mega-legs,,1,,112,84,1,0.0
+690,6643,,out-of-chain,xmx_rec_window_block,f16,534336x96x32b1,,,4.1594,4.8776,4.6722,,,,fused-mega-legs,,1,,112,84,1,0.0
