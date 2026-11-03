@@ -1584,6 +1584,10 @@ static int run_all() {
             //   varying diff sets   => the SLM handoff between phases is racy.
             // 0xA5 in "mine" = the launch never wrote that byte; anything else = a stale/garbage read.
             const int nrep = getenv("M_REPEAT") ? atoi(getenv("M_REPEAT")) : 1;
+            // P20 control for the historical "1/158" reading: was it the harness (no submit barrier
+            // between the 0xA5 scrub and the launch) or the kernel? M_REPEAT_BAR=1 (default) adds
+            // ext_oneapi_submit_barrier(); =0 reproduces the original wait-only probe.
+            const int RBAR = getenv("M_REPEAT_BAR") ? atoi(getenv("M_REPEAT_BAR")) : 1;
             if (nrep > 1) {
                 int nbad = 0;
                 printf("-- M flaky probe: %d DUMP launches, taps poisoned 0xA5, vs block3 --\n", nrep);
@@ -1594,7 +1598,9 @@ static int run_all() {
                     q.memset(fOUT, 0xA5, nC*2); q.memset(fPK3, 0xA5, nC); q.memset(fSC3, 0xA5, (size_t)M*4);
                     q.memset(dO2, 0xA5, nC*2);
                     q.wait();
+                    if (RBAR) q.ext_oneapi_submit_barrier();
                     ffn2::fused<S, true, S::NPH>(q, fa).wait();
+                    if (RBAR) q.ext_oneapi_submit_barrier();
                     q.memcpy(fpk1.data(), fPK1, nC); q.memcpy(fsc1.data(), fSC1, (size_t)M*4);
                     q.memcpy(fhid.data(), fHID, nH*2);
                     if (!f16proj) { q.memcpy(fpk2.data(), fPK2, nH); q.memcpy(fsc2.data(), fSC2, (size_t)M*4); }
@@ -1616,7 +1622,7 @@ static int run_all() {
                     fflush(stdout);
                     if (!okr) ++nbad;
                 }
-                printf("FLAKY %s: %d of %d DUMP launches differ from block3 -- %s\n", shid, nbad, nrep,
+                printf("FLAKY %s: %d of %d DUMP launches differ from block3 (bar=%d) -- %s\n", shid, nbad, nrep,
                        nbad ? "NON-DETERMINISTIC (a real SLM handoff race, not an index bug)"
                             : "all launches bit-identical to block3");
                 fflush(stdout);

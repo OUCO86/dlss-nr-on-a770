@@ -815,6 +815,11 @@ static bool run_shape(const char* tag, int M, int N_e, int b_e, int N_p, int K_p
     {
         const int NST = getenv("PORT_STRESS") ? atoi(getenv("PORT_STRESS")) : 0;
         if (NST > 1) {
+            // P20 control: does the measured non-reproducibility survive an explicit
+            // producer->consumer submit barrier at every handoff inside the stress loop?
+            // PORT_STRESS_BAR=1 (default) inserts ext_oneapi_submit_barrier() around the scrub and
+            // the launch; =0 reproduces the original wait-only harness.
+            const int SBAR = getenv("PORT_STRESS_BAR") ? atoi(getenv("PORT_STRESS_BAR")) : 1;
             const size_t bOUT = (size_t)nCp * 2, bPK3 = (size_t)nCp, bSC3 = (size_t)Mpad * 4, bFR3 = (size_t)nCp;
             std::vector<uint8_t> r0OUT(bOUT), r0PK3(bPK3), r0SC3(bSC3), r0FR3(bFR3);
             std::vector<uint8_t> r1OUT(bOUT), r1PK3(bPK3), r1SC3(bSC3), r1FR3(bFR3);
@@ -823,7 +828,9 @@ static bool run_shape(const char* tag, int M, int N_e, int b_e, int N_p, int K_p
             int nbad = 0, nsent = 0, first_s = -1; size_t first_row = 0, first_col = 0;
             for (int s2 = 1; s2 < NST; ++s2) {
                 q.memset(pOUT, 0xA5, bOUT).wait();
+                if (SBAR) q.ext_oneapi_submit_barrier();
                 port::fused<S, true, 5>(q, fa).wait();
+                if (SBAR) q.ext_oneapi_submit_barrier();
                 q.memcpy(r1OUT.data(), pOUT, bOUT); q.memcpy(r1PK3.data(), pPK3, bPK3);
                 q.memcpy(r1SC3.data(), pSC3, bSC3); q.memcpy(r1FR3.data(), pFR3, bFR3); q.wait();
                 size_t dOUT = 0, dPK3 = 0, dSC3 = 0, dFR3 = 0, sent = 0;
@@ -841,8 +848,8 @@ static bool run_shape(const char* tag, int M, int N_e, int b_e, int N_p, int K_p
                     fflush(stdout);
                 }
             }
-            printf("STRESS SUMMARY port::fused KN=%d LW=%d G=%d launches=%d bad=%d with_sentinel=%d first_bad_s=%d\n",
-                   S::KN, S::LW, S::G, NST, nbad, nsent, first_s);
+            printf("STRESS SUMMARY port::fused KN=%d LW=%d G=%d launches=%d bad=%d with_sentinel=%d first_bad_s=%d bar=%d\n",
+                   S::KN, S::LW, S::G, NST, nbad, nsent, first_s, SBAR);
             fflush(stdout);
         }
     }

@@ -1357,3 +1357,28 @@ T1 的机器读数：**corr_min 0.9828**（R .983 G .992 B .990，luma .991）�
 ⇒ **军规 49**：**bench 里跨 kernel 的面交接必须显式 `ext_oneapi_submit_barrier()`；`q.wait()` 只保证完成、不保证下一个 kernel 读到。** 否则逐字节门会**随机假红**——**比假绿更难查，因为它会把"合成体错了"当成结论**。
 **下一步（代理已在跑）**：**B2b** = 门 4（合成体 `--stress 1000`，L1+L2+L3 全链哨兵重发）+ 门 5（台账逐列，`s6/spillcheck_port.py` 加 `port_e_chain` label）；**B2c** = 单价 ≥10 进程 x 60 s，对实测基线 **1.525 / 1.658**，目标 **<=0.844 ms/链 => 8 链 -5.6 串行 => 帧 -2.4**。
 本轮 GPU 约 **11 分钟**（gate 稳定性 3.4 + cross 1.5 + 探针若干）；`out\libxmx.dll` 与 `oneapi\libxmx_sycl.dll` = **ABB969FE** 未动；三金标未动；进程 0 残留。
+
+## 71. ★ P20 控制实验：**"port 核不自重复"维持**（BAR=0 与 BAR=1 **同率**）；四个连发 harness 原先确实都没有 submit barrier（已修）
+**① 审计**（`tools/p20_audit.py` -> `tools/p20_audit.csv`，30 行 `file,arm,line,call,sync`）：
+| harness | 交接点有 barrier | 只有 wait / 无同步 |
+|---|---|---|
+| `port_ffn_fused.cpp`（`PORT_STRESS` 臂） | 2（本轮加开关） | **5 处 phase-bisection 计时发 NO-SYNC + 2** |
+| `s6b_att.cpp`（`S6B_ATT_REPEAT` 臂） | **0** | **9**（scrub->launch、pack->gemm 全 wait-only） |
+| `s6_ffn_block4.cpp`（`M_REPEAT` 探针） | 3（本轮加开关） | 9 |
+| `stress_repeat.cpp`（负对照） | 0 | 1（memset->launch） |
+| `port_e_chain.cpp`（合成体） | **9**（P20 之后加的） | - |
+⇒ **四个连发/比对 harness 原先全都没有 submit barrier** ⇒ 对旧结论的怀疑成立，必须做控制实验。
+**② 控制实验**（同一 exe、同一 cache、**只切 barrier**；port 核 `KN=1 LW=16`；2 x 1000 连发 x 两臂；进程间 60 s；`s6/p20_ctrl.ps1`，5.9 min）：
+| 臂 | bad / 1000 | 签名 |
+|---|---|---|
+| **BAR=1**（每处交接 `ext_oneapi_submit_barrier()`） | **4 + 3 = 7/2000** | `dOUT 约 89-193 / dPK3 约 157-526 / dSC3 约 6-26`，出错行 **`row%16 in {0,7}`**，`sentinel_pairs=0` |
+| **BAR=0**（原始 wait-only） | **4 + 3 = 7/2000** | **完全相同** |
+⇒ **两臂同率 ⇒ P20 解释不了 port 核的不自重复**；**结论维持：他们的核真的不可重复（约 0.35%/发）**。
+⇒ **这反向加强了 §66 的归因**：错在**核内**（跨波 SLM/global 交接、8 行 fragment 边界），不是 host 侧命令序列。
+⇒ **我上一条提的那条漏洞（"barrier 缺失可能让读到上一发旧值而非哨兵，所以 sentinel_pairs=0 没排除干净"）被这条 A/B 直接排掉**：加 barrier 后 bad 不降，且失败签名在两臂一致。
+**③ 一条重要的推理补强（我自己补的）**：**缺 barrier = 更弱的同步 = 更容易暴露竞态**。所以 §67 里"我们的两核 0 bad / 1800 连发"是在**更苛刻的条件下**得到的 ⇒ **那个"我们的核干净"的结论不因 P20 削弱，反而更强**。
+**④ 正在跑的历史悬案**：`notes/port-M.md:249-252` 的 **"1/158"** 出自 `s6_ffn_block4.cpp` 的 `M_REPEAT` 探针，当时也是 **wait-only** => 同一嫌疑。已给 block4 加 `M_REPEAT_BAR` 开关（默认 1）并重编 `b4_m2b.exe = 28F4A47B…`，跑 **S1/S2 x BAR=0/1 x 1000 连发**（job `pwsh-86f918005a544e37`，约 15 min）：
+- **BAR=0 有 bad、BAR=1 归零** ⇒ §35/port-M 的 1/158 **降级为 harness 假警**（要重写的账 = §64④/§65②③/§66 里引用 1/158 的措辞 + 军规 46/48 的证据链加一条"P20 已排除"）；
+- **两臂都有 bad** ⇒ 那条 1/158 是真的，**且已出货 1a 形态在 1000 连发下有暴露** => **B2 暂停、先救 shipped**（修法 = 拆槽/挪相，不是加 barrier）。
+**⑤ 军规 49 已在 B2 正文**（上一条提交）：bench 里任何 kernel 写 -> 下一 kernel 读 / 主机比对的交接必须显式 `ext_oneapi_submit_barrier()`；`q.wait()` 只保证完成、不保证下一个 kernel 读到。缺它 => 逐字节门随机假红，**flaky 探针读数也会失真**（就是 ④ 这条）。
+**合成体状态（不阻塞）**：门 1-3 全绿（25 项逐字节 0、LIVENESS 1,158,095/4,177,920、cross blob `7E963BF2…` IDENTICAL、6/6 进程 GREEN），**门 4 预跑 2 x 1000 bad=0**；exe `EC1D8CFE…`。

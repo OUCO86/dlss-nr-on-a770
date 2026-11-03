@@ -1,0 +1,31 @@
+file,arm,line,call,sync
+port_ffn_fused.cpp,PORT_STRESS,830,"q.memset(pOUT, 0xA5, bOUT).wait();",BARRIER
+port_ffn_fused.cpp,PORT_STRESS,832,"port::fused<S, true, 5>(q, fa).wait();",BARRIER
+port_ffn_fused.cpp,PORT_STRESS,925,"Stat t1 = timeit([&]{ return port::fused<S, false, 1>(q, fa); });",NO-SYNC
+port_ffn_fused.cpp,PORT_STRESS,926,"Stat t2 = timeit([&]{ return port::fused<S, false, 2>(q, fa); });",NO-SYNC
+port_ffn_fused.cpp,PORT_STRESS,927,"Stat t3 = timeit([&]{ return port::fused<S, false, 3>(q, fa); });",NO-SYNC
+port_ffn_fused.cpp,PORT_STRESS,928,"Stat t4 = timeit([&]{ return port::fused<S, false, 4>(q, fa); });",NO-SYNC
+port_ffn_fused.cpp,PORT_STRESS,929,"Stat t5 = timeit([&]{ return port::fused<S, false, 5>(q, fa); });",NO-SYNC
+s6b_att.cpp,S6B_ATT_REPEAT,875,"att5::fused<64, 2, 5, true, false>(q, dImg, dBp, dBS, dQS, dBias, dOp,",wait-only
+s6b_att.cpp,S6B_ATT_REPEAT,879,"att5::fused<128, 4, 5, true, false>(q, dImg, dBp, dBS, dQS, dBias, dOp",wait-only
+s6b_att.cpp,S6B_ATT_REPEAT,897,"q.memset(fQ, 0xA5, sQ).wait(); q.memset(fK, 0xA5, sQ).wait(); q.memset",wait-only
+s6b_att.cpp,S6B_ATT_REPEAT,898,"q.memset(fPKT, 0xA5, sPKT).wait();",wait-only
+s6b_att.cpp,S6B_ATT_REPEAT,899,"q.memset(fAS2, 0xA5, sAS2).wait(); q.memset(fOut, 0xA5, sOut).wait();",wait-only
+s6b_att.cpp,S6B_ATT_REPEAT,929,"packdev::pack_a16_b(q, rQ, rDq, 64, 64, 32, (int)batches);",wait-only
+s6b_att.cpp,S6B_ATT_REPEAT,930,"packdev::pack_b16_t_b(q, rK, rDk, 32, 64, (int)batches);",wait-only
+s6b_att.cpp,S6B_ATT_REPEAT,932,"q.parallel_for(range((size_t)batches * 64u),",wait-only
+s6b_att.cpp,S6B_ATT_REPEAT,934,"packdev::pack_a16_b(q, rProbs, rProbsPack, 64, 64, 64, (int)batches);",wait-only
+stress_repeat.cpp,CTRL(stress_repeat),ARM-NOT-FOUND,,
+s6_ffn_block4.cpp,M_REPEAT,1595,"q.memset(fPK1, 0xA5, nC); q.memset(fSC1, 0xA5, (size_t)M*4);",NO-SYNC
+s6_ffn_block4.cpp,M_REPEAT,1596,"q.memset(fHID, 0xA5, nH*2);",NO-SYNC
+s6_ffn_block4.cpp,M_REPEAT,1597,"if (fPK2) { q.memset(fPK2, 0xA5, nH); q.memset(fSC2, 0xA5, (size_t)M*4",wait-only
+s6_ffn_block4.cpp,M_REPEAT,1598,"q.memset(fOUT, 0xA5, nC*2); q.memset(fPK3, 0xA5, nC); q.memset(fSC3, 0",BARRIER
+s6_ffn_block4.cpp,M_REPEAT,1599,"q.memset(dO2, 0xA5, nC*2);",BARRIER
+s6_ffn_block4.cpp,M_REPEAT,1602,"ffn2::fused<S, true, S::NPH>(q, fa).wait();",BARRIER
+s6_ffn_block4.cpp,M_REPEAT,1668,"Stat r1 = timeit_wall([&]{ packdev::gather_pack_b_b(q, dWER, dBpE, N_e",wait-only
+s6_ffn_block4.cpp,M_REPEAT,1670,"Stat r2 = timeit_wall([&]{ packdev::pack_b(q, dWEW, dBpEW, HID, C); q.",wait-only
+s6_ffn_block4.cpp,M_REPEAT,1672,"Stat r3 = timeit_wall([&]{ packdev::gather_pack_b_diag_b(q, dWPR, dBpP",wait-only
+s6_ffn_block4.cpp,M_REPEAT,1674,"Stat r4 = timeit_wall([&]{ packdev::pack_b(q, dWRR, dBpR, C, C); q.wai",wait-only
+s6_ffn_block4.cpp,M_REPEAT,1681,"Stat wallF = timeit_wall([&]{ ffn2::fused<S, false, S::NPH>(q, fa).wai",wait-only
+s6_ffn_block4.cpp,M_REPEAT,1682,"Stat gpuF  = timeit([&]{ return ffn2::fused<S, false, S::NPH>(q, fa); ",NO-SYNC
+port_e_chain.cpp,chain stress + REF/CHAIN legs,ARM-NOT-FOUND,,

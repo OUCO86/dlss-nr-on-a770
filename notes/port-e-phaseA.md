@@ -455,3 +455,155 @@ Get-Content E:\DSH\s6\K2_probe_S0.log,E:\DSH\s6\K2_probe_S1.log,E:\DSH\s6\K2_pro
 **两颗牙（同一台仓内仪器）**：负对照 `qr_kernel_rowthread` **bad=0/200** ✓；正对照 `port::fused KN=1 LW=16` **bad=4/1000** ✓（200 连发时会显示 0/200 ⇒ 正对照需要 n≥1000）。
 **现场**：`out\libxmx.dll` = `oneapi\libxmx_sycl.dll` = **ABB969FE** ✓ 未 stage；三金标未动；仓 porcelain = ` M port_ffn_fused.cpp` / ` M s6b_att.cpp` / `?? stress_repeat.cpp` / `?? tools/stress_repeat.ps1`（**未 commit/未 push**）；临时副本 `E:\DSH\tmp\pe_stress.cpp` `F3552A9C…`、`E:\DSH\tmp\pe_stress_att.cpp` `0CF3CEB2…`（已被仓内版取代，可删）；exe：`pe_stress 3DB5E9D3…`、`pe_stress_att E1F6345E…`、`b4_base FF8E19E3…`。进程 **0 残留**；本轮 GPU ≈ **55 分钟**（37 + 17）⇒ **下次开工凉 ≥5 分钟**。
 **B2 状态：按令按住，等你一句。** 地基已就绪：我们的两半在 1000/600 连发下 self-reproducible=0 bad，接口 map 同形（§62/§64 的 T=32 参数化改道），SLM 算术过关（31,104 B ⇒ 2 resident）。
+
+---
+
+# §68 B2-ready（**续跑包**，用户 2026-11-03 16:2x 令：GPU 交还给游戏，B2 不批不开；这一节只为下次开工不留思考成本）
+
+## ① B2 的第一条命令 = 原样可粘贴
+**目标形态（写死，别再重新推导）**：一条 C=64 链 **11 发 → 3 发**
+- **发 1 = `att5L::fused<64,2,…>`**（左半，5 腿合一：P7 `QUANT_WINDOW` → P8 `GEMM_INT8_QKV` → P9 `WINDOW_ATTENTION` → P10 `QUANT` → P11 `GEMM_WINDOW_INT8_RESIDUAL`）：`TOK=64`（一个 WG 一个 64-token 窗口）、**LW=16**、`SLMB=32,768 B`（= 占用崖，实测 2 resident）、网格 `windows×16 = 510×16 = 8,160` 线程、`PKT = KBN×2048 B` 在 SLM、map `PKT + kb*2048 + row*32`；**新增出口**：把 P10 的 pk2 以 **FFN 半的全局 fragment map** 落一份 global（见发 2 的 map），**不再**由 FFN 半重新 pack；
+- **发 2 = R1 生产者（`quantize + fragment-order store`）**：照 `s6_ffn_block4.cpp` 已验的那一条腿，实测 **0.0892 ms**（`CSVROW;S1;R1_producer_quant+fragstore`）——它把链首 `QUANT` 与"入口面按 dpas fragment 序写"合成**一发**（= §50 的 ③/C1 路线，非新增 pack 腿）；
+- **发 3 = `ffn2c::fused`（1a/M2b 形态，T=32）**：5 腿合一（expand → 核内 requant → contract → outquant → residual），**T=32 / LW=64 / SLM=31,104 B（2 resident）/ 网格 1020 WG**，**唯一改动** = global A 面寻址参数化：
+  `O_PK 入口地址 = face + kb*2048 + (hb*16 + band)*512 + lane*32`（`kb = 0..1`，`hb ∈ {0,1}` = 64-token 窗口的哪一半，`band = (t>>4)`，`lane = (t&15)`），**内部 SLM 的 PK 图（`kb*BANDS + (t>>4)`，BANDS=2）一字不动**；
+- **禁**：`LW=32`（§65 临时规矩 + port 核在 LW=32 的 0/200 与 LW=16 的 4/1000 都不给信任）、`T=64`（§64：ACT2/ACT6 = 128 > LW 64 ⇒ 要 LW=128 = 已证死锁区）、`KN=1`（用 **KN=0** 保留 SLM out 副本，少一个变量）。
+
+**编译（CPU，不占 GPU）**
+```
+& 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -NoProfile -ExecutionPolicy Bypass -File E:\DSH\s6\cc_portE.ps1 -Src E:\DSH\dlss-nr-on-a770\src\bench\sycl\port_e_chain.cpp -Out port_e_chain
+```
+**跑（GPU，先凉 ≥5 分钟；机器读日志走 cmd 原字节 = P16）**
+```
+Set-Location E:\DSH\oneapi
+$env:SYCL_DEVICE_FILTER='level_zero:gpu'; $env:SYCL_CACHE_PERSISTENT='1'; $env:SYCL_CACHE_DIR='E:\DSH\sycl-cache-portE'
+& cmd.exe /c "`".\port_e_chain.exe`" > `"E:\DSH\s6\PE_chain_g1.log`" 2>&1"
+```
+
+## ② B2 的判据（照抄，不许挪）
+1. **逐字节**：**13 项（照 `port_ffn_fused`/block4 的 tap 集：pk1、pk1-face、sc1、hid、pk2、pk2-frag、sc2、out-1275、pk3、pk3-frag、sc3、1267/1270-FINAL + faceA-vs-faceB）+ 4 项接口检查点（面布局字节序、scale 粒度、e4m3 编码、epilogue 出口形态）= 全 diff 0**；任一点 ≠0 ⇒ **停下回报**（贴第一个偏差坐标 + 那行地址表达式原文，军规 25）。
+2. **LIVENESS 反证**：把某个中间面 ×0.5 ⇒ 出口必须变（照 `s6b_att.cpp` 的 `LIVENESS(probs*0.5)` 写法，防"哑火合并"）。
+3. **两组进程交叉** `--cross`：两个独立进程各自跑 gate，互相逐字节比（防"同一进程内自洽、跨进程不一致"）。
+4. **新合成核必须过 `stress_repeat` 的 ≥1000 连发 bad=0**（军规 46/48；200 连发只是快筛 —— §66 实测 0.5% 基率下 200 发会漏报）：
+```
+& 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -NoProfile -File E:\DSH\dlss-nr-on-a770\tools\stress_repeat.ps1 -N 1000 -Arms ctrl,port,att,ffn2
+```
+（B2 完成后要把链 exe 加进 `-Arms`，并在 `s6/spillcheck_port.py` 的 `label()` 里加链核的 mangled 前缀，否则台账会**静默 0 行** = P14 型坑。）
+5. **单价**：**≥10 独立进程、进程间 ≥60 s**（P18/军规 45：背靠背把 TOPS 压低 >2 倍）、min-of-15×5、60 ms 组间、**nosink**；台账逐列（key 含 simd+module_id），**计价腿 `private/spill/scratch = 0`、`scratch 指令 = 0`**；每相对 `tools/xmx_roof.csv` 报"占屋顶 %"（按 (dtype,N,K,M)，M 成轴；无同形屋顶点必须明说"低可信"，军规 26/37）。
+6. **基线用实测**：`tools/rt_per_closure.csv` 的 **chain 48 = 1.525 ms/链**、**8 条 C64 链均值 1.658**；**不许再用 2.080**（§63⑤/§50 更正）。
+7. **目标**：合成体 **≤0.844 ms/链**（bench 内 −42%）⇒ **8 链 −5.6 ms 串行 ⇒ 帧 −2.4 ms**（诚实净值；别报 −4.5/−5.1）。
+8. **健康闸六条照旧**：不出现小 M/线程饥饿、**launch 只减不增**（11→3 ✓）、**不新增 quant/pack 腿**（发 2 的 fragstore 就是原 `QUANT` 本身 ✓）、计价腿台账干净、每对对照屋顶表、三关（1301 逐位 / 40 门 / 帧对）不变。
+
+## ③ B2 前必须留的空（下次开工直接照着补，不用重新想）
+1. **端到端合成体不存在**：`att5L::fused`（在 `s6b_att.cpp`，1104 行，单 main）与 `ffn2c::fused`（在 `s6_ffn_block4.cpp`，1909 行，单 main）**都是 bench 内联核，没有 header 可 include**；两边还有同名 helper（`Stat/timeit/csvrow/mk/diffbytes`）⇒ **不能 `#include` 拼 TU**（会撞名 + `main` 撞）。做法 = 新建 `src/bench/sycl/port_e_chain.cpp`，用 python 按行区间**机械抽取**两个核体（`att5::fused` ≈ `s6b_att.cpp:100-670`；`ffn2::fused` + `Shape` ≈ `s6_ffn_block4.cpp:150-1100`）进两个各自独立的 `namespace PE_ATT / PE_FFN`，再写新的 host main（≈250 行）。抽取脚本照 `s6/pe_mkstress*.py` 的 marker 写法（幂等、可重放）。
+2. **共享面串法（唯一的新数据流）**：att 半的 P10 现在把 pk2 只留在 SLM（`PKT`）给 P11 用 ⇒ 合成时**必须多落一份 global fragment 面**给发 3 用；这份 store 的代价 = 与发 2（R1 生产者 0.0892 ms）同量级 ⇒ **要在 B2 单价里显式列出这一腿**，不许混进"零 pack"口号里。
+3. **`WKey` 教训（四元组防串键）**：新核的 JIT cache key 第四字段（module id / defines）必须与两半的旧件**不同**，并在 trace 里打印四元组；否则 `sycl-cache-portE` 会把旧模块当新的复用 ⇒ 出现"改了源码读数不动"的假象（刀 1 的 WKey 事故同源）。
+4. **台账标签**：`s6/spillcheck_port.py` 的 `label()` 目前认 `port::fused` / `ffn2c::fused` / `p2::fused` ⇒ **加 `pe_chain::` 前缀**，否则新核不进台账 = 静默漏判（P14）。
+5. **flaky 探针的开关陷阱**：`ffn2` 的 M-FLAKY 只在 **`C2_STAGE=1 或 3`** 才执行（`C2_STAGE=2` 释放 1a taps ⇒ 探针**静默不跑**，本轮第一次就是这么漏的）。
+6. **port 核的病只到"族"，未到"指令"**（§66 的 mod-16 ∈ {0,7} = 8 行 fragment 边界是最强线索）：下一步最便宜的 A/B = **按 NPHASE 截断做压力**（`PORT_STRESS_PHASE=2/3/4/5`，脚本 `s6/pe_mkstress_ph.py` 已写好、**未编译未跑**）⇒ 若 bad 只在 ≥4 出现 ⇒ 病在 outquant/residual；若 2/3 就翻 ⇒ 在 expand/requant。**GPU 归用户，跑前先凉 ≥5 分钟。**
+
+## ④ 现场（16:2x 实证，全部 host 侧）
+见 §69（清理 + md5 实证 + 进程 0）。**本轮到此停手，不开 B2、不做新测量、不编译。**
+
+## B2-ready（**由主会话代写：代理在落盘前被暂停令打断**；下次开工直接照这一节走，不用再问）
+
+**现场已核（16:2x，全部实证）**：`git` = `b54de7e`、porcelain **CLEAN**；`out\libxmx.dll` = `oneapi\libxmx_sycl.dll` = **`ABB969FE…`**；三金标 `bk.1301.bin`=`bk.1301.skip.bin`=**`DD49827D…`**、`bk.1301.pre-skip-1a.bin`=**`249A46F3…`**；**GPU/bench 进程 = 0**；`E:\DSH\tmp\pe_stress.cpp`、`pe_stress_att.cpp` 仍在（已被仓内版 `src/bench/sycl/stress_repeat.cpp` 取代，可删）。
+
+### ① B2 要写的东西（端到端合成体，**目前不存在**）
+`src/bench/sycl/port_e_chain.cpp` = **一条 C=64 链、11 发 → 3 发**，两半各自已绿、只差串起来：
+- **att 半** = `s6b_att.cpp` 的 `att5L::fused`（**0 bad / 1200 连发**，GATE GREEN，C64 档 5 发合一相 wall **0.4329** / GPU 0.3531）；
+- **FFN 半** = `s6_ffn_block4.cpp` 的 `ffn2::fused`（**0 bad / 600 连发**，9/9 + 13/13；**M2b 档 0.4109-0.4142**）；
+- **共享面直连（零 pack / 零 quant）**：把 **FFN 半的 global A 面寻址参数化**成
+  `kb*2048 + (hb*16 + band)*512 + lane*32`（`hb ∈ {0,1}` = 窗口半），
+  与 att 半的 `PKT + kb*2048 + row*32` **逐位同式**；scale 单列同形（`AS2 + row*4` vs `O_SC + t*4`）；
+- **几何锁死**：**T=32、LW=64、SLM 31,104 B（2 resident WG）、网格 1020 WG**（与现档 `nblk = M/T = 1020` 一致）；**禁 LW=32**、**一律 KN=0**；
+- **不许改数值**：累加顺序、`fdiv_rn`、e4m3 snap、`eh_round/ef_div`、FMA contraction 全部 VERBATIM。
+
+### ② B2 的判据（写死，缺一不算成）
+1. **13 + 4 项检查点逐字节 = 0**（4 项接口 = 面布局字节序 / scale 粒度 / e4m3 编码 / epilogue 出口形态）；
+2. **LIVENESS 反证**（中间面 ×0.5 ⇒ 出口必须变）+ **`--cross` 两组进程 IDENTICAL**；
+3. **新合成核必须过自重复门：`stress_repeat` ≥1000 连发 bad=0**（军规 46/48；**注意 200 连发只做快筛**——本案 port 核 1×200 bad=0、2×1000 各 bad=4，真基率 ≈0.5%）；
+4. **单价**：≥10 个独立进程、**进程间 ≥60 s**（P18/军规 45：背靠背把 TOPS 压低 2.5 倍）、min-of-15×5、nosink、台账逐列（**key 含 simd+module_id**，`private/spill/scratch=0`、scratch 指令=0）；
+5. **基线用实测**：`tools/rt_per_closure.csv` 的 **chain 48 = 1.525 ms/链**、**8 条 C64 链均值 1.658**（**不许再用 1a 之前的 2.080**）；
+6. **目标 ≤0.844 ms/链**（bench 内 −42%）⇒ **8 链 −5.6 ms 串行 ⇒ 帧 −2.4**（**诚实净值，别报回 −4.5/−5.1**）。
+
+### ③ B2 之前必须留的空 / 已知坑
+- **`WKey` 四元组**：新支路的权重缓存键必须另立字段，**复用 split 键会静默吃到非块对角的预铺 B**（门可能照样绿、到 1301 才爆）；实施后**先跑 1301 再看门**，并在 trace 里打印四元组；
+- **`att5L` 的 fATT 面故意不 scrub / 不比**（核不重写整块 att 面；第一版误算造成 **bad=199/200 假警**）；
+- **`ffn2` 臂只在 `C2_STAGE=1 或 3` 执行**（`C2_STAGE=2` 释放 1a taps ⇒ 探针静默不跑）；
+- **接图（阶段 C）需要记录/计划层换序 + 稳定面**（§56b：96 个 residual 站点里相邻同形腿对 = 0；R9 已证"重写本身在改图"）⇒ **B2 只在 bench 层，接图前另立铲**；
+- **构建一律走 `tools/build_shipped.ps1` + `tools/shipped_build.defs`**（HEAD 不带 `/D` ⇒ 1301 会落在旧代 `249A46F3`，逐位门假红）。
+
+### ④ 下次开工第一步（照抄）
+```
+# 0) 现场核对 + 凉 GPU >=5 分钟（本轮 GPU 已用 ~55 分钟）
+cd E:\DSH\dlss-nr-on-a770 ; git status --porcelain        # 期望 0 行
+Get-Process | ? { $_.ProcessName -like 'LOP-Win64-Shipping*' }   # 期望 0（用户在玩就等）
+# 1) 先复现两颗牙（~2 分钟，确保仪器还在响）
+cmd /c "E:\DSH\oneapi\stress_repeat.exe >> E:\DSH\s6\SR_ctrl.log 2>&1"     # 期望 bad=0/200
+cmd /c "set PORT_STRESS=1000&& E:\DSH\oneapi\port_ffn_fused.exe >> E:\DSH\s6\SR_port.log 2>&1"   # 期望 bad>0
+# 2) 再写 port_e_chain.cpp（按 ①），gate 全绿后才谈单价
+```
+
+### ⑤ 新仪器坑 P19（本次实测）：**python 在 GBK 控制台打印 CJK/箭头会 `UnicodeEncodeError` 崩**
+⇒ **脚本里若要打印非 ASCII，先 `sys.stdout.reconfigure(encoding="utf-8")`**，或只打印 ASCII 摘要（**16c 的延伸：不只是 .ps1，任何机器读的 stdout 都优先 ASCII**）。
+
+---
+
+# §69 停机现场（**代理侧实证，16:2x**；本节取代上面"B2-ready 现场已核"里关于 tmp 的那句）
+**只做 host 侧三件事，未跑任何 GPU、未编译。**
+**① 清理（已执行）**：删除 `E:\DSH\tmp\pe_stress.cpp`（67,604 B，md5 `F3552A9C2715CFD1FE634050935DC769`）与 `E:\DSH\tmp\pe_stress_att.cpp`（81,593 B，md5 `0CF3CEB22CECEA89B6ECFB3FF7E334E1`）——功能已被仓内版取代（`src/bench/sycl/stress_repeat.cpp` + `port_ffn_fused.cpp`/`s6b_att.cpp` 内建的 `PORT_STRESS` / `S6B_ATT_REPEAT`）。
+**留下一个半成品（如实登记，未编译未跑）**：`E:\DSH\tmp\pe_stress_ph.cpp`（68,306 B，16:22 生成）= §68③6 / 上面③ 说的 **NPHASE 截断压力 A/B** 副本；生成器 `s6/pe_mkstress_ph.py` 在仓外 `s6\`，下次一条命令可重建。
+**② md5 实证（逐条跑过）**
+```
+out\libxmx.dll                ABB969FE4AAF0F94AA03C3F53781EDD0
+oneapi\libxmx_sycl.dll        ABB969FE4AAF0F94AA03C3F53781EDD0
+dumps\bk.1301.bin             DD49827DD33A7EF07C2C17892F18970D
+dumps\bk.1301.skip.bin        DD49827DD33A7EF07C2C17892F18970D
+dumps\bk.1301.pre-skip-1a.bin 249A46F374E98EB5FF5AD5E3A38EBC55
+out\test_1270e4m3.dll         D37FFD5D081CEF1B7C394182A37F6457
+out\test_skip_c512.dll        2D878C079E3AA46EC6C20E743381B70B
+```
+**③ 进程**：`nr_replay / stress_repeat / port_ffn_fused / s6b_att / b4_* / pe_* / batch_merge_probe / knife2_probe / icx` = **0**；`LOP-Win64-Shipping` = **0**（GPU 交还用户）。
+**④ 日志计数核对**：本轮 46 个机器读日志**全部非空**（`B0_*` 30 个、`B0S_*` 4、`S1_*` 6、`S1b_*` 6、`S2_*` 5）；最短 = `S2_ctrl.log` **1 行** = 设计如此（`stress_repeat.exe` 只打一行 `STRESS SUMMARY … bad=0`），不是截断。
+**⑤ 仓**：tip 已从 `d8af4d6` 前进到 **`b54de7e`**（主会话把 §67 仪器 + B2-ready 入库），porcelain **0**；**我未 commit、未 push**。
+**⑥ 停机**：B2 未开、无新测量、无编译。下次开工：先凉 ≥5 分钟（本轮 GPU ≈55 分钟），再照上面"④ 下次开工第一步"复现两颗牙。
+
+---
+
+# §70 B2a = **合成体建成并通过门 1-3**　2026-11-04 02:0x-02:5x
+**新文件（bench 层）**：`src/bench/sycl/port_e_chain.cpp`（480 行）+ 生成物 `src/bench/sycl/port_e_chain_bodies.inc`（`s6/pe_mkchain.py` 从 `s6b_att.cpp` + `s6_ffn_block4.cpp` **逐字抽取**、各自包进 `namespace PE_ATT / PE_FFN`、`main` 改名保留）。exe `oneapi\port_e_chain.exe`：本轮多次重编，最终 **`EC1D8CFE8A9554D10D1A4FD190E966D3`**（2,527,744 B），编译带 `-Defs '/DM_P4FORM=0 /DM_PEAK=1 /DM_P3SPLIT=1'`（M2b 档；`Shape` 有 static_assert 要求模板参数 = 宏 ⇒ 档位只能走编译期，不能运行期选）。
+
+**形态**：一条 C=64 链（plan closures 641..651）= **11 个 plan op / 现路 13 个 device 发 → 3 发**：
+- **L1** `PE_ATT::att5::fused<64,2,5,DUMP,LIVE>`（5 腿：QUANT_WINDOW→QKV→WINDOW_ATTENTION→QUANT→GEMM_WINDOW_INT8_RESIDUAL，出口 = 1270 token 序）
+- **L2** `packdev::pack_a_fused(1270 → face + scA)`（链自己的 QUANT=646，顺手按 dpas fragment 序落 A 面 = R1 生产者）
+- **L3** `PE_FFN::ffn3::fused<S,true,NPH-1,0>`（1a/M2b 五腿一发，P1 由 L2 供，出口 = 1267）
+- 几何：**T=32 / LW=64 / SLM 31,744 B（台账实测，2 resident）/ 1020 WG**；**KN=0**；**未用 LW=32** ✓
+- REF（对照）= 13 发拆腿链（att 5 + FFN 8：`qr_launch_esimd / gather_pack_a_b_v / gemm_b_pub_slm / qr / gather_pack_a_b_v / gemm_b_pub / pack_a_fused / gemm_b_res`）+ scores/probs 的 split 权威（`pack_a16_b / pack_b16_t_b / f16v2::gemm_b2 / smax::softmax_kernel`）
+
+**门 1（逐字节）= 25 项全 0**：att 12 项（`pk0 sc0 Q-plane K-plane V-plane scores probs att(P9) pk2 sc2 pk2-folded 1270-FINAL`）+ FFN 13 项（`pk1 pk1-face faceA-vs-faceB sc1 hid pk2 pk2-frag sc2 out1275 pk3 pk3-frag sc3 1267-FINAL`）；其中 4 项接口 = 面布局字节序（`pk1-face` + `faceA-vs-faceB`：**一发生产者面 = 两发 qr+retile 面 = split packA 面**）、scale 粒度（`sc1/sc2/sc3` 每行一 float）、量化编码（`pk1/pk2/pk3`）、epilogue 出口形态（`out1275/pk3-frag/1267-FINAL`）。
+**稳定性：6 个独立进程（40 s 间隔）= 6/6 GATE GREEN。**
+**门 2（LIVENESS）= 过**：`faceB /= 2` 后重跑 L3 ⇒ `1267 differs in 1,158,095 / 4,177,920 bytes`，6 个进程数字完全一致 ⇒ 共享面真的喂到出口。
+**门 3（cross）= IDENTICAL**：`PE_blobA.bin` / `PE_blobB.bin`（16,842,240 B = 1270+1267+face+scA+out1275+pk3+sc3）md5 同为 **`7E963BF25B6F3E8B4608D8F185FB875E`**，`CROSS …: IDENTICAL`。
+**门 4（预跑，正式读数见 §72）= 合成体 2 × 1000 连发 bad=0**（L1+L2+L3 全链、每次发射前哨兵 memset、与 launch-0 逐字节比）。
+
+# §71 **新坑 P20：bench 里 `q.wait()` 不保证 producer→consumer 可见性**（这次是先撞在我自己的合成体上）
+**症状**：同一个 `port_e_chain.exe`、同一个 `sycl-cache-portE`，**4 个进程里 2 个 GATE RED**，且错在 **REF 侧**：`packdev::gather_pack_b_b` 的出口 `dBpE` 前 8 字节 = `0 0 0 0…`（输入 `dWER` 正确）⇒ REF 的 expand 写全零 hidden ⇒ 9 项 DIFF。
+**排除**：不是 D2H 读空（设备侧探针也是零）、不是内存压力（当时只分配 120 MB）、不是编译差异（同一 exe）。
+**修法**：每个 producer→consumer 交接点插 `q.ext_oneapi_submit_barrier()`（出货 bench 本来就这么写：`leg_pk2` = `pack_a_fused(...); return q.ext_oneapi_submit_barrier();`）。插了 9 处之后 **6/6 GREEN + 2/2 cross IDENTICAL**。
+**审计（`s6/p20_audit.py` → `E:\DSH\s6\p20_audit.csv`，30 行）**：
+| harness | 交接点 BARRIER | wait-only / NO-SYNC |
+|---|---|---|
+| `port_ffn_fused.cpp`（PORT_STRESS 臂） | 2（我加的开关） | 5（phase bisection 的 5 发计时 NO-SYNC）+ 2 |
+| `s6b_att.cpp`（S6B_ATT_REPEAT 臂） | **0** | 9 |
+| `s6_ffn_block4.cpp`（M_REPEAT 探针） | 3（开关） | 9 |
+| `stress_repeat.cpp`（负对照） | 0 | 1（memset→launch，只有 wait） |
+| `port_e_chain.cpp` | 9 | — |
+**控制实验（port 核 `KN=1 LW=16`，同一 exe，`PORT_STRESS_BAR` 开关，2×1000 连发 × 两臂，进程间 60 s）**：
+| 臂 | bad / 1000 | 签名 |
+|---|---|---|
+| **BAR=1（每处交接都有 submit barrier）** | **4 + 3 = 7 / 2000** | `dOUT/dPK3/dSC3`，`row%16 ∈ {0,7}`，`sentinel_pairs=0` |
+| **BAR=0（原始 wait-only）** | **4 + 3 = 7 / 2000** | 同上 |
+⇒ **两臂同率 ⇒ P20 解释不了 port 核的不自重复 ⇒ §64/§67 的结论维持**（他们的核真的不可重复，≈0.35%/发）；而且这反过来**加强**了 §66 的归因：错在**核内**（跨波 SLM/global 交接），不是 host 侧命令序列。
+**要重读的历史账**：`notes/port-M.md:249-252` 的 **"1/158"** 用的是 `s6_ffn_block4.cpp` 的 `M_REPEAT` 探针（当时 wait-only、且 `C2_STAGE` 组合未知）⇒ 同一类嫌疑。**正在跑 A/B**（`s6/p20_block4.ps1`：S1/S2 × BAR=0/1 × 1000 连发，job `pwsh-86f918005a544e37`）⇒ 读数进 §72。
+**军规候补（建议主会话入库）**：**军规 49 = bench 里任何"kernel 写 → 下一个 kernel 读/主机比"的交接必须显式 `ext_oneapi_submit_barrier()`；`q.wait()` 只保证完成、不保证下一个 kernel 读到。缺它会让逐字节门随机假红（也会让 flaky 探针读数失真）。**
+
