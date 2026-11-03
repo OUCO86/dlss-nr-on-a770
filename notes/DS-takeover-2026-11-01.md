@@ -1441,3 +1441,27 @@ T1 的机器读数：**corr_min 0.9828**（R .983 G .992 B .990，luma .991）�
 - 匹配器先例：`struct S6Chain`@541、`s6_on()`@556（`NR_S6_FFN` 默认 ON）、`s6_take_*`@575/592/617 逐级 stage 校验 + `s6_gap` 相邻检查、`s6_take_residual`@650 在最后一腿匹配时把前 5 个 closure 置 no-op、`g_s6_fires` 计数、`NR_S6_TRACE` record-time witness@683、**"all six or none"**@676-679；
 - 权重键：`WKey{id,a,b,c}`@475 + `cached_pack_b_i8`@494；att 半两个 pack（QKV `3C x C`@3674/4087、proj `C x C`@4091）**现路已用同键** => CHAIN2 不需要新键，但按清单③在 trace 里打印四元组；
 - 新开关 **`NR_ATT5_FUSE`，默认 0 = 现状逐位不变**；接图件只出 `builds\`；`out\libxmx.dll`(ABB969FE) 与三金标不动。
+
+## 74. ★★ C-1 交回：**默认档自证逐位不变（1301 = `DD49827D`、passes 691、skip 计数一字未变）**；ON 档不逐位（82.6% 散）且图内慢 +4.4 ms/run ⇒ **停条件触发、按令交续跑包**；**根因已定位 = 我绑错 plan buffer + 图像 pitch 假设，不是核**
+**做完的东西（bench 层 + 默认 OFF 的接线，未 commit）**：
+- **`src/bench/sycl/att5_fused_kernel.hpp`**（42,540 B）= `s6b_att.cpp:87-617` 的 `namespace att5` **逐字抽出**（生成器 `s6/pe_mk_att5_hpp.py`；只把 bench 文件级 `using namespace sycl;` / `namespace esimd=` 搬进 namespace，**核体一字未改**）；先单独 probe 编译通过；
+- `libxmx_sycl.cpp` +约 200 行：`struct A5Chain` + `a5_on()`（**`NR_ATT5_FUSE` 默认 0**）+ 五个 record-time hook（照 `S6Chain`/`s6_take_*`/`s6_gap` 先例，**四条腿全 no-op 或全不 no-op**）+ `a5_att_run()`（在 645 自己的 closure 里跑 `att5::fused<64,2,5,false,false>`，操作数全用现路 plan buffer、**零新面、零 pool_get**；权重走 `cached_pack_b_i8(wqkv,3C,C)` 与 `(wo,C,C)` = **与 split 腿同一个 WKey**）+ `NR_ATT5_TRACE` witness（fire 序号 / 几何 / 被 no-op 的 closure 号 / 两个 WKey 四元组 / **逐操作数 id+bytes**）；
+- 变体件 `builds\libxmx_att5a.dll = 35F6FFEA`（干净版）-> `att5c/d/e/f/g`（诊断），**`att5g = BC28CE374D6AFEBD35F5EA94EBC16005`**。
+**② 双档读数**（`walk.ps1 -Dll builds\...`）：
+| 档 | passes | 1301 | 每 run 帧时 |
+|---|---|---|---|
+| **默认（不设 env）** | **691** | **EXACT = `DD49827D…`** | 58.02 / 58.27 / 58.43 ms |
+| `NR_ATT5_FUSE=1` | 691（closure 数不变，与 S6 同口径） | **MISMATCH = `249A46F3…`（= pre-skip-1a 那颗）** | **62.71 / 62.84 / 62.85 => 慢 +4.4 ms/run** |
+逐位差 = **82.635% 字节（6,904,834 / 8,355,840），第一个差异在 byte 0** => 不是末位漂移，是"输出换了来源"级别。**S6 没被破坏**：两档 `[s6-fire]` 都 40 行、样例一字不差 => FFN 半的既有融合不受影响。**fire 覆盖面**：8 条 C64 链只 fire 到 **2 条**（x2 次录制 = 4 行）。
+★ **根因（`[a5-op]` 运行期逐操作数 id+bytes 实测）**：
+`src1267 id=1303 bytes=66,846,720`（期望 4,177,920）、`out1270 id=1271 4,177,920` OK、`faceQ id=1308 4,571,136`、`faceK id=1307 33,554,432`、`faceV id=1309 4,571,136`（都不是 plane_want）；bias/scale/bscale/W 全 OK。
+- **66,846,720 = 960 x 544 x 64 x 2（精确）** => **引擎的 1267 是整幅 960x544 的 f16 面**，而 bench 的 `dImg` 是 **136 x 240 x 64**；链的 M=32640 只覆盖子窗口网格，**行距 pitch = 960 而不是 240** => 融合核 P7 gather 与 P11 skip 按 `x + y*image_w` 寻址 => **读错像素** => 82% 全散；**这也解释了 `P(id,bytes,what)` 的下界校验为什么没炸：buffer 比需要的大**。
+- **Q/K/V 三面也不匹配**：4,571,136 = 2 x (558 x 64 x 64) => **558 窗口**，而我们这条链是 **510 窗口** => **这些 id 属于另一条链 / 另一次录制的实例**（plan 首轮录制会把 buffer 建成 tiny placeholder、后续 resize => **id -> pointer 在运行期可能指向别的实例**）。
+⇒ **结论：融合核本身没问题**（bench 里 25 检查点 0 差、0 bad / 2000），**错在 C-1 的 buffer 绑定与图像 pitch 假设**。
+
+### 74b. ★ 新事实（对以后每一把接图铲都关键）+ 军规 56
+**引擎面几何事实（实测）**：`1267` 类残差面在引擎里是 **整幅 960x544**（C=64 => 66,846,720 B），**pitch = 960**；bench 用的是 **链局部 136x240**（pitch 240）。**同一 id 的 buffer 在不同录制里可能 resize 成别的实例**（558 窗口 vs 510 窗口的 Q/K/V 面即为此例）。
+**军规 56**：**接图前必须用运行期 `[a5-op]` 式的逐操作数 `id + bytes` 对账**，把每个操作数的 **bytes 与 pitch** 与 bench 假设逐项核对；**`P(id,bytes,what)` 只校验下界会静默放过"buffer 过大"**（本案就是）=> 校验要同时查 **bytes 上界 == plane_want** 与 **pitch/维度语义**，否则接图会把"读错像素"当成"核错了"。
+**续跑包（下一条命令原样，按代价从小到大）**：① 给 `att5::fused` 加 `image_pitch` 参数（plan 侧 960、bench 侧 image_w），P7 gather / P11 skip 改 `base + y*pitch*C + x*C`；**bench 的 dImg 扩成 960x544 全幅 + 同 top/left**，然后**重跑 25 检查点门**（**不重跑门就不许再接图**）；② 核对 Q/K/V 三面在 `xmx_rec_gemm_int8_qkv` 里的真实尺寸来源（`g_bufs[q].bytes` 怎么算、`l0_ceil_bm` 之类）把 fragment 面对齐；**若必须另立私有面 => 违反清单④"零新面" => 停下回报**；③ fire 覆盖面：把 `a5-dbg` 的 40 行上限放大 + 对 8 条 C64 链逐条打 tuple，找出被挡掉的 6 条；④ 然后才是 自重复门（>=1000 连发，面集合按军规 51）-> 40 门 -> 帧 16 对。
+**复现命令**：`tools/build_shipped.ps1 -Tag att5g`；`walk.ps1 -Dll E:\DSH\builds\libxmx_att5g.dll -Tag att5g_on -Runs 1`（前置 `NR_ATT5_FUSE=1 NR_ATT5_TRACE=1 SYCL_CACHE_DIR=E:\DSH\sycl-cache`）。
+**安全边界**：`NR_ATT5_FUSE` 默认 0 且默认档已自证逐位不变（1301 = `DD49827D`、passes 691、`chains_skipped=14 refused=0 closures_noop=168` 一字未变）=> **这堆接线对现在的 shipped 零影响**；本轮 C-1 GPU 约 8 分钟（5 次 walk）。

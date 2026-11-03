@@ -47,6 +47,8 @@
 #include "gemm_f16_v3_kernel.hpp"
 #include "pack_device.hpp"
 #include "s6_ffn_block_kernel.hpp"   // S6-1a block-resident FFN chain (NR_S6_FFN; body verbatim from s6_ffn_block2.cpp:68-400)
+// A5: the C=64 attention half fused (NR_ATT5_FUSE; body verbatim from s6b_att.cpp:87-617)
+#include "att5_fused_kernel.hpp"
 #include "pre_kernel.hpp"
 #include "post_kernel.hpp"
 #include <cstring>
@@ -730,6 +732,221 @@ static void s6_ffn_run(const S6Fuse& f) {
         static_assert(S::T == 16 && S::SLM <= 32768u, "S6 S2 shape/slm drift");
         ffn2::fused<S, false, S::NPH>(*GQ, a);
     }
+}
+
+// ==================== A5: the C=64 attention half fused (NR_ATT5_FUSE) ====================
+// What this is: the frame's attention closure is FIVE recorder ops per C=64 chain --
+//   QUANT_WINDOW(1267 -> pk/sc) -> GEMM_INT8_QKV(pk x W81 -> Q,K,V) ->
+//   WINDOW_ATTENTION(Q,K,V,bias -> 1277) -> QUANT(1277 -> pk2/sc2) ->
+//   GEMM_WINDOW_INT8_RESIDUAL(pk2 x W79 -> 1270, skip=1267)
+// (rt_per_closure.csv chain 48: 0.0021 + 0.2922 + 0.4266 + 0.0021 + 0.2592 = 0.982 ms).
+// The pk/sc planes and the Q/K/V planes are single-read by the next op of the same chain (the
+// census: all 104 quant_window pks are single-read by exactly the next QKV), so the whole block
+// can live inside ONE launch: att5::fused keeps the gather-quant, the scores/probs and the PKT
+// fold in SLM; only the 1267 read and the 1270 write survive.
+//
+// WIRING RULE (the S6-1a precedent, knife2b #75): the pairing happens at RECORD time through a
+// strict adjacency state machine over the five recorder sites. When a chain completes, the
+// closures are NOT dropped -- the first FOUR become no-ops and the window-residual's own closure
+// runs the fused kernel. Partial no-oping is forbidden: the split legs read pk/QKV scratch the
+// fused leg never writes, so a half-fused chain would read junk. The closure COUNT (and with it
+// 'passes') is unchanged; only bodies change.
+//
+// SWITCH: NR_ATT5_FUSE -- DEFAULT 0 = the split path verbatim (bit-identical to today's shipped).
+// NR_ATT5_FUSE=1 wires the eight C=64 chains only. Read once per process. Military rules 4/9: no
+// branch was added inside the kernel -- the switch lives at closure level only.
+// NR_ATT5_TRACE is a record-time host witness (prints nothing on the device, adds no op),
+// presence-gated like the NR_*_TRACE family. It prints the matched closure indices AND both
+// weight-cache four-tuples: a wrong WKey would silently feed a non-block-diagonal pre-packed B
+// and could still pass the byte gates (knife2b #68).
+//
+// EVIDENCE (bench, byte-exact): port_e_chain.cpp -- 25 checkpoints diff=0 between this 2-launch
+// composition and the 13-launch shipped chain; 6/6 processes GREEN; cross-process blob IDENTICAL
+// (md5 7E963BF25B6F3E8B4608D8F185FB875E); LIVENESS proven; 0 bad / 2000 self-repetition
+// relaunches of the DUMP=false form. PRICE (bench, min-of-15x5, 10 processes, 60 s apart):
+// att half 5 legs 0.6435 -> 1 launch 0.4336; the composition 13 launches 1.4112 -> 2 launches
+// 0.9421 (ratio 0.6676 => chain 1.525 -> ~1.02 ms, 8 chains ~-4.1 ms serial, frame ~-1.8 ms).
+// NOT wired: the C=128 rung (att fused measured +51% slower there, SLM 41,984 B crosses the
+// 32 KB cliff) and nothing outside the eight C=64 chains (0,1,2,3,48,49,50,51).
+struct A5Chain {
+    int stage = 0;                 // 0 idle | 1 QW | 2 QKV | 3 WA | 4 Q2 (awaiting the window residual)
+    size_t c_qw = 0, c_qkv = 0, c_wa = 0, c_q2 = 0;   // g_cmds indices of the four future no-ops
+    int src = 0, pk = 0, sc = 0;                     // 641 operands (recorder buffer ids)
+    int wqkv = 0, bsqkv = 0, qkvsc = 0;              // 642: weight / b_scale / qkv_scale ids
+    int q = 0, k = 0, v = 0;                         // 642 targets = the fused kernel's faces
+    int bias = 0, att = 0;                           // 643: bias id, the 1277 plane id
+    int pk2 = 0, sc2 = 0;                            // 644 operands
+    unsigned M = 0, C = 0, heads = 0, tokens = 0, batches = 0;
+    unsigned height = 0, width = 0, across = 0, pad = 0;
+};
+static A5Chain g_a5;
+static long g_a5_fires = 0, g_a5_fires_gen = 0;
+static bool a5_on() {
+    static bool v = getenv("NR_ATT5_FUSE") ? (atoi(getenv("NR_ATT5_FUSE")) != 0) : false;
+    return v;
+}
+static void a5_reset() { g_a5 = A5Chain(); }
+static bool a5_gap(size_t a, size_t b) { return b > a && (b - a) <= 4u; }
+static int g_a5_dbg = 0;
+static void a5_dbg(const char* where, size_t cmd, int stage, const char* why) {
+    if (!getenv("NR_ATT5_TRACE") || g_a5_dbg >= 40) return;
+    ++g_a5_dbg;
+    printf("[a5-dbg] %-12s cmd=%zu stage=%d %s\n", where, cmd, stage, why ? why : "");
+}
+
+static void a5_note_qw(size_t cmd, int source, int packed, int scale, unsigned M, unsigned K,
+                       unsigned height, unsigned width, unsigned across, unsigned pad) {
+    if (!a5_on()) return;
+    a5_reset();
+    a5_dbg("qw", cmd, 0, "");
+    if (M != 32640u || K != 64u || !across || !height || !width) { a5_dbg("qw-REJECT", cmd, 0, "M/K/geom"); return; }
+    g_a5.stage = 1; g_a5.c_qw = cmd;
+    g_a5.src = source; g_a5.pk = packed; g_a5.sc = scale;
+    g_a5.M = M; g_a5.C = K; g_a5.height = height; g_a5.width = width;
+    g_a5.across = across; g_a5.pad = pad;
+}
+static void a5_take_qkv(size_t cmd, int a, int b, int q, int k, int v, int a_scale, int b_scale,
+                        int qkv_scale, unsigned M, unsigned channels, unsigned heads,
+                        unsigned tokens, unsigned flags) {
+    if (!a5_on()) return;
+    if (g_a5.stage != 1 || !a5_gap(g_a5.c_qw, cmd)) { a5_dbg("qkv-REJECT", cmd, g_a5.stage, "stage/gap"); a5_reset(); return; }
+    a5_dbg("qkv", cmd, g_a5.stage, "");
+    if (a != g_a5.pk || a_scale != g_a5.sc || M != g_a5.M || channels != g_a5.C ||
+        channels != heads * 32u || tokens != 64u || (flags & ~0x2000u)) { a5_dbg("qkv-REJECT", cmd, g_a5.stage, "tuple"); a5_reset(); return; }
+    g_a5.stage = 2; g_a5.c_qkv = cmd;
+    g_a5.wqkv = b; g_a5.bsqkv = b_scale; g_a5.qkvsc = qkv_scale;
+    g_a5.q = q; g_a5.k = k; g_a5.v = v; g_a5.heads = heads; g_a5.tokens = tokens;
+}
+static void a5_take_wa(size_t cmd, int q, int k, int v, int bias, int out,
+                       unsigned batches, unsigned heads, unsigned merged) {
+    if (!a5_on()) return;
+    if (g_a5.stage != 2 || !a5_gap(g_a5.c_qkv, cmd)) { a5_dbg("wa-REJECT", cmd, g_a5.stage, "stage/gap"); a5_reset(); return; }
+    a5_dbg("wa", cmd, g_a5.stage, "");
+    if (q != g_a5.q || k != g_a5.k || v != g_a5.v || heads != g_a5.heads || merged != 1u ||
+        heads == 0u || batches % heads || batches / heads * g_a5.tokens != g_a5.M) { a5_dbg("wa-REJECT", cmd, g_a5.stage, "tuple"); a5_reset(); return; }
+    g_a5.stage = 3; g_a5.c_wa = cmd; g_a5.bias = bias; g_a5.att = out; g_a5.batches = batches;
+}
+static void a5_note_quant(size_t cmd, int source, int packed, int scale, unsigned M, unsigned K) {
+    if (!a5_on()) return;
+    if (g_a5.stage != 3) return;
+    if (!a5_gap(g_a5.c_wa, cmd) || source != g_a5.att ||
+        M != g_a5.M || K != g_a5.C) { a5_dbg("q2-REJECT", cmd, g_a5.stage, "gap/src/M/K"); a5_reset(); return; }
+    a5_dbg("q2", cmd, g_a5.stage, "");
+    g_a5.stage = 4; g_a5.c_q2 = cmd; g_a5.pk2 = packed; g_a5.sc2 = scale;
+}
+struct A5Fuse {
+    int wqkv = 0, wo = 0, bsqkv = 0, qkvsc = 0, bias = 0, bs2 = 0, cosine = 0;
+    int src = 0, out = 0, q = 0, k = 0, v = 0;
+    unsigned M = 0, C = 0, heads = 0, windows = 0, across = 0, top = 0, left = 0, ih = 0, iw = 0;
+};
+// the window-residual leg = the chain's last op. On a match the four earlier closures become
+// no-ops and THIS closure runs att5::fused. Returns false unless every field of the tuple agrees.
+static bool a5_take_wres(size_t cmd, int a, int b, int c, int a_scale, int b_scale, int skip,
+                         int cosine, unsigned M, unsigned N, unsigned K, unsigned flags,
+                         unsigned height, unsigned width, unsigned across, unsigned pad,
+                         A5Fuse& outf) {
+    if (!a5_on()) return false;
+    A5Chain g = g_a5; a5_reset();
+    a5_dbg("wres", cmd, g.stage, "");
+    // A5-644-dissolved: the C=64 chain's 644 QUANT is not an xmx_rec_quant call at all -- the
+    // plan records it as "quant(FUSED-pack)", i.e. the pk2/sc2 production is folded into the
+    // consumer (the same P2 mechanism that makes 641 read "quant_window(FUSED-pack)"). The
+    // fused attention kernel never reads pk2/sc2 (its P10 fold lives in SLM), so the chain may
+    // legally complete from stage 3 as well; 1301 byte-identity is the judge of that claim.
+    if (g.stage != 4 && g.stage != 3) { a5_dbg("wres-REJECT", cmd, g.stage, "stage"); return false; }
+    const size_t prev = (g.stage == 4) ? g.c_q2 : g.c_wa;
+    if (!a5_gap(prev, cmd)) { a5_dbg("wres-REJECT", cmd, g.stage, "gap"); return false; }
+    const unsigned epi = (flags >> 8) & 0xFu;
+    const bool narrow = (flags & 0x1000u) != 0u, half_skip = (flags & 0x40000u) != 0u;
+    // from stage 3 the pk2/sc2 ids are unknown until this very op (the 644 QUANT is dissolved
+    // into the consumer), so only stage 4 can require them to match.
+    const bool needA = (g.stage == 4);
+    if ((needA && (a != g.pk2 || a_scale != g.sc2)) || M != g.M || N != g.C || K != g.C ||
+        epi != 1u || !narrow || !half_skip || skip != g.src ||
+        height != g.height || width != g.width || across != g.across || pad != g.pad ||
+        g.heads != 2u || g.batches == 0u) {
+        if (getenv("NR_ATT5_TRACE") && g_a5_dbg < 40) {
+            ++g_a5_dbg;
+            printf("[a5-dbg] wres-TUPLE cmd=%zu a=%d pk2=%d as=%d sc2=%d M=%u N=%u K=%u epi=%u narrow=%d half=%d skip=%d src=%d ih=%u iw=%u ac=%u pad=%u heads=%u batches=%u\n",
+                   cmd, a, g.pk2, a_scale, g.sc2, M, N, K, epi, (int)narrow, (int)half_skip,
+                   skip, g.src, height, width, across, pad, g.heads, g.batches);
+        }
+        return false; }
+    // THE RULE: all four or none.
+    // A5-NOOP-GUARD: c_q2 is only a real index when the chain passed through a recordable 644
+    // QUANT. From stage 3 it is still 0 -- no-oping g_cmds[0] would kill an unrelated closure.
+    g_cmds[g.c_qw]  = [](){}; g_cmd_names[g.c_qw]  = "quant_window(A5-fused)";
+    g_cmds[g.c_qkv] = [](){}; g_cmd_names[g.c_qkv] = "gemm_int8_qkv(A5-fused)";
+    g_cmds[g.c_wa]  = [](){}; g_cmd_names[g.c_wa]  = "window_attention(A5-fused)";
+    if (g.stage == 4 && g.c_q2) { g_cmds[g.c_q2] = [](){}; g_cmd_names[g.c_q2] = "quant(A5-fused)"; }
+    if (g.stage == 3) { g.pk2 = a; g.sc2 = a_scale; }   // recorded for the witness only
+    ++g_a5_fires; ++g_a5_fires_gen;
+    outf = A5Fuse{ g.wqkv, b, g.bsqkv, g.qkvsc, g.bias, b_scale, cosine,
+                   g.src, c, g.q, g.k, g.v,
+                   g.M, g.C, g.heads, g.batches / g.heads, across,
+                   pad >> 16, pad & 0xffffu, height, width };
+    if (getenv("NR_ATT5_TRACE"))
+        printf("[a5-fire] n=%ld M=%u C=%u heads=%u windows=%u across=%u pad=%u img=%ux%u"
+               " noop=%zu/%zu/%zu/%zu fused@%zu WKeyQKV=(%d,%d,%d,0) WKeyPROJ=(%d,%d,%d,0)"
+               " qkv=%d/%d/%d pk=%d/%d pk2=%d/%d 1267=%d 1270=%d 1277=%d bias=%d\n",
+               g_a5_fires, g.M, g.C, g.heads, g.batches / g.heads, across, pad, height, width,
+               g.c_qw, g.c_qkv, g.c_wa, g.c_q2, cmd,
+               g.wqkv, (int)(3u * g.C), (int)g.C,
+               b, (int)g.C, (int)g.C,
+               g.q, g.k, g.v, g.pk, g.sc, g.pk2, g.sc2, g.src, c, g.att, g.bias);
+    return true;
+}
+static void a5_att_run(const A5Fuse& f) {
+    auto P = [&](int id, size_t bytes, const char* what) -> void* {
+        auto it = g_bufs.find(id);
+        if (it == g_bufs.end())
+            throw std::runtime_error(std::string("a5: ") + what + " not live at run");
+        if (it->second.bytes < bytes)
+            throw std::runtime_error(std::string("a5: ") + what + " smaller than needed at run");
+        return it->second.p;
+    };
+    const size_t pl = (size_t)f.M * f.C * 2u, img = (size_t)f.ih * f.iw * f.C * 2u;
+    // a5-sizes: the RUN-TIME operand ledger (the record-time trace cannot see the real sizes --
+    // the plan is first recorded with tiny placeholders, the step-2588 lesson). If 1267/1270 are
+    // not `img` bytes, or Q/K/V are not `pl`, the matcher bound the wrong plan buffers.
+    if (getenv("NR_ATT5_TRACE")) {
+        auto SZ = [&](int id) -> size_t { auto it = g_bufs.find(id); return it == g_bufs.end() ? 0 : it->second.bytes; };
+        // one line per operand: no format/argument miscount is possible this way
+        printf("[a5-op] img_want=%zu plane_want=%zu\n", img, pl);
+        printf("[a5-op] src1267 id=%d bytes=%zu\n", f.src, SZ(f.src));
+        printf("[a5-op] out1270 id=%d bytes=%zu\n", f.out, SZ(f.out));
+        printf("[a5-op] faceQ id=%d bytes=%zu\n", f.q, SZ(f.q));
+        printf("[a5-op] faceK id=%d bytes=%zu\n", f.k, SZ(f.k));
+        printf("[a5-op] faceV id=%d bytes=%zu\n", f.v, SZ(f.v));
+        printf("[a5-op] bias id=%d bytes=%zu (want %zu)\n", f.bias, SZ(f.bias), (size_t)f.heads * 4096u * 4u);
+        printf("[a5-op] qkv_scale id=%d bytes=%zu (want %zu)\n", f.qkvsc, SZ(f.qkvsc), (size_t)f.heads * 4u);
+        printf("[a5-op] qkv_bscale id=%d bytes=%zu (want %zu)\n", f.bsqkv, SZ(f.bsqkv), (size_t)(3u * f.C) * 4u);
+        printf("[a5-op] wres_bscale id=%d bytes=%zu (want %zu)\n", f.bs2, SZ(f.bs2), (size_t)f.C * 4u);
+        printf("[a5-op] cosine id=%d bytes=%zu (want %zu)\n", f.cosine, SZ(f.cosine), (size_t)f.C * 4u);
+        printf("[a5-op] W81 id=%d bytes=%zu (want %zu)\n", f.wqkv, SZ(f.wqkv), (size_t)(3u * f.C) * f.C);
+        printf("[a5-op] W79 id=%d bytes=%zu (want %zu)\n", f.wo, SZ(f.wo), (size_t)f.C * f.C);
+        fflush(stdout);
+    }
+    sycl::half* dImg = (sycl::half*)P(f.src, img, "1267");
+    sycl::half* Out2 = (sycl::half*)P(f.out, img, "1270");
+    sycl::half* Q  = (sycl::half*)P(f.q, pl, "Q");
+    sycl::half* Kk = (sycl::half*)P(f.k, pl, "K");
+    sycl::half* V  = (sycl::half*)P(f.v, pl, "V");
+    const float* bias = (const float*)P(f.bias, (size_t)f.heads * 4096u * 4u, "bias");
+    const float* qs  = (const float*)P(f.qkvsc, (size_t)f.heads * 4u, "qkv_scale");
+    const float* bs  = (const float*)P(f.bsqkv, (size_t)(3u * f.C) * 4u, "qkv b_scale");
+    const float* bs2 = (const float*)P(f.bs2, (size_t)f.C * 4u, "wres b_scale");
+    const float* cp  = (const float*)P(f.cosine, (size_t)f.C * 4u, "cosine");
+    int8_t* Wq = (int8_t*)P(f.wqkv, (size_t)(3u * f.C) * f.C, "W81 raw");
+    int8_t* Wo = (int8_t*)P(f.wo, (size_t)f.C * f.C, "W79 raw");
+    // the SAME cache keys the split legs use (knife2b #75 item 3: no new key; the trace prints the
+    // four-tuples so a mixup with the FFN wide/diag keys cannot pass silently).
+    const int8_t* dBp = cached_pack_b_i8(f.wqkv, Wq, (int)(3u * f.C), (int)f.C);
+    const int8_t* dOp = cached_pack_b_i8(f.wo, Wo, (int)f.C, (int)f.C);
+    att5::Outlets o;                 // DUMP=false: every outlet stays null and folds away
+    att5::fused<64, 2, 5, false, false>(*GQ, dImg, dBp, bs, qs, bias, dOp, bs2, cp, Out2,
+                                        Q, Kk, V, f.windows, f.across, f.top, f.left,
+                                        f.ih, f.iw, o);
 }
 static sycl::half* cached_pack_b_f16(int bufid, const sycl::half* B, int K, int N) {
     WKey wk{bufid, K, N, 0};
@@ -3616,6 +3833,8 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
     const float* bs = (const float*)ibs->second.p;             // 3*channels entries
     const float* qs = (const float*)iqs->second.p;             // heads entries
     const bool vit = (flags & 0x2000u) != 0u;
+    a5_take_qkv(g_cmds.size(), a, b, q, k, v, a_scale, b_scale, qkv_scale,
+              M, channels, heads, tokens, flags);   // A5
     const unsigned C = channels, NH = 3u * channels;
     const int Mp = l0_ceil_bm(M);
     // P4b (section 100): a REGISTERED GATHER quant_window feeding this QKV (the
@@ -4051,6 +4270,14 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
     g_cmd_names.push_back(__func__);
     pgraph_ids({a,b,c,a_scale,b_scale,skip,cosine});   // PGRAPH touch-set (conservative: every operand id)
         flop_note("win_int8_res",M,N,K,1);
+    A5Fuse a5f;
+    const bool a5fire = a5_take_wres(g_cmds.size(), a, b, c, a_scale, b_scale, skip, cosine,
+                                     M, N, K, flags, height, width, across, pad, a5f);
+    if (a5fire) {
+        g_cmd_names.push_back(__func__);
+        pg_push([a5f]() { a5_att_run(a5f); });
+        return 0;   // the window-residual closure itself became the fused launch
+    }
     // B6-1 completion: the fused chain's LAST leg. When the quant leg matched and
     // THIS wres consumes exactly that pk/a_scale pair with the expected image map
     // (M/N/K + adjacency), rewrite: the wa closure (at g_b6.wacmd) becomes ONE
@@ -4266,6 +4493,7 @@ int xmx_rec_quant_window(int source, int packed, int scale, unsigned M, unsigned
     static int qwstop = getenv("NR_QW_STOP") ? atoi(getenv("NR_QW_STOP")) : 0;
     if (qwstop == 9) { g_cmd_names.push_back(__func__);pg_push([](){}); return 0; }
     pgraph_ids({source,packed,scale});   // PGRAPH touch-set (conservative: every operand id)
+    a5_note_qw(g_cmds.size(), source, packed, scale, M, K, height, width, across, pad);  // A5
     if (!M || !K || (K % 64u)) FAILMSG("a gathered quantiser needs K a multiple of 64");
     if (!across || !height || !width) FAILMSG("a gathered quantiser needs the image extent and windows per row");
     auto s = g_bufs.find(source), p2 = g_bufs.find(packed), c = g_bufs.find(scale);
@@ -4779,6 +5007,7 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
     const size_t ctx_elems = (size_t)batches * 64u * 32u;  // attnV context
     g_cmd_names.push_back(__func__);
     pgraph_ids({q,k,v,bias,out});   // PGRAPH touch-set (conservative: every operand id)
+    a5_take_wa(g_cmds.size(), q, k, v, bias, out, batches, heads, merged);   // A5
         flop_note("winattn_scores",64u,64u,32u,batches); flop_note("winattn_attnv",64u,32u,64u,batches);
     // B5-5b SLICE 1 pairing (P2 take mechanism, record-time): a STASHED guarded qkv
     // whose target ids == this wa's q/k/v ids, same heads, windows*64 == qkv M, bias
@@ -6049,6 +6278,7 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
         return 0;
     }
     s6_note_quant(g_cmds.size(), source, packed, scale, M, K);   // S6-1a (see above)
+    a5_note_quant(g_cmds.size(), source, packed, scale, M, K);   // A5
     pg_push([=]() {
         qr_launch(*GQ, *GD, qr_kernel(), a, pk, sc, M, K, 0u, 0u, 0u, 0u, 0u, nullptr, nullptr);
         if (getenv("NR_PK_DUMP")) { static int pdSP=0; if(pdSP<1){pdSP++;

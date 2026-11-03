@@ -601,10 +601,50 @@ int main(int argc, char** argv) {
         Stat c3 = timeit_wall(CHAIN3);
         Stat c3n = timeit_wall(CHAIN3n);
         Stat c2 = timeit_wall(CHAIN2);
+        // half-chain breakdown: where does the 0.10 ms composition cost sit?
+        auto REFA5 = [&] {
+            packdev::pack_a_fused_gather(q, dImg, rAp, rAS, (int)M, (int)Mp, (int)C, image_h, image_w, across, pad);
+            qres::gemm_qkv_res(q, rAp, dBp, rQ, rK, rV, rAS, dBS, dQS, (int)M, (int)Mp, (int)C, (int)NH, (int)heads, (int)TOK, false, nullptr);
+            wares::launch_wa_res(q, rQ, rK, rV, nullptr, dBias, r1277, batches, heads, true);
+            packdev::pack_a_fused(q, r1277, rAp2, rAS2, (int)M, (int)Mp, (int)C);
+            s8v8::gemm_b_res_window(q, rAp2, dOp, (void*)r1270, rAS2, dBS2, dImg, dCos, (int)M, (int)Mp, (int)C, (int)C, true, true, 1u, across, top, left, image_h, image_w);
+            q.wait();
+        };
+        auto REFF8 = [&] {
+            qr_launch_esimd(q, dev, r1270, (sycl::uint2*)dPK, dSCt, M, C);
+            packdev::gather_pack_a_b_v(q, dPK, dApE, M, Mp, C, C, 0, b_e);
+            s8v8::gemm_b_pub_slm<false>(q, dApE, dBpE, (void*)dH, dSCt, dSE, M, Mp, N_e, C, b_e, (size_t)N_e, (unsigned)HID, 0u, (unsigned)N_e, true, 3u);
+            qr_launch_esimd(q, dev, dH, (sycl::uint2*)dPK, dSCt, M, (unsigned)HID);
+            packdev::gather_pack_a_b_v(q, dPK, dApP, M, Mp, HID, HID, 0, 1);
+            s8v8::gemm_b_pub(q, dApP, dBpP, (void*)dOt, dSCt, dSP, M, Mp, C, HID, 1, (size_t)0, (unsigned)C, 0u, 0u, true, 1u);
+            packdev::pack_a_fused(q, dOt, dApR, dSCt, M, Mp, C);
+            s8v8::gemm_b_res(q, dApR, dBpR, (void*)r1267, dSCt, dSR, (const void*)r1270, dCos, M, Mp, C, C, true, true, 1u);
+            q.wait();
+        };
+        Stat a5 = timeit_wall(REFA5);
+        Stat f8 = timeit_wall(REFF8);
+        Stat l1 = timeit_wall(L1n);
+        Stat ffn = timeit_wall([&] { PE_FFN::ffn2::fused<S, false, S::NPH, 0>(q, fa).wait(); });
+        // C-0: is the composition cost the 1270 write->read DEPENDENCY, or just two launches?
+        // FFN2D runs the same kernel on a plane that was written long ago (the REF's 1270): no RAW
+        // on L1's outlet. CHAIN2I = L1n + that independent-input launch: same launch count and grid,
+        // dependency broken. If CHAIN2I ~= CHAIN2 the cost is launch/grid, not the dependency.
+        PE_FFN::ffn2::Args faD = fa; faD.dIn = r1270;
+        Stat ffnD = timeit_wall([&] { PE_FFN::ffn2::fused<S, false, S::NPH, 0>(q, faD).wait(); });
+        Stat c2i = timeit_wall([&] { L1n(); PE_FFN::ffn2::fused<S, false, S::NPH, 0>(q, faD).wait(); });
+        // within-process drift probe: the same dependent arm measured again, last.
+        Stat ffnL = timeit_wall([&] { PE_FFN::ffn2::fused<S, false, S::NPH, 0>(q, fa).wait(); });
         printf("CSVROW;S1-C64;REF13;%.4f;%.4f;%.4f;%.4f\n", c13.msm, c13.msM, c13.msX, c13.med);
         printf("CSVROW;S1-C64;CHAIN3;%.4f;%.4f;%.4f;%.4f\n", c3.msm, c3.msM, c3.msX, c3.med);
         printf("CSVROW;S1-C64;CHAIN3n;%.4f;%.4f;%.4f;%.4f\n", c3n.msm, c3n.msM, c3n.msX, c3n.med);
         printf("CSVROW;S1-C64;CHAIN2;%.4f;%.4f;%.4f;%.4f\n", c2.msm, c2.msM, c2.msX, c2.med);
+        printf("CSVROW;S1-C64;REFA5;%.4f;%.4f;%.4f;%.4f\n", a5.msm, a5.msM, a5.msX, a5.med);
+        printf("CSVROW;S1-C64;REFF8;%.4f;%.4f;%.4f;%.4f\n", f8.msm, f8.msM, f8.msX, f8.med);
+        printf("CSVROW;S1-C64;L1n;%.4f;%.4f;%.4f;%.4f\n", l1.msm, l1.msM, l1.msX, l1.med);
+        printf("CSVROW;S1-C64;FFN2;%.4f;%.4f;%.4f;%.4f\n", ffn.msm, ffn.msM, ffn.msX, ffn.med);
+        printf("CSVROW;S1-C64;FFN2D;%.4f;%.4f;%.4f;%.4f\n", ffnD.msm, ffnD.msM, ffnD.msX, ffnD.med);
+        printf("CSVROW;S1-C64;CHAIN2I;%.4f;%.4f;%.4f;%.4f\n", c2i.msm, c2i.msM, c2i.msX, c2i.med);
+        printf("CSVROW;S1-C64;FFN2L;%.4f;%.4f;%.4f;%.4f\n", ffnL.msm, ffnL.msM, ffnL.msX, ffnL.med);
         fflush(stdout);
     }
 
