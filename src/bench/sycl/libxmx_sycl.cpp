@@ -789,7 +789,9 @@ static void a5_reset() { g_a5 = A5Chain(); }
 static bool a5_gap(size_t a, size_t b) { return b > a && (b - a) <= 4u; }
 static int g_a5_dbg = 0;
 static void a5_dbg(const char* where, size_t cmd, int stage, const char* why) {
-    if (!getenv("NR_ATT5_TRACE") || g_a5_dbg >= 40) return;
+    // the cap was 40 -- with 8 C64 chains x 5 legs x 2 recordings the reject map was cut off,
+    // which is why only 2 of the 8 chains could even be discussed in knife2b #78.
+    if (!getenv("NR_ATT5_TRACE") || g_a5_dbg >= 900) return;
     ++g_a5_dbg;
     printf("[a5-dbg] %-12s cmd=%zu stage=%d %s\n", where, cmd, stage, why ? why : "");
 }
@@ -799,6 +801,13 @@ static void a5_note_qw(size_t cmd, int source, int packed, int scale, unsigned M
     if (!a5_on()) return;
     a5_reset();
     a5_dbg("qw", cmd, 0, "");
+    // a5-geom: every quant_window the recorder sees, with its full geometry, so the eight C=64
+    // chains can be counted and any rejected one traced to the exact field that disagreed.
+    if (getenv("NR_ATT5_TRACE") && g_a5_dbg < 900) {
+        ++g_a5_dbg;
+        printf("[a5-geom] qw cmd=%zu src=%d pk=%d sc=%d M=%u K=%u ih=%u iw=%u across=%u pad=%u\n",
+               cmd, source, packed, scale, M, K, height, width, across, pad);
+    }
     if (M != 32640u || K != 64u || !across || !height || !width) { a5_dbg("qw-REJECT", cmd, 0, "M/K/geom"); return; }
     g_a5.stage = 1; g_a5.c_qw = cmd;
     g_a5.src = source; g_a5.pk = packed; g_a5.sc = scale;

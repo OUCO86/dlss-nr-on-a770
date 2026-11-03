@@ -730,3 +730,91 @@ exe `port_e_chain.exe` = **`A6CA9F5D08E6F55DEB6748D5173F522C`**（加 `FFN2D / C
 3. **第一遍（§76）的 FFN2 双峰（0.49 vs 0.386）= 热漂移**：那一遍跑在 ~55 min 连续 GPU 之后**没有冷却**；这一遍先凉 300 s ⇒ FFN2 稳定 0.3862，且**进程内漂移探针 FFN2L = 0.3866（与 FFN2 同值）** ⇒ 双峰消失。**教训（进 P18/军规 45 的实例）**：半链单独价与合成价**必须在同一冷却状态下测**，否则会造出一个假的"交接代价"。
 **C-0 关闭**：不碰 ffn2 的 P1；C-1 按 §75/§72b 的 9 条清单接 `xmx_rec_att5_fused`（CHAIN2 形态 = 11 op → 2 发）。
 
+
+
+# §78 **C-1 现场：接图机制跑通了（匹配器会 fire、四条腿会 no-op），但 ON 侧不逐位、且在图内更慢 ⇒ 按⑤的停条件停下**　2026-11-04 04:4x-05:0x
+**做了什么（只在 bench 层源 + `builds\` 变体件；没动 `out\`、没动 `oneapi\libxmx_sycl.dll`、没 commit）**
+1. `src/bench/sycl/att5_fused_kernel.hpp`（42,540 B）= `s6b_att.cpp:87-617` 的 `namespace att5` **逐字抽出**（生成器 `s6/pe_mk_att5_hpp.py`；只把 bench 文件级的 `using namespace sycl;` / `namespace esimd = ...` 两条**搬进 namespace**，核体一字未改）。先单独 probe 编译通过（`E:\DSH\tmp\pe_att5_probe.cpp`）。
+2. `src/bench/sycl/libxmx_sycl.cpp`（+176 行起，加诊断后更多；打补丁脚本 `s6/pe_c1b.py` + `pe_c1_addinclude.py` + `pe_c1_dbg*.py`）：
+ - `#include "att5_fused_kernel.hpp"`；
+ - `struct A5Chain` + `a5_on()`（**`NR_ATT5_FUSE` 默认 0**）+ 五个 record-time hook（`a5_note_qw / a5_take_qkv / a5_take_wa / a5_note_quant / a5_take_wres`，照 `S6Chain`/`s6_take_*`/`s6_gap` 先例，**"四条腿全 no-op 或全不 no-op"**）；
+ - `a5_att_run()`：在 645 自己的 closure 里跑 `att5::fused<64,2,5,false,false>`，**操作数全部复用现路的 plan buffer**（1267 / QKV 三面 / 1270 / bias / qkv_scale / b_scale / cosine），**零新面、零 pool_get**（清单②/④）；权重走 `cached_pack_b_i8(wqkv, 3C, C)` 与 `cached_pack_b_i8(wo, C, C)` = **与 split 腿同一个 WKey**（清单③）；
+ - `NR_ATT5_TRACE` record-time witness（fire 序号、M/C/heads/windows/across/pad/img、被 no-op 的 closure 号、fused 所在 closure 号、两个 WKey 四元组、各 buffer id）。
+3. 变体件链：`builds\libxmx_att5a.dll = 35F6FFEA26064D7AA58FD169834DCA6B`（无诊断）→ `att5c/att5d`（加 `a5-dbg` 停点）→ **`att5e = C2D161DBAACF9D55699FF19F06740AB3`**（会 fire 的那版）。
+
+**② 双档自证（读数）**
+| 档 | passes | 1301 | 每 run 帧时 |
+|---|---|---|---|
+| **默认（不设 env，att5a）** | **691** ✓ | **EXACT = `DD49827DD33A7EF07C2C17892F18970D`** ✓ | 58.02 / 58.27 / 58.43 ms |
+| **`NR_ATT5_FUSE=1`（att5e）** | 691 ✓（closure 数不变，与 S6 同口径） | **MISMATCH = `249A46F374E98EB5FF5AD5E3A38EBC55`**（= 三金标里的 **pre-skip-1a** 那颗）✗ | **62.71 / 62.84 / 62.85 ms ⇒ 比默认档慢 ≈4.4 ms/run** ✗ |
+逐位差多少：`att5a_off.1301.bin` vs `att5e_on.1301.bin` = **82.635% 字节不同（6,904,834 / 8,355,840），第一个差异在 byte 0** ⇒ 不是末位漂移，是"整段输出换了来源"级别的错。
+fire 情况：一次录制里 **只有 4 条 fire = 2 条 C64 链 × 2 次录制**，8 条 C64 链只匹配到 2 条；其余 `qw-REJECT M/K/geom` 是 C128/C256 链被正确拒掉 ✓。样例：
+`[a5-fire] n=1 M=32640 C=64 heads=2 windows=510 across=30 pad=0 img=136x240 noop=19/20/21/0 fused@23 … 1267=1273 1270=1274 1277=1268 bias=1271`
+**S6 没被我破坏**：两档 `[s6-fire]` 都是 **40 行**、样例一字不差（`fam=0 M=32640 C=64 HID=256 cmds 13..18 src=1271 pk=1273 sc=1274 -> out=1268 skip=1271`）⇒ FFN 半的既有融合不受影响 ✓
+**排查中定到并已修的两处真 bug（在 att5d/e 里）**：
+ - **644 的 QUANT 在 plan 里是 `quant(FUSED-pack)`**（P2 融合把它折进消费者），**根本不经过 `xmx_rec_quant` 的记录路径** ⇒ 状态机卡在 stage 3 永远到不了 stage 4 ⇒ 改成 **stage 3 也允许完成**（`pe_c1_dbg2.py`），并加 **`A5-NOOP-GUARD`**：stage 3 时 `c_q2 == 0`，**绝不能 no-op `g_cmds[0]`**（`pe_c1_dbg3.py`）——这个 guard 差点让我杀掉一条无关 closure；
+ - stage 3 完成时 pk2/sc2 的 id 在 645 之前未知 ⇒ 校验按 stage 分支（`pe_c1_dbg4.py`）。
+**头号可疑点（续跑第一刀该砍的地方）**：fire 行里 **`1267=1273 / 1270=1274`**，而 S6 行里 **`pk=1273 / sc=1274`** ⇒ 我把 641 的 source 和 645 的 out 绑到了 **在 FFN 角色里是 pk/sc scratch** 的号 ⇒ 高度怀疑 **plan 的 buffer id 在不同链之间按同形复用编号**，而 `A5Fuse` 取到的 `g.src` / `c` 不是这条链真正的 1267 / 1270 ⇒ 融合核**读错输入面、写错输出面** ⇒ 82% 全散。**修法**：像 S6 那样在 fire 时把每个 id 的 `g_bufs[].bytes` 与期望尺寸一起打进 witness（我已有 run 期 `P(id, bytes, what)` 校验，但它只在执行时才炸；把尺寸也打进 record-time witness 就能一眼看出绑错），并用 `NR_RES_BYTE`/`rb_push(c,…,"wres")` 的现有账本对照 1270 的 id。
+**③ 自重复门（shipped 件 ≥1000 连发）：未跑**（ON 侧不逐位 ⇒ 先修绑定再跑才有意义）。
+**④ 40 门 / ⑤ 帧 16 对：未跑**——⑤ 的停条件已触发（**图内比默认档慢 +4.4 ms/run，且 1301 不逐位**）⇒ 按⑥交续跑包。
+**现场**：`out\libxmx.dll` = `oneapi\libxmx_sycl.dll` = **`ABB969FE4AAF0F94AA03C3F53781EDD0`** 未动；三金标未动（`DD49827D` ×2 / `249A46F3`）；`builds\` 多 att5a/att5b/att5c/att5d/att5e 五颗；仓 = `M libxmx_sycl.cpp`（A5 接线 + 诊断，**未 commit**）、`M port_e_chain.cpp`（两形态 + 门 4 修正）、`?? att5_fused_kernel.hpp`；本轮 C-1 GPU ≈ 6 min（4 次 walk）。
+**重要：默认档逐位不变 = 已自证 ✓** ⇒ 接线本身没有污染现状，ON 侧的错只在显式 `NR_ATT5_FUSE=1` 时发生 ⇒ **现在的 shipped 头等于是安全的一半**。
+
+
+# §79 **C-1 停条件的根因已定位：plan 的 1267 是 **960x544x64** 全尺寸面，不是 bench 里的 136x240 子面 ⇒ 融合核的 gather 用了错的行距**　2026-11-04 05:2x
+**证据（`builds\libxmx_att5g.dll = BC28CE374D6AFEBD35F5EA94EBC16005`，`NR_ATT5_FUSE=1 NR_ATT5_TRACE=1`，`walk_att5g_on.txt`，逐操作数一行）**：
+```
+[a5-op] img_want=4177920 plane_want=4177920
+[a5-op] src1267 id=1303 bytes=66846720      <-- 不是 4,177,920
+[a5-op] out1270 id=1271 bytes=4177920       OK
+[a5-op] faceQ id=1308 bytes=4571136  faceK id=1307 bytes=33554432  faceV id=1309 bytes=4571136   <-- 都不是 plane_want
+[a5-op] bias 71/32768 OK   qkv_scale 72/8 OK   qkv_bscale 83/768 OK   wres_bscale 81/256 OK
+[a5-op] cosine 73/256 OK   W81 id=82 12288 OK   W79 id=80 4096 OK
+```
+**66,846,720 = 960 x 544 x 64 x 2**（精确）⇒ 引擎的 1267 是**整幅 960x544 的 f16 面**，而 bench 的 `dImg` 是 **136x240x64**（= 2,088,960 元素 = 4,177,920 B）。链的 M=32640 = 136x240 只覆盖**子窗口网格**，但**行距（pitch）是 960**，不是 240。
+⇒ 融合核 P7 的 gather 与 P11 的 skip 读都按 `x + y*image_w` 寻址（image_w=240）⇒ **读错像素** ⇒ 1301 差 82.6%、第一个差异在 byte 0 ✓ 这条解释了全部现象，也解释了为什么 `P(id, bytes, what)` 的尺寸校验没炸（buffer 比需要的大 ⇒ 只查下界）。
+**Q/K/V 三面同样不匹配**（4,571,136 / 33,554,432 / 4,571,136 ≠ 4,177,920）⇒ 现路的 QKV 面是**带 padding / 不同 dtype 的面**（K 面 33.5 MB ≈ 8x 于 f16 面 ⇒ 可能是 f32 或 4x 过采样）⇒ 融合核的 fragment 面不能直接绑这三个 id，**要么按现路的真实布局写，要么另立私有面**。
+**修法（下一轮的头三刀，按代价从小到大）**：
+1. **给 `att5::fused` 传图像 pitch**（新参数 `image_pitch`，plan 里 = 960；bench 侧 = image_w）：P7 的 gather 与 P11 的 skip 都改成 `base + y*image_pitch*C + x*C`。**这改的是核的寻址参数，不改数值链**（累加顺序/fdiv/e4m3 一字不动），但**必须在 bench 里重跑 25 检查点门**（bench 的 dImg 要扩成 960x544 全幅 + 同样的 top/left 偏移，才能复现引擎的输入）。
+2. **Q/K/V 面**：先打印现路三面在 `xmx_rec_gemm_int8_qkv` 里的真实尺寸来源（`g_bufs[q].bytes` 是怎么算出来的、`l0_ceil_bm` 之类），把融合核的 fragment 面尺寸/对齐与之对齐；否则就**不用 plan 的 q/k/v id**，改用一个私有面（但那就违反清单④"零新面"，要回报）。
+3. **fire 覆盖面**：8 条 C64 链只 fire 了 2 条 ⇒ 另外 6 条被 `qw-REJECT M/K/geom` 之外的条件挡掉，需要把每条链的 641-645 实际 tuple 打出来对比（`a5-dbg` 上限 40 行要放大）。
+**未做**：③ shipped 侧 >=1000 连发（不逐位 ⇒ 无意义）、④ 40 门、⑤ 帧 16 对（停条件已触发：ON 侧 62.7-62.9 ms/run vs 默认 58.0-58.4 ms/run，**慢 +4.4 ms**，且 1301 不逐位）。
+**安全边界确认**：`NR_ATT5_FUSE` **默认 0**，且默认档在 att5a 上已自证 **1301 EXACT = DD49827D + passes 691** ⇒ 这堆接线现在对 shipped 头**零影响**；`out\libxmx.dll` / `oneapi\libxmx_sycl.dll` = **ABB969FE** 未动；三金标未动。
+
+
+# §80 **1301 差异的形态 = 全平面、亚 64 字节碎块的数值差 ⇒ 不是绑错 buffer，而是我的 bench REF 不等于引擎实际跑的拆腿路**　2026-11-04 05:1x（host 侧分析，零 GPU）
+`s6/pe_diff_profile.py` 把 `dumps\att5a_off.1301.bin`（默认档 = 现 shipped，EXACT `DD49827D`）与 `dumps\att5g_on.1301.bin`（`NR_ATT5_FUSE=1`）逐字节比对：
+```
+diff bytes 6,904,834 / 8,355,840 = 82.635%
+contiguous differing runs: 1,428,541      runs shorter than 4 KiB: 1,428,541 (全部!)
+最长碎块只有 71 字节；两个 4,177,920 B 的 plane 块各自差 82.4% / 82.9%；完全相同的块: 0/2
+```
+**读法**：如果是"写错面 / 绑错 buffer"，差异会是**大块连续**（整段面要么对、要么全散）；这里是**每一处都差、但每次只差几个字节**（碎块最大 71 B、平均 ≈4.8 B）= **同一个量、数值略有不同**的签名 ⇒ 浮点/定点的**低位不同**，不是取错地址。
+**⇒ 修正 §79 的判断**：`[a5-op]` 里 1267=66,846,720 B（= 960x544x64x2）**不是绑错**，而是 plan 把该面**过订**成整幅（split 腿同样以 height=136/width=240/across=30/pad=0 从这块的基址读，所以尺寸大是正常现象）；Q/K/V 三面 4,571,136 / 33,554,432 同理（过订/复用）。**下界校验 `P(id,bytes,what)` 通过 = 绑定合法。**
+**真正的缺口**：门 1 的 25 检查点是拿**我在 bench 里搭的 REF13**（`pack_a_fused_gather / qres::gemm_qkv_res / wares::launch_wa_res / pack_a_fused / s8v8::gemm_b_res_window / qr_launch_esimd / gather_pack_a_b_v / s8v8::gemm_b_pub_slm / gemm_b_pub / gemm_b_res`）当对照；而**引擎默认档实际跑的不是这组腿**：
+ - 641 = `quant_window(**FUSED-pack**)`（被 P4b/qfuse 溶解，pk 由 642 自己 gather）；
+ - 644 = `quant(**FUSED-pack**)`（被 645 的 `pack_a_fused` 溶解，见 libxmx_sycl.cpp:4137-4141）；
+ - 646-651 = S6-1a 已融合（`[s6-fire]` 40 行）。
+⇒ **融合核与"引擎真实腿"之间从来没有做过逐位对照** ⇒ 82.6% 的碎块差异就是这么来的（很可能是 643 的 window_attention 在引擎里走的是另一个变体/另一个累加顺序，而不是 bench 用的 `wares::launch_wa_res`）。
+**下一轮的第一刀（先于任何 shipped 改动）**：把 **bench 的 REF 换成"引擎真实路"** —— 直接从 `nr_replay_now` 的 dump（默认档 `att5a_off.1301.bin`）取该链的 1270 与 1267 两面，作为合成体的**唯一对照**（不再由我手工搭 13 条腿）。做法：`port_e_chain` 加 `--gold <1301.bin>` 模式，从 dump 里按 plan 的 buffer 偏移切出 1270/1267，与 CHAIN2/CHAIN3n 的出口逐字节比；**只有这个门绿了，接图才有意义**。
+**同时保留**：现在这套 REF13 门仍然有用（它证明了两半的核彼此一致 + 与"我认知的拆腿路"一致），但它的名字要改准：**它是"bench 内部一致性门"，不是"对 shipped 的逐位门"**。
+**未跑**：③ shipped ≥1000 连发、④ 40 门、⑤ 帧 16 对（⑤ 停条件已触发：ON 慢 +4.4 ms/run 且不逐位）。
+
+
+# §81 **C-1 续（90 分钟窗口）：几何图 = 104 条 quant_window 全表；"只 fire 2 条"的原因找到了；pitch 假设被否**　2026-11-04 05:2x-05:4x
+件：`builds\libxmx_att5h.dll = B9528F5D3567EF93A26E9D451A3DB2F2`（`a5-dbg` 上限 40 ⇒ **900**，并给每条 quant_window 打一行 `[a5-geom]`）。**只跑一次 walk**（`NR_ATT5_FUSE=1 NR_ATT5_TRACE=1`，`logs\walk_att5h_on.txt`，GPU ≈2 min）。
+**104 条 quant_window**（= 全帧的窗口量化腿），**K=64 的 C64 族有四种几何**：
+| M | across | pad | 含义 |
+|---|---|---|---|
+| **32640** | 30 | **0** | 无 halo 的那批 ⇒ **只有这批 fire**（4 行 = 2 条链 x 2 次录制）|
+| 35712 | 31 | 262148 (top=4,left=4) | 带 4 像素 halo 的变体 |
+| 33728 | 31 | 4 (top=0,left=4) | 单边 halo |
+| 34560 | 30 | 262144 (top=4,left=0) | 单边 halo |
+（K=128/256/512 的其它 tier 各自也有 2-3 种几何，全部被 `qw-REJECT M/K/geom` 正确挡掉：**100 次 qw-REJECT / 116 qkv-REJECT / 100 wa-REJECT / 100 wres-REJECT，`wres-TUPLE` 0 行** ⇒ 到了 645 时元组全部对得上，**没有一条链是在最后一步被元组挡掉的**。）
+⇒ **"8 条 C64 链只 fire 2 条"的解释 = 匹配器目前只接受 `pad==0 && across==30 && M==32640` 的几何；带 halo 的三种变体（M=35712/33728/34560）被我的 `qw` 门槛挡在门外。** 这不是 bug，是**覆盖面决定帧价的一半**：要么把 att5 核的 gather 支持 pad（top/left 已经在参数里，`qr_kernel` 的 gather 就是 `y = ... - pad_top` 同一套），要么只接 pad=0 那批并如实报只兑现一半。
+**pitch 假设被否（更正 §79）**：`[a5-geom]` 显示**所有** quant_window 的 `src/pk/sc = 1268/1273/1274` ⇒ **plan 在链之间复用同一组 scratch id**；而引擎自己的 gather 寻址就是 `base = (y*image_w + x)*K`（`quantize_row_kernel.hpp:57`、`pack_device.hpp:641`）⇒ **行距 = 传进去的 image_w（=240），不是 960** ⇒ 我 bench 的 136x240 局部几何与引擎**同语义**，`att5::fused` **不需要 `image_pitch` 参数**（军规 56 的"上界也查"仍要做，但这次不是绑错面）。
+**新查到的两条真实尺寸事实（下一条该从这里接）**：
+ - `faceQ/faceV` 的 plan buffer = **4,571,136 B = 35712 x 64 x 2** ⇒ QKV 三面按**全帧最大 M（35712）**订座，不是本链的 32640 ⇒ 过订，安全；
+ - `faceK` = **33,554,432 B = 960 x 544 x 32 x 2 = 2^25** ⇒ **K 面是整幅 960x544、32 通道的图像序面**，不是 token 序面 ⇒ 融合核往它里写 fragment/token 序是**布局不符**（虽然 643 已被 no-op、没有别人读它，但这解释不了 82.6% 的散，因为 1270 才是出口）。
+**ON 侧 82.6% 碎块式数值差的根因：仍未定**。已排除：绑错面（尺寸/复用都合法）、S6 被破坏（40 行 fire 不变）、wa 腿不等价（引擎 `wares::launch_wa_res(Q,K,V,dBv,Bp,Out,batches,heads,rawv2=true)` vs bench `(rQ,rK,rV,nullptr,dBias,r1277,...,true)`，rawv2=true 时 dBv 不被读 ⇒ 等价）。**剩下的头号嫌疑 = 642 的 qkv 腿**：引擎默认档里 641 被 qfuse 溶解后，**gather 由 642 自己做**（`pack_a_fused_gather` @3669）之后接的是哪一版 qkv（`qres::gemm_qkv_res` 还是 `dAp9b`/`Mp32` 那条 @3662 的变体）需要读 3640-3730 定死；bench 用的是 `qres::gemm_qkv_res(..., false, nullptr)`。**下一步第一刀 = 把 642 的默认分支逐行抄进 bench 的 REF，重跑 25 检查点门**（门必须在改后的 REF 上过），过了再谈接图与自重复门。
+**现场**：进程 0；`out\libxmx.dll` = `oneapi\libxmx_sycl.dll` = **ABB969FE** 未动；三金标未动；`builds\` 多 att5h；`NR_ATT5_FUSE` 默认 0、默认档 att5a 已自证 `1301 = DD49827D` + `passes 691` ⇒ shipped 头零影响。C-1 累计 GPU ≈ 10 min。

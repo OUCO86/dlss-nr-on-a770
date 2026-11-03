@@ -1465,3 +1465,24 @@ T1 的机器读数：**corr_min 0.9828**（R .983 G .992 B .990，luma .991）�
 **续跑包（下一条命令原样，按代价从小到大）**：① 给 `att5::fused` 加 `image_pitch` 参数（plan 侧 960、bench 侧 image_w），P7 gather / P11 skip 改 `base + y*pitch*C + x*C`；**bench 的 dImg 扩成 960x544 全幅 + 同 top/left**，然后**重跑 25 检查点门**（**不重跑门就不许再接图**）；② 核对 Q/K/V 三面在 `xmx_rec_gemm_int8_qkv` 里的真实尺寸来源（`g_bufs[q].bytes` 怎么算、`l0_ceil_bm` 之类）把 fragment 面对齐；**若必须另立私有面 => 违反清单④"零新面" => 停下回报**；③ fire 覆盖面：把 `a5-dbg` 的 40 行上限放大 + 对 8 条 C64 链逐条打 tuple，找出被挡掉的 6 条；④ 然后才是 自重复门（>=1000 连发，面集合按军规 51）-> 40 门 -> 帧 16 对。
 **复现命令**：`tools/build_shipped.ps1 -Tag att5g`；`walk.ps1 -Dll E:\DSH\builds\libxmx_att5g.dll -Tag att5g_on -Runs 1`（前置 `NR_ATT5_FUSE=1 NR_ATT5_TRACE=1 SYCL_CACHE_DIR=E:\DSH\sycl-cache`）。
 **安全边界**：`NR_ATT5_FUSE` 默认 0 且默认档已自证逐位不变（1301 = `DD49827D`、passes 691、`chains_skipped=14 refused=0 closures_noop=168` 一字未变）=> **这堆接线对现在的 shipped 零影响**；本轮 C-1 GPU 约 8 分钟（5 次 walk）。
+
+## 75. ★ C-1 续（几何全表）：**"只 fire 2 条"的原因查明 = 匹配器只收 `pad=0 / across=30 / M=32640`，带 halo 的三种 C64 几何被挡**；**并且我 §74 的 pitch 归因被代理自己否证**（军规 56 保留，但这次的错不在那）
+**件**：`builds\libxmx_att5h.dll = B9528F5D3567EF93A26E9D451A3DB2F2`（`a5-dbg` 上限 40 -> 900 + 每条 quant_window 一行 `[a5-geom]`）；**只跑一次 walk**（`NR_ATT5_FUSE=1 NR_ATT5_TRACE=1`，GPU 约 2 min）。
+**① 全帧 104 条 quant_window 里，K=64 的 C64 族有四种几何**：
+| M | across | pad | 结果 |
+|---|---|---|---|
+| **32640** | 30 | **0** | **只有这批 fire**（4 行 = 2 条链 x 2 次录制）|
+| 35712 | 31 | 262148（top=4,left=4）| 被 `qw-REJECT M/K/geom` 挡 |
+| 33728 | 31 | 4（top=0,left=4）| 同上 |
+| 34560 | 30 | 262144（top=4,left=0）| 同上 |
+reject 计数：**qw 100 / qkv 116 / wa 100 / wres 100，`wres-TUPLE` = 0 行** => **凡进到 645 的链，元组全部对上**（没有一条是在最后一步被挡的）。
+⇒ **"帧价只兑现一半"的真实原因不是匹配器 bug，而是只覆盖了 pad=0 那批**；`att5` 核的 gather 参数里**已经有 `top/left`**（引擎 `qr_kernel` 的 gather 就是 `y = ... - pad_top`、`x = ... - pad_left` 同一套）=> **放宽到四种几何是参数活，不是改数值**。**要么放宽，要么只接 pad=0 那批并如实报只有一半。**
+**② ★ 更正 §74：不是绑错面，也不需要 `image_pitch`**（代理自我否证，我采纳）：
+- `[a5-geom]` 显示**所有** quant_window 的 `src/pk/sc = 1268/1273/1274` => **plan 在链之间复用同一组 scratch id（合法）**；
+- 引擎自己的 gather 寻址 = `base = (y*image_w + x)*K`（`quantize_row_kernel.hpp:57`、`pack_device.hpp:641`）=> **行距就是传进去的 image_w（240），不是 960** => **bench 的 136x240 局部几何与引擎同语义** => **`att5::fused` 不需要 `image_pitch` 参数**；
+⇒ **军规 56 的"上界也查"仍然要做**（它是对的通用规矩），**但 §74 里把 82.6% 归因到 pitch 是错的，现予更正**。
+**③ 两条新尺寸事实（都是潜在陷阱，记下）**：`faceQ/faceV = 4,571,136 B = 35712 x 64 x 2` => **QKV 三面按全帧最大 M 订座（过订、安全）**；`faceK = 33,554,432 B = 960 x 544 x 32 x 2 = 2^25` => **K 面是整幅 960x544、32 通道的图像序面（不是 token 序）** => **融合核往它里写 fragment 序属于布局不符**；但 643 已被 no-op、无人再读 => **不能解释 82.6%**。⇒ **但这条要在接图时处理**：我们的"零新面"说法在这里其实是**把 fragment 序写进一张语义不同的现成面**（今天没人读，不等于以后没人读）。
+**④ ON 侧 82.6% 碎块式数值差：根因仍未定**。**已排除**：绑错面 / S6 被破坏（两档 `[s6-fire]` 都 40 行、样例一字不差）/ wa 腿不等价（引擎 `wares::launch_wa_res(Q,K,V,dBv,Bp,Out,batches,heads,rawv2=true)`，rawv2 时 dBv 不被读 => 与 bench 的 `nullptr` 等价）。
+**剩下头号嫌疑 = 642 的 qkv 腿**：默认档里 641 被 qfuse 溶解后 gather 由 642 自己做（`pack_a_fused_gather`@3669），但它接的是哪一版 qkv（`qres::gemm_qkv_res` 还是 @3662 那条 `dAp9b/Mp32` 变体）**还没读死**；**bench 用的是 `qres::gemm_qkv_res(..., false, nullptr)`**。
+**下一刀**：把 642 的默认分支**逐行抄进 bench 的 REF** => **重跑 25 检查点门（门必须在改后的 REF 上过）** => 绿了再谈放宽四种几何 + 接图 + 自重复门；不绿就贴第一个偏差坐标停下。
+**现场**：进程 0；`out\libxmx.dll` = `oneapi\libxmx_sycl.dll` = **ABB969FE** 未动；三金标未动；工作区只有诊断放宽 + a5-op witness（已随本条入库）；C-1 累计 GPU 约 10 min；**默认档仍自证 1301 = `DD49827D` + passes 691 => shipped 头零影响**。
