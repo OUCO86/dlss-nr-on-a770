@@ -35,7 +35,14 @@ OUT = DSH / "out"
 DUMPS = DSH / "dumps"
 LOGS = DSH / "logs"
 
-SHIP_MD5 = "abb969fe4aaf0f94aa03c3f53781edd0"      # 转正件（§45 部署链）
+# 身份守卫读"当前转正件 md5"的唯一出处（军规 59）：每次转正只改 out/SHIPPED_MD5.txt，
+# 不改本门。历史上这里是写死的 abb969fe...（§45 部署链），导致每次转正都让本门的身份检查
+# 按设计 RED，把"实质检查"淹掉。缺失即 RED（不许静默放行）。
+_SHIPF = OUT / "SHIPPED_MD5.txt"
+if not _SHIPF.exists():
+    print("FAIL 缺 out/SHIPPED_MD5.txt —— 无法核对被测件身份（这是身份守卫，不是实质检查）")
+    sys.exit(1)
+SHIP_MD5 = _SHIPF.read_text(encoding="utf-8").strip().lower()   # 当前转正件
 GOLDEN = DUMPS / "bk.1301.skip.bin"                # 新金标（跳块代）
 GOLDEN_MD5 = "dd49827dd33a7ef07c2c17892f18970d"
 PLAN = OUT / "plan_960x544.bin"
