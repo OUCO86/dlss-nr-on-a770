@@ -1135,6 +1135,7 @@ static bool sc_pure(const char* n) {
     for (const char* w : k) if (sc_is(n, w)) return true;
     return false;
 }
+static std::set<size_t> g_skipped_cmds;   // closure indices the skip pass no-op'd (knife 1 reads it)
 static void skip_chains_apply(std::vector<std::function<void()>>& cmds,
                               const std::vector<const char*>& names, int graphid) {
     const std::vector<int>& want = skip_chain_set();
@@ -1200,7 +1201,7 @@ static void skip_chains_apply(std::vector<std::function<void()>>& cmds,
                         wk, c.a, c.b, c.b - c.a + 1, (int)c.term, pure);
             ++refused; continue;
         }
-        for (size_t i = c.a; i <= c.b; ++i) { cmds[i] = [](){}; ++noops; }
+        for (size_t i = c.a; i <= c.b; ++i) { cmds[i] = [](){}; g_skipped_cmds.insert(i); ++noops; }
         ++skipped;
         std::printf("[skip-chains] chain=%d SKIPPED closures %zu..%zu (%zu no-ops): %s .. %s\n",
                     wk, c.a, c.b, c.b - c.a + 1, nm(c.a), nm(c.b));
@@ -1208,6 +1209,200 @@ static void skip_chains_apply(std::vector<std::function<void()>>& cmds,
     std::printf("[skip-chains] graph=%d chains_skipped=%zu refused=%zu closures_noop=%zu "
                 "passes=%zu (unchanged)\n", graphid, skipped, refused, noops, n);
     std::fflush(stdout);
+}
+
+// ==================== KNIFE 1: NR_BMERGE -- same-shape residual legs merged into ONE launch ====
+// notes/shape-merge-plan.md 7.1 knife 1, A3 slice (xmx_rec_gemm_int8_residual: 16 sites of
+// 2040x256x256 + 12 sites of 8160x128x128, all ALIVE on the load slot per tools/shapes_alive.csv).
+// The batch dim is a GRID dim: per-element reduction order is untouched, so the merged launch must
+// be bit-identical to the b separate ones (the twin kernel body is a verbatim copy of gemm_b_res;
+// only the group index and the pointer sources differ -- gemm_s8_v8_kernel.hpp S8ResDesc).
+// Default side (NR_BMERGE unset/0): the stash below is never taken and bmerge_apply returns at
+// once -- the shipped closure bodies are never rewritten.
+static int bmerge_level() {
+    static int v = getenv("NR_BMERGE") ? atoi(getenv("NR_BMERGE")) : 0;
+    return v;
+}
+struct BmResSite {
+    const int8_t *Araw, *Braw; void* Cout; const float *as, *bs; const void* skp; const float* cp;
+    const sycl::half* a16r; bool fused_r; int b_id;
+    int id_a, id_c, id_skip, id_cos;        // plan buffer ids: the dependency probe
+    int M, Mp, N, K; unsigned flags; bool narrow, half_skip; unsigned epi; size_t na;
+    size_t cmd;
+};
+static std::vector<BmResSite> g_bm_res_sites;
+struct BmResGroup {
+    std::vector<s8v8::S8ResDesc> slots;
+    std::vector<int8_t*> held;
+    std::vector<int8_t*> face;           // dedicated A faces, one per member (never pooled)
+    std::vector<sycl::half*> scratch;    // NR_BMERGE_SCRATCH discard outputs
+    s8v8::S8ResDesc* dtab = nullptr;      // dedicated device table, uploaded once at capture
+    int n;
+};
+static std::vector<BmResGroup*> g_bm_groups;      // alive for the life of the process (cgraph-safe)
+static void bmerge_apply(std::vector<std::function<void()>>& cmds) {
+    if (bmerge_level() < 1 || g_bm_res_sites.size() < 2) { g_bm_res_sites.clear(); return; }
+    // group by (M,N,K,flags) with a linear scan (no map/tuple/array: keep the include set untouched)
+    struct BmKey { long long m,n,k,f; bool operator==(const BmKey& o) const {
+                       return m==o.m && n==o.n && k==o.k && f==o.f; } };
+    std::vector<std::vector<size_t>> groups;
+    std::vector<BmKey> keys;
+    for (size_t i = 0; i < g_bm_res_sites.size(); ++i) {
+        BmResSite& s = g_bm_res_sites[i];
+        BmKey k{ s.M, s.N, s.K, (long long)s.flags };
+        size_t gi = groups.size();
+        for (size_t j = 0; j < keys.size(); ++j) if (keys[j] == k) { gi = j; break; }
+        if (gi == groups.size()) { keys.push_back(k); groups.push_back({}); }
+        groups[gi].push_back(i);
+    }
+    size_t merged = 0, ngrp = 0, refused_dep = 0, refused_skip = 0;
+    for (auto& gv0 : groups) {
+        // drop members whose closure the skip pass killed: their bodies never run
+        std::vector<size_t> gv;
+        for (size_t idx : gv0) if (!g_skipped_cmds.count(g_bm_res_sites[idx].cmd)) gv.push_back(idx);
+        if (gv.size() != gv0.size()) refused_skip += gv0.size() - gv.size();
+        static int bmax = getenv("NR_BMERGE_MAX") ? atoi(getenv("NR_BMERGE_MAX")) : 16;
+        if (bmax < 2) bmax = 2;
+        for (size_t p = 0; p + 1 < gv.size(); p += (size_t)bmax) {
+            size_t take = gv.size() - p; if (take > (size_t)bmax) take = (size_t)bmax;
+            if (take < 2) break;
+            // dependency guard over the whole cmd span this merged launch would cover
+            size_t first = g_bm_res_sites[gv[p]].cmd, last = g_bm_res_sites[gv[p + take - 1]].cmd;
+            std::vector<void*> outs;
+            for (size_t k = 0; k < take; ++k) outs.push_back(g_bm_res_sites[gv[p + k]].Cout);
+            // DEFECT found by bisect (2026-11-03 13:2x): the twin kernel is byte-exact in the probe
+            // (s6/BMERGE_twin_F2/F3.log: diff=0 at b=1,2,4,8) and the DEFAULT side walks are exact,
+            // but the merged side is wrong EVEN WITH NR_CGRAPH=0 => the rewrite itself reorders a
+            // read. Guarding only the outputs is not enough: a member's INPUT face (its A plane, its
+            // skip / cosine planes, its a_scale / b_scale arrays, the fused-quant raw image) may be
+            // rewritten by a closure that sits between that member's pack and the merged launch, and
+            // the merged launch would then read the LATER value. Protect every member's inputs from
+            // the member's own closure index up to the merged launch (last).
+            std::vector<std::vector<void*>> ins(take);
+            for (size_t k = 0; k < take; ++k) {
+                const BmResSite& m = g_bm_res_sites[gv[p + k]];
+                void* v[] = { (void*)m.Araw, (void*)m.Braw, (void*)m.skp, (void*)m.cp,
+                              (void*)m.as, (void*)m.bs, (void*)m.a16r };
+                for (void* x : v) if (x) ins[k].push_back(x);
+            }
+            bool unsafe = false;
+            // INTRA-group dependency: if one member reads a face another member of the SAME group
+            // writes (the residual's skip plane IS the previous chain's residual output -- measured
+            // 2026-11-03 13:1x: 32 such collisions among the 96 residual sites), then one merged
+            // launch cannot preserve the read-before-write order. Refuse the group.
+            for (size_t x = 0; x < take && !unsafe; ++x) {
+                const BmResSite& mx = g_bm_res_sites[gv[p + x]];
+                void* ins[] = { (void*)mx.Araw, (void*)mx.Braw, (void*)mx.skp, (void*)mx.cp,
+                                (void*)mx.as, (void*)mx.bs, (void*)mx.a16r };
+                for (size_t y = 0; y < take && !unsafe; ++y) {
+                    if (y == x) continue;
+                    void* oc = g_bm_res_sites[gv[p + y]].Cout;
+                    for (void* ip : ins) if (ip && ip == oc) { unsafe = true; break; }
+                }
+            }
+            for (size_t ci = first + 1; ci < last && !unsafe; ++ci) {
+                bool member = false;
+                for (size_t k = 0; k < take; ++k) if (g_bm_res_sites[gv[p + k]].cmd == ci) { member = true; break; }
+                if (member || ci >= g_cmds_touch.size()) continue;
+                const std::vector<void*>& tt = g_cmds_touch[ci];
+                // an UNREGISTERED closure (touch = {(void*)-1}, see pgraph_ids/pg_push) can read
+                // anything, so it must be treated as a conflict: deferring a write past it is not
+                // provably safe (the 2-member merge was already non-exact: 2026-11-03 13:3x).
+                if (tt.size() == 1 && tt[0] == (void*)-1) { unsafe = true; break; }
+                for (size_t k = 0; k < take && !unsafe; ++k) {
+                    if (g_bm_res_sites[gv[p + k]].cmd >= ci) continue;   // not yet produced
+                    for (void* tp : tt)
+                        for (void* ip : ins[k]) if (tp == ip) { unsafe = true; break; }
+                }
+                if (unsafe) break;
+                for (void* tp : tt)
+                    for (void* op : outs) if (tp == op) { unsafe = true; break; }
+            }
+            if (unsafe) { ++refused_dep; continue; }
+            BmResGroup* gr = new BmResGroup();
+            gr->n = (int)take; gr->slots.resize(take); gr->face.assign(take, nullptr);
+            // ALL device objects for the group are created here (rewrite time), outside any
+            // captured closure body -- see the note above.
+            bool poolfaces0 = getenv("NR_BMERGE_POOLFACES") && atoi(getenv("NR_BMERGE_POOLFACES"));
+            if (!poolfaces0)
+                for (size_t k = 0; k < take; ++k)
+                    gr->face[k] = (int8_t*)sycl::malloc_device(g_bm_res_sites[gv[p + k]].na, *GQ);
+            gr->dtab = (s8v8::S8ResDesc*)sycl::malloc_device(
+                sizeof(s8v8::S8ResDesc) * (size_t)take, *GQ);
+            if (getenv("NR_BMERGE_SCRATCH") && atoi(getenv("NR_BMERGE_SCRATCH"))) {
+                size_t ob = (size_t)g_bm_res_sites[gv[p]].Mp * (size_t)g_bm_res_sites[gv[p]].N * 2;
+                gr->scratch.resize(take, nullptr);
+                for (size_t k = 0; k < take; ++k)
+                    gr->scratch[k] = (sycl::half*)sycl::malloc_device(ob, *GQ);
+            }
+            g_bm_groups.push_back(gr); ++ngrp;
+            for (size_t k = 0; k < take; ++k) {
+                BmResSite s = g_bm_res_sites[gv[p + k]];
+                cmds[s.cmd] = [s, gr, k]() {
+                    // dedicated face, NOT from the scratch pool: holding pool blocks would shift
+                    // the pool's allocation sequence for every other closure (the engine's alias /
+                    // fold-slot machinery depends on that sequence), which is the leading suspect
+                    // for the merged side still being non-exact at MAX=2.
+                    // NR_BMERGE_POOLFACES=1: take the A face from the scratch pool exactly like the
+                    // shipped body does (and return it at the end of this member). This is the
+                    // control for the finding that KEEP+SCRATCH was still corrupt: if the graph is
+                    // EXACT here, then the only thing my rewrite broke was the POOL ALLOCATION
+                    // SEQUENCE (faces held alive / allocated outside the pool), i.e. the engine's
+                    // correctness depends on eager face recycling.
+                    static int poolfaces = getenv("NR_BMERGE_POOLFACES") ? atoi(getenv("NR_BMERGE_POOLFACES")) : 0;
+                    bool put_back_now = false;
+                    int8_t* dAp = nullptr;
+                    if (poolfaces) { dAp = (int8_t*)pool_get(s.na); put_back_now = true; }
+                    else dAp = gr->face[k];          // allocated at rewrite time, NOT here
+                    if (s.fused_r) packdev::pack_a_fused(*GQ, s.a16r, dAp, (float*)s.as, s.M, s.Mp, s.K);
+                    else           packdev::pack_a(*GQ, s.Araw, dAp, s.M, s.Mp, s.K);
+                    int8_t* dBp = cached_pack_b_i8(s.b_id, s.Braw, s.N, s.K);
+                    // NR_BMERGE_SCRATCH=1: the merged launch writes a DISCARD buffer instead of the
+                    // member's real C face. Together with NR_BMERGE_KEEP=1 (every member also runs
+                    // its own shipped gemm at its own position) this separates "the merged launch
+                    // produces different values" from "the rewrite itself breaks the graph".
+                    static int scr = getenv("NR_BMERGE_SCRATCH") ? atoi(getenv("NR_BMERGE_SCRATCH")) : 0;
+                    if (scr && !gr->scratch.empty()) gr->slots[k] = s8v8::S8ResDesc{ dAp, dBp,
+                                          (void*)gr->scratch[k], s.as, s.bs, s.skp, s.cp };
+                    else gr->slots[k] = s8v8::S8ResDesc{ dAp, dBp, s.Cout, s.as, s.bs, s.skp, s.cp };
+                    gr->held.push_back(dAp);
+                    // NR_BMERGE_KEEP=1 = the decisive bisect switch (2026-11-03 13:2x): every member
+                    // ALSO runs its own shipped gemm at its own position, and the merged launch is
+                    // still emitted afterwards. If the 1301 face is then EXACT, the twin launch and
+                    // the plumbing are fine and ONLY the deferral of the write is unsafe (chain k+1
+                    // reads chain k's residual output, so moving that write later poisons the image).
+                    static int keep = getenv("NR_BMERGE_KEEP") ? atoi(getenv("NR_BMERGE_KEEP")) : 0;
+                    if (keep)
+                        s8v8::gemm_b_res(*GQ, dAp, dBp, s.Cout, s.as, s.bs, s.skp, s.cp,
+                                         s.M, s.Mp, s.N, s.K, s.narrow, s.half_skip, s.epi);
+                    if (put_back_now) pool_put(dAp);
+                    if ((int)gr->held.size() < gr->n) return;      // gemm deferred to the last member
+                    // The descriptor table must NOT come from the scratch pool: a pool block is
+                    // handed to other closures after pool_put, and their recorded writes then
+                    // clobber the table between replays (measured: the merged side produced four
+                    // different 1301 md5s across four processes, while the twin kernel itself is
+                    // byte-exact in the probe -- s6/BMERGE_twin_F*.log). A dedicated allocation,
+                    // uploaded once at capture and never recycled, is stable across replays.
+                    s8v8::S8ResDesc* dtab = gr->dtab;   // allocated at rewrite time
+                    s8v8::gemm_b_res_batch(*GQ, dtab, s.M, s.Mp, s.N, s.K, gr->n,
+                                           s.narrow, s.half_skip, s.epi);
+                    // faces stay allocated (dedicated, reused by the same group every pass)
+                };
+                merged++;
+            }
+        }
+    }
+    std::printf("[bmerge] sites=%zu groups=%zu closures_rewritten=%zu level=%d "
+                "gemm_launches %zu -> %zu refused_dep=%zu dropped_skipped=%zu\n",
+                g_bm_res_sites.size(), ngrp, merged, bmerge_level(), merged, ngrp,
+                refused_dep, refused_skip);
+    if (getenv("NR_BMERGE_DBG")) {
+        for (auto& s2 : g_bm_res_sites)
+            std::printf("[bmerge-site] cmd=%zu M=%d N=%d K=%d a=%d w=%d c=%d skip=%d cos=%d\n",
+                        s2.cmd, s2.M, s2.N, s2.K, s2.id_a, s2.b_id, s2.id_c, s2.id_skip, s2.id_cos);
+    }
+    std::fflush(stdout);
+    g_bm_res_sites.clear();
 }
 
 // ==================== NR_RES_BYTE: the byte-GRID probe (2026-11-02, 字节网格铲) =========
@@ -1457,6 +1652,7 @@ int xmx_graph_capture(void) {
     // NR_SKIP_CHAINS: whole-chain no-ops, applied to the frozen closure list BEFORE the
     // graph is stored (default empty => this function is never entered; see the block above).
     skip_chains_apply(g_cmds, g_cmd_names, (int)g_graphs.size());
+    bmerge_apply(g_cmds);      // KNIFE 1: runs AFTER the skip pass, so skipped legs cannot merge
     rb_report((int)g_graphs.size());      // NR_RES_BYTE census (no-op when the switch is unset)
     g_graphs.push_back(std::move(g_cmds)); g_graph_names.push_back(std::move(g_cmd_names));
     g_graph_touch.push_back(std::move(g_cmds_touch)); g_cmds_touch.clear();
@@ -3760,6 +3956,14 @@ int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale,
         rb_push(c, (unsigned)Mp, N, "residual");               // NR_RES_BYTE grid probe
         return 0;
     }
+    // KNIFE 1 (NR_BMERGE): remember this residual leg's full context so bmerge_apply (capture
+    // time, after the skip pass) can fold same-shape legs into one batched launch. Skipped /
+    // S6-fused / rb8 bodies never reach here, and a skipped closure never runs its body, so a
+    // dead leg can never join a group.
+    if (bmerge_level() >= 1 && !s6fire && (N % 64u) == 0u && (K % 32u) == 0u)
+        g_bm_res_sites.push_back(BmResSite{ Araw, Braw, Cout, as, bs, skp, cp, a16r, fused_r,
+                                            b, a, c, skip, cosine, (int)M, Mp, (int)N, (int)K, flags, narrow,
+                                            half_skip, epi, na, g_cmds.size() });
     pg_push([=]() {
         // device pack (section 92): Araw/Braw are already on device -- pack in place,
         // no download/upload round-trip (same conversion as gemm_int8, packdev gate).

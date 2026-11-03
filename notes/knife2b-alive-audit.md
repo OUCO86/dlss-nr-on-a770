@@ -211,3 +211,66 @@ Get-Content E:\DSH\s6\K2_probe_S0.log,E:\DSH\s6\K2_probe_S1.log,E:\DSH\s6\K2_pro
 新增件：`builds\libxmx_ship1.dll` `7BB0618E…`（**ship 基座，可直接当刀变体的底**）；`builds\libxmx_rt2.dll` 不变；walk 产物 `dumps\ship1_[a-d].1301.bin`（4×`DD49827D`）与 `dumps\rt2noskip.1301.bin`（`249A46F3`，对照证据）。
 进程：**`nr_replay=0 / LOP-Win64-Shipping=0 / icx=0`** ✓。未 commit / 未 push。
 **热状态**：本会话 GPU 累计 ≈ **0.5 分钟**（A/B 0.2 + 4 walk 0.2 + 对照 walk 0.1），远 <20 min ⇒ 无冷却要求；最后一次 GPU 动作在 11:5x ⇒ **下次开工卡是凉的**（但 P13 说明冷机绝对 ms 会偏高 ~35%）。
+
+---
+
+# §56 阶段 A（刀 1 四族成对实测）= **完成，判据 GO**　2026-11-03 12:0x-13:0x
+**仪器**：仓内 `src/bench/sycl/batch_merge_probe.cpp`（untracked，`5F8081F94E6D498DA2066F567B6C1751`）；exe `oneapi\batch_merge_probe.exe` = `B4939F6887A7137B6C5DD3DE85088B07`；跑批 `s6/run_bmerge.ps1` + 补跑 `s6/k1_topup.ps1`；汇总 `s6/bmerge_sum.py` ⇒ `s6/bmerge_sum.txt` `03466E0322C3CCE2092F937C5884B773`；台账 `s6/BMERGE_ledger.csv` `85C2D7AF3AA0A83D0F67EF255129A594`（生成器 `s6/mk_bmerge_ledger.py`，cache=`sycl-cache-bmerge` 独立目录，key 含 simd+module）。
+**四族（plan 真值，取自 `tools/shapes_alive.csv`）**：F0 `A1 qkv 2560×768×256`、F1 `A2 window-res 2560×256×256`、F2 `A3 res 2040×256×256`、F3 `A3 res 8160×128×128`。
+**协议**：**同进程内 split(b×batch=1) / merged(1×batch=b) 交替配对**（P13：只比 `PAIR;ratio`）；5 组 × min-of-15、组间 60 ms、nosink、GPU-event 按形求和；样本进程 F0 15 / F1 18 / F2 10 / F3 10 ⇒ 96 个 (族,dtype,腿,epi,b) 组。
+
+**① DIFF（逐字节）**：修正哨兵后 **128/128 = diff=0**（`s6/BMERGE_DCHK_F0..F3.log`）。主跑里 pub 腿的 nonzero 全是**哨兵伪差异**：`diff=(Mp−M)·N·esz`、`first_off=M·N·esz+1`（pub 核有 `if (rr<M)` 守卫、不写填充行；raw 核写满 ⇒ raw 全 0）——F0/F1 的 M=Mp ⇒ 连伪差异都不出现，这条自证成立。
+**② RESTWIN 分离实验**（`s6/BMERGE_twin_F2/F3.log`）：孪生核 `s8v8::gemm_b_res_batch`（设备 `S8ResDesc` 表）vs 出货 `gemm_b_res`×b，F2/F3 的 **b=1,2,4,8 全部 diff=0** ⇒ **孪生核逐字节正确**。
+**③ ratio（中位）**：best b=16 的 24 组里 **23 PASS**；唯一 FAIL = F3 int8 raw 1.464（F3 帧上的腿是 fused-store ≈ pub epi1 = **1.882** ✓）。按 §7.1 的 plan 档：
+
+| 族 | int8 pub epi1 | int8 raw | f16 pub epi1 | 备注 |
+|---|---|---|---|---|
+| F0（b8 档） | **1.522** ✓ | 1.580 ✓ | 1.445 ✗ | b16：1.671 / 1.738 / 1.540 |
+| F1（b8 档） | **1.597** ✓ | 1.400 ✗ | 1.896 ✓ | b16：1.937 / 1.771 / 2.259(n=3 低置信) |
+| F2（b8 档） | **1.515** ✓ | 1.446 ✗ | 1.852 ✓ | b16：1.913 / 1.880 / 2.395 |
+| F3（b4 档） | **1.317 ✗** | 0.921 ✗ | 1.069 ✗ | b8 档 1.605 ✓ / b16 1.882 ⇒ **该族必须并到 ≥b8，b4 无肉** |
+
+⇒ **合并倍率随 b 显著增长，§7.1 写的 b8/b4 偏低；真要实施应取 b=16（一族 16 发正好并成 1 发）**。
+**④ TOPS 对照 §50**：F0 int8 raw merged b8 = **29.80** vs `xmx_roof.csv` G18 = 29.73 ✓（差 0.2%，同形同核）；但我的 split b8 = 18.88 而 §50 的 G17 单发 b1 = 11.70 ⇒ **口径不同**（同进程连续 8 发合计 vs 单发 min-of-15）⇒ **别把 §50 的 2.54x 当本案 ratio**，本案同进程配对 = 1.58x。
+**⑤ 台账**：20 条实例（`s8v8::gemm_b/gemm_b_pub/gemm32_b`、`f16v1::gemm_b/gemm_b_pub_f16`、`packdev::pack_a/pack_b/pack_a16_b/pack_b16_b`）⇒ **grf=128、simd=1/16/32、private/spill/scratch=0、scratch 指令=0** ✓。
+**新坑 P16**：PS 5.1 的 `*>>`/`>>` 会把子进程输出**重编码成 UTF-16** 并与 ASCII 头混在一个文件里 ⇒ 机器读的 log 一律用 `cmd /c "exe >> log 2>&1"` 落原字节，解析用 python（BOM 嗅探）。本轮第一次跑批因此白烧 6 个进程。
+**新坑 P17**：probe 在 **F1 形上随机 fastfail（0xC0000409）**（F1 14 次尝试 11 次崩；F0/F2/F3 干净），崩点集中在最后几条腿（大 b + 大 C 缓冲）⇒ 对策 = 分 dtype 补跑（`BMP_DT=int8`）+ 崩溃重试 + **逐点报 n**。
+
+# §57 阶段 B = **卡点回报：合并侧未过逐位门（10 轮 build 后停手）**
+已实现（都在仓里、未 commit；`porcelain = 2 M + 1 ??`）：
+- 孪生核生成器 `s6/k1_add_batch_res.py` ⇒ `gemm_s8_v8_kernel.hpp` 新增 `S8ResDesc` + `gemm_b_res_batch`（体贴从 `gemm_b_res` **逐字节复制**，只改 group 索引与指针来源）；
+- 引擎侧 `s6/k1_engine_bmerge.py` ⇒ `NR_BMERGE` 分档 + 记录期 stash（`xmx_rec_gemm_int8_residual`）+ **捕获期（skip pass 之后）** closure 重写 + `[bmerge]` 计数打印；
+- 全部 build 走 `tools/build_shipped.ps1`（ship 基座 + `/D`），**单次编译仅 0.6-0.7 分钟** ⇒ 迭代便宜。
+
+读数：
+- **默认侧（不设 `NR_BMERGE`）= 1301 `DD49827D` EXACT ×4 独立进程** ✓ ⇒ "开关默认逐位不变"成立；`chains_skipped=14 refused=0 closures_noop=168 passes=691` 一字未变。
+- **合并侧从未逐位**：MAX=16（k1a-k1c）1 组/16 发 ⇒ 4 进程 4 个不同 md5；MAX=2（8 组/2 发）⇒ 仍 MISMATCH。`s6/k1_bands.py`：**1301 面 100% 元素不同**（4 通道 × 544 行全错）⇒ 早期一次错误写入毒化整图。
+- 逐轮排除：
+  - **R1** 组内含被 skip 杀掉的成员（合并发射不出）⇒ 加 `g_skipped_cmds` 过滤 ✓ 仍错；
+  - **R2** 成员**输出面**被中间 closure 触碰 ⇒ 加 `outs` 指针相交守卫（MAX16 时 4 组被拒）✓ 仍错；
+  - **R3** 未注册 closure（touch=`{(void*)-1}`）视为冲突 ✓ 仍错；
+  - **R4** 成员**输入面**（Araw/Braw/skip/cos/as/bs/a16r）在 pack 之后、合并发射之前被改写 ⇒ 加输入保护 ⇒ **MAX16 = groups=0 ⇒ 1301 EXACT（负对照干净）**；MAX2 的 8 组仍错；
+  - **R5** 描述符表走 scratch pool 可能被复用 ⇒ 专用 malloc + 一次性上传 ✓ 仍错；
+  - **R6** 持有 pool 块改变别的 closure 的取块序列 ⇒ 成员 A 面改专用 malloc（不进池）✓ 仍错；
+  - **R7** cgraph 参与？⇒ `NR_CGRAPH=0`：默认侧 EXACT、合并侧仍错 ⇒ **与 cgraph 无关**；
+  - **R8** 孪生核？⇒ probe RESTWIN diff=0 ⇒ **核无罪**；
+  - **R9 决定性对照**（`NR_BMERGE_KEEP=1` 每条腿仍按出货位置发射自己的 gemm + `NR_BMERGE_SCRATCH=1` 合并腿只写丢弃缓冲）⇒ **仍错** ⇒ **"重写"本身在改图**；
+  - **R10** 把组的全部设备对象（face/dtab/scratch）移到**重写期**分配（绝不在被捕获的 body 里 malloc，:1589 的规矩）⇒ keep+scratch 仍错；**纯合并 = 挂死**（`nr_replay_now` 22 分钟无输出，已杀 pid 4024）。
+- **诚实结论**：刀 1 的**单价结论成立**（§56），但**"把 b 条链的腿推迟到组内最后一条链的位置"在当前记录顺序下不等价**；指针级依赖守卫（PGRAPH touch sets）不足以刻画真实依赖；R9/R10 说明连"额外发射一条写丢弃缓冲的腿"都会改变结果 ⇒ 最可能根因：这些腿的输入面（A 面 / a_scale / b_scale / skip / cosine）在链间被**复用/改写**，且引擎把 **scratch-pool 的取块序列当作正确性的一部分**。⇒ **closure 级重写做不成这件事**；刀 1 需要**记录/计划层换序 + 稳定面**（把同形腿排到相邻、并给它们不被回收的面）＝ port-E 量级，不是小刀。
+- **安全性**：`NR_BMERGE` 默认 0；且在 R4 守卫下**默认档 MAX=16 = groups=0**（打开开关也不会合并任何腿）⇒ 这批 dirty 文件对出货路径无风险；**但别在 MAX≤4 档跑合并（会挂死）**。
+- **40 门**：stage `builds\libxmx_k1i.dll` 后 = **39 GREEN / 1 RED**，唯一 RED 是 `gate_skip_graph` 的**自带 md5 守卫**（要求 oneapi 里的件 = ABB969FE，而我 stage 了候选件）；该门的功能检查全过（`chains_skipped=14 refused=0 closures_noop=168 passes=691` + 三进程 1301 EXACT）。**复原 `oneapi\libxmx_sycl.dll` = ABB969FE 后重跑 = 40 GREEN / 0 RED** ✓
+- **帧 16 对：未跑**（B 未过门，按令不进 C3）。
+- 中间件（只出 `builds\`）：`k1a 3B2FE100 / k1b 174083DA / k1c F4435F29 / k1d 7B626BFB / k1e 077B9933 / k1f 9C1CB0B8 / k1g 8AC8B7AA / k1h 0A2586F5 / k1i EF2C9677 / k1j B0AC7948 / k1k 60475C4B / k1l D62015D7 / k1m 22F49260`（3,844,608→3,853,312 B）。补丁全由 `s6/k1_*.py` 生成，可复现可回退（`git checkout -- src/bench/sycl/libxmx_sycl.cpp src/bench/sycl/gemm_s8_v8_kernel.hpp`）。
+
+# §58 现场（14:0x 实证）
+`out\libxmx.dll` = `oneapi\libxmx_sycl.dll` = **ABB969FE…** ✓（门跑时 stage 过 k1i，**已复原并贴 md5**）；三金标 **DD49827D / DD49827D / 249A46F3** ✓；`out\test_*.dll` ✓ 未动；`wt-08e8b62` ✓ 未动；`knife2_probe.exe` `B5A82BE2…` 仍未跑。
+仓：`ds-quality-relax-2026-11-02` @ **`3abc02a`**，porcelain = ` M gemm_s8_v8_kernel.hpp` / ` M libxmx_sycl.cpp` / `?? batch_merge_probe.cpp`（刀 1 未提交工作，**未 commit/未 push**）。
+新产物：`oneapi\batch_merge_probe.exe` `B4939F68…`（留用别重编）、`s6/{cc_bmerge,run_bmerge,k1_topup,k1_gates}.ps1`、`s6/{bmerge_sum,k1_add_batch_res,k1_engine_bmerge,k1_fix_*,k1_add_*,k1_dep_probe,k1_bands,k1_mkledger}.py`、`s6/BMERGE_F{0..3}.log`、`s6/BMERGE_DCHK_F{0..3}.log`、`s6/BMERGE_twin_F{2,3}.log`、`s6/BMERGE_ledger.csv`、`s6/bmerge_sum.txt`、`s6/K1_dep_trace.log`、`s6/k1_probe_{fix,add_*}.py`。
+进程：**`nr_replay=0 / batch_merge_probe=0 / LOP=0`**（挂死的 pid 4024 已杀）。
+**热状态**：本会话 GPU 累计 ≈ **65 分钟**（含 22 分钟挂死进程）⇒ **下次开工先凉 ≥5 分钟**；跨配置对照仍须同热交替。
+
+# §59 下一步建议（等裁决，未动）
+1. **closure 级刀 1 判死**（R9/R10 的证据链），把"同形腿相邻 + 面不被回收"作为**任何合并刀的前置条件**写进 §7.1 的依赖列：刀 1/刀 3 都吃这条；
+2. 机器可查的换序规模：96 个 residual 站点里**相邻（cmd 连续）的同形腿对 = 0**（组成员间隔 10 = 一条链的长度）⇒ 换序 = 重排记录序列，属 port-E 量级；
+3. 若继续找"画质零代价"的帧钱：优先 **C1（quant 折进生产者 store）** 与 **③ window-major 面布局**（§50：pack 腿 23.7-34.9%/链），它们不依赖跨链换序；
+4. 仪器全部保留可复用：`batch_merge_probe.exe` + `BMERGE_*` 日志 + 台账 + `shapes_alive.csv`（刀 3 的 A4 族若要测，换 `BMP_FAM` 加两族即可）。

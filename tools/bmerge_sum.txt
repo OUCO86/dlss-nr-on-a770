@@ -1,0 +1,271 @@
+logs: ['BMERGE_F0.log', 'BMERGE_F1.log', 'BMERGE_F2.log', 'BMERGE_F3.log']
+PAIR groups parsed: 96  DIFF groups: 64  procs per fam: {'F0_A1_qkv_2560_768_256': 355, 'F1_A2_wres_2560_256_256': 323, 'F2_A3_res_2040_256_256': 240, 'F3_A3_res_8160_128_128': 240}
+
+=== DIFF: main logs (old sentinel) explained, then the corrected DCHK run ===
+  F0_A1_qkv_2560_768_256     f16  pub epi1  zero     procs=59
+  F0_A1_qkv_2560_768_256     f16  raw epi0  zero     procs=59
+  F0_A1_qkv_2560_768_256     int8 pub epi1  zero     procs=61
+  F0_A1_qkv_2560_768_256     int8 raw epi0  zero     procs=61
+  F1_A2_wres_2560_256_256    f16  pub epi1  zero     procs=40
+  F1_A2_wres_2560_256_256    f16  raw epi0  zero     procs=40
+  F1_A2_wres_2560_256_256    int8 pub epi1  zero     procs=77
+  F1_A2_wres_2560_256_256    int8 raw epi0  zero     procs=77
+  F2_A3_res_2040_256_256     f16  pub epi1  nonzero  procs=40
+  F2_A3_res_2040_256_256     f16  raw epi0  zero     procs=40
+  F2_A3_res_2040_256_256     int8 pub epi1  nonzero  procs=40
+  F2_A3_res_2040_256_256     int8 raw epi0  zero     procs=40
+  F3_A3_res_8160_128_128     f16  pub epi1  zero     procs=40
+  F3_A3_res_8160_128_128     f16  raw epi0  zero     procs=40
+  F3_A3_res_8160_128_128     int8 pub epi1  nonzero  procs=40
+  F3_A3_res_8160_128_128     int8 raw epi0  zero     procs=40
+  CORRECTED diff pass (['BMERGE_DCHK_F0.log', 'BMERGE_DCHK_F1.log', 'BMERGE_DCHK_F2.log', 'BMERGE_DCHK_F3.log']): diff=0 lines = 128, nonzero = 0
+
+=== PAIR ratio: median across processes (gate 1.5 on the BEST b) ===
+  F0_A1_qkv_2560_768_256     f16  pub epi1  b=1   n=16 ratio_med= 0.999 [ 0.985.. 1.018]  split= 0.1391 merged= 0.1390 ms
+  F0_A1_qkv_2560_768_256     f16  pub epi1  b=4   n=16 ratio_med= 1.298 [ 1.293.. 1.304]  split= 0.4165 merged= 0.3208 ms
+  F0_A1_qkv_2560_768_256     f16  pub epi1  b=8   n=14 ratio_med= 1.445 [ 1.432.. 1.450]  split= 0.7789 merged= 0.5388 ms
+  F0_A1_qkv_2560_768_256     f16  pub epi1  b=16  n=13 ratio_med= 1.540 [ 1.537.. 1.549]  split= 1.5014 merged= 0.9746 ms
+  F0_A1_qkv_2560_768_256     f16  pub epi4  b=1   n=16 ratio_med= 1.002 [ 0.983.. 1.009]  split= 0.1360 merged= 0.1366 ms
+  F0_A1_qkv_2560_768_256     f16  pub epi4  b=4   n=15 ratio_med= 1.306 [ 1.296.. 1.322]  split= 0.4069 merged= 0.3117 ms
+  F0_A1_qkv_2560_768_256     f16  pub epi4  b=8   n=14 ratio_med= 1.461 [ 1.457.. 1.469]  split= 0.7592 merged= 0.5199 ms
+  F0_A1_qkv_2560_768_256     f16  pub epi4  b=16  n=13 ratio_med= 1.556 [ 1.551.. 1.561]  split= 1.4625 merged= 0.9386 ms
+  F0_A1_qkv_2560_768_256     f16  raw epi0  b=1   n=16 ratio_med= 0.998 [ 0.988.. 1.011]  split= 0.1190 merged= 0.1186 ms
+  F0_A1_qkv_2560_768_256     f16  raw epi0  b=4   n=16 ratio_med= 1.365 [ 1.358.. 1.373]  split= 0.3610 merged= 0.2647 ms
+  F0_A1_qkv_2560_768_256     f16  raw epi0  b=8   n=14 ratio_med= 1.548 [ 1.539.. 1.553]  split= 0.6803 merged= 0.4396 ms
+  F0_A1_qkv_2560_768_256     f16  raw epi0  b=16  n=13 ratio_med= 1.671 [ 1.666.. 1.673]  split= 1.3197 merged= 0.7894 ms
+  F0_A1_qkv_2560_768_256     int8 pub epi1  b=1   n=16 ratio_med= 1.003 [ 0.989.. 1.029]  split= 0.1041 merged= 0.1036 ms
+  F0_A1_qkv_2560_768_256     int8 pub epi1  b=4   n=16 ratio_med= 1.296 [ 1.278.. 1.309]  split= 0.3018 merged= 0.2330 ms
+  F0_A1_qkv_2560_768_256     int8 pub epi1  b=8   n=14 ratio_med= 1.522 [ 1.483.. 1.533]  split= 0.5639 merged= 0.3707 ms
+  F0_A1_qkv_2560_768_256     int8 pub epi1  b=16  n=13 ratio_med= 1.671 [ 1.655.. 1.679]  split= 1.0819 merged= 0.6468 ms
+  F0_A1_qkv_2560_768_256     int8 pub epi4  b=1   n=16 ratio_med= 0.997 [ 0.972.. 1.021]  split= 0.1046 merged= 0.1048 ms
+  F0_A1_qkv_2560_768_256     int8 pub epi4  b=4   n=16 ratio_med= 1.309 [ 1.301.. 1.323]  split= 0.3034 merged= 0.2316 ms
+  F0_A1_qkv_2560_768_256     int8 pub epi4  b=8   n=14 ratio_med= 1.547 [ 1.535.. 1.574]  split= 0.5662 merged= 0.3654 ms
+  F0_A1_qkv_2560_768_256     int8 pub epi4  b=16  n=13 ratio_med= 1.711 [ 1.703.. 1.724]  split= 1.0889 merged= 0.6366 ms
+  F0_A1_qkv_2560_768_256     int8 raw epi0  b=1   n=16 ratio_med= 1.000 [ 0.989.. 1.017]  split= 0.0859 merged= 0.0858 ms
+  F0_A1_qkv_2560_768_256     int8 raw epi0  b=4   n=16 ratio_med= 1.364 [ 1.350.. 1.377]  split= 0.2328 merged= 0.1707 ms
+  F0_A1_qkv_2560_768_256     int8 raw epi0  b=8   n=15 ratio_med= 1.580 [ 1.562.. 1.588]  split= 0.4259 merged= 0.2692 ms
+  F0_A1_qkv_2560_768_256     int8 raw epi0  b=16  n=14 ratio_med= 1.738 [ 1.727.. 1.811]  split= 0.8091 merged= 0.4652 ms
+  F1_A2_wres_2560_256_256    f16  pub epi1  b=1   n=14 ratio_med= 0.996 [ 0.983.. 1.029]  split= 0.0937 merged= 0.0940 ms
+  F1_A2_wres_2560_256_256    f16  pub epi1  b=4   n=12 ratio_med= 1.530 [ 1.282.. 1.547]  split= 0.2550 merged= 0.1675 ms
+  F1_A2_wres_2560_256_256    f16  pub epi1  b=8   n=11 ratio_med= 1.896 [ 1.720.. 1.914]  split= 0.4621 merged= 0.2448 ms
+  F1_A2_wres_2560_256_256    f16  pub epi1  b=16  n= 3 ratio_med= 2.259 [ 2.127.. 2.264]  split= 0.8783 merged= 0.3893 ms
+  F1_A2_wres_2560_256_256    f16  pub epi4  b=1   n=14 ratio_med= 1.000 [ 0.993.. 1.011]  split= 0.0927 merged= 0.0927 ms
+  F1_A2_wres_2560_256_256    f16  pub epi4  b=4   n=12 ratio_med= 1.338 [ 1.281.. 1.547]  split= 0.2175 merged= 0.1633 ms
+  F1_A2_wres_2560_256_256    f16  pub epi4  b=8   n=11 ratio_med= 1.888 [ 1.685.. 1.920]  split= 0.4485 merged= 0.2380 ms
+  F1_A2_wres_2560_256_256    f16  pub epi4  b=16  n= 3 ratio_med= 2.274 [ 2.141.. 2.301]  split= 0.8550 merged= 0.3765 ms
+  F1_A2_wres_2560_256_256    f16  raw epi0  b=1   n=14 ratio_med= 0.996 [ 0.614.. 1.017]  split= 0.0854 merged= 0.0852 ms
+  F1_A2_wres_2560_256_256    f16  raw epi0  b=4   n=12 ratio_med= 1.576 [ 1.316.. 1.602]  split= 0.2282 merged= 0.1454 ms
+  F1_A2_wres_2560_256_256    f16  raw epi0  b=8   n=11 ratio_med= 2.015 [ 1.825.. 2.052]  split= 0.4169 merged= 0.2074 ms
+  F1_A2_wres_2560_256_256    f16  raw epi0  b=16  n= 3 ratio_med= 2.464 [ 2.314.. 2.476]  split= 0.8002 merged= 0.3248 ms
+  F1_A2_wres_2560_256_256    int8 pub epi1  b=1   n=22 ratio_med= 0.999 [ 0.887.. 1.034]  split= 0.0720 merged= 0.0718 ms
+  F1_A2_wres_2560_256_256    int8 pub epi1  b=4   n=19 ratio_med= 1.365 [ 1.046.. 1.454]  split= 0.1721 merged= 0.1264 ms
+  F1_A2_wres_2560_256_256    int8 pub epi1  b=8   n=17 ratio_med= 1.597 [ 1.367.. 1.621]  split= 0.2973 merged= 0.1869 ms
+  F1_A2_wres_2560_256_256    int8 pub epi1  b=16  n= 8 ratio_med= 1.937 [ 1.715.. 2.048]  split= 0.5489 merged= 0.2814 ms
+  F1_A2_wres_2560_256_256    int8 pub epi4  b=1   n=22 ratio_med= 1.001 [ 0.847.. 1.162]  split= 0.0726 merged= 0.0723 ms
+  F1_A2_wres_2560_256_256    int8 pub epi4  b=4   n=18 ratio_med= 1.357 [ 1.232.. 1.881]  split= 0.1728 merged= 0.1267 ms
+  F1_A2_wres_2560_256_256    int8 pub epi4  b=8   n=15 ratio_med= 1.615 [ 1.364.. 1.636]  split= 0.3000 merged= 0.1858 ms
+  F1_A2_wres_2560_256_256    int8 pub epi4  b=16  n= 5 ratio_med= 1.983 [ 1.975.. 2.143]  split= 0.5505 merged= 0.2751 ms
+  F1_A2_wres_2560_256_256    int8 raw epi0  b=1   n=22 ratio_med= 1.000 [ 0.464.. 2.162]  split= 0.0287 merged= 0.0287 ms
+  F1_A2_wres_2560_256_256    int8 raw epi0  b=4   n=22 ratio_med= 0.992 [ 0.950.. 1.337]  split= 0.1034 merged= 0.1046 ms
+  F1_A2_wres_2560_256_256    int8 raw epi0  b=8   n=18 ratio_med= 1.400 [ 1.317.. 1.657]  split= 0.2004 merged= 0.1433 ms
+  F1_A2_wres_2560_256_256    int8 raw epi0  b=16  n=15 ratio_med= 1.771 [ 1.737.. 2.103]  split= 0.3885 merged= 0.2186 ms
+  F2_A3_res_2040_256_256     f16  pub epi1  b=1   n=10 ratio_med= 0.997 [ 0.953.. 1.056]  split= 0.0966 merged= 0.0970 ms
+  F2_A3_res_2040_256_256     f16  pub epi1  b=4   n=10 ratio_med= 1.433 [ 1.348.. 1.474]  split= 0.2129 merged= 0.1486 ms
+  F2_A3_res_2040_256_256     f16  pub epi1  b=8   n=10 ratio_med= 1.852 [ 1.801.. 1.886]  split= 0.4063 merged= 0.2195 ms
+  F2_A3_res_2040_256_256     f16  pub epi1  b=16  n=10 ratio_med= 2.395 [ 2.331.. 2.508]  split= 0.7929 merged= 0.3324 ms
+  F2_A3_res_2040_256_256     f16  pub epi4  b=1   n=10 ratio_med= 0.990 [ 0.951.. 1.023]  split= 0.0958 merged= 0.0969 ms
+  F2_A3_res_2040_256_256     f16  pub epi4  b=4   n=10 ratio_med= 1.425 [ 1.346.. 1.455]  split= 0.2071 merged= 0.1452 ms
+  F2_A3_res_2040_256_256     f16  pub epi4  b=8   n=10 ratio_med= 1.849 [ 1.807.. 1.882]  split= 0.3945 merged= 0.2137 ms
+  F2_A3_res_2040_256_256     f16  pub epi4  b=16  n=10 ratio_med= 2.386 [ 2.316.. 2.410]  split= 0.7707 merged= 0.3233 ms
+  F2_A3_res_2040_256_256     f16  raw epi0  b=1   n=10 ratio_med= 1.006 [ 0.985.. 1.026]  split= 0.0497 merged= 0.0495 ms
+  F2_A3_res_2040_256_256     f16  raw epi0  b=4   n=10 ratio_med= 1.425 [ 1.385.. 1.437]  split= 0.1828 merged= 0.1281 ms
+  F2_A3_res_2040_256_256     f16  raw epi0  b=8   n=10 ratio_med= 1.898 [ 1.825.. 1.920]  split= 0.3509 merged= 0.1845 ms
+  F2_A3_res_2040_256_256     f16  raw epi0  b=16  n=10 ratio_med= 2.456 [ 2.362.. 2.486]  split= 0.6880 merged= 0.2800 ms
+  F2_A3_res_2040_256_256     int8 pub epi1  b=1   n=10 ratio_med= 1.004 [ 0.954.. 1.061]  split= 0.0733 merged= 0.0723 ms
+  F2_A3_res_2040_256_256     int8 pub epi1  b=4   n=10 ratio_med= 1.205 [ 1.077.. 1.221]  split= 0.1319 merged= 0.1091 ms
+  F2_A3_res_2040_256_256     int8 pub epi1  b=8   n=10 ratio_med= 1.515 [ 1.494.. 1.691]  split= 0.2512 merged= 0.1657 ms
+  F2_A3_res_2040_256_256     int8 pub epi1  b=16  n=10 ratio_med= 1.913 [ 1.863.. 2.032]  split= 0.4911 merged= 0.2567 ms
+  F2_A3_res_2040_256_256     int8 pub epi4  b=1   n=10 ratio_med= 0.984 [ 0.943.. 1.041]  split= 0.0728 merged= 0.0731 ms
+  F2_A3_res_2040_256_256     int8 pub epi4  b=4   n=10 ratio_med= 1.213 [ 1.182.. 1.798]  split= 0.1332 merged= 0.1096 ms
+  F2_A3_res_2040_256_256     int8 pub epi4  b=8   n=10 ratio_med= 1.535 [ 1.486.. 1.759]  split= 0.2532 merged= 0.1656 ms
+  F2_A3_res_2040_256_256     int8 pub epi4  b=16  n=10 ratio_med= 1.937 [ 1.888.. 2.077]  split= 0.4934 merged= 0.2549 ms
+  F2_A3_res_2040_256_256     int8 raw epi0  b=1   n=10 ratio_med= 1.000 [ 0.989.. 1.007]  split= 0.0282 merged= 0.0282 ms
+  F2_A3_res_2040_256_256     int8 raw epi0  b=4   n=10 ratio_med= 1.087 [ 1.057.. 1.097]  split= 0.0999 merged= 0.0920 ms
+  F2_A3_res_2040_256_256     int8 raw epi0  b=8   n=10 ratio_med= 1.446 [ 1.322.. 1.464]  split= 0.1904 merged= 0.1317 ms
+  F2_A3_res_2040_256_256     int8 raw epi0  b=16  n=10 ratio_med= 1.880 [ 1.805.. 1.895]  split= 0.3718 merged= 0.1980 ms
+  F3_A3_res_8160_128_128     f16  pub epi1  b=1   n=10 ratio_med= 0.998 [ 0.972.. 1.198]  split= 0.0897 merged= 0.0899 ms
+  F3_A3_res_8160_128_128     f16  pub epi1  b=4   n=10 ratio_med= 1.069 [ 1.050.. 1.273]  split= 0.1972 merged= 0.1847 ms
+  F3_A3_res_8160_128_128     f16  pub epi1  b=8   n=10 ratio_med= 1.440 [ 1.282.. 1.456]  split= 0.4144 merged= 0.2890 ms
+  F3_A3_res_8160_128_128     f16  pub epi1  b=16  n=10 ratio_med= 1.610 [ 1.522.. 1.651]  split= 0.7862 merged= 0.4881 ms
+  F3_A3_res_8160_128_128     f16  pub epi4  b=1   n=10 ratio_med= 0.996 [ 0.895.. 1.013]  split= 0.0896 merged= 0.0897 ms
+  F3_A3_res_8160_128_128     f16  pub epi4  b=4   n=10 ratio_med= 1.042 [ 0.992.. 1.282]  split= 0.1900 merged= 0.1815 ms
+  F3_A3_res_8160_128_128     f16  pub epi4  b=8   n=10 ratio_med= 1.369 [ 1.288.. 1.479]  split= 0.3868 merged= 0.2769 ms
+  F3_A3_res_8160_128_128     f16  pub epi4  b=16  n=10 ratio_med= 1.578 [ 1.443.. 1.710]  split= 0.7424 merged= 0.4698 ms
+  F3_A3_res_8160_128_128     f16  raw epi0  b=1   n=10 ratio_med= 0.996 [ 0.979.. 1.054]  split= 0.0766 merged= 0.0776 ms
+  F3_A3_res_8160_128_128     f16  raw epi0  b=4   n=10 ratio_med= 1.118 [ 0.936.. 1.245]  split= 0.1800 merged= 0.1613 ms
+  F3_A3_res_8160_128_128     f16  raw epi0  b=8   n=10 ratio_med= 1.416 [ 1.205.. 1.521]  split= 0.3402 merged= 0.2398 ms
+  F3_A3_res_8160_128_128     f16  raw epi0  b=16  n=10 ratio_med= 1.613 [ 1.605.. 1.707]  split= 0.6444 merged= 0.3992 ms
+  F3_A3_res_8160_128_128     int8 pub epi1  b=1   n=10 ratio_med= 0.996 [ 0.769.. 1.062]  split= 0.0766 merged= 0.0779 ms
+  F3_A3_res_8160_128_128     int8 pub epi1  b=4   n=10 ratio_med= 1.317 [ 1.201.. 1.362]  split= 0.1948 merged= 0.1486 ms
+  F3_A3_res_8160_128_128     int8 pub epi1  b=8   n=10 ratio_med= 1.605 [ 1.537.. 1.721]  split= 0.3513 merged= 0.2198 ms
+  F3_A3_res_8160_128_128     int8 pub epi1  b=16  n=10 ratio_med= 1.882 [ 1.741.. 1.914]  split= 0.6640 merged= 0.3523 ms
+  F3_A3_res_8160_128_128     int8 pub epi4  b=1   n=10 ratio_med= 1.007 [ 0.967.. 1.040]  split= 0.0765 merged= 0.0764 ms
+  F3_A3_res_8160_128_128     int8 pub epi4  b=4   n=10 ratio_med= 1.324 [ 1.193.. 1.545]  split= 0.1946 merged= 0.1472 ms
+  F3_A3_res_8160_128_128     int8 pub epi4  b=8   n=10 ratio_med= 1.597 [ 1.513.. 1.645]  split= 0.3528 merged= 0.2213 ms
+  F3_A3_res_8160_128_128     int8 pub epi4  b=16  n=10 ratio_med= 1.907 [ 1.847.. 1.941]  split= 0.6693 merged= 0.3509 ms
+  F3_A3_res_8160_128_128     int8 raw epi0  b=1   n=10 ratio_med= 0.996 [ 0.445.. 1.008]  split= 0.0275 merged= 0.0275 ms
+  F3_A3_res_8160_128_128     int8 raw epi0  b=4   n=10 ratio_med= 0.921 [ 0.867.. 1.258]  split= 0.1006 merged= 0.1101 ms
+  F3_A3_res_8160_128_128     int8 raw epi0  b=8   n=10 ratio_med= 1.202 [ 1.159.. 1.488]  split= 0.1959 merged= 0.1622 ms
+  F3_A3_res_8160_128_128     int8 raw epi0  b=16  n=10 ratio_med= 1.464 [ 1.395.. 1.790]  split= 0.3846 merged= 0.2620 ms
+
+=== best b per (family,dtype,leg,epi) ===
+  F0_A1_qkv_2560_768_256     f16  pub epi1  -> best b=16  ratio= 1.540 [1.537..1.549] n=13  PASS
+  F0_A1_qkv_2560_768_256     f16  pub epi4  -> best b=16  ratio= 1.556 [1.551..1.561] n=13  PASS
+  F0_A1_qkv_2560_768_256     f16  raw epi0  -> best b=16  ratio= 1.671 [1.666..1.673] n=13  PASS
+  F0_A1_qkv_2560_768_256     int8 pub epi1  -> best b=16  ratio= 1.671 [1.655..1.679] n=13  PASS
+  F0_A1_qkv_2560_768_256     int8 pub epi4  -> best b=16  ratio= 1.711 [1.703..1.724] n=13  PASS
+  F0_A1_qkv_2560_768_256     int8 raw epi0  -> best b=16  ratio= 1.738 [1.727..1.811] n=14  PASS
+  F1_A2_wres_2560_256_256    f16  pub epi1  -> best b=16  ratio= 2.259 [2.127..2.264] n=3  PASS
+  F1_A2_wres_2560_256_256    f16  pub epi4  -> best b=16  ratio= 2.274 [2.141..2.301] n=3  PASS
+  F1_A2_wres_2560_256_256    f16  raw epi0  -> best b=16  ratio= 2.464 [2.314..2.476] n=3  PASS
+  F1_A2_wres_2560_256_256    int8 pub epi1  -> best b=16  ratio= 1.937 [1.715..2.048] n=8  PASS
+  F1_A2_wres_2560_256_256    int8 pub epi4  -> best b=16  ratio= 1.983 [1.975..2.143] n=5  PASS
+  F1_A2_wres_2560_256_256    int8 raw epi0  -> best b=16  ratio= 1.771 [1.737..2.103] n=15  PASS
+  F2_A3_res_2040_256_256     f16  pub epi1  -> best b=16  ratio= 2.395 [2.331..2.508] n=10  PASS
+  F2_A3_res_2040_256_256     f16  pub epi4  -> best b=16  ratio= 2.386 [2.316..2.410] n=10  PASS
+  F2_A3_res_2040_256_256     f16  raw epi0  -> best b=16  ratio= 2.456 [2.362..2.486] n=10  PASS
+  F2_A3_res_2040_256_256     int8 pub epi1  -> best b=16  ratio= 1.913 [1.863..2.032] n=10  PASS
+  F2_A3_res_2040_256_256     int8 pub epi4  -> best b=16  ratio= 1.937 [1.888..2.077] n=10  PASS
+  F2_A3_res_2040_256_256     int8 raw epi0  -> best b=16  ratio= 1.880 [1.805..1.895] n=10  PASS
+  F3_A3_res_8160_128_128     f16  pub epi1  -> best b=16  ratio= 1.610 [1.522..1.651] n=10  PASS
+  F3_A3_res_8160_128_128     f16  pub epi4  -> best b=16  ratio= 1.578 [1.443..1.710] n=10  PASS
+  F3_A3_res_8160_128_128     f16  raw epi0  -> best b=16  ratio= 1.613 [1.605..1.707] n=10  PASS
+  F3_A3_res_8160_128_128     int8 pub epi1  -> best b=16  ratio= 1.882 [1.741..1.914] n=10  PASS
+  F3_A3_res_8160_128_128     int8 pub epi4  -> best b=16  ratio= 1.907 [1.847..1.941] n=10  PASS
+  F3_A3_res_8160_128_128     int8 raw epi0  -> best b=16  ratio= 1.464 [1.395..1.790] n=10  FAIL
+
+=== ratio at the PLAN target b (7.1: 2560/2040 families -> b8, 8160x128x128 -> b4) ===
+  F0_A1_qkv_2560_768_256     f16  pub epi1  b=8   n=14 ratio_med= 1.445 FAIL
+  F0_A1_qkv_2560_768_256     f16  pub epi4  b=8   n=14 ratio_med= 1.461 FAIL
+  F0_A1_qkv_2560_768_256     f16  raw epi0  b=8   n=14 ratio_med= 1.548 PASS
+  F0_A1_qkv_2560_768_256     int8 pub epi1  b=8   n=14 ratio_med= 1.522 PASS
+  F0_A1_qkv_2560_768_256     int8 pub epi4  b=8   n=14 ratio_med= 1.547 PASS
+  F0_A1_qkv_2560_768_256     int8 raw epi0  b=8   n=15 ratio_med= 1.580 PASS
+  F1_A2_wres_2560_256_256    f16  pub epi1  b=8   n=11 ratio_med= 1.896 PASS
+  F1_A2_wres_2560_256_256    f16  pub epi4  b=8   n=11 ratio_med= 1.888 PASS
+  F1_A2_wres_2560_256_256    f16  raw epi0  b=8   n=11 ratio_med= 2.015 PASS
+  F1_A2_wres_2560_256_256    int8 pub epi1  b=8   n=17 ratio_med= 1.597 PASS
+  F1_A2_wres_2560_256_256    int8 pub epi4  b=8   n=15 ratio_med= 1.615 PASS
+  F1_A2_wres_2560_256_256    int8 raw epi0  b=8   n=18 ratio_med= 1.400 FAIL
+  F2_A3_res_2040_256_256     f16  pub epi1  b=8   n=10 ratio_med= 1.852 PASS
+  F2_A3_res_2040_256_256     f16  pub epi4  b=8   n=10 ratio_med= 1.849 PASS
+  F2_A3_res_2040_256_256     f16  raw epi0  b=8   n=10 ratio_med= 1.898 PASS
+  F2_A3_res_2040_256_256     int8 pub epi1  b=8   n=10 ratio_med= 1.515 PASS
+  F2_A3_res_2040_256_256     int8 pub epi4  b=8   n=10 ratio_med= 1.535 PASS
+  F2_A3_res_2040_256_256     int8 raw epi0  b=8   n=10 ratio_med= 1.446 FAIL
+  F3_A3_res_8160_128_128     f16  pub epi1  b=4   n=10 ratio_med= 1.069 FAIL
+  F3_A3_res_8160_128_128     f16  pub epi4  b=4   n=10 ratio_med= 1.042 FAIL
+  F3_A3_res_8160_128_128     f16  raw epi0  b=4   n=10 ratio_med= 1.118 FAIL
+  F3_A3_res_8160_128_128     int8 pub epi1  b=4   n=10 ratio_med= 1.317 FAIL
+  F3_A3_res_8160_128_128     int8 pub epi4  b=4   n=10 ratio_med= 1.324 FAIL
+  F3_A3_res_8160_128_128     int8 raw epi0  b=4   n=10 ratio_med= 0.921 FAIL
+
+=== merged-form TOPS (median across procs) vs the section-50 roof table ===
+  F0_A1_qkv_2560_768_256     f16  pub epi1  merged  b=1   TOPS_med=   7.24
+  F0_A1_qkv_2560_768_256     f16  pub epi1  merged  b=4   TOPS_med=  12.55
+  F0_A1_qkv_2560_768_256     f16  pub epi1  merged  b=8   TOPS_med=  14.95
+  F0_A1_qkv_2560_768_256     f16  pub epi1  merged  b=16  TOPS_med=  16.53
+  F0_A1_qkv_2560_768_256     f16  pub epi4  merged  b=1   TOPS_med=   7.37
+  F0_A1_qkv_2560_768_256     f16  pub epi4  merged  b=4   TOPS_med=  12.92
+  F0_A1_qkv_2560_768_256     f16  pub epi4  merged  b=8   TOPS_med=  15.49
+  F0_A1_qkv_2560_768_256     f16  pub epi4  merged  b=16  TOPS_med=  17.16
+  F0_A1_qkv_2560_768_256     f16  raw epi0  merged  b=1   TOPS_med=   8.49
+  F0_A1_qkv_2560_768_256     f16  raw epi0  merged  b=4   TOPS_med=  15.21
+  F0_A1_qkv_2560_768_256     f16  raw epi0  merged  b=8   TOPS_med=  18.32
+  F0_A1_qkv_2560_768_256     f16  raw epi0  merged  b=16  TOPS_med=  20.40
+  F0_A1_qkv_2560_768_256     int8 pub epi1  merged  b=1   TOPS_med=   9.71
+  F0_A1_qkv_2560_768_256     int8 pub epi1  merged  b=4   TOPS_med=  17.28
+  F0_A1_qkv_2560_768_256     int8 pub epi1  merged  b=8   TOPS_med=  21.73
+  F0_A1_qkv_2560_768_256     int8 pub epi1  merged  b=16  TOPS_med=  24.90
+  F0_A1_qkv_2560_768_256     int8 pub epi4  merged  b=1   TOPS_med=   9.61
+  F0_A1_qkv_2560_768_256     int8 pub epi4  merged  b=4   TOPS_med=  17.38
+  F0_A1_qkv_2560_768_256     int8 pub epi4  merged  b=8   TOPS_med=  22.04
+  F0_A1_qkv_2560_768_256     int8 pub epi4  merged  b=16  TOPS_med=  25.30
+  F0_A1_qkv_2560_768_256     int8 raw epi0  merged  b=1   TOPS_med=  11.73
+  F0_A1_qkv_2560_768_256     int8 raw epi0  merged  b=4   TOPS_med=  23.59
+  F0_A1_qkv_2560_768_256     int8 raw epi0  merged  b=8   TOPS_med=  29.91
+  F0_A1_qkv_2560_768_256     int8 raw epi0  merged  b=16  TOPS_med=  34.62
+  F1_A2_wres_2560_256_256    f16  pub epi1  merged  b=1   TOPS_med=   3.57
+  F1_A2_wres_2560_256_256    f16  pub epi1  merged  b=4   TOPS_med=   8.01
+  F1_A2_wres_2560_256_256    f16  pub epi1  merged  b=8   TOPS_med=  10.97
+  F1_A2_wres_2560_256_256    f16  pub epi1  merged  b=16  TOPS_med=  13.79
+  F1_A2_wres_2560_256_256    f16  pub epi4  merged  b=1   TOPS_med=   3.62
+  F1_A2_wres_2560_256_256    f16  pub epi4  merged  b=4   TOPS_med=   8.22
+  F1_A2_wres_2560_256_256    f16  pub epi4  merged  b=8   TOPS_med=  11.28
+  F1_A2_wres_2560_256_256    f16  pub epi4  merged  b=16  TOPS_med=  14.26
+  F1_A2_wres_2560_256_256    f16  raw epi0  merged  b=1   TOPS_med=   3.94
+  F1_A2_wres_2560_256_256    f16  raw epi0  merged  b=4   TOPS_med=   9.23
+  F1_A2_wres_2560_256_256    f16  raw epi0  merged  b=8   TOPS_med=  12.94
+  F1_A2_wres_2560_256_256    f16  raw epi0  merged  b=16  TOPS_med=  16.53
+  F1_A2_wres_2560_256_256    int8 pub epi1  merged  b=1   TOPS_med=   4.67
+  F1_A2_wres_2560_256_256    int8 pub epi1  merged  b=4   TOPS_med=  10.62
+  F1_A2_wres_2560_256_256    int8 pub epi1  merged  b=8   TOPS_med=  14.36
+  F1_A2_wres_2560_256_256    int8 pub epi1  merged  b=16  TOPS_med=  19.08
+  F1_A2_wres_2560_256_256    int8 pub epi4  merged  b=1   TOPS_med=   4.64
+  F1_A2_wres_2560_256_256    int8 pub epi4  merged  b=4   TOPS_med=  10.59
+  F1_A2_wres_2560_256_256    int8 pub epi4  merged  b=8   TOPS_med=  14.45
+  F1_A2_wres_2560_256_256    int8 pub epi4  merged  b=16  TOPS_med=  19.52
+  F1_A2_wres_2560_256_256    int8 raw epi0  merged  b=1   TOPS_med=  11.71
+  F1_A2_wres_2560_256_256    int8 raw epi0  merged  b=4   TOPS_med=  12.83
+  F1_A2_wres_2560_256_256    int8 raw epi0  merged  b=8   TOPS_med=  18.73
+  F1_A2_wres_2560_256_256    int8 raw epi0  merged  b=16  TOPS_med=  24.56
+  F2_A3_res_2040_256_256     f16  pub epi1  merged  b=1   TOPS_med=   2.76
+  F2_A3_res_2040_256_256     f16  pub epi1  merged  b=4   TOPS_med=   7.20
+  F2_A3_res_2040_256_256     f16  pub epi1  merged  b=8   TOPS_med=   9.75
+  F2_A3_res_2040_256_256     f16  pub epi1  merged  b=16  TOPS_med=  12.87
+  F2_A3_res_2040_256_256     f16  pub epi4  merged  b=1   TOPS_med=   2.76
+  F2_A3_res_2040_256_256     f16  pub epi4  merged  b=4   TOPS_med=   7.37
+  F2_A3_res_2040_256_256     f16  pub epi4  merged  b=8   TOPS_med=  10.01
+  F2_A3_res_2040_256_256     f16  pub epi4  merged  b=16  TOPS_med=  13.23
+  F2_A3_res_2040_256_256     f16  raw epi0  merged  b=1   TOPS_med=   5.40
+  F2_A3_res_2040_256_256     f16  raw epi0  merged  b=4   TOPS_med=   8.35
+  F2_A3_res_2040_256_256     f16  raw epi0  merged  b=8   TOPS_med=  11.60
+  F2_A3_res_2040_256_256     f16  raw epi0  merged  b=16  TOPS_med=  15.28
+  F2_A3_res_2040_256_256     int8 pub epi1  merged  b=1   TOPS_med=   3.70
+  F2_A3_res_2040_256_256     int8 pub epi1  merged  b=4   TOPS_med=   9.80
+  F2_A3_res_2040_256_256     int8 pub epi1  merged  b=8   TOPS_med=  12.91
+  F2_A3_res_2040_256_256     int8 pub epi1  merged  b=16  TOPS_med=  16.67
+  F2_A3_res_2040_256_256     int8 pub epi4  merged  b=1   TOPS_med=   3.66
+  F2_A3_res_2040_256_256     int8 pub epi4  merged  b=4   TOPS_med=   9.76
+  F2_A3_res_2040_256_256     int8 pub epi4  merged  b=8   TOPS_med=  12.92
+  F2_A3_res_2040_256_256     int8 pub epi4  merged  b=16  TOPS_med=  16.78
+  F2_A3_res_2040_256_256     int8 raw epi0  merged  b=1   TOPS_med=   9.48
+  F2_A3_res_2040_256_256     int8 raw epi0  merged  b=4   TOPS_med=  11.63
+  F2_A3_res_2040_256_256     int8 raw epi0  merged  b=8   TOPS_med=  16.24
+  F2_A3_res_2040_256_256     int8 raw epi0  merged  b=16  TOPS_med=  21.61
+  F3_A3_res_8160_128_128     f16  pub epi1  merged  b=1   TOPS_med=   2.97
+  F3_A3_res_8160_128_128     f16  pub epi1  merged  b=4   TOPS_med=   5.79
+  F3_A3_res_8160_128_128     f16  pub epi1  merged  b=8   TOPS_med=   7.40
+  F3_A3_res_8160_128_128     f16  pub epi1  merged  b=16  TOPS_med=   8.76
+  F3_A3_res_8160_128_128     f16  pub epi4  merged  b=1   TOPS_med=   2.98
+  F3_A3_res_8160_128_128     f16  pub epi4  merged  b=4   TOPS_med=   5.89
+  F3_A3_res_8160_128_128     f16  pub epi4  merged  b=8   TOPS_med=   7.73
+  F3_A3_res_8160_128_128     f16  pub epi4  merged  b=16  TOPS_med=   9.11
+  F3_A3_res_8160_128_128     f16  raw epi0  merged  b=1   TOPS_med=   3.45
+  F3_A3_res_8160_128_128     f16  raw epi0  merged  b=4   TOPS_med=   6.63
+  F3_A3_res_8160_128_128     f16  raw epi0  merged  b=8   TOPS_med=   8.92
+  F3_A3_res_8160_128_128     f16  raw epi0  merged  b=16  TOPS_med=  10.72
+  F3_A3_res_8160_128_128     int8 pub epi1  merged  b=1   TOPS_med=   3.43
+  F3_A3_res_8160_128_128     int8 pub epi1  merged  b=4   TOPS_med=   7.20
+  F3_A3_res_8160_128_128     int8 pub epi1  merged  b=8   TOPS_med=   9.73
+  F3_A3_res_8160_128_128     int8 pub epi1  merged  b=16  TOPS_med=  12.14
+  F3_A3_res_8160_128_128     int8 pub epi4  merged  b=1   TOPS_med=   3.50
+  F3_A3_res_8160_128_128     int8 pub epi4  merged  b=4   TOPS_med=   7.27
+  F3_A3_res_8160_128_128     int8 pub epi4  merged  b=8   TOPS_med=   9.67
+  F3_A3_res_8160_128_128     int8 pub epi4  merged  b=16  TOPS_med=  12.19
+  F3_A3_res_8160_128_128     int8 raw epi0  merged  b=1   TOPS_med=   9.72
+  F3_A3_res_8160_128_128     int8 raw epi0  merged  b=4   TOPS_med=   9.71
+  F3_A3_res_8160_128_128     int8 raw epi0  merged  b=8   TOPS_med=  13.19
+  F3_A3_res_8160_128_128     int8 raw epi0  merged  b=16  TOPS_med=  16.33
+
+  roof-table cross-check (section 50, 6 procs each):
