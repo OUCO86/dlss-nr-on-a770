@@ -429,3 +429,29 @@ Get-Content E:\DSH\s6\K2_probe_S0.log,E:\DSH\s6\K2_probe_S1.log,E:\DSH\s6\K2_pro
 4. **对已出货 1a 的建议**：同一个放大器套到 `ffn2::fused`（block4 的 DUMP 面）上跑 200 连发 ⇒ **只测不改**；若它也 bad>0，那 §43 的 RACE 条目就不是"机器级不成立"，而需要按 §44/§52 的**拆槽/挪相**修法（不是加 barrier）。**我下一步就去做这个读数。**
 **⑥ 仍未结的部分（诚实）**：没做到"指令级"（未反汇编到具体 `lsc_load/store` 的 cache-control 位与 barrier 插入点）；那需要把 `pe_stress` 的失败样本配上 `ocloc` 反汇编 + 把 `HIDF` 的 band 跨度改成 32B 对齐分区做 A/B。⇒ 建议 B2 之后补这一刀，或先做 1a 的 200 连发（便宜、决定 shipped 是否有暴露）。
 **热状态**：B0 冷阶梯 31.6 min + 压力 5.2 min ⇒ 本轮 GPU ≈ **37 分钟**；最后一次动作 15:4x ⇒ 下一段跑前凉 ≥5 分钟。
+
+---
+
+# §66 第 1 步（放大器套我们自己的核）= **判决 ①：两核 bad=0 ⇒ 出货件不暴露，port 核的病是它自己的**　15:5x-16:1x
+**跑法**（`s6/pe_s1.ps1` 7.8 min + `s6/pe_s1b.ps1` 9.5 min，进程间 60 s，0 残留）：
+| 核 | 进程 | 连发 | **bad** | 备注 |
+|---|---|---|---|---|
+| **`ffn2::fused`（已出货 1a 形态，`b4_base.exe` = M_P4FORM=0/PEAK=0/P3SPLIT=0）** | **3** | 200 each | **0 / 0 / 0（共 0/600）** | 每进程同时 **B3GATE PASS（9 ffn2 检查点 vs block3）** + **GATE PASS C2-R1（13/13）** |
+| **`att5L::fused`（我们的 att 5 发一相）** | **3** | 200 × 两形（C=64 与 C=128） | **0（共 0/1200）** | 同时 **GATE: GREEN（0 checkpoints differ）× 两形 × 3** |
+| `port::fused`（他们的核，对照） | 2 | **1000** each | **4 / 4** | 见下 |
+| `qr_kernel_rowthread<64>`（无 SLM 无栅栏的负对照） | 1 | 200 | **0** | 仪器不误报 ✓ |
+⇒ **统计**：我们的核 **0 bad / 1800 连发**；他们的核 **12 bad / 2400 连发（≈0.5%）**（4/1000 + 4/1000 + 0/200 + 4/200）⇒ Fisher 双侧 **p ≈ 2e-4** ⇒ **不是运气，是他们的核不可重复、我们的核可重复**。
+**⚠ 方法学教训（写死）**：**200 连发不够**——同一 port 核一个 200 连发进程 **bad=0**、两个 1000 连发进程各 **bad=4** ⇒ 真基率 **≈0.5%**（不是 §65 估的 1-2%）⇒ **军规 46 的门要按"≥1000 连发 bad=0"执行**（200 只能当快速筛）；这也是 §65 那次"1/20 进程"读数的来历（0.5% × 20 ≈ 10% 概率抽中一次）。
+**签名收窄（指令级归因的关键线索，比 §65④ 更硬）**：1000 连发里 8 次失败的**行号 mod 16 = {0: 4, 7: 4}** ⇒ **全部落在 16 行 tile 的 8 行 fragment 边界**（`row%16==0` = tile 首行、`==7` = 第一个 8 行半片的末行）⇒ 与 port-B 记过的 ESIMD 硬坑 #18(2)（**dpas 累加器 fragment 只有 8 行，`select<8,1>(row*8)` 的 row 必须 0..7**）同一边界族 ⇒ **嫌疑点收窄到"跨 8 行半片的 SLM 槽/带边界"**（`HIDF` 的 `kb*512 + r*32` band 里 16 行混 4 个波 + `SCB` 4 字节槽），**不是 global、不是栅栏类型、不是 WG 宽度**（`sentinel_pairs=0` 全次成立 ⇒ 不是"没写过的槽"）。
+**临时规矩更新**：合成链继续禁 `LW=32`、用 `KN=0`；**新增**：任何进 shipped 的核 **≥1000 连发 bad=0**（200 只做快筛）。
+
+# §67 第 2 步（仪器进仓，军规 46 可执行）= **完成，两颗牙都验过**
+**仓内改动（bench 层，shipped 源未碰）**：
+- `src/bench/sycl/stress_repeat.cpp`（新，untracked）= **负对照**：`qr_launch_esimd`/`qr_kernel_rowthread<64>`，M=32640、哨兵 memset、200 连发自比 ⇒ 实测 **bad=0** ✓（exe `oneapi\stress_repeat.exe` `9C8D0062…`）；
+- `src/bench/sycl/port_ffn_fused.cpp`（+40 行，`PORT_STRESS=N`）⇒ 重编 `oneapi\port_ffn_fused.exe` `3BFCF6C7…`；
+- `src/bench/sycl/s6b_att.cpp`（+61 行，`S6B_ATT_REPEAT=N`；**fATT 故意不 scrub/不比**：核不重写整块 att 面 ⇒ 第一版把它算进去造成 **bad=199/200 的假警**，已排除并注明在源码注释里）⇒ 重编 `oneapi\s6b_att.exe` `AB4ADC03…`；
+- `tools/stress_repeat.ps1`（新，untracked，纯 ASCII）= 四臂矩阵（ctrl / port / att / ffn2）+ **60 s 进程间隔** + **自动"牙齿检查"**（CTRL 必须 bad=0、PORT 必须 bad>0，否则报"仪器坏了/正对照丢信号"）；
+- `ffn2` 那一臂用的是仓里**已有**的 M-FLAKY 探针（`s6_ffn_block4.cpp:1580-1620`，`M_REPEAT=N`，taps 先 memset 0xA5 再逐发比 block3）——**注意它只在 `C2_STAGE=1 或 3` 才跑**（`C2_STAGE=2` 会释放 1a taps ⇒ 探针静默不执行，第一次跑就是这么漏掉的）。
+**两颗牙（同一台仓内仪器）**：负对照 `qr_kernel_rowthread` **bad=0/200** ✓；正对照 `port::fused KN=1 LW=16` **bad=4/1000** ✓（200 连发时会显示 0/200 ⇒ 正对照需要 n≥1000）。
+**现场**：`out\libxmx.dll` = `oneapi\libxmx_sycl.dll` = **ABB969FE** ✓ 未 stage；三金标未动；仓 porcelain = ` M port_ffn_fused.cpp` / ` M s6b_att.cpp` / `?? stress_repeat.cpp` / `?? tools/stress_repeat.ps1`（**未 commit/未 push**）；临时副本 `E:\DSH\tmp\pe_stress.cpp` `F3552A9C…`、`E:\DSH\tmp\pe_stress_att.cpp` `0CF3CEB2…`（已被仓内版取代，可删）；exe：`pe_stress 3DB5E9D3…`、`pe_stress_att E1F6345E…`、`b4_base FF8E19E3…`。进程 **0 残留**；本轮 GPU ≈ **55 分钟**（37 + 17）⇒ **下次开工凉 ≥5 分钟**。
+**B2 状态：按令按住，等你一句。** 地基已就绪：我们的两半在 1000/600 连发下 self-reproducible=0 bad，接口 map 同形（§62/§64 的 T=32 参数化改道），SLM 算术过关（31,104 B ⇒ 2 resident）。

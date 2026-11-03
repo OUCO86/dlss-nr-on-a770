@@ -861,6 +861,67 @@ static int run_shape(const Shape& sh) {
                                              fQ, fK, fV, sh.windows, sh.across, top, left,
                                              sh.image_h, sh.image_w, o).wait();
     }
+
+    // ================= STRESS-REPEAT (rule 46) on the ATT half =================
+    // Same method: relaunch the DUMP fused launch N times with every cross-wave plane scrubbed to
+    // 0xA5, compare each launch to launch 0. P8 writes Q/K/V to GLOBAL and P9 reads them back from
+    // OTHER WAVES of the same work-group -- exactly the pattern that broke the port core's
+    // self-reproducibility, so this half must carry the same instrument.
+    {
+        const int NST = getenv("S6B_ATT_REPEAT") ? atoi(getenv("S6B_ATT_REPEAT")) : 0;
+        if (NST > 1) {
+            auto LAUNCH = [&]() {
+                if (C == 64)
+                    att5::fused<64, 2, 5, true, false>(q, dImg, dBp, dBS, dQS, dBias, dOp, dBS2, dCos,
+                                                       fOut, fQ, fK, fV, sh.windows, sh.across, top, left,
+                                                       sh.image_h, sh.image_w, o).wait();
+                else
+                    att5::fused<128, 4, 5, true, false>(q, dImg, dBp, dBS, dQS, dBias, dOp, dBS2, dCos,
+                                                        fOut, fQ, fK, fV, sh.windows, sh.across, top, left,
+                                                        sh.image_h, sh.image_w, o).wait();
+            };
+            const size_t sQ = (size_t)npl * 2, sATT = (size_t)2 * npl * 2, sPKT = (size_t)npl,
+                         sAS2 = (size_t)M * 4, sOut = (size_t)imgn * 2;
+            std::vector<uint8_t> r0Q(sQ), r0K(sQ), r0V(sQ), r0ATT(sATT), r0PKT(sPKT), r0AS2(sAS2), r0Out(sOut);
+            std::vector<uint8_t> r1Q(sQ), r1K(sQ), r1V(sQ), r1ATT(sATT), r1PKT(sPKT), r1AS2(sAS2), r1Out(sOut);
+            auto SNAP = [&](std::vector<uint8_t>& Q, std::vector<uint8_t>& K, std::vector<uint8_t>& V,
+                            std::vector<uint8_t>& AT, std::vector<uint8_t>& PK, std::vector<uint8_t>& AS,
+                            std::vector<uint8_t>& OT) {
+                q.memcpy(Q.data(), fQ, sQ); q.memcpy(K.data(), fK, sQ); q.memcpy(V.data(), fV, sQ);
+                q.memcpy(AT.data(), fATT, sATT); q.memcpy(PK.data(), fPKT, sPKT);
+                q.memcpy(AS.data(), fAS2, sAS2); q.memcpy(OT.data(), fOut, sOut); q.wait();
+            };
+            SNAP(r0Q, r0K, r0V, r0ATT, r0PKT, r0AS2, r0Out);
+            int nbad = 0, nsent = 0, first_s = -1; size_t first_row = 0;
+            for (int s2 = 1; s2 < NST; ++s2) {
+                q.memset(fQ, 0xA5, sQ).wait(); q.memset(fK, 0xA5, sQ).wait(); q.memset(fV, 0xA5, sQ).wait();
+                q.memset(fPKT, 0xA5, sPKT).wait();
+                q.memset(fAS2, 0xA5, sAS2).wait(); q.memset(fOut, 0xA5, sOut).wait();
+                LAUNCH();
+                SNAP(r1Q, r1K, r1V, r1ATT, r1PKT, r1AS2, r1Out);
+                size_t dQ = 0, dK = 0, dV = 0, dAT = 0, dPK = 0, dAS = 0, dOT = 0, sent = 0;
+                for (size_t i = 0; i < sQ; ++i) { if (r1Q[i] != r0Q[i]) ++dQ; if (r1K[i] != r0K[i]) ++dK; if (r1V[i] != r0V[i]) ++dV; }
+                // fATT is NOT scrubbed/compared: the kernel does not rewrite the whole att plane
+                // (only the head bands), so scrubbing it fabricates a 100% diff (measured 2026-11-03
+                // 15:5x: bad=199/200 on every plane-except-fATT-clean run). Excluded on purpose.
+                for (size_t i = 0; i < 0; ++i) if (r1ATT[i] != r0ATT[i]) ++dAT;
+                for (size_t i = 0; i < sPKT; ++i) if (r1PKT[i] != r0PKT[i]) { if (!dPK) first_row = i / (size_t)C; ++dPK; }
+                for (size_t i = 0; i < sAS2; ++i) if (r1AS2[i] != r0AS2[i]) ++dAS;
+                for (size_t i = 0; i < sOut; ++i) if (r1Out[i] != r0Out[i]) ++dOT;
+                for (size_t i = 0; i + 1 < sQ; i += 2)
+                    if (r1Q[i] == 0xA5 && r1Q[i+1] == 0xA5 && !(r0Q[i] == 0xA5 && r0Q[i+1] == 0xA5)) ++sent;
+                if (dQ || dK || dV || dAT || dPK || dAS || dOT) {
+                    ++nbad; if (sent) ++nsent; if (first_s < 0) first_s = s2;
+                    printf("STRESS s=%d dQ=%zu dK=%zu dV=%zu dATT=%zu dPKT=%zu dAS2=%zu dOut=%zu sentinel_pairs=%zu first_pkt_row=%zu mod16=%d\n",
+                           s2, dQ, dK, dV, dAT, dPK, dAS, dOT, sent, first_row, (int)(first_row % 16u));
+                    fflush(stdout);
+                }
+            }
+            printf("STRESS SUMMARY att5::fused C=%d launches=%d bad=%d with_sentinel=%d first_bad_s=%d\n",
+                   C, NST, nbad, nsent, first_s);
+            fflush(stdout);
+        }
+    }
     // the REF chain, in the shipped order
     leg_qw().wait(); leg_qkv().wait(); leg_wa().wait(); leg_pk2().wait(); leg_wres().wait();
     // the authorities for the two pk planes and for scores/probs

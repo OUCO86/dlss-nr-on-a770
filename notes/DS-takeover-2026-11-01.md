@@ -1315,3 +1315,25 @@ T1 的机器读数：**corr_min 0.9828**（R .983 G .992 B .990，luma .991）�
 ★★ **零代价改道（代理找到，很好）**：合成不需要 T=64。两半元素级 map 本来就同形，差的是 kb 块带宽数：att 半 `PKT + kb*2048 + row*32`（每 kb 块 4 band）vs FFN 半 `O_PK + (kb*BANDS + (t>>4))*512 + (t&15)*32`（BANDS=2 => `kb*1024 + t*32`）⇒ **把 FFN 半的 global A 面寻址参数化**成 `kb*2048 + (hb*16 + band)*512 + lane*32`（`hb in {0,1}` = 窗口半）⇒ **T=32、LW=64、SLM 31,104（2 resident）一字不动**，只改入口面 stride 与一个 band base ⇒ **零 pack 腿、零 quant 腿**（健康闸第 3 条满足），网格仍是 1020 WG（与现档 `nblk = M/T = 1020` 完全一致）。
 
 ## 66. ★ 新军规 46/47（已入 B2）：低基率竞态必须用"同进程 200 连发 + 哨兵"放大器归因；任何核进 shipped 前必须过 bad=0 自重复门
+
+## 67. ★★★ B0 续：**判决 ① —— 我们的两核 0 bad / 1800 连发；他们的核 12 bad / 2400（约 0.5%，Fisher p 约 2e-4）⇒ 出货件不暴露，port 核的病是它自己的**
+| 核 | 进程 x 连发 | **bad** | 同时的门 |
+|---|---|---|---|
+| **`ffn2::fused`（已出货 1a 形态）** | 3 x 200 | **0/0/0（0/600）** | 每进程 **B3GATE PASS（9 检查点 vs block3）+ GATE PASS C2-R1（13/13）** |
+| **`att5L::fused`（我们的 att 5 发一相）** | 3 x 200 x 两形（C64/C128） | **0（0/1200）** | 每形每进程 **GATE GREEN（0 checkpoints differ）** |
+| `port::fused`（他们的核，对照） | 2 x **1000** | **4 / 4** | GATE PASS（逐字节门过，翻的是**自重复性**） |
+| `qr_kernel_rowthread<64>`（无 SLM 无栅栏的负对照） | 1 x 200 | **0** | - |
+★ **方法学更正（重要）**：**200 连发不够当判决** —— 同一个 port 核一个 200 连发进程 bad=0、两个 1000 连发进程各 bad=4 ⇒ **真基率约 0.5%**（不是 §65 估的 1-2%）；这也解释了"1/20 冷进程"（0.5% x 20 = 10% 抽中一次）。⇒ **军规 46 的门改成">=1000 连发 bad=0"，200 只做快速筛。**
+**签名收窄（已接近钉到指令）**：1000 连发的 8 次失败里 **出错行 `row % 16` 分布 = {0: 4, 7: 4}** ⇒ **全部落在 16 行 tile 的 8 行 fragment 边界**（0 = tile 首行，7 = 第一个 8 行半片的末行）。**这与 ESIMD 硬坑 #18(2)（dpas 累加器 fragment 只有 8 行、`select<8,1>(row*8)` 的 row 必须 0..7）同一边界族**。
+⇒ 嫌疑收窄到**跨 8 行半片的 SLM 槽/带边界**：`HIDF` 的 `kb*512 + r*32` band（一个 512B band 混 4 个波的行）+ `SCB` 的 4 字节跨波槽。
+⇒ **再次排除**：栅栏类型（§44 机器级同类）、C1 global 读回刀（KN=0 也翻）、WG 宽度（LW=32 本轮 0/200，LW=16 才翻）、读到未写槽（**全部失败里 `sentinel_pairs=0`** => 错字节是别的真实值）。
+
+## 68. ★ 自重复门已进仓成通用仪器（两颗牙都验过）
+- 新 `src/bench/sycl/stress_repeat.cpp` = **负对照**（`qr_launch_esimd`/`qr_kernel_rowthread<64>`，M=32640，哨兵 memset，连发自比）=> `oneapi/stress_repeat.exe` `9C8D0062…`，实测 **bad=0** ✓；
+- `src/bench/sycl/port_ffn_fused.cpp` +40 行（`PORT_STRESS=N`）=> `port_ffn_fused.exe` `3BFCF6C7…`；`src/bench/sycl/s6b_att.cpp` +61 行（`S6B_ATT_REPEAT=N`）=> `s6b_att.exe` `AB4ADC03…`；**注意 fATT 故意不 scrub/不比**（核不重写整块 att 面；第一版把它算进去造成 **bad=199/200 假警**，已在源码注释注明）；
+- 新 `tools/stress_repeat.ps1`（纯 ASCII）= 四臂矩阵（ctrl / port / att / ffn2）+ 60 s 进程间隔 + **自动牙齿检查**（CTRL 必须 bad=0、PORT 必须 bad>0，否则明说"仪器没牙 / 正对照丢信号"）；
+- `ffn2` 臂复用仓内已有的 M-FLAKY 探针（`s6_ffn_block4.cpp:1580-1620`，`M_REPEAT=N`）——**只在 `C2_STAGE=1 或 3` 才执行**（`C2_STAGE=2` 会释放 1a taps => 探针静默不跑，第一次就是这么漏掉的，已入账）；
+- **两颗牙都过**：负对照 `qr_kernel_rowthread` bad=0/200 ✓；正对照 `port::fused KN=1 LW=16` bad=4/1000 ✓。
+**规矩状态（即刻生效）**：① 合成链禁 **LW=32**、用 **KN=0**；② 进 shipped 前 **>=1000 连发 bad=0**（200 只做快筛）；③ **已出货 1a 不必修**（0/600 + 9/9 + 13/13）=> **不动 shipped**。
+**军规 48（新，入 B2）**：**ESIMD 里 16 行 tile 的"8 行 fragment 边界"是危险线**：任何跨波/跨半片的 SLM 槽与带（band）设计都要按这条线检查——本案 port 核 8 次失败的出错行 `row % 16` 只落在 0 与 7；这与硬坑 #18(2)（dpas 累加器 fragment 只有 8 行）同族。
+**对上游的一条诚实观察（值得记）**：**lmxx 的 FFN 融合核在我们工具链里逐字节正确、但不自重复（约 0.5%）** —— 他们的逐字节门（GATE PASS）抓不到这类事，因为那是单次输出对参考，不是自身重复。

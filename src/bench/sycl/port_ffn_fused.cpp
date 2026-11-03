@@ -808,6 +808,46 @@ static bool run_shape(const char* tag, int M, int N_e, int b_e, int N_p, int K_p
     port::fused<S, true, 5>(q, fa).wait();
     printf("-- port launch done --\n");
 
+    // ================= STRESS-REPEAT (rule 46) on the PORT core =================
+    // N relaunches of the DUMP kernel in THIS process, every cross-wave handoff plane scrubbed to
+    // the 0xA5 sentinel before each launch, each launch byte-compared against launch 0.
+    // bad>0  => the kernel is not self-reproducible (a real ordering race), bad=0 => it is.
+    {
+        const int NST = getenv("PORT_STRESS") ? atoi(getenv("PORT_STRESS")) : 0;
+        if (NST > 1) {
+            const size_t bOUT = (size_t)nCp * 2, bPK3 = (size_t)nCp, bSC3 = (size_t)Mpad * 4, bFR3 = (size_t)nCp;
+            std::vector<uint8_t> r0OUT(bOUT), r0PK3(bPK3), r0SC3(bSC3), r0FR3(bFR3);
+            std::vector<uint8_t> r1OUT(bOUT), r1PK3(bPK3), r1SC3(bSC3), r1FR3(bFR3);
+            q.memcpy(r0OUT.data(), pOUT, bOUT); q.memcpy(r0PK3.data(), pPK3, bPK3);
+            q.memcpy(r0SC3.data(), pSC3, bSC3); q.memcpy(r0FR3.data(), pFR3, bFR3); q.wait();
+            int nbad = 0, nsent = 0, first_s = -1; size_t first_row = 0, first_col = 0;
+            for (int s2 = 1; s2 < NST; ++s2) {
+                q.memset(pOUT, 0xA5, bOUT).wait();
+                port::fused<S, true, 5>(q, fa).wait();
+                q.memcpy(r1OUT.data(), pOUT, bOUT); q.memcpy(r1PK3.data(), pPK3, bPK3);
+                q.memcpy(r1SC3.data(), pSC3, bSC3); q.memcpy(r1FR3.data(), pFR3, bFR3); q.wait();
+                size_t dOUT = 0, dPK3 = 0, dSC3 = 0, dFR3 = 0, sent = 0;
+                for (size_t i = 0; i < bOUT; ++i) if (r1OUT[i] != r0OUT[i]) ++dOUT;
+                for (size_t i = 0; i < bSC3; ++i) if (r1SC3[i] != r0SC3[i]) { if (!dSC3) first_row = i / 4; ++dSC3; }
+                for (size_t i = 0; i < bPK3; ++i) if (r1PK3[i] != r0PK3[i]) {
+                    if (!dPK3) { first_row = i / (size_t)C; first_col = i % (size_t)C; } ++dPK3; }
+                for (size_t i = 0; i < bFR3; ++i) if (r1FR3[i] != r0FR3[i]) ++dFR3;
+                for (size_t i = 0; i + 1 < bOUT; i += 2)
+                    if (r1OUT[i] == 0xA5 && r1OUT[i+1] == 0xA5 && !(r0OUT[i] == 0xA5 && r0OUT[i+1] == 0xA5)) ++sent;
+                if (dOUT || dPK3 || dSC3 || dFR3) {
+                    ++nbad; if (sent) ++nsent; if (first_s < 0) first_s = s2;
+                    printf("STRESS s=%d dOUT=%zu dPK3=%zu dSC3=%zu dFR3=%zu sentinel_pairs=%zu row=%zu col=%zu mod16=%d\n",
+                           s2, dOUT, dPK3, dSC3, dFR3, sent, first_row, first_col, (int)(first_row % 16u));
+                    fflush(stdout);
+                }
+            }
+            printf("STRESS SUMMARY port::fused KN=%d LW=%d G=%d launches=%d bad=%d with_sentinel=%d first_bad_s=%d\n",
+                   S::KN, S::LW, S::G, NST, nbad, nsent, first_s);
+            fflush(stdout);
+        }
+    }
+
+
     std::vector<uint8_t> fpk1(nC), fsc1((size_t)M*4), fhid(nH*2), ffr1(nH), fdec(nH*2),
                          fpk2(nH), fsc2((size_t)M*4),
                          ffr2(nH), fout(nC*2), fpk3(nC), fsc3((size_t)M*4), ffr3(nC), fres(nC*2);
