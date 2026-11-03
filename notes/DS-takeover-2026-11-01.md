@@ -1540,3 +1540,34 @@ bench：`qres::gemm_qkv_res(q, rAp, dBp, rQ, rK, rV, rAS, dBS, dQS, M, Mp, C, NH
 ★ **帧净值口径按 7/8 报：预期 `7 x 0.509 x 0.43 ≈ −1.53 ms/帧`**（不是 8/8 的 −1.75…−1.90）。
 ★ **实测帧回放（同热，run 1-3）**：**ON 57.29 / 57.40 / 57.36** vs **默认 58.09 / 58.23 / 59.09** => **约 −0.8…−1.5 ms/run** ✓ 与 7/8 预期同量级（walk 的 run0 含 JIT 冷启动，不计）。
 **变体链**：att5j（namefix）-> att5k（touch A/B 开关）-> **att5m（当前基座：touch 已删 + 四几何放宽，两档 EXACT）**。本段 GPU 约 6 min（5 次 walk，均 60 s 间隔）。
+
+## 79. ★★★ ③④⑤⑥ 交回：**A5 融合 = 帧 −0.978 ms（赢 15/16，CI95 [-1.186,-0.769]）= 够转正**；**新仪器 `NR_SELFREP`（引擎侧 1000 帧自比）过门 bad=0**；**⑥ 逐 op 对账严格吻合，并揪出一笔 +0.73 ms 的白工**
+**③ 自重复门（shipped 件 + 真实 plan 操作数）**：`src/gpu/nr_replay.c` 加 **`NR_SELFREP=N`**（presence-gated；每帧后下载 buffer 1301（8,355,840 B）与**上一帧**逐字节比；**从第 10 帧起比**——plan 回放有跨帧 history，run0 vs run500 合法不同，稳态才是基准）=> `builds/nr_replay_sr.exe = 9FB2ED24…`。
+**牙齿检查**（不带 SELFREP、默认档）：计数与 walk 完全一致、`SR_teeth.1301.bin` md5 = `DD49827D` = 金标 => 仪器忠实 ✓
+| 臂 | fires | SELFREP |
+|---|---|---|
+| **`NR_ATT5_FUSE=1`** | 14 = 7 链 x 2 录制 | **`id=1301 runs=1000 compared=989 bad=0 first_bad_run=-1`** ✓（约 **7000 次融合 launch，0 bad**）|
+| 默认档对照 | 0 | `runs=1000 compared=989 bad=0` ✓ |
+**④ 40 门**（`run_gates.sh` 一字未改；先备份再 stage，跑完复原）：**变体 = 39 GREEN / 1 RED**，RED 是 `gate_skip_graph` 的**工件身份守卫**（要求 out 与 oneapi 都是 `ABB969FE`）——**它的实质子检查在变体下全过**（`gate40_p3: 691 passes`、`1301 dump 8,355,840 B`、**`1301 EXACT vs bk.1301.skip.bin`**）；**复原 `oneapi\libxmx_sycl.dll` = ABB969FE 后复跑 = GREEN（1/0）** => 诚实写法：**变体 39/40 + 第 40 门实质 EXACT（只有身份守卫按设计 RED）；基座复原后 40/40**。
+**⑤ 帧 16 对**（A = `out\libxmx.dll`(ABB969FE) unset 全部 `NR_*`；B = `att5m` + `NR_ATT5_FUSE=1`；ab.ps1 v3，run0 丢弃、run1-3 中位）：
+deltas: `-0.670 -0.470 -1.440 -1.080 -1.150 -0.810 -1.200 -1.030 -1.090 +0.040 -1.580 -1.160 -1.290 -1.030 -0.700 -0.980`
+**n=16 mean −0.978 sd 0.392 CI95 [-1.186,-0.769] 赢 15/16**，每对 `passes 691/691` => **判据（<=−0.5 且 >=10/16）过 = 可转正**
+⇒ **现在可兑现 = −0.98 ms/帧（7/8 链）**，**不是** 8/8 的 −1.75…−1.90。
+**⑥ 逐 op 复核**（件 `builds/libxmx_rt2a5.dll = F6620510…` = RUN_TIMING + A5；两臂各 691 行 rtcsv）：
+| closure | 默认 | ON | Δ | 行数 |
+|---|---|---|---|---|
+| `xmx_rec_window_attention` | 16.48 | 13.30 | **−3.18** | 52 -> 45 |
+| `xmx_rec_gemm_int8_qkv` | 14.55 | 12.58 | **−1.96** | 60 -> 53 |
+| `quant_window(FUSED-pack)` | 0.12 | 0.10 | −0.02 | 52 -> 45 |
+| `xmx_rec_gemm_window_int8_residual` | 12.98 | **14.07** | **+1.09** | 52 -> 52 |
+| `xmx_rec_quant` | 3.65 | **4.38** | **+0.73** | **80 -> 87** |
+| 三条 no-op 行（A5-fused） | - | 0.02/0.01/0.01 | ≈0 | 0 -> 7 each |
+| **TOTAL** | **135.98** | **133.68** | **−2.30 ms 串行/帧** | |
+**对账**：`−2.30 x 0.43 = −0.99 ms/帧` 与 ⑤ 的 **−0.978** 严格吻合 ✓；融合后那条 wres ≈ **0.40 ms/链** 与 bench `L1n = 0.4336` 同量级 ✓
+★ **白工（下一铲的钱）**：`xmx_rec_quant` 80 -> 87 行、+0.73 ms => 那 7 条链的 **644 QUANT 从"FUSED-pack 溶解态"退回成真发**——**645 里 `return 0` 太早，跳过了 `fused_w`/`g_fused_quant` 的 fold 登记（@4137-4141）** => 644 白做一次量化（约 0.104 ms/链）。**修法 = A5 命中时补上该链 644 的 fold 登记（或显式 no-op c_q2）= 纯登记活、不改数值 => 预计 +0.31 ms/帧。**
+**剩余站排序**：⑴ 捡 644 白工（+0.31，登记活）；⑵ 第 8 条 C64 链（`epi=0 narrow=0`，要给 P11 加第二种 epilogue => 改数值面，代价另评）；⑶ **C128 tier 不接**（att 合一 +51%、SLM 41,984 越崖）。
+
+### 79b. ★★ 我（主会话）的一次实操错误 + 两条新军规（59/60）
+**错误实录**：06:3x 我按 ⑤ 的读数把 `att5m` 部署进加载位，**随即发现 `a5_on()` 的默认值是 0**（`libxmx_sycl.cpp:785`：`getenv("NR_ATT5_FUSE") ? atoi(...) : false`）=> **光换 dll 不生效**（16 对是在 B 侧设了 env 才赢的）。**已当场退回 `ABB969FE`**（备份 `out\libxmx.before-ATT5.keep`），并在 `out\DEPLOY.md5.txt` 补了更正；`att5m` 留在 `builds\` 当基座。
+**军规 59**：**开关默认 OFF 的件，部署进加载位 = 不生效**。**转正前必须把开关固化成编译期默认**（照 `tools/shipped_build.defs` 里 `T_SKIP_CHAINS_DEF` 的先例，加 `T_ATT5_FUSE_DEF`），并且**换位后要做三件核验**：① `out\libxmx.dll` 与 `oneapi\libxmx_sycl.dll` md5 一致；② 该件在**不设任何 env** 时的 `[skip-chains]` / `fires` 计数就是预期档；③ 帧收益的 A/B 两侧都不依赖 env（ab.ps1 会清场）。
+**军规 60（军规 31 的加强版，新仪器）**：**引擎侧自重复门 `NR_SELFREP=N`** —— 同一进程连放 N 帧，每帧下载 `1301` 与**上一帧**逐字节比，**从第 10 帧起比**（plan 回放有跨帧 history，run0 vs run500 合法不同），要求 **bad=0**。本案 `runs=1000 compared=989 bad=0`（约 7000 次融合 launch）。**任何新接入的融合腿都要过这一门**（bench 的 200/1000 连发只测单核，测不到图内真实操作数与跨帧状态）。

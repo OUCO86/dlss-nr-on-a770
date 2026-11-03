@@ -903,3 +903,102 @@ exe `oneapi\port_e_chain.exe` = **`A6CA9F5D08E6F55DEB6748D5173F522C`**（含 C-0
 **新军规候补（军规 57）**：**recorder 里任何"改写 closure 体"的融合，必须保持 `g_cmds` / `g_cmd_names` / `g_cmds_touch` 三个向量逐位同长同序；多推一条 name 会让 NR_SKIP_CHAINS 静默 REFUSED，表现为"融合数值错了"的假象（1301 会等于某个历史 gold，而不是乱码）。判据：`[skip-chains]` 头部行的 `closures/names/name_offset` 在开关两侧必须相同。**
 **GPU 记账**：C-1 累计 ≈ **19 min**（7 次 walk + 3 进程门 + 两次 ladder），每次都带 60 s 间隔/冷却。
 **现场**：进程 0；`out\libxmx.dll` = `oneapi\libxmx_sycl.dll` = ABB969FE 未动；三金标未动；git tip e20179e，未 commit；工作区 = `M src/bench/sycl/libxmx_sycl.cpp`；`builds\` 多 att5i/att5j（**att5j = C3F926C2…** 是下一铲的基座）。
+
+
+# §87 **新时间盒开工：① touch 申报 A/B（结论=不需要，已删）+ ② 四种 halo 几何放宽（7/8 链 fire、两档 1301 都 EXACT、帧回放 −0.8…−1.5 ms/run）**　2026-11-04 05:5x-06:5x
+## ① `pgraph_extra` 必需性 A/B —— 件 `builds\libxmx_att5k.dll = E97E9D81107C8FE2B60FDB8CA0E0F855`（`NR_ATT5_TOUCH` 开关，其余与 att5j 一字不动；三次 walk 各 60 s）
+**先按军规 57 读计数，再看 1301**：三臂的 `[skip-chains]` 全部是
+ `closures=691 names=1382 name_offset=691 chains=52` + `chains_skipped=14 refused=0 closures_noop=168 passes=691 (unchanged)`
+| 臂 | 1301 |
+|---|---|
+| ON + TOUCH=1 | **EXACT `DD49827DD33A7EF07C2C17892F18970D`** |
+| **ON + TOUCH=0** | **EXACT**（同一颗 md5）|
+| 默认档（不设 FUSE）+ TOUCH=0 | **EXACT** |
+⇒ **申报不是必需的 ⇒ 已删**（`s6/pe_c1_touchdel.py`；注释里留了 A/B 读数和 caveat："这颗 plan 不需要" ≠ "任何 tier 都不会重叠"，将来别的 tier 接融合要先重跑这个 A/B）。
+## ② 放宽四种 halo 几何 —— 件 **`builds\libxmx_att5m.dll = 0FCF9C20B0204D7E626824423FE639F4`**（当前基座）
+改的只有 `a5_note_qw` 的门槛：`M==32640 && pad==0` ⇒ **四个 (M, across, pad) 白名单**；**核与数值一字未改**（`top/left/across` 本来就是 `att5::fused` 的入参，引擎 gather 就是 `quantize_row_kernel.hpp:54-57` 同一套 `-pad_top/-pad_left`）。
+| 档 | 1301 | `[skip-chains]` | fires |
+|---|---|---|---|
+| `NR_ATT5_FUSE=1` | **EXACT `DD49827D…`** ✓ | `closures=691 names=1382 name_offset=691 chains_skipped=14 refused=0 closures_noop=168 passes=691 (unchanged)` ✓ | **14 行 = 7 链 × 2 次录制** |
+| 默认（不设 env） | **EXACT `DD49827D…`** ✓ | 同上 ✓ | **0** ✓ |
+fire 按几何：`32640/30/0` = 4 行（2 链）✓、`33728/31/4` = 4（2 链）✓、`35712/31/262148` = 4（2 链）✓、**`34560/30/262144` = 2（只有 1 链）** ⇒ **7/8 覆盖**。
+**第 8 条放不进去的确切原因（不是 halo）**：它的窗口残元腿 flags = **`epi=0 narrow=0 half=1`**（witness 原文：`[a5-dbg] wres-TUPLE cmd=56 a=1273 … M=34560 N=64 K=64 epi=0 narrow=0 half=1 skip=1268 src=1268 ih=136 iw=240 ac=30 pad=262144 heads=2 batches=1080`），而 `att5::fused` 的 P11 只实现 **epi=1 + narrow + half_skip** 这一种出口形态 ⇒ 元组校验把它正确拒掉。**接它 = 给核加第二种 epilogue = 改数值面 ⇒ 不在本铲范围。**
+**帧回放（同热，run1-3）**：**ON = 57.29 / 57.40 / 57.36 ms** vs **默认 = 58.09 / 58.23 / 59.09 ms** ⇒ **≈ −0.8…−1.5 ms/run** ✓ 与 7/8 的预期（`7 × 0.509 × 0.43 ≈ 1.53 ms`）同量级；**口径按 7/8 报，不再用 8/8 的 −1.75…−1.90**。
+## ③ 自重复门（进行中）：新仪器 + 读数
+**仪器**：给 replay 工具加 `NR_SELFREP=N`（`src/gpu/nr_replay.c`，presence-gated；每帧后把 buffer 1301（8,355,840 B）下载并与**上一帧**逐字节比，**从第 10 帧起比**——plan 回放有跨帧 history，run0 vs run500 合法地会不同，稳态才是基准）。重编工具 `builds\nr_replay_sr.exe = 9FB2ED24B3426835A55E2C8C2E9BDD6A`（脚本 `s6/build_replay_sr.bat`）。
+**牙齿检查（先证工具忠实）**：不带 SELFREP 跑默认档 ⇒ 计数与 walk 完全一致（`closures=691 names=1382 name_offset=691 chains_skipped=14 refused=0 closures_noop=168`）、`run 0..3` 都在、**`SR_teeth.1301.bin` md5 = `DD49827DD33A7EF07C2C17892F18970D` = 金标** ✓ ⇒ 工具可用。
+**两臂（`s6/pe_selfrep_run.ps1`，job `pwsh-97ebbec92513453c`，各 1000 帧、60 s 间隔）**：ON(`NR_ATT5_FUSE=1`) 与默认档对照 ⇒ 读数进 §88。
+**GPU 记账**：① 3 次 walk ≈ 4.5 min + ② 2 次 walk ≈ 3 min + 牙齿 1 次 ≈ 1.5 min + ③ 两臂 ≈ 8 min ⇒ 本盒 ≈ **17 min**。
+
+
+# §88 **③ 自重复门在 shipped 件上过：ON 档 1000 帧连发、989 次相邻帧逐字节比 = ad=0**（默认档对照同样 0）　2026-11-04 06:0x-06:2x
+件：uilds\libxmx_att5m.dll = 0FCF9C20B0204D7E626824423FE639F4 + 新仪器 uilds\nr_replay_sr.exe = 9FB2ED24B3426835A55E2C8C2E9BDD6A（NR_SELFREP 在 **每帧后**把 buffer 1301（8,355,840 B）下载并与**上一帧**逐字节比；从第 10 帧起比，因为 plan 回放有跨帧 history，run0 vs run500 合法地会不同 —— 稳态才是基准）。
+**牙齿检查**（不带 SELFREP，默认档）：closures=691 names=1382 name_offset=691、chains_skipped=14 refused=0 closures_noop=168 passes=691、SR_teeth.1301.bin md5 = **DD49827DD33A7EF07C2C17892F18970D = 金标** ⇒ 重编的工具与 oneapi\nr_replay_now.exe 等价 ✓
+| 臂 | fires | SELFREP |
+|---|---|---|
+| **NR_ATT5_FUSE=1（ON）** | **14 = 7 链 x 2 录制** | **id=1301 runs=1000 compared=989 bad=0 first_bad_run=-1** ✓ |
+| 默认档（不设 env，对照） | 0 | 
+uns=1000 compared=989 bad=0 ✓ |
+⇒ **融合后的 shipped closure 在真实 plan 操作数上自重复：1000 帧 x 7 条链 = 约 7000 次融合 launch，0 bad**（军规 46/48/51 满足；面集合 = 该形态真正会写的 1301 双面，不是诊断面）。
+**两臂的 [skip-chains] 计数一致**（chains_skipped=14 refused=0 closures_noop=168 passes=691 (unchanged)）⇒ 军规 57 的三向量同长同序在 1000 帧尺度上也成立 ✓
+**GPU**：③ 两臂 ≈ 8 min（1000 帧 x 2 + 60 s 间隔）。④ 40 门、⑤ 帧 16 对随后。
+
+
+# §89 **④ 40 门：变体件上 39 GREEN / 1 RED，而那颗 RED 是 `gate_skip_graph` 的**工件身份守卫**（它的实质检查在变体下也 EXACT）；复原 ABB969FE 后该门 GREEN**　2026-11-04 06:3x-06:5x
+**做法（不碰 `out\libxmx.dll`，只临时 stage `oneapi\libxmx_sycl.dll`，并先做备份）**：
+ - 备份：`oneapi\libxmx_sycl.dll`(ABB969FE…) → `builds\libxmx_sycl_ABB969FE.bak.dll`（md5 复核 = ABB969FE ✓）
+ - stage：`builds\libxmx_att5m.dll`（0FCF9C20…）→ `oneapi\libxmx_sycl.dll`
+ - `bash E:/DSH/run_gates.sh`（40 门，一字未改）
+**结果**：**39 GREEN / 1 RED**，RED = `gate_skip_graph`。
+**RED 的原因（读日志 `logs\gate_skip_graph.log`）**：该门自己的**工件守卫**在叫：
+ `FAIL  … out/libxmx.dll 与 oneapi/libxmx_sycl.dll 必须 ABB969FE（你没有改写任何 dll）`
+而它在**变体下**的实质检查全部 ok：`gate40_p3: 691 passes`、`1301 dump … (8355840 B)`、**`1301 EXACT vs bk.1301.skip.bin md5=dd49827d…`** ✓ ⇒ **不是融合把 skip/graph 门打坏了，是这道门设计上只认 ABB969FE 基座**（与 §69 那次"stage 非 ABB969FE ⇒ RED，复原后 40 GREEN"同一现象，已在账）。
+**复原 + 复跑**：`oneapi\libxmx_sycl.dll` = **ABB969FE4AAF0F94AA03C3F53781EDD0** ✓（`out\libxmx.dll` 全程未动，同为 ABB969FE ✓）；`GATE_ONLY=gate_skip_graph bash E:/DSH/run_gates.sh` ⇒ **GREEN，1 GREEN / 0 RED** ✓
+⇒ **④ 的诚实写法：变体件 = 39/40 GREEN + 第 40 门的实质子检查也 EXACT（只有工件身份守卫按设计 RED）；基座复原后 40/40 GREEN。**
+**⑤ 帧 16 对已开跑**（job `pwsh-f5cad28889a7406c`）：`ab.ps1 -DllA out\libxmx.dll -DllB builds\libxmx_att5m.dll -Pairs 16 -EnvB 'NR_ATT5_FUSE=1'`（A 侧 unset 全部 NR_*，ab.ps1 v3 每腿自清 ✓）；**预期口径 = 7/8 覆盖 ⇒ ≈ −1.0…−1.5 ms/帧**（不是 8/8 的 −1.75…−1.90）。读数进 §90。
+**GPU 记账**：③ 8 min + ④ 40 门 ≈ 12 min + 复原复跑 1 门 ≈ 0.5 min + ⑤ 16 对（进行中，预计 20-35 min）。
+
+
+# §90 **⑤ 帧 16 对 = −0.978 ms/帧（赢 15/16，CI95 [−1.186, −0.769]）+ ⑥ 逐 op 复核：串行 −2.30 ms 与帧 −0.98 严格对得上（×0.43），并揪出一笔 +0.73 ms 的白工**　2026-11-04 06:5x-08:0x
+## ⑤ 帧 16 对（同热交替，A = `out\libxmx.dll` = ABB969FE 且 unset 全部 NR_*，B = `builds\libxmx_att5m.dll` + `NR_ATT5_FUSE=1`）
+`ab.ps1` v3（每腿自清 NR_*），16 对，run0 丢弃、run1-3 取中位：
+```
+pair  1..16 delta: -0.670 -0.470 -1.440 -1.080 -1.150 -0.810 -1.200 -1.030 -1.090 +0.040 -1.580 -1.160 -1.290 -1.030 -0.700 -0.980
+A mean 58.872 ms   B mean 57.894 ms   n=16  mean -0.978  sd 0.392  se 0.098  **CI95 [-1.186, -0.769]**  **赢 15/16**
+判定：**转正**（判据 <=-0.5 且赢 >=10/16 ✓）；passes 两侧每对都 691/691 ✓
+```
+⇒ **7/8 链覆盖的实际帧净值 = −0.98 ms**（不是 8/8 的 −1.75…−1.90；口径已按 §87 更正）。
+## ⑥ 逐 op 复核（新件 `builds\libxmx_rt2a5.dll = F662051077B2BA709CEBA7EF7C348C31` = RUN_TIMING 仪器 + A5 接线；两臂各 691 行 rtcsv，`s6/pe_rt_ab.ps1` / `s6/pe_rt_read.py`）
+| closure 名 | 默认档 ms/帧 | ON 档 ms/帧 | Δ | 行数 off→on |
+|---|---|---|---|---|
+| `xmx_rec_window_attention` | 16.48 | 13.30 | **−3.18** | 52 → 45（7 条被 no-op）|
+| `xmx_rec_gemm_int8_qkv` | 14.55 | 12.58 | **−1.96** | 60 → 53 |
+| `quant_window(FUSED-pack)` | 0.12 | 0.10 | −0.02 | 52 → 45 |
+| `xmx_rec_gemm_window_int8_residual` | 12.98 | **14.07** | **+1.09** | 52 → 52（融合 launch 挂在这条上）|
+| `xmx_rec_quant` | 3.65 | **4.38** | **+0.73** | **80 → 87** |
+| `xmx_rec_gemm_int8_batched` / `_residual` | 7.10 / 22.28 | 7.10 / 22.87 | +0.01 / +0.59 | 72 / 68 不变 |
+| `quant_window(A5-fused)` / `gemm_int8_qkv(A5-fused)` / `window_attention(A5-fused)` | — | **0.02 / 0.01 / 0.01**（7 行 each） | ≈0 ✓ | 0 → 7 |
+| **TOTAL（691 行）** | **135.98** | **133.68** | **−2.30 ms 串行/帧** | |
+**对账**：串行 −2.30 ms × 0.43 = **−0.99 ms/帧** ⇒ **与 ⑤ 实测 −0.978 严格吻合** ✓（仪器与图内自洽，不是撞来的）。
+**融合 launch 的真实单价**：`wres_window` 52 条里 7 条背上融合 ⇒ +1.09/7 = **0.156 ms** 增量；原来这条自己 ≈0.25 ms ⇒ **融合后这条 ≈0.40 ms/链** ✓ 与 bench 的 `L1n = 0.4336` 同量级 ✓
+**★ 揪出一笔白工（下一铲的钱在这里）**：`xmx_rec_quant` 行数 **80 → 87、+0.73 ms** ⇒ 那 7 条链的 **644 QUANT 从"FUSED-pack 溶解态"退回成真发**：我在 645 里 `return 0` 太早，**跳过了 `fused_w`/`g_fused_quant` 的登记**（@4137-4141 那套 fold），于是 644 不再被溶解、白做一次量化 ⇒ **≈0.104 ms/链 × 7 = 0.73 ms 串行 ≈ 0.31 ms/帧 可以捡回来**。修法 = A5 命中时把该链 644 的 fold 登记补上（或显式 no-op c_q2），**不改数值**。
+**剩余活站（给下一铲排序用）**：
+ 1. 捡回 644 的白工（+0.31 ms/帧，纯登记活）；
+ 2. 第 8 条 C64 链（`epi=0 narrow=0`）要接得给 P11 加第二种 epilogue 形态 ⇒ **改数值面**，代价另评；
+ 3. C128 tier（12 条链，att 合一在 bench 上 **+51% 更差**、SLM 41,984 越 32KB 崖 ⇒ **不接**，除非先解决 SLM）；
+ 4. FFN 半已出货（S6-1a，`chains_skipped=14` 不变）；刀 1（跨链合并）已判死。
+**GPU 记账**：⑤ 16 对 ≈ 22 min（单批，>20 min ⇒ 批后冷却）+ ⑥ 两臂 ≈ 4 min ⇒ 本盒 GPU ≈ **31 min**；`out\libxmx.dll` / `oneapi\libxmx_sycl.dll` 收尾均为 **ABB969FE4AAF0F94AA03C3F53781EDD0**（④ 的 stage 已复原并复核），三金标未动，进程 0。
+
+
+# §91 **那笔 +0.73 ms 白工的机制已读死（为下一铲备好三条路，均未动手）**　2026-11-04 06:4x-06:5x（纯 host）
+**为什么 ON 档多出 7 条真发 `xmx_rec_quant`（80→87 行、+0.73 ms）：**
+ - 642 的 qkv 折叠在**运行期**登记 `g_fused_quant[c] = a_scale`（`libxmx_sycl.cpp:3670`，在 `pg_push` 的 body 里）；
+ - 644 的溶解也是**运行期**判断：它的 body 先查 `g_fused_quant.find(source)`（@6217-6218），查到就退化成 memcpy/不做；
+ - **A5 命中后 642 的 body 被 no-op ⇒ 登记不再发生 ⇒ 644 在运行期查不到 ⇒ 退回真发量化** ⇒ +0.104 ms/链 × 7 = +0.73 ms 串行（≈ **0.31 ms/帧**）。
+ - 这也解释了为什么我原先在 645 **record 期** no-op `g_cmds[c_q2]` 的打算没用：A5 的 fire 发生在 645 的 record 时刻，而 644 的溶解决定在**运行期**才做，那时 map 已经空了。
+**三条候选修法（代价从小到大，都没做）**：
+ 1. **让融合 closure 在运行期补登记**：在 `a5_att_run()` 末尾把该链 644 的 (source -> a_scale) 写进 `g_fused_quant`（语义 = "int8+scale 已由 producer 写好"）。**但 att5 核在 DUMP=false 时根本不写 pk2/sc2**（P10 的全局 store 在 `if (DUMP)` 里）⇒ 单补登记 = 让 644 读到没人写过的面 ⇒ **数值危险，必须先做第 2 条**。
+ 2. **打开 P10 的 PKT/AS2 全局写出**（≈2 MB/链 的 int8+float 写，远便宜过一次完整量化）：把 `att5_fused_kernel.hpp` 的 P10 outlet store 从 `if (DUMP)` 里拆出来、变成 shipped 侧的一个独立开关（例如 `WRITEOUT`），融合 closure 写完之后 644 的溶解 memcpy 甚至可以直接省掉。⇒ **改的是写出面，不动数值链**，但要重跑 25 检查点门 + 双档 1301 + SELFREP。
+ 3. **不动它**：接受 0.73 ms 串行（0.31 ms/帧）的损失，当前净值仍 −0.98 ms/帧。
+**我的建议顺序**：先 2 再 1（2 是 1 的前提），做完必须重跑：bench 25 检查点门（3 进程）→ 双档 1301 → `NR_SELFREP=1000` → 40 门（记得备份/stage/复原 ABB969FE）→ 16 对复测（预期 −0.98 → **约 −1.3 ms/帧**）。
+**未验假设**：+0.73 ms 的归因来自行计数（80→87）与 `g_fused_quant` 的代码语义，**没有单独跑一次"只补登记不写面"的对照**（那会 RED，正好可以证伪/证实这条链）——留给下一铲，别在没门的情况下试。

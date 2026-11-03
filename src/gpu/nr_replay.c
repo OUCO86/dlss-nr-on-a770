@@ -1593,11 +1593,37 @@ int main(int argc, char **argv)
 	 * through that loop run over run -- a test artifact, not a wiring fault. One run
 	 * (fresh=1, no history behind it) isolates the wiring: pre -> network -> post. */
 	int nruns = fused_synth ? 1 : 4;
+	/* NR_SELFREP=N (military rules 46/48/51; knife2b #87): run the graph N times in THIS
+	 * process and compare the chosen plan buffer between CONSECUTIVE runs once the walk is
+	 * warm (the plan replay has cross-frame history, so run 0 vs run 500 may legitimately
+	 * differ -- steady state is the reference). A cross-launch or cross-wave race inside a
+	 * shipped closure shows up as run k != run k-1. Presence-gated: unset => behaviour
+	 * identical to before. NR_SELFREP_ID picks the buffer (default 1301, the 8 MB pair). */
+	int selfrep = getenv("NR_SELFREP") ? atoi(getenv("NR_SELFREP")) : 0;
+	int srep_id = getenv("NR_SELFREP_ID") ? atoi(getenv("NR_SELFREP_ID")) : 1301;
+	if (selfrep > nruns) nruns = selfrep;
+	unsigned char *sprev = NULL, *scur = NULL; unsigned long long snb = 0;
+	int srep_bad = 0, srep_first = -1, srep_cmp = 0;
 	for (int i = 0; i < nruns; i++) {
 		double at = now_ms();
 		passes = f_graph_run(r.graph);
 		printf("run %d: %.2f ms (%d passes)\n", i, now_ms() - at, passes);
+		if (selfrep && i >= 10 && srep_id >= 0 && (unsigned)srep_id < nr_plan_buffer_count
+		    && r.ids[srep_id] >= 0) {
+			unsigned long long nb = nr_plan_buffers[srep_id].bytes;
+			if (nb && (!sprev || snb != nb)) { free(sprev); sprev = malloc((size_t)nb); snb = nb; }
+			if (!scur) scur = malloc((size_t)nb);
+			if (sprev && scur && f_buf_download(r.ids[srep_id], scur, 0, nb) == 0) {
+				if (srep_cmp) {
+					++srep_cmp;
+					if (memcmp(sprev, scur, (size_t)nb) != 0) { ++srep_bad; if (srep_first < 0) srep_first = i; }
+				} else { memcpy(sprev, scur, (size_t)nb); srep_cmp = 1; }
+				memcpy(sprev, scur, (size_t)nb);
+			}
+		}
 	}
+	if (selfrep) printf("SELFREP id=%d runs=%d compared=%d bad=%d first_bad_run=%d\n",
+	             srep_id, selfrep, srep_cmp ? srep_cmp - 1 : 0, srep_bad, srep_first);
 	if (passes < 0)
 		return 1;
 
