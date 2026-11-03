@@ -1337,3 +1337,23 @@ T1 的机器读数：**corr_min 0.9828**（R .983 G .992 B .990，luma .991）�
 **规矩状态（即刻生效）**：① 合成链禁 **LW=32**、用 **KN=0**；② 进 shipped 前 **>=1000 连发 bad=0**（200 只做快筛）；③ **已出货 1a 不必修**（0/600 + 9/9 + 13/13）=> **不动 shipped**。
 **军规 48（新，入 B2）**：**ESIMD 里 16 行 tile 的"8 行 fragment 边界"是危险线**：任何跨波/跨半片的 SLM 槽与带（band）设计都要按这条线检查——本案 port 核 8 次失败的出错行 `row % 16` 只落在 0 与 7；这与硬坑 #18(2)（dpas 累加器 fragment 只有 8 行）同族。
 **对上游的一条诚实观察（值得记）**：**lmxx 的 FFN 融合核在我们工具链里逐字节正确、但不自重复（约 0.5%）** —— 他们的逐字节门（GATE PASS）抓不到这类事，因为那是单次输出对参考，不是自身重复。
+
+## 70. ★★★ B2a 交回：**端到端合成体建成并通过门 1-3**（25 项逐字节全 0、6/6 进程 GREEN、LIVENESS、cross IDENTICAL）+ 新坑 P20（会**伪造 RED 门**的 bench 陷阱）
+**合成体**：`src/bench/sycl/port_e_chain.cpp`（480 行）+ `src/bench/sycl/port_e_chain_bodies.inc`（由 `s6/pe_mkchain.py` 从 `s6b_att.cpp` + `s6_ffn_block4.cpp` **机械抽取、逐字不改**，各自包进 `namespace PE_ATT / PE_FFN`）；exe `oneapi/port_e_chain.exe` = **`EC1D8CFE8A9554D10D1A4FD190E966D3`**（2,527,744 B），编译 `s6/cc_portE.ps1 -Defs "/DM_P4FORM=0 /DM_PEAK=1 /DM_P3SPLIT=1"`（**M2b 档**；Shape 有 `static_assert` 要求模板参数 = 宏，所以档位走编译期）。
+**形态**（一条 C=64 链，plan closures 641..651）：
+- **L1** `PE_ATT::att5::fused<64,2,5,DUMP,LIVE>` = 5 个 plan 腿一发（QUANT_WINDOW -> QKV -> WINDOW_ATTENTION -> QUANT -> GEMM_WINDOW_INT8_RESIDUAL，出口 = 1270，token 序）；
+- **L2** `packdev::pack_a_fused(1270 -> face + scA)` = 链自己的那发 QUANT（646），**顺手按 dpas fragment 序落 A 面**（R1 生产者）；
+- **L3** `PE_FFN::ffn3::fused<S,true,NPH-1,0>` = 1a/M2b 的 FFN 五腿一发（expand -> requant -> contract -> outquant -> residual，出口 = 1267），**P1 由 L2 供**；
+⇒ **11 个 plan op / 现路 13 个 device 发 -> 3 发**；几何锁死 **T=32 / LW=64 / SLM 31,104 B（2 resident）/ 1020 WG**；**KN=0**、**从未用 LW=32** ✓
+**门 1 = 25 项全 0**：att 12 项（`pk0/sc0/Q-plane/K-plane/V-plane/scores/probs/att/pk2/sc2/pk2-folded/1270-FINAL`）+ FFN 13 项（`pk1/pk1-face/faceA-vs-faceB/sc1/hid/pk2/pk2-frag/sc2/out1275/pk3/pk3-frag/sc3/1267-FINAL`）；其中 4 项接口 = **面布局字节序**（`pk1-face` + `faceA-vs-faceB`：**一发生产者面 = 两发 qr+retile 面 = split packA 面，逐字节同**）、**scale 粒度**（每行一个 float）、**量化编码**、**epilogue 出口形态**。
+**稳定性：6 个独立进程（40 s 间隔）= 6/6 GATE GREEN**，每进程 `#### port_e_chain: GREEN (fails=0)`。
+**门 2 LIVENESS**：把 L2 的共享面 `faceB` 就地 /2 再重跑 L3 ⇒ **`1267 differs in 1,158,095 / 4,177,920 bytes`** ⇒ 共享面真的喂到出口，**且 6 个进程这个数字一模一样**。
+**门 3 cross**：`PE_blobA/B.bin`（各 16,842,240 B：1270 + 1267 + face + scA + out1275 + pk3 + sc3）两进程 md5 同为 **`7E963BF25B6F3E8B4608D8F185FB875E`**，`CROSS: IDENTICAL` ✓
+
+### ★ P20 / 军规 49：**bench 里 `q.wait()` 不等于 producer -> consumer 的可见性屏障**
+症状：同一 exe、同一 cache 目录，**4 进程里 2 个 GATE RED**，且 **RED 错在 REF 侧**：`packdev::gather_pack_b_b` 的出口面 `dBpE` 前 8 字节 = `0 0 0 0…`（输入 `dWER` 正确）=> REF 的 expand 写出全零 hidden => `hid/pk2/pk2-frag/sc2/out1275/pk3/pk3-frag/sc3/1267` 全 DIFF。
+定位：在 pack 前后加探针（`PACK-PROBE` / `REF pre-expand probe` / `REF-dH device probe`）=> **不是 D2H 读空、不是内存压力（当时只分配 120 MB）**，就是那发 pack 的输出在下一次 kernel 读之前**没可见**。
+修法：**每个 producer -> consumer 交接点插 `q.ext_oneapi_submit_barrier()`**（出货 bench 本来就这么写：`leg_pk2` = `pack_a_fused(...); return q.ext_oneapi_submit_barrier();`）——**新写的 driver 漏了**。插 9 处之后 **5/5 -> 6/6 GREEN、cross 两次 IDENTICAL**。
+⇒ **军规 49**：**bench 里跨 kernel 的面交接必须显式 `ext_oneapi_submit_barrier()`；`q.wait()` 只保证完成、不保证下一个 kernel 读到。** 否则逐字节门会**随机假红**——**比假绿更难查，因为它会把"合成体错了"当成结论**。
+**下一步（代理已在跑）**：**B2b** = 门 4（合成体 `--stress 1000`，L1+L2+L3 全链哨兵重发）+ 门 5（台账逐列，`s6/spillcheck_port.py` 加 `port_e_chain` label）；**B2c** = 单价 ≥10 进程 x 60 s，对实测基线 **1.525 / 1.658**，目标 **<=0.844 ms/链 => 8 链 -5.6 串行 => 帧 -2.4**。
+本轮 GPU 约 **11 分钟**（gate 稳定性 3.4 + cross 1.5 + 探针若干）；`out\libxmx.dll` 与 `oneapi\libxmx_sycl.dll` = **ABB969FE** 未动；三金标未动；进程 0 残留。
