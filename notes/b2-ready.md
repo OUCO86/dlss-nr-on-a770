@@ -1,7 +1,7 @@
 
 ## B2-ready（**由主会话代写：代理在落盘前被暂停令打断**；下次开工直接照这一节走，不用再问）
 
-**现场已核（16:2x，全部实证）**：`git` = `b54de7e`、porcelain **CLEAN**；`out\libxmx.dll` = `oneapi\libxmx_sycl.dll` = **`ABB969FE…`**；三金标 `bk.1301.bin`=`bk.1301.skip.bin`=**`DD49827D…`**、`bk.1301.pre-skip-1a.bin`=**`249A46F3…`**；**GPU/bench 进程 = 0**；`E:\DSH\tmp\pe_stress.cpp`、`pe_stress_att.cpp` 仍在（已被仓内版 `src/bench/sycl/stress_repeat.cpp` 取代，可删）。
+**现场已核（16:2x，全部实证）**：`git` = `b54de7e`、porcelain **CLEAN**；`out\libxmx.dll` = `oneapi\libxmx_sycl.dll` = **`ABB969FE…`**；三金标 `bk.1301.bin`=`bk.1301.skip.bin`=**`DD49827D…`**、`bk.1301.pre-skip-1a.bin`=**`249A46F3…`**；**GPU/bench 进程 = 0**；`E:\DSH\tmp\pe_stress.cpp`、`pe_stress_att.cpp` **已由代理在 16:2x 删除**（仓内版 `src/bench/sycl/stress_repeat.cpp` 已取代）；**留下未编译的 `tmp\pe_stress_ph.cpp`（68,306 B，NPHASE 压力 A/B 副本，生成器 `s6/pe_mkstress_ph.py`）**——那是第 3 步"把机理钉到指令"的备料，下次要用再说。
 
 ### ① B2 要写的东西（端到端合成体，**目前不存在**）
 `src/bench/sycl/port_e_chain.cpp` = **一条 C=64 链、11 发 → 3 发**，两半各自已绿、只差串起来：
