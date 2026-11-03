@@ -337,3 +337,95 @@ Get-Content E:\DSH\s6\K2_probe_S0.log,E:\DSH\s6\K2_probe_S1.log,E:\DSH\s6\K2_pro
 ⇒ **结论（给阶段 B）**：三方的 A 面 map 在 **64-token 窗口 + kb 块 2048 B + 16-token band 512 B + 每 token 32 B** 这一档**完全一致** ⇒ "att 半 P10 的出口面直接喂 FFN 半 P1 的入口面、**不加 pack 腿**"（健康闸第 3 条）**在布局上成立**。
 ⚠ 但**当前 block4 的 S1 跑的是 T=32**（台账 `ffn2::fused T32 C64 HID256`）⇒ 合成必须把 FFN 半的 token-group 抬到 **T=64**（BANDS=4），这是一次**几何改动、要重新计价**（port-C1 已证 T/LW 改动会挪 SLM 与占用：S1 T=32 的 SLM=31,744 B，T=64 会翻倍 ⇒ 撞 32KB 崖的风险要先测）。
 ⇒ 阶段 B 的最小验证顺序建议：① 先把 FFN 半在 `T=64` 下重跑 gate+价（一个进程，`s6_ffn_block4.cpp` 的 Shape 模板换 T）；② 再写 `port_e_chain.cpp` 把两半按共享面串成 3 发；③ 才谈接图（记录/计划层换序）。
+
+---
+
+# §63 B0（前置：把 port 核 LW=32 的 flaky 归因到指令级）　15:0x- 进行中
+**判别器（正在跑，`s6/pe_b0.ps1`，job `pwsh-3a602c094c934e01`）**：三臂，每臂独立进程、进程间 **60 s**（军规 45/P18）：
+- **A `KN=1 LW=32`（出事格）×10**、**B `KN=0 LW=32`（无 global RAW）×10**、**C `KN=1 LW=16`（同 RAW、小 WG）×5**；计数 = GATE FAIL 次数。（注：`M_BAR` 是 **block4/1a** 的开关，**port 核没有这个开关**——它从头到尾用的是真 `group_barrier`（`port_ffn_fused.cpp:347/398/447/500`），所以对 port 核而言**"栅栏类型"这一维已经被排除**；能分离"是否存在跨波 global RAW"的开关是 **KN（C1 的 SLM 刀）** ⇒ 判别器按 KN 做，等价且更直接。）
+
+**代码级定位（已做，原文照抄）**：
+- PHASE 3 出口（`port_ffn_fused.cpp:433-435`）：
+  ```
+  if (KN == 0) esimd::slm_block_store(OUTP + (uint32_t)r*(C*2u) + (uint32_t)col*2u, hh, overaligned_tag<16>{});
+  hh.copy_to(a.dOut1275 + (size_t)(r0 + r)*C + col);   // their :98 (the 1275 plane)
+  ```
+- **中间只有一个 `group_barrier(gr);`（:447）**；
+- PHASE 4 行峰（`:461-470`）：
+  ```
+  const half* rowp = a.dOut1275 + (size_t)(r0 + r) * C;
+  esimd::simd<half,16> h = (KN == 0) ? esimd::slm_block_load<half,16>(OUTP + ...)
+                                     : esimd::block_load<half,16>(rowp + c*16, overaligned_tag<16>{});
+  mx = esimd::max(mx, esimd::abs(esimd::convert<float>(h)));   ...   float peak = esimd::hmax<float,float,16>(mx);
+  ```
+⇒ **`KN=1` 时 PHASE 4 从 GLOBAL 读回 PHASE 3（同一 WG 的其它波）刚写的 1275 行**；`KN=0` 时读的是 SLM 副本（`OUTP`）⇒ **没有跨波 global RAW**。这正是两臂的差别，也是"1/5 进程失败、且只在 LW=32"的宽度解释（LW=32 ⇒ 每 WG 波数翻倍 ⇒ 跨波窗口更宽）。
+**`barrier_audit.py` 的两栏（§44 升级仪器，跑在 shipped 目录：`s6/barrier_audit_pe.csv`，38 行）**：它**不覆盖 bench 文件**（`port_ffn_fused.cpp`/`s6b_att.cpp` 不在名单），但对 **1a（`ffn2::fused`）** 给的是：`verdict_source = RACE`（O_PK/O_HID/O_PKH/O_OUT 四条 HANDOFF/REUSE），而 **`verdict_machine` = 实测：`esimd::barrier()` 与 `group_barrier(it.get_group())` 编出**同字节数的 .text**（S1 md5 `053032299BADFDC09BE3144438741E26` / S2 `21DDE963AC6AF9BEDEBB6B1EA6B28795`），都发 **8 条 signal barrier**；DM_PROBE 加 1 条 ⇒ 9 条 ⇒ **"读写在机器级是同一类 CTA 栅栏"** ⇒ 源码级 RACE 条目在机器级不成立**。⇒ 按 §44，port 核 flaky **不是"栅栏类型错"**；剩下的可能只有 (i) **栅栏位置/数量不够覆盖 global 可见性**（CTA barrier 是执行栅栏，**不等于 global L1 一致性**；跨波 global RAW 需要 coherent 存取或额外 fence），或 (ii) **行峰的归约/初始化**（`mx` 每行重置为 0 ✓、`hmax<16>` 顺序固定 ⇒ 无归约序问题；`esimd::max/abs` 无未初始化读 ⇒ **排除 (ii)**）。⇒ **首要嫌疑 = (i)：`KN=1` 的跨波 global RAW，缺的是 coherent fence，不是 barrier 类型**。
+**出错行的坐标（解析，已算）**：`sc3` 只有 **9/32,640** 处不同、first row **29872**：
+- 面布局 M=32640 = **510 windows × 64 tokens** ⇒ row 29872 = **window 466（0-based）、token-in-window 48**；band = `48>>4` = **3**、lane = `48&15` = **0**、col 0；
+- 两个 scale 反推行峰（`scale = peak/127`）：ref `2.01574802 × 127 = 256.0`（f16 精确）、port `2.26771665 × 127 = 288.0` ⇒ **port 那一行看到的最大值是 288，参考是 256**；
+- 对应 A 面坐标：row-major `dpk1 + 29872*C + kb*32`；fragment 序 `grp = 29872/16 = 1867, r = 0` ⇒ `dfrag + 1867*(16*C) + kb*512 + 0*32`；a_scale = `dsc1[29872]`；
+- ⇒ **288 是"上一轮发射留下的值"而不是乱码**（bench 会对同一面连发 225+ 次，面被复用）⇒ **典型的"读到上一次发射的旧行"**，与"缺 global 可见性 fence/多一次栅栏"完全吻合（若是别名污染会大面积错，不会只有 9 行）。
+**临时规矩（写进账，即刻生效）**：**归因未结之前，任何新合成链一律禁 `LW=32` 档**（只用 **LW=16** 与 **T=64**）；**带 flaky 的档不得接进 shipped**。
+**计数与结论 = 待 job 完成填入**（A/B/C 三臂 fails 数）。**若 B 臂（KN=0）0 失败而 A 臂有失败 ⇒ 跨波 global RAW 坐实 ⇒ 修法 = 让 PHASE 4 读 SLM 副本（KN=0）或给 1275 的写/读加 coherent 通道，不是加 barrier**；届时对**已出货 1a** 的建议 = 审它有没有同类"跨波 global RAW"（`ffn2::fused` 的 O_OUT 是 SLM ⇒ 预计没有），**只报不改**。
+
+---
+
+# §64 B1（先算字节再编）= **算术过关，但几何不过 ⇒ 不编 T=64；合成改走 T=32 + 参数化 global 面 stride**（按军规 22/30 先回报）
+**逐项 SLM 表（公式取自 `s6_ffn_block4.cpp:164-176`，S1 = C=64 / HID=256 / KS4=4 / KS6=2；`SLM = ((O_SC+SZ_SC+15)/16)*16`）**
+
+| 区域 | 公式 | **T=32（现档）** | **T=64** |
+|---|---|---|---|
+| `O_PKH` hidden-int8 A 面 | `KB_H·BANDS·512`（KB_H=8） | 8·2·512 = **8,192** | 8·4·512 = **16,384** |
+| `O_PK` pk 面 | `KB_C·BANDS·512`（KB_C=2） | 2·2·512 = **2,048** | 2·4·512 = **4,096** |
+| `O_HID` hidden f16 | `T·HID·2` | 32·256·2 = **16,384** | 64·256·2 = **32,768** |
+| `O_OUT` out f16（= M2 的 `O_PEAK` 别名，`SZ_PEAK=T·(HID/16)·4`） | `T·C·2` | 32·64·2 = **4,096**（peak 4,096 ✓ 别名成立） | 64·64·2 = **8,192**（peak 8,192 ✓） |
+| `O_SC` 三个 scale 槽 | `3·128`（注释写死 **T≤32 floats each**） | **384** ✓ | **需要 3·256 = 768 ⇒ 现码 `O_SC+128`/`O_SC+256` 两处偏移会串槽 = 硬结构阻塞** |
+| **合计 / 取整** | | **31,104**（JIT 台账实测 **31,744** ⇒ 驱动 padding 640） | **62,208**（+padding ≈ **62,848**） |
+| 对 32,768 占用崖 | | **崖内 ⇒ 2 resident WG/slice** ✓ | **越崖 ⇒ 1 resident** |
+| 对 65,536 硬帽 | | ✓ | ✓（勉强，余量 2,688 B） |
+
+**几何（活动图）不过 —— 这才是决定项**：`nd_range(range(nblk·64), range(64))` ⇒ **每 WG 固定 64 个 ESIMD 线程**（`:253`），而各相的活跃线程数 `ACT`（`:193-205`）在 T=64 时**超出 WG**：
+| 相 | ACT 公式 | T=32 | **T=64** |
+|---|---|---|---|
+| P2 expand | `(T/8)·(HID/16)` | 64 = LW ✓ 全活跃 | **128 > 64 ✗** |
+| P4 contract | `(T/8)·(C/8)`（form2） | 32 ✓ | **64 ✓（刚好）** |
+| P6 residual | `(T/8)·(C/8)·KS6` | 64 ✓ | **128 > 64 ✗** |
+| P3（M2b） | `64` | 64 ✓ | 64 ✓ |
+⇒ **T=64 需要 LW=128**，而 **`LW≥128 + barrier` = 已证的死锁区**（`notes/s6-port-spec.md` D1，前辈 256 线程/WG 在 ESIMD 下直接 HANG）；否则要给 P2/P6 加 per-thread 循环 = **改核心**（违反"不许顺手改数值/形态"）。
+⇒ **B1 裁决：不编 T=64**（算术虽过硬帽，几何与 scale 槽两处都撞）。
+
+**改道（不损失任何东西，且更省）**：合成**不需要 T=64**。两半的**元素级 fragment map 本来就同形**，差的是 **kb 块的带宽数**：
+- att 半（`s6b_att.cpp:510`）：`PKT + kb·2048 + row·32`，row=0..63 ⇒ 每 kb 块 **4 个 16-token band**；
+- FFN 半（`:281`）：`O_PK + (kb·BANDS + (t>>4))·512 + (t&15)·32`，BANDS=2 ⇒ 每 kb 块 **2 个 band**；
+⇒ 把 FFN 半的 **global A 面寻址参数化**成 `kb·2048 + (hb·16 + band)·512 + lane·32`（`hb ∈ {0,1}` = 窗口半，随 WG 的 token 段给定）⇒ **T=32、LW=64、SLM 31,104（2 resident）一字不动**，只是把入口面的 kb stride 从 1024 改成 2048 + 一个 band base ⇒ **零 pack 腿、零 quant 腿**（健康闸第 3 条 ✓），且 FFN 半内部 SLM 的 PK 图不变。
+**代价/待验**：一个 WG 处理的 32-token 段落在别人的窗口里 ⇒ **1 个窗口要 2 个 WG**（S1：510 窗口 ⇒ 1020 WG，与现档 `nblk=M/T=1020` **完全一致** ✓ 网格不变、只是面 stride 变）。⇒ **B2 按这条路写**。
+
+---
+
+# §65 B0 读数（**竞态坐实**，但不是我们原先猜的那把）　15:0x-15:4x
+**① 冷进程判别器（`s6/pe_b0.ps1`，job `pwsh-3a602c094c934e01`，batch 31.6 min，0 残留）**：三臂各独立进程、进程间 60 s：
+`KN=1 LW=32` **fails 0/10**、`KN=0 LW=32` **0/10**、`KN=1 LW=16` **0/5** ⇒ **冷档分不出**；把全部历史样本合起来：`KN=1 LW=32` = **1 fails / 20 进程**（pe_runA 5 + pe_runB 5 + B0 10），`KN=1 LW=16` = 0/15 ⇒ **基率 ≈ 5%，n=10 不够**（Fisher p≈0.5）⇒ **按令"≥10 冷进程"这条路不能归因**。
+**② 换放大器（决定性）**：`E:\DSH\tmp\pe_stress.cpp`（**仓外副本**，源 = `port_ffn_fused.cpp`，md5 `3DB5E9D3…`）+ `s6/pe_mkstress.py`：同一进程内**连发 200 次 DUMP 核**，每次发射前把跨波交接面 `dOut1275` **memset 成哨兵 0xA5**，然后与 launch-0 的 `OUT/PK3/SC3/FR3` 逐字节比 ⇒ **不需要参考链就能测"自身可重复性"**（军规 31 的强化版）。读数（`s6/pe_b0s.ps1`，job `pwsh-000ab6ff01f047e1`，5.2 min）：
+
+| 臂 | launches | **bad** | 带哨兵字节的次数 | 首个 bad |
+|---|---|---|---|---|
+| KN=1 LW=32 | 200 | **0** | 0 | — |
+| KN=0 LW=32 | 200 | **0** | 0 | — |
+| **KN=1 LW=16** | 200 | **4**（s=20/147/166/178） | 0 | dOUT=189 dPK3=583 **dSC3=27** row=17040 col=0 |
+| **KN=0 LW=16** | 200 | **2**（s=132/135） | 0 | dOUT=98 dPK3=268 **dSC3=14** row=14336 col=0 |
+⇒ **竞态坐实：port 核在 200 连发里 2-4 次（≈1-2%）产出与自身前一次不同的面**；并且原先的"只在 LW=32 / 只在 C1 刀（KN=1）"两条猜测**都被证伪**：
+- **不是栅栏类型**：`KN=0/KN=1` 都翻；§44 机器级实测已证 `esimd::barrier()` 与 `group_barrier` 编出同一类 CTA 栅栏（8 条 signal barrier）⇒ 换类型无用；
+- **不是 C1 的 global 读回刀**：`KN=0`（读 SLM 副本）同样翻；
+- **不是 WG 宽度**：本轮 **LW=16 反而比 LW=32 更容易翻**（4/200 vs 0/200）⇒ 之前 1/20 集中在 LW=32 是小样本 + 背靠背热态，不是几何因果；
+- **不是"读到哨兵"**：`sentinel_pairs = 0` ⇒ 错的字节不是未写过的槽，而是**别的真实值** ⇒ 排除"单纯读早了看到 0xA5"。
+**③ 偏差的形状（定位到组级）**：出错行 **17040 / 14368 / 10272 / 2064 / 14336 全是 16 的倍数** = **fragment band / 每 WG 16 行的边界** ⇒ **整个 work-group 一级**的偏差；每次数到 **10-30 个行 scale**（`sc2/sc3`）不同 ⇒ 与 §57 那次 `first row 29872`（= 16×1867 ✓ 同样 band 对齐）同一签名：**行峰取到不同值 ⇒ 下游 pk3/out/1267 跟着差**。
+**④ 剩下唯一活着的机理族 = 同一 WG 内跨波的 SLM 槽可见性/顺序**（不是 global、不是栅栏类型）：候选点已缩到两处——
+ (a) `SCB`（行 scale 槽）：**4 字节粒度**跨波写 + 读（`:374 store(SCB + r*4, simd<float,1>)`；`:422-423 load<float,8>(SCB)`；`:474 store(SCB + 64 + r*4)`）；
+ (b) `HIDF` 的 **in-place requant**（`:361-369` 先整行读峰、`:376-385` 再把同一批字节**原地覆写**）：PHASE 2 内**没有** barrier，行所有权虽按 `r = w*RPI + i` 划分（S1 RPI=4 ⇒ 每波 4 行、互不重叠 ✓），但 `HIDF` 的字节跨度是 `kb*512 + r*32` ⇒ **同一 512B band 内混着 4 个波的行** ⇒ 若 band 的写/读在机器级不是 32B 原子，就会出现"读到别的波刚覆写的行字节"的**组级**污染 ⇒ 与签名（band 对齐、整组 scale 变）吻合。
+**⑤ 临时规矩（即刻生效，写进账）**：
+1. **归因未结之前，任何新合成链禁 `LW=32` 档**（只用 LW=16 与 T=32）✓ 原令；
+2. **追加**：合成链**一律用 KN=0（保留 SLM out 副本）**，不用 C1 的 global 读回刀（两臂都翻，而 KN=0 的翻法不依赖 global ⇒ 少一个变量）；
+3. **追加**：**任何新核进 shipped 前必须过 200 连发压力门（bad=0）**（`pe_stress` 的哨兵法可以照搬成通用仪器），单进程一次 ≈ 15 s ⇒ 便宜；
+4. **对已出货 1a 的建议**：同一个放大器套到 `ffn2::fused`（block4 的 DUMP 面）上跑 200 连发 ⇒ **只测不改**；若它也 bad>0，那 §43 的 RACE 条目就不是"机器级不成立"，而需要按 §44/§52 的**拆槽/挪相**修法（不是加 barrier）。**我下一步就去做这个读数。**
+**⑥ 仍未结的部分（诚实）**：没做到"指令级"（未反汇编到具体 `lsc_load/store` 的 cache-control 位与 barrier 插入点）；那需要把 `pe_stress` 的失败样本配上 `ocloc` 反汇编 + 把 `HIDF` 的 band 跨度改成 32B 对齐分区做 A/B。⇒ 建议 B2 之后补这一刀，或先做 1a 的 200 连发（便宜、决定 shipped 是否有暴露）。
+**热状态**：B0 冷阶梯 31.6 min + 压力 5.2 min ⇒ 本轮 GPU ≈ **37 分钟**；最后一次动作 15:4x ⇒ 下一段跑前凉 ≥5 分钟。
