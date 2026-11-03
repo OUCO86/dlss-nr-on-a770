@@ -1486,3 +1486,25 @@ reject 计数：**qw 100 / qkv 116 / wa 100 / wres 100，`wres-TUPLE` = 0 行** 
 **剩下头号嫌疑 = 642 的 qkv 腿**：默认档里 641 被 qfuse 溶解后 gather 由 642 自己做（`pack_a_fused_gather`@3669），但它接的是哪一版 qkv（`qres::gemm_qkv_res` 还是 @3662 那条 `dAp9b/Mp32` 变体）**还没读死**；**bench 用的是 `qres::gemm_qkv_res(..., false, nullptr)`**。
 **下一刀**：把 642 的默认分支**逐行抄进 bench 的 REF** => **重跑 25 检查点门（门必须在改后的 REF 上过）** => 绿了再谈放宽四种几何 + 接图 + 自重复门；不绿就贴第一个偏差坐标停下。
 **现场**：进程 0；`out\libxmx.dll` = `oneapi\libxmx_sycl.dll` = **ABB969FE** 未动；三金标未动；工作区只有诊断放宽 + a5-op witness（已随本条入库）；C-1 累计 GPU 约 10 min；**默认档仍自证 1301 = `DD49827D` + passes 691 => shipped 头零影响**。
+
+## 76. ★★ C-1 收口（续跑包 §82）：**我提的"REF 不忠实"也被自我否证 ⇒ 82.6% 差仍未定因**；**覆盖面精确数完 ⇒ 现在可兑现的帧净值只有 ≈ −0.44 ms**（不是 −1.75/−1.90）
+**① "把 642 的默认分支抄进 bench REF" => 逐参数对照后发现无差异可抄（我的假设否证）**：
+引擎 `xmx_rec_gemm_int8_qkv`（3822-4136）默认分支：`pool_get(na)` -> `packdev::pack_a_fused_gather(*GQ, src, dAp, as, M, Mp, C, image_h, image_w, across, pad)`@3897（`NR_QW_FUSE` 默认 ON => 641 溶解）-> `qres::gemm_qkv_res(*GQ, dAp, dBp, Q, Kk, V, as, bs, qs, M, Mp, C, NH, heads, tokens, vit, vit_recip_tab())`@3920（`NR_QKV_RES` 默认 ON）。
+bench：`qres::gemm_qkv_res(q, rAp, dBp, rQ, rK, rV, rAS, dBS, dQS, M, Mp, C, NH, heads, TOK, false, nullptr)`。**唯一差别 = 末两个实参**；`qkv_resident.hpp:165`：`float recip = vit ? vit_recip_vec(hr, recip_tab) : wbv3::cosine_recip_vec(hr);` => **`recip_tab` 只在 `vit=true` 被读**，本链 flags 无 `0x2000` => `vit=false` => **`nullptr` 等价于 `vit_recip_tab()` => 642 忠实** ✓
+（641/643/644/645 此前已逐条查过：643 引擎 `launch_wa_res(...,dBv,...,rawv2=true)` vs bench `(...,nullptr,...,true)`，rawv2 时 `dBv` 不被读@5101-5105 => 等价；644 溶解 = 645 里的 `pack_a_fused`@4137-4141；645 = `s8v8::gemm_b_res_window`。）
+**② 覆盖面精确计数（host 离线，零 GPU）**：104 行 `[a5-geom]` 按 (K, M, across, pad) 计数（每帧录制两次 => 除以 2 = 链数）：
+| tier | 几何 | 链数 |
+|---|---|---|
+| **C=64** | 32640/30/**pad0** | **2**（现在只有这批 fire）|
+| | 33728/31/pad=4 | 2 |
+| | 34560/30/pad=262144 | 2 |
+| | 35712/31/pad=262148 | 2 |
+| C=128 / 256 / 512 | 各 4 种 halo | 6 / 16 / 16 |
+合计 **52 条**（8+6+16+16）= 104/2 ✓ => **C=64 的 8 条链 = 四种 halo 几何各 2 条，我只覆盖 pad=0 => 2/8**
+⇒ **现在可兑现的帧净值只能写 ≈ −0.44 ms**（`0.509 ms/链 x 2 链 x 0.43`）；**−1.75…−1.90 是四种几何全覆盖之后的值**（§77/§81 口径已按此更正）。
+⇒ 放宽本身是参数活（`top/left/across/M` 已是 `att5::fused` 入参，`qr_kernel`/`pack_a_fused_gather` 的 gather 就是同一套 `-pad_top/-pad_left`），**但顺序要求不变：K 面证据 + 门绿之后才做。**
+**③ 尾巴 1（`faceK` 布局不符）= 未结，没靠推断糊过去**：plan 的 K 面 = `33,554,432 B = 960x544x32x2`（**图像序**），而 `att5::fused` P8 写的是 **fragment/token 序**；目前只有 `P(id,bytes,what)` 的**下界**检查通过。
+下一刀两种做法都要留账：(a) 运行期读集证据 —— `rg -n "pgraph_ids|g_touch|NR_BPACK_TRACE" src/bench/sycl/libxmx_sycl.cpp` 找打印点 => `walk.ps1 -Dll builds\libxmx_att5h.dll -Tag att5h_touch -Runs 1`（前置 `NR_ATT5_FUSE=1 NR_ATT5_TRACE=1`）与默认档同打印对比；(b) 让 `a5_att_run` 先把 Q/K/V 三面 memset `0xA5` 再跑融合核、D2H 抽查 K 面是否只被写过一次。**若最终必须另立私有面 => 清单④"零新面"破了，如实写：新面 = 3 x 4,177,920 B（Q/K/V）+ pool 影响。**
+**④ 82.6% 差的剩下两类嫌疑**：(i) **融合核在真实 plan 数据上触发了合成数据没触发的路径**（未测）；(ii) **K 面布局**（尾巴 1）。
+**未验假设（代理自己明说）**：① "82.6% 是数值差而非取错地址"只依据碎块统计（**1,428,541 段、最长 71 B、平均 4.8 B**），**没做 f16 逐字段解码对照**；② "K 面在 ON 档无读者" = 推断；③ 真实数据路径差异 = 假说未测。
+**现场**：进程 0；`out\libxmx.dll` = `oneapi\libxmx_sycl.dll` = **ABB969FE**；三金标未动；工作区只有诊断放宽（`a5-dbg` 上限 900、`[a5-geom]` 每 quant_window 一行、`[a5-op]` 逐操作数 id+bytes、witness 实参修正）；变体 `builds\libxmx_att5{a..h}`，最新 **att5h = B9528F5D**（`NR_ATT5_FUSE` 默认 0；默认档在 att5a 上自证 `1301 = DD49827D` + `passes 691`）；本轮 GPU ≈ 12 min，最后 25 min 纯 host。
