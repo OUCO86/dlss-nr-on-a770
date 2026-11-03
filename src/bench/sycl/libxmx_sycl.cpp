@@ -808,7 +808,17 @@ static void a5_note_qw(size_t cmd, int source, int packed, int scale, unsigned M
         printf("[a5-geom] qw cmd=%zu src=%d pk=%d sc=%d M=%u K=%u ih=%u iw=%u across=%u pad=%u\n",
                cmd, source, packed, scale, M, K, height, width, across, pad);
     }
-    if (M != 32640u || K != 64u || !across || !height || !width) { a5_dbg("qw-REJECT", cmd, 0, "M/K/geom"); return; }
+    // A5-HALO (knife2b #82-bu census): the C=64 tier is FOUR window geometries, two chains each --
+    //   M=32640 across=30 pad=0        (top 0, left 0)
+    //   M=33728 across=31 pad=4        (top 0, left 4)
+    //   M=34560 across=30 pad=262144   (top 4, left 0)
+    //   M=35712 across=31 pad=262148   (top 4, left 4)
+    // all of them 8x8-token windows over the same 136x240 image, and att5::fused already takes
+    // top/left/across as parameters (the same -pad_top/-pad_left gather as the shipped qr_kernel,
+    // quantize_row_kernel.hpp:54-57) => widening is a PARAMETER job, no numerics change.
+    const bool geom_ok = (K == 64u) && (M % 64u == 0u) && across && height && width &&
+        (M == 32640u || M == 33728u || M == 34560u || M == 35712u);
+    if (!geom_ok) { a5_dbg("qw-REJECT", cmd, 0, "M/K/geom"); return; }
     g_a5.stage = 1; g_a5.c_qw = cmd;
     g_a5.src = source; g_a5.pk = packed; g_a5.sc = scale;
     g_a5.M = M; g_a5.C = K; g_a5.height = height; g_a5.width = width;
@@ -896,9 +906,17 @@ static bool a5_take_wres(size_t cmd, int a, int b, int c, int a_scale, int b_sca
     // another closure that touches the same memory -- exactly the signature of the 82.6%
     // scattered numeric divergence on real plan data (knife2b #82/#83). pgraph_extra() exists
     // for out-of-band touched buffers.
-    pgraph_extra(g.q); pgraph_extra(g.k); pgraph_extra(g.v);
-    pgraph_extra(g.pk); pgraph_extra(g.sc);   // 641's dissolved quant planes: the fused kernel
-                                             // computes them in SLM, but they stay in the tuple
+    // ① A/B: NR_ATT5_TOUCH=0 drops the out-of-band declarations (everything else identical).
+    // If the ON side still lands 1301 EXACT with them off, the declaration is not required;
+    // if it goes MISMATCH (or the [skip-chains] counters move), it is a precondition of wiring.
+    // (1) A/B RESULT, knife2b #87: declaring the Q/K/V + pk/sc planes with pgraph_extra() turned
+    // out NOT to be required -- builds\libxmx_att5k.dll with NR_ATT5_TOUCH=0 still gave
+    // 1301 = DD49827D EXACT with the same [skip-chains] counters (closures=691 names=1382
+    // name_offset=691 chains_skipped=14 refused=0 closures_noop=168). So the declaration is
+    // removed again: fewer implicit dependencies, and the byte-identity gate is the judge.
+    // Caveat kept on the record: "not required here" is an observation about THIS plan, not a
+    // proof that no other closure ever overlaps those planes -- if a future tier fires the
+    // fusion, re-run the same A/B before trusting the overlap freedom.
     ++g_a5_fires; ++g_a5_fires_gen;
     outf = A5Fuse{ g.wqkv, b, g.bsqkv, g.qkvsc, g.bias, b_scale, cosine,
                    g.src, c, g.q, g.k, g.v,

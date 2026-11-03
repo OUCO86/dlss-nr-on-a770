@@ -1522,3 +1522,21 @@ bench：`qres::gemm_qkv_res(q, rAp, dBp, rQ, rK, rV, rAS, dBS, dQS, M, Mp, C, NH
 ★ **诊断签名（值得单独记，军规 32 的新变体）**：**"MISMATCH 等于某颗历史金标"= 配置没生效的指纹**，不是数值改动。本案 `att5i_on = 249A46F3`（pre-skip-1a 那颗）=> 当时就该先查 `[skip-chains]` 的 REFUSED 行，而不是去查核与 REF。**这一条省下的是"抄 REF"那一整铲。**
 **两条尾巴状态**：① **`faceK` 布局不符：没结，但降级** —— 真相是 name 错位不是 K 面；不过 **touch 申报的必要性仍未单独证明**（att5i = 有 touch 无 namefix => pre-1a；att5j = 两者都有 => EXACT）。**下一铲做一次"只去掉 `pgraph_extra`"的 A/B**；按 §83 读到的语义（touch token = 设备指针、"same pointer in two closures = conflict (any direction)"、`(void*)-1` = 未注册 => 自己一个 wave），代理判断**申报是必需的**，但**这是推断，没跑对照**。
 ② **覆盖面**：已精确数完（§82-补）=> C=64 的 8 条链 = 四种 halo 几何各 2 条，现在只 fire pad=0 => **2/8** => **可兑现帧净值 ≈ −0.44**；**−1.75…−1.90 是全覆盖后的值**。**放宽是参数活（`top/left/across/M` 已是入参），门已绿 => 现在可以放宽。**
+
+## 78. ★★★ ①+② 交回：**touch 申报不是必需的（已删，带 A/B 证据）**；**几何放宽成功 => 8 条 C64 链里 7 条 fire，两档 1301 都 `DD49827D` EXACT、skip 计数两侧一字不差；帧回放 ≈ −0.8…−1.5 ms/run**
+**① `pgraph_extra` 必需性 A/B**（件 `builds/libxmx_att5k.dll = E97E9D81…`，新开关 `NR_ATT5_TOUCH`，其余与 att5j 一字不动；三档 walk 各 60 s 间隔；**先按军规 57 读计数再看 1301**）：
+| 臂 | [skip-chains] | 1301 |
+|---|---|---|
+| ON + touch=1 | `closures=691 names=1382 name_offset=691 chains_skipped=14 refused=0 closures_noop=168` | **EXACT `DD49827D`** |
+| ON + touch=0 | **同上，一字不差** | **EXACT `DD49827D`** |
+| 默认档（不设 FUSE） | 同上 | **EXACT `DD49827D`** |
+⇒ **申报不是必需的 => 已删**（`s6/pe_c1_touchdel.py`），注释里留 A/B 读数与 caveat：**"这个 plan 里不需要"不等于"任何 tier 都不会重叠"**，将来若别的 tier 接融合，**先重跑这个 A/B**。
+**② 放宽四种 halo 几何**（件 **`builds/libxmx_att5m.dll = 0FCF9C20B0204D7E626824423FE639F4`** = 当前基座；`a5_note_qw` 门槛从 `M==32640 && pad==0` 改成**四个 (M,across,pad) 白名单**；**核与数值一字未改**，`top/left/across` 本来就是入参）：
+- **ON 档**：`1301 EXACT = DD49827D` ✓；`closures=691 names=1382 name_offset=691 chains_skipped=14 refused=0 closures_noop=168 passes=691 (unchanged)` ✓（军规 57 三向量同长同序 ✓）
+- **默认档**：`1301 EXACT` ✓、`fires=0` ✓、计数同上 ✓ => **开关两侧都逐位**
+- **fire 普查**（`[a5-fire]` 按几何计数，14 行 = 7 链 x 2 次录制）：`32640/30/0` = 2 链 ✓；`33728/31/4 (top0,left4)` = 2 链 ✓；`35712/31/262148 (top4,left4)` = 2 链 ✓；**`34560/30/262144 (top4,left0)` = 1 链**（另一条被挡）=> **7/8 覆盖**
+★ **第 8 条被挡的确切原因 = 不是 halo，是 epilogue 标志不同**：它的 645 窗口残元腿 flags = **`epi=0 narrow=0 half=1`**，而其它三种几何都是 **`epi=1 narrow=1 half=1`**；`att5::fused` 的 **P11 只实现 `epi=1 + narrow + half_skip` 一种出口形态** => **元组校验把它正确拒掉**（witness 原文：`[a5-dbg] wres-TUPLE cmd=56 a=1273 ... M=34560 N=64 K=64 epi=0 narrow=0 half=1 skip=1268 ... heads=2 batches=1080`）。
+⇒ 要接它就得**给核加第二种 epilogue 形态 = 改数值面 => 不在本铲范围**。
+★ **帧净值口径按 7/8 报：预期 `7 x 0.509 x 0.43 ≈ −1.53 ms/帧`**（不是 8/8 的 −1.75…−1.90）。
+★ **实测帧回放（同热，run 1-3）**：**ON 57.29 / 57.40 / 57.36** vs **默认 58.09 / 58.23 / 59.09** => **约 −0.8…−1.5 ms/run** ✓ 与 7/8 预期同量级（walk 的 run0 含 JIT 冷启动，不计）。
+**变体链**：att5j（namefix）-> att5k（touch A/B 开关）-> **att5m（当前基座：touch 已删 + 四几何放宽，两档 EXACT）**。本段 GPU 约 6 min（5 次 walk，均 60 s 间隔）。
