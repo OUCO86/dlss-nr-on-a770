@@ -869,3 +869,37 @@ contiguous differing runs: 1,428,541      runs shorter than 4 KiB: 1,428,541 (�
 | 合计 | | **104** | **52 = 8 + 6 + 16 + 16** ✓ |
 ⇒ **C=64 tier 的 8 条链 = 四种 halo 几何各 2 条**；我的匹配器只收 `pad=0` ⇒ **只覆盖 2/8** ⇒ **现在可兑现的帧净值只能写 ≈ −0.44 ms**（0.509 ms/链 x 2 链 x 0.43），**−1.75…−1.90 是四种几何全覆盖后的值**（§77/§81 的外推口径已按此更正）。
 ⇒ 放宽 = 把 `a5_note_qw` 的门槛从 `M==32640 && pad==0` 改成"四种 tuple 各自核对 `ih/iw/across/pad` 与 645 一致"（`top/left` 已经是 `att5::fused` 的入参，`qr_kernel`/`pack_a_fused_gather` 的 gather 就是同一套 `-pad_top/-pad_left`）⇒ **参数活，不改数值**；但按军规 56 与本轮顺序，**必须在 K 面读集证据 + 门绿之后再做**。
+
+
+# §83 **批准那一刀的收尾（3/3 门绿）+ 一条新的头号嫌疑：融合 closure 没把 Q/K/V 报进 PGRAPH touch set**　2026-11-04 05:3x-05:4x
+## 1) 25 检查点门按你的要求在改后 REF 上重跑：**3 个独立进程、间隔 60 s、3/3 GATE GREEN**
+exe `oneapi\port_e_chain.exe` = **`A6CA9F5D08E6F55DEB6748D5173F522C`**（含 C-0 的三条判别臂 + CHAIN2 检查点）；日志 `s6\PE_final{1,2,3}.log`；每进程：`GATE: GREEN (0 checkpoints differ)`、`LIVENESS(faceB/2): 1267 differs in 1,158,095 / 4,177,920 bytes`（**三遍数字一模一样**）、`#### port_e_chain: GREEN (fails=0)`（这个计数含 `CHAIN2-1267 / CHAIN2-pk3` 两个 2 发形态检查点）⇒ **REF 抄证之后门仍然绿** ✓ 本批 GPU 2.0 min，进程 0 残留。
+## 2) **新的头号嫌疑（host 侧读代码读出来的，零 GPU）**：`pgraph_ids` / `pg_push` 的 touch set 语义
+`libxmx_sycl.cpp:118-143`：
+ - **touch token = 设备指针**；"same pointer in two closures = conflict (any direction)"；**`(void*)-1` = 未注册 op ⇒ 自己一个 wave**；
+ - `pgraph_ids({...})` 由 recorder 声明该 closure 摸到的**所有** buffer（读写不分），`pg_push` 把它存进 `g_cmds_touch`；
+ - **`pgraph_extra(int id)`@135 的存在理由就是"recorder 要补一条 plan 外的被摸 buffer"**。
+**我的 A5 分支只继承了 645 自己的 touch set（`a,b,c,a_scale,b_scale,skip,cosine`）⇒ 融合核实际还写/读 **Q/K/V 三面**（`f.q/f.k/f.v`）**而没有报进 touch set** ⇒ 调度器可以把它和别的摸同三面（同一指针）的 closure 排在一起 ⇒ **跨 closure 竞态** ⇒ 完全符合"碎块式、全平面、只对真实数据出现"的 82.6% 签名（bench 里没有别的 closure，所以测不出来）。
+**下一刀（一行级，已备好）**：在 `a5_take_wres` 命中后、`pg_push` 之前补
+ `pgraph_extra(g.q); pgraph_extra(g.k); pgraph_extra(g.v);`（**外加 641 的 pk/sc 若融合核也摸**）⇒ 重编 `builds\libxmx_att5i.dll` ⇒ 一次 walk（`NR_ATT5_FUSE=1 NR_ATT5_TRACE=1`）看 **1301 是否变 EXACT `DD49827D`**。
+**若这一刀命中 ⇒ 尾巴 1（`faceK` 布局不符）同时结案**：它不是"布局错"，而是"没申报"，**零新面仍然成立**（清单④不破）。
+## 3) 覆盖面口径已按 (b) 定死（§82-补）：**现在可兑现 ≈ −0.44 ms/帧（2/8 链）**；−1.75…−1.90 是四种 halo 几何全覆盖后的值；放宽按你的顺序排在门绿之后。
+## 4) 现场
+进程 0；`out\libxmx.dll` = `oneapi\libxmx_sycl.dll` = **ABB969FE…**；三金标未动；git tip **e20179e**，未 commit；工作区 = `M src/bench/sycl/libxmx_sycl.cpp`（只有诊断：dbg 上限 900 + `[a5-geom]` + `[a5-op]` + witness 实参数修正）；`builds\` = att5a…att5h（最新 **att5h = B9528F5D3567EF93A26E9D451A3DB2F2**）；本轮 GPU 累计 ≈ **14 min**（5 次 walk + 3 进程门 + 两次 ladder）。
+
+
+# §85 ★★ **ON 侧"82.6% 数值差"的真相：不是数值，是我多推了一条 `g_cmd_names` ⇒ skip 机构 REFUSED ⇒ 14 条链不再被跳过。修好之后 `NR_ATT5_FUSE=1` 档 1301 = `DD49827D` EXACT**　2026-11-04 06:0x-06:2x
+**发现链（host 比对，零 GPU）**：`walk_att5i_on.txt` 里有一行
+ `[skip-chains] graph=0 REFUSED: name offset 695 not a whole recording`
+而默认档是 `closures=691 names=1382 name_offset=691 chains=52` ⇒ **`g_cmd_names` 比 `g_cmds` 多了 4 条 = 正好 4 次 fire**：我在 A5 分支里又 `g_cmd_names.push_back(__func__)` 一次，而 645 在 `pgraph_ids`/`flop_note` 处已经推过 ⇒ **名称向量与 closure 向量错位 ⇒ NR_SKIP_CHAINS 整套机构拒绝工作 ⇒ 14 条链不再被跳过**。
+**铁证**：`dumps\att5i_on.1301.bin` 与 `dumps\bk.1301.pre-skip-1a.bin` **逐字节完全相同**（8,355,840 B，`same bytes? True`）⇒ ON 侧的 1301 从来不是"融合核算错"，而是**skip 配置没生效**；那 +4.4 ms/run 也是同一件事（少了 14 条链的跳过）。
+**修一行（`s6/pe_c1_namefix.py`：删掉重复的 name push）⇒ `builds\libxmx_att5j.dll = C3F926C226BD53E7B747C36216B3DF2F`**：
+| 档 | 1301 | 计数 | 每 run 帧时 |
+|---|---|---|---|
+| 默认（不设 env）att5j_off | **EXACT `DD49827DD33A7EF07C2C17892F18970D`** ✓ | — | 58.0-58.7 ms |
+| **`NR_ATT5_FUSE=1` att5j_on** | **EXACT `DD49827DD33A7EF07C2C17892F18970D`** ✓ | `chains_skipped=14 refused=0 closures_noop=168 passes=691 (unchanged)` ✓ 一字未变 | **58.02 / 58.26 / 58.70 ms（与默认档同热）** |
+⇒ **接图的逐位门在 C=64/pad=0 的 2 条链上已经通过**（fire 仍是 4 = 2 链 × 2 次录制）。
+**顺带**：这一版还含 §83 的 `A5-TOUCH`（把 Q/K/V + pk/sc 报进 `pgraph_extra`）。**它的必要性未单独证明**（att5i = touch 但无 namefix ⇒ pre-1a；att5j = 两者都有 ⇒ EXACT）⇒ 下一轮该做一次 **只去掉 touch** 的 A/B，确认 touch 申报是不是必需（按 §83 的语义它应当是必需的：融合 closure 确实摸了那三面，不申报就是让调度器看不见冲突）。
+**新军规候补（军规 57）**：**recorder 里任何"改写 closure 体"的融合，必须保持 `g_cmds` / `g_cmd_names` / `g_cmds_touch` 三个向量逐位同长同序；多推一条 name 会让 NR_SKIP_CHAINS 静默 REFUSED，表现为"融合数值错了"的假象（1301 会等于某个历史 gold，而不是乱码）。判据：`[skip-chains]` 头部行的 `closures/names/name_offset` 在开关两侧必须相同。**
+**GPU 记账**：C-1 累计 ≈ **19 min**（7 次 walk + 3 进程门 + 两次 ladder），每次都带 60 s 间隔/冷却。
+**现场**：进程 0；`out\libxmx.dll` = `oneapi\libxmx_sycl.dll` = ABB969FE 未动；三金标未动；git tip e20179e，未 commit；工作区 = `M src/bench/sycl/libxmx_sycl.cpp`；`builds\` 多 att5i/att5j（**att5j = C3F926C2…** 是下一铲的基座）。

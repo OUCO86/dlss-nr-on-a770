@@ -889,6 +889,16 @@ static bool a5_take_wres(size_t cmd, int a, int b, int c, int a_scale, int b_sca
     g_cmds[g.c_wa]  = [](){}; g_cmd_names[g.c_wa]  = "window_attention(A5-fused)";
     if (g.stage == 4 && g.c_q2) { g_cmds[g.c_q2] = [](){}; g_cmd_names[g.c_q2] = "quant(A5-fused)"; }
     if (g.stage == 3) { g.pk2 = a; g.sc2 = a_scale; }   // recorded for the witness only
+    // A5-TOUCH: the fused closure also reads/writes the Q/K/V planes (they are its internal
+    // faces now that 642/643 are no-ops), but 645's own pgraph_ids() never listed them. touch
+    // tokens here are DEVICE POINTERS and "same pointer in two closures = conflict (any
+    // direction)" (libxmx_sycl.cpp:118-143), so an unlisted plane lets the scheduler overlap
+    // another closure that touches the same memory -- exactly the signature of the 82.6%
+    // scattered numeric divergence on real plan data (knife2b #82/#83). pgraph_extra() exists
+    // for out-of-band touched buffers.
+    pgraph_extra(g.q); pgraph_extra(g.k); pgraph_extra(g.v);
+    pgraph_extra(g.pk); pgraph_extra(g.sc);   // 641's dissolved quant planes: the fused kernel
+                                             // computes them in SLM, but they stay in the tuple
     ++g_a5_fires; ++g_a5_fires_gen;
     outf = A5Fuse{ g.wqkv, b, g.bsqkv, g.qkvsc, g.bias, b_scale, cosine,
                    g.src, c, g.q, g.k, g.v,
@@ -4283,7 +4293,11 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
     const bool a5fire = a5_take_wres(g_cmds.size(), a, b, c, a_scale, b_scale, skip, cosine,
                                      M, N, K, flags, height, width, across, pad, a5f);
     if (a5fire) {
-        g_cmd_names.push_back(__func__);
+        // A5-NAMEFIX: the recorder ALREADY pushed this closure's name (the pgraph_ids/flop_note
+        // lines above). Pushing a second one desynchronised g_cmd_names from g_cmds by +1 per
+        // fire: with 4 fires the skip machinery saw "name offset 695 not a whole recording" and
+        // REFUSED -- so the ON side silently stopped skipping 14 chains (its 1301 came out
+        // byte-identical to bk.1301.pre-skip-1a.bin, and the run time went +4.4 ms). knife2b #85.
         pg_push([a5f]() { a5_att_run(a5f); });
         return 0;   // the window-residual closure itself became the fused launch
     }

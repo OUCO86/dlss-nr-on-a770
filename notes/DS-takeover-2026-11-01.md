@@ -1508,3 +1508,17 @@ bench：`qres::gemm_qkv_res(q, rAp, dBp, rQ, rK, rV, rAS, dBS, dQS, M, Mp, C, NH
 **④ 82.6% 差的剩下两类嫌疑**：(i) **融合核在真实 plan 数据上触发了合成数据没触发的路径**（未测）；(ii) **K 面布局**（尾巴 1）。
 **未验假设（代理自己明说）**：① "82.6% 是数值差而非取错地址"只依据碎块统计（**1,428,541 段、最长 71 B、平均 4.8 B**），**没做 f16 逐字段解码对照**；② "K 面在 ON 档无读者" = 推断；③ 真实数据路径差异 = 假说未测。
 **现场**：进程 0；`out\libxmx.dll` = `oneapi\libxmx_sycl.dll` = **ABB969FE**；三金标未动；工作区只有诊断放宽（`a5-dbg` 上限 900、`[a5-geom]` 每 quant_window 一行、`[a5-op]` 逐操作数 id+bytes、witness 实参修正）；变体 `builds\libxmx_att5{a..h}`，最新 **att5h = B9528F5D**（`NR_ATT5_FUSE` 默认 0；默认档在 att5a 上自证 `1301 = DD49827D` + `passes 691`）；本轮 GPU ≈ 12 min，最后 25 min 纯 host。
+
+## 77. ★★★ 破案：**ON 侧那 82.6% 从来不是数值错 —— 是我多推了一条 `g_cmd_names` => `NR_SKIP_CHAINS` 静默 REFUSED => 14 条链不再被跳过。修一行之后 `NR_ATT5_FUSE=1` 档 1301 = `DD49827D` EXACT**
+**发现链（host 比对，零 GPU）**：`walk_att5i_on.txt` 里一行 `[skip-chains] graph=0 REFUSED: name offset 695 not a whole recording`，而默认档是 `closures=691 names=1382 name_offset=691 chains=52` => **name 向量比 closure 向量多 4 条 = 正好 4 次 fire**：A5 分支里又 `g_cmd_names.push_back(__func__)`，而 645 在 `pgraph_ids`/`flop_note` 处已经推过 => **错位 => 整套 skip 机构拒绝工作**。
+★ **铁证**：`dumps/att5i_on.1301.bin` 与 `dumps/bk.1301.pre-skip-1a.bin` **逐字节完全相同**（8,355,840 B）=> 所谓"碎块式数值差"= **skip 配置没生效的旧状态**；**那个 +4.4 ms/run 的"变慢"也是同一件事**。
+**修一行（`s6/pe_c1_namefix.py`：删掉重复的 name push）=> `builds/libxmx_att5j.dll = C3F926C226BD53E7B747C36216B3DF2F`**（下一铲的基座）：
+| 档 | 1301 | 计数 | 每 run 帧时（同热）|
+|---|---|---|---|
+| 默认（不设 env，att5j_off） | **EXACT `DD49827D`** | - | 58.0-58.7 ms |
+| **`NR_ATT5_FUSE=1`（att5j_on）** | **EXACT `DD49827D`** | **`chains_skipped=14 refused=0 closures_noop=168 passes=691 (unchanged)`** | **58.02 / 58.26 / 58.70** |
+⇒ **② 的双档自证两边都过**；fire 仍是 4 = 2 条链 x 2 次录制。另补跑 25 检查点门 3 进程（exe `A6CA9F5D`，间隔 60 s）：**3/3 GATE GREEN、fails=0、LIVENESS 三遍同值 1,158,095/4,177,920** ✓。
+**军规 57（新，正式入 B2）**：**recorder 里任何"改写 closure 体"的融合，必须让 `g_cmds` / `g_cmd_names` / `g_cmds_touch` 三个向量逐位同长同序**。多推一条 name 会让 `NR_SKIP_CHAINS` **静默 REFUSED**，表现成"融合数值错了"的假象（**1301 不是乱码，而是等于某个历史 gold**）。**判据**：`[skip-chains]` 头部行的 `closures / names / name_offset` 在开关两侧必须相同。
+★ **诊断签名（值得单独记，军规 32 的新变体）**：**"MISMATCH 等于某颗历史金标"= 配置没生效的指纹**，不是数值改动。本案 `att5i_on = 249A46F3`（pre-skip-1a 那颗）=> 当时就该先查 `[skip-chains]` 的 REFUSED 行，而不是去查核与 REF。**这一条省下的是"抄 REF"那一整铲。**
+**两条尾巴状态**：① **`faceK` 布局不符：没结，但降级** —— 真相是 name 错位不是 K 面；不过 **touch 申报的必要性仍未单独证明**（att5i = 有 touch 无 namefix => pre-1a；att5j = 两者都有 => EXACT）。**下一铲做一次"只去掉 `pgraph_extra`"的 A/B**；按 §83 读到的语义（touch token = 设备指针、"same pointer in two closures = conflict (any direction)"、`(void*)-1` = 未注册 => 自己一个 wave），代理判断**申报是必需的**，但**这是推断，没跑对照**。
+② **覆盖面**：已精确数完（§82-补）=> C=64 的 8 条链 = 四种 halo 几何各 2 条，现在只 fire pad=0 => **2/8** => **可兑现帧净值 ≈ −0.44**；**−1.75…−1.90 是全覆盖后的值**。**放宽是参数活（`top/left/across/M` 已是入参），门已绿 => 现在可以放宽。**
