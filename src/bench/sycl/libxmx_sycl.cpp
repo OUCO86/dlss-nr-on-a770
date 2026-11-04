@@ -2339,6 +2339,13 @@ int xmx_graph_run(int id) {
         // 691 SYCL submits (coopmat pays this once via a single Vulkan command buffer).
         if (getenv("NR_SUBMIT_PROBE")) {
             // per-closure ENQUEUE time (GPU drain excluded): where does the 455ms go?
+// LAUNCH-MAP FIX (knife2b #118): the first enqueue loop is polluted by cold JIT /
+// first-touch costs, which made the family totals halve between runs and destroyed the
+// comparison (four arms all moved, including families the switch cannot touch). Warm the
+// loop once WITHOUT timing, then measure. Diagnostic path only -- the shipping replay
+// (cgraph) is untouched.
+            for (auto& fn : g_graphs[id]) fn();
+            GQ->wait();
             std::vector<double> en; en.reserve(g_graphs[id].size());
             for (auto& fn : g_graphs[id]) {
                 auto t0 = std::chrono::steady_clock::now();
