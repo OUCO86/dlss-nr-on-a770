@@ -1,0 +1,7 @@
+group,kind,dtype,members,max_adjacent_run_roleaware,clean_pairs,adjacency_feasible,members_serial_ms,mech
+A4,fat-M,int8,28,1,0,0,8.674,fat-M 上界参照 (8 发合一)
+A3,block-diag,int8,28,1,0,0,9.378,batch 进 grid (16 发 -> 2 发)
+B1(knife2),block-diag,f16,20,1,0,0,4.950,"wide-diag f16 (lda=K*b, sa=K)"
+A2,block-diag,int8,16,1,0,0,3.797,batch 进 grid (16 发 -> 2 发)
+A1,block-diag,int8,16,1,0,0,3.808,batch 进 grid (同形 16 发 -> 2 发)
+B2,other,int8,16,1,0,0,4.332,fat-N (A 广播，sa=0)
