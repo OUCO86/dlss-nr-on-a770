@@ -1594,3 +1594,41 @@ pair 3: A=62.240 B=61.270 delta=-0.970 | pair 4: A=62.120 B=61.020 delta=-1.100
 **⇒ 我建议阶段 B 的靶 = C512 att 段（qkv + global_attention）**：腿少、单腿贵（1.43 ms）、八段互不重叠、**先例是已出货的 A5 本体**；代价是要先把 `att5::fused` 的模板从 C=64 扩到 C=512 档（bench 里扩，不进引擎）。
 ## 现场（A 阶段）
 **零 GPU**；件无新增；两槽 `3BAECF2A…`、三金标、`out\SHIPPED_MD5.txt` 未动；产物 `tools/fusion_rank.csv`（16 行 + 两条 NOTE）；脚本 `s6/{pe_fusion_rank,pe_fusion_rank2,pe_fusion_rank3,pe_fix_rank3}.py`（v1/v2 留档，v3 是交付口径）；账 §116。
+
+
+# §117 **B3-a 绿（SLM 15,744 B / C=32 HID=128 / 余量 2-6 倍）→ 但 B3 的靶**早已被出货机制吃掉**：`ffn` 的 8 条腿走的是 `NR_FFN_CHIP` 一核（默认 ON、4.4x、BIT-EXACT）⇒ 我的 §116 身份判定是**半错**（只查了 `s6_family`，漏了 ffn 自己的 guard）。顺带出一张**默认 ON 机制覆盖表**，并认一条 GPU 浪费（roof 组下标算错）**　2026-11-05 04:0x-05:1x
+## B3-a（零 GPU）：SLM 三态 = **GREEN**（已交，摘要）
+8 站形状全部 **M=130,560 · cin=32 · hidden=128 · groups=1**；照 `ffn2::Shape` 分区表原式：T=8 ⇒ 5,504 B；T=16 ⇒ 8,064 B；**T=32 ⇒ 15,744 B**（vs 出货 S6 的 31,744、vs 32,768 的 2-resident 线 ⇒ **余量 17 KB**）。**"HID≥1024 线性爆炸"在本案不成立（HID=128 ⇒ O_HID 最大 8,192 B）**。产物 `tools/ffn_fusion_slm.csv`。
+身份三条也钉了：`ffn_stem`@0（M=522,240，`NR_FFN_DUAL` 的 `gemm_dual_pub` 已双 gemm 一核）、`unary2`@680（4,177,920 独立 unary）、`ffn_merge`@689（544×960）⇒ **都不是 ffn block 腿**。
+## ★★ 但 B3 的靶已经不存在了——**我 §116 的"未融合"标签是错的**
+读 `xmx_rec_ffn`@3128-3190 的正文：出货路径是
+```
+static bool ffntile = !getenv("NR_FFN_TILE") || ... ;   // 默认 ON
+static bool ffchip  = !getenv("NR_FFN_CHIP")  || ... ;  // 默认 ON
+if (ffntile && ffchip && hidden == 128u && cin == 32u && !narrow && epi == 0u) { ... ffnc::launch_ffn_chip... }
+```
+注释里写得很清楚：**"P3c v3d ffn_fused CHIP kernel —— ONE launch，hidden 永不下芯片，连 pack_a16 都吃掉；bench_ffnchip 4.4x vs 已转正的 tile-chain split，BIT-EXACT"**，后面还有 `NR_FFN_CHIPRES / NR_FFN_JOIN / NR_FF3 / NR_FF9 / NR_CHIP_CS` 一串默认 ON 的相位合并。
+⇒ **本案 8 条腿的 guard 全中**（cin=32、hidden=128、epi=(flags>>8)&0xF=0、narrow=flags&0x1000=0；closure 681 的 `flags=0` 与另七条的 `0x40000=half_skip` **都不影响这个 guard** ⇒ **8/8 已经在融合核上**）
+⇒ **所以 §116 里 `ffn` 那行（6.237 ms、上限带 7.57-9.54 ms）**不是"未融合的钱"，是**已经吃掉的收益的现值** ⇒ **从靶单上划掉**。**我为什么漏**：我只查了 S6 的 `s6_family(C,HID)`（它确实只认 C64/HID256、C128/HID512），**没查 ffn 记录器自己的默认 ON 开关** ⇒ **军规 23 的教训在高一层重演：不能按"名字/单一开关"判融合状态，要按**该记录器里所有默认 ON 的机制**判。**
+## 覆盖表（`s6/pe_fusion_coverage.py` → `tools/fusion_coverage.csv`，30 个开关逐条带 guard 原文与所在记录器）
+| 家族 | 腿 | 现值 ms | 默认 ON 的机制（已吃掉的） | 仍 OFF 的 |
+|---|---|---|---|---|
+| `ffn` | 8 | 6.237 | `NR_FFN_TILE`+**`NR_FFN_CHIP`**（一核、4.4x）+`NR_FFN_CHIPRES`+`NR_FFN_JOIN`+`NR_FF3`+`NR_FF9`+`NR_CHIP_CS` | — |
+| `ffn_stem` | 1 | 1.717 | `NR_FFN_DUAL`（两 gemm 一核 `gemm_dual_pub`） | — |
+| `gemm` (f16) | 42 | 7.032 | `NR_G_FOLD`（publish 折进 gemm 存储，B5-2 默认） | — |
+| `gemm_int8_batched` | 72 | 4.859 | `NR_B_WIDE`（P8-b 块对角宽形）+`NR_BPACK_VEC`+`NR_PUB_SLM` | `NR_V9B`、`NR_G32_PUB`（OFF） |
+| `gemm_int8_qkv` | 60 | 9.673 | `NR_QW_FUSE`+**`NR_QKV_RES`**（`qres::gemm_qkv_res` QKV+残差一核）+`NR_QKV_VITES` | — |
+| `global_attention` | 8 | 11.475 | **`NR_GA_TILE`+`NR_GA_MERGE`** | — |
+| `window_attention` | 52 | 10.212 | **`NR_WA_RES`+`NR_WA_RAWV`+`NR_WA_TILE`+`NR_WA_MERGE`** | — |
+| `window_block` | 10 | 18.187 | **`NR_WB_FUSE`+`NR_WB_FUSE_PH`** | `NR_LEG3_STG`（OFF） |
+| `quant` | 224 | 3.105 | `NR_Q_FUSE`（qfuse，144 腿已溶解） | — |
+| `gemm_int8_residual` / `gemm_window_int8_residual` / `gemm_int8` | 68 / 52 / 24 | 20.06 / 11.36 / 2.73 | **表里这些家族没有默认 ON 的融合开关**（只有它们喂给下游的 quant 被 qfuse）⇒ **这才是还没并的部分** | — |
+⇒ **重新排的实际靶 = `gemm_int8_residual`(20.06/68 腿) + `gemm_window_int8_residual`(11.36/52 腿) + `gemm_int8`(2.73/24)**，以及 `window_block` 里 `NR_LEG3_STG` 那条还没开的相位。
+## 认一条 GPU 浪费（如实）
+B3-b 我按 `pe_k3_roofgroup.py` 报的"SRP_GRP=45"跑了 3 个进程，**日志里打的是 `G45_wb_53336`** ⇒ **probe 内部数组下标 ≠ 我在源文件里数出来的行序**（表里有条目我没数到/或另有映射）⇒ **测的是已有屋顶点，不是缺的那形（130560×32×128）**。发现后**当场 kill 掉剩余批次**（`job_kill` + 手工确认进程 0），**没让 B3-c 继续为已死的靶花钱**。
+**根因**：我用"文件里第几个 `{\"Gxx…\"}`"当下标，没有用 probe 自己打印的组名反查 ⇒ **教训并入 73b 一类：任何"组号/索引"必须用被控程序自己吐的名字回验**。
+## B3 的处置建议（等父点头）
+1. **B3-c 不跑**（靶已融合，跑它 = 为已出货的东西再花 30 分钟 GPU，且 ratio 必然 ≈1）；
+2. **B3-b 的缺形（130560×32×128）也不补**——没有消费者（军规 26/35a 的"别为不存在的手术备料"）；
+3. **改跑一张"机制覆盖实测表"**（**每个默认 ON 开关跑一个逃生臂 walk**：`NR_X=0` vs 默认，看 1301 是否变 + 帧时变化 ⇒ 证明该机制**真的在帧里生效**、以及它**已经贡献了多少**）：11 个开关 × 1 walk ≈ **25 min GPU + 间隔 ≈ 40 min**，产出 `tools/mechanism_liveness.csv` ⇒ **这才是把 §116 排序表修对的证据**，也是下一铲（残差家族融合）的定价底料；
+4. 或者**直接换靶到 `gemm_int8_residual` 家族**（20.06 ms/68 腿，覆盖表里唯一"整族没融合开关"的大族）做链内融合设计——但按新流程，**先单价后引擎**，而单价要先有融合臂的 bench 核（新设计）。

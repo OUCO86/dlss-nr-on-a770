@@ -1935,3 +1935,36 @@ gates: 40 GREEN / 0 RED
 2. **window_block 的融合没有可抄核**，且 §105 说它**不绑带宽也不绑 XMX** => 融合不一定治它的病；
 3. **屋顶缺口（军规 26/35a）**：`xmx_roof.csv` 里 **attention/wb/ga 三族 0 个同形屋顶点**（qkv 0/60、wa 0/52、ga 0/8、wb 0/10）=> 任何倍率都得先补屋顶；而现有 `shape_roof_probe.exe` 只跑 gemm 腿（`gemm_b/pub`），**wb/ga 的地板是带宽型（§6.22 整面流量法），不是 dpas 屋顶** => 补这型"屋顶"要**新造一套计价臂**。
 **方法入账（军规 77 候选）**：**排序口径必须匹配被筛对象的真实结构**（本案：融合是"异族相邻腿并一核"，用"同族相邻"筛 = 用已知为零的口径筛东西）；**且未映射区不得连段**（scope 回落要封顶）。
+
+## 97. ★★★★ **B3 中途急报：`ffn` 那 8 条腿早就在一核上（`NR_FFN_CHIP` 默认 ON、4.4x、BIT-EXACT）=> 我 §116 的身份判定半错；B3-c 不跑（跑它 = 为已转正的东西花 GPU，ratio 必然 ≈1）**；同时挖出一条更深的口径错：**"没开关"不等于"没融合"**
+### ① 证据（源码正文，不是名字）：`xmx_rec_ffn`@3128-3190
+```
+static bool ffntile = !getenv("NR_FFN_TILE") || ...;   // 默认 ON
+static bool ffchip  = !getenv("NR_FFN_CHIP")  || ...;  // 默认 ON
+if (ffntile && ffchip && hidden == 128u && cin == 32u && !narrow && epi == 0u) { ... ffnc::launch_ffn_chip ... }
+```
+注释原话：**"P3c v3d ffn_fused CHIP kernel —— ONE launch，hidden 永不下芯片，连 pack_a16 都吃掉；bench_ffnchip **4.4x** vs 已转正的 tile-chain split，**BIT-EXACT**"**，后面还有 `NR_FFN_CHIPRES / NR_FFN_JOIN / NR_FF3 / NR_FF9 / NR_CHIP_CS` 一串默认 ON 的相位合并。
+本案 8 站的 guard 全中：`cin=32` ✓ `hidden=128` ✓ `epi=(flags>>8)&0xF=0` ✓ `narrow=flags&0x1000=0` ✓ => **8/8 已在融合核上**；**closure 681 的 `flags=0` 与另七条的 `0x40000` 都不影响这个 guard => 我点的"681 三选一"根本不用选：融合核早就同时覆盖两形**（§117 白排了一道队）。
+### ② ★ 我为什么漏，以及漏得更深的那一层
+- 我只查了 S6 的 `s6_family(C,HID)`（它确实只认 C64/HID256、C128/HID512），**没读 ffn 记录器自己的默认 ON 开关** => **军规 23 的教训在高一层重演：判"融合没有"不能按名字/单一开关，要按该记录器里所有默认 ON 的机制**；
+- **更深一层**：按开关扫（`tools/fusion_coverage.csv`，30 个开关带 guard 原文）已能看出 qkv/wa/ga/wb/batched/gemm/quant 全有默认 ON 的合并；**但 `gemm_int8_residual` 没有开关却被标成"未融合"也是错的** —— 它正文直接调 **`s8v8::gemm_b_res`（gemm+残差一核）与 `packdev::pack_a_fused`** => **有些融合是无条件的、没有逃生口 => "没开关" != "没融合"**。
+### ③ 覆盖表（`tools/fusion_coverage.csv`，生成器 `s6/pe_fusion_coverage.py`）
+| 家族 | 腿 | 现值 ms | 默认 ON 的机制 | 仍 OFF |
+|---|---|---|---|---|
+| ffn | 8 | 6.237 | FFN_TILE + **FFN_CHIP（一核 4.4x）** + CHIPRES + JOIN + FF3 + FF9 + CHIP_CS | - |
+| ffn_stem | 1 | 1.717 | FFN_DUAL（两 gemm 一核）| - |
+| gemm | 42 | 7.032 | G_FOLD（publish 折进 gemm 存储）| - |
+| gemm_int8_batched | 72 | 4.859 | B_WIDE + BPACK_VEC + PUB_SLM | V9B、G32_PUB |
+| gemm_int8_qkv | 60 | 9.673 | QW_FUSE + **QKV_RES（QKV+残差一核）** + QKV_VITES | - |
+| global_attention | 8 | 11.475 | **GA_TILE + GA_MERGE** | - |
+| window_attention | 52 | 10.212 | **WA_RES + WA_RAWV + WA_TILE + WA_MERGE** | - |
+| window_block | 10 | 18.187 | **WB_FUSE + WB_FUSE_PH** | **LEG3_STG** |
+| quant | 224 | 3.105 | Q_FUSE（144 腿已溶解）| - |
+| gemm_int8_residual / gemm_window_int8_residual | 68 / 52 | 20.06 / 11.36 | **无条件融合**（`gemm_b_res`、`pack_a_fused`）=> 无开关可扫 | - |
+⇒ **§116 排序表里"未融合 => 可并"的行（ffn / ga / wa / wb / residual）全部要重标**；**真正的剩余空间不是"开关有没有"，而是"每族还剩几次发射"**。
+### ④ 一条 GPU 浪费（如实认）
+B3-b 按 `pe_k3_roofgroup.py` 报的"SRP_GRP=45"跑了 3 个进程，**日志打出的是 `G45_wb_534336`** => **probe 内部下标 != 我在源文件里数出来的行序** => 测的是已有屋顶点而不是缺的 `130560x32x128`。发现后**当场 kill 剩余批次**（进程 0）；**且因为 B3-c 已死、那个缺形没有消费者 => 不补**（军规 26/35a：别为不存在的手术备料）。
+**军规 79（新）**：**任何组号 / 下标 / 枚举值必须用被控程序自己打出的名字回验**，不能拿源文件里数出来的顺序当口径。
+**军规 80（新）**：**判"某机制有没有做"要扫该记录器里所有默认 ON 的开关 + 无条件调用**；**"没开关"不等于"没融合"**（本案 `gemm_int8_residual` 的 `gemm_b_res` / `pack_a_fused` 就是无条件融合）。
+### ⑤ 正在跑（~30 min GPU，出货件 `3BAECF2A`，不 stage）：**机制存活实测表 `tools/mechanism_liveness.csv`**
+八臂：基线 + `NR_FFN_CHIP=0`、`NR_FFN_TILE=0`、`NR_GA_MERGE=0`、`NR_GA_TILE=0`、`NR_WA_MERGE=0`、`NR_WB_FUSE=0`、`NR_G_FOLD=0`；每臂 1 次 walk（3 runs 取稳态）+ 1301 判定 => **(a) 该机制在帧里真的活着吗（关了就换字节 => 活着且数值参与）；(b) 它已经贡献了多少 ms/帧（关掉后的时间差）** => **这是把 §116 排序修回真实的唯一办法，也是下一铲的定价底料。**
