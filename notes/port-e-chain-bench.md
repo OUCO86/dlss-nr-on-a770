@@ -1237,3 +1237,44 @@ FAIL 要求 out/libxmx.dll 与 oneapi/libxmx_sycl.dll 必须 ABB969FE（你没�
 **(b2) 要不要跑，等你一句话**：可跑的两条腿 = (i) 先实现 state-3（P3/P4/P5 拆 8 行半块，**这才是那 8,192 B 的来源**，也是我标了 medium-high 风险的那段：dpas 累加器从 `simd<float,64>×4` 变两半 `×4`，v9b 惩罚区）；(ii) 或者先只做 **40,960 的 per-launch 计价**（现档 vs 别名档）来**回答你 ⑥ 想要的"当年为什么只兑现 9%"**——这一条不需要 state-3，只要把探针 `wb_ga_probe.cpp` 改成调 `wbv4phS::launch_v4ph`（已有副本，两行文本改动）就能成对出价。
 **我的建议**：先做 (ii)（便宜、且它给的是**下一刀的定价依据**，判死也算赚），再做 state-3 的实现与三态对照。
 **GPU**：本铲只用了 **~40 s**（两次 stub JIT 触发，零测量）；进程 0；两槽仍 `3BAECF2A…` ✓、三金标未动 ✓、`out\SHIPPED_MD5.txt` 未动 ✓；未 commit；新产物 `wb_v4ph_slm.hpp`、`wb_slm_stub.cpp`、`s6/pe_mk_wbslm.py`、`s6/pe_wbs_srcdiff.py`、`s6/pe_wbs_text.py`、`s6/pe_wbs_ledger.py`、`s6/spillcheck_wb.py`、`tools/barrier_audit_wb_slm.csv`、`tools/wb_slm_budget.csv`。
+
+
+# §104 **(ii') 纯 CPU 限制因子分析：c1/c690 两发 = 不是带宽限制（3-6%）、也不是 occupancy 主限制（compute 已贴我们自己的同形锚点）⇒ 建议 (i) 不做；这一铲按物理理由判死**　2026-11-04 08:3x-08:5x（零 GPU）
+表 = **`E:\DSH\tools\wb_c1c690_limit.csv`**（17 行 × 6 列；生成器 `s6/pe_mk_limit.py` + `pe_fix_limit{,2,3}.py`）。要点：
+- **读放大 = 1.000（pool）/ 1.023（head）**：pool 的 68x120 个 8x8 窗正好平铺 544x960；
+- **DRAM**：c1 = 133.7 MB / 4.243 ms = **31.5 GB/s**；c690 = 76.8 MB / 4.278 ms = **17.9 GB/s** ⇒ 对照我们自己测到的 **446-560 GB/s**（`notes/census-knifeB-2026-11-01.md`、`notes/section100-blueprint.md`）= **3.2%-5.6%**；把权重流全按 miss L2 算也只到 ~10% ⇒ **不是带宽限制** ✓
+- **compute**：c1 **8.556 GFLOP ⇒ 2.02 TFLOP/s**、c690 **9.298 GFLOP ⇒ 2.17 TFLOP/s**；`tools/xmx_roof.csv` 里**有同 M/N/K 的 f16 锚点**（M=64 N=64 K=32 b=320 ⇒ 0.75/1.31；M=64 N=32 K=64 b=320 ⇒ **2.20**/1.84）⇒ **融合块已经贴在最好锚点上**（batch 不同 ⇒ 只当锚点、**不内插**，军规 26）；A770 聚合上限（表里 int8 大形状实测 41 TFLOP/s）离它 ~20× ⇒ **"离硬件顶远"不等于"还有 occupancy 可吃"**；
+- **occupancy 台账**：grf=128 / simd=1 / slm=45,056 / 无 spill、private、scratch。
+**三态结论 = `不是 bandwidth-bound`；`occupancy 不是主限制`；剩下的是"单个 WG 内的 issue/dependency"** ⇒ **把 resident 从 1 抬到 2 解不开这个结**。
+**与历史自洽**：§40 已经把 SLM 做到 32,768、实测 **−0.365/32 对** vs 上限 −3.9 ms ⇒ **兑现 ~9%** ⇒ 若真是 occupancy-bound，9% 说不过去；若不是，9% 正是应得的数 ⇒ **这就是"当年为什么只兑现 9%"的答案** ✓
+**建议**：**(i)（SCR 半块拆分换 8,192 B）不做** —— 买一个不 binding 的旋钮，代价是 dpas 累加器形态改动 + v9b 的 >8-acc 惩罚区（medium-high）。
+**军规候补（军规 63）**：**任何 SLM/occupancy/别名类手术，动手前先算两件事：① 该 closure 的 DRAM 占实测带宽的比例；② 它的 compute 与**同形**（同 M/N/K，不同 batch 只当锚点）实测锚点的比值。两者都不 binding ⇒ **不动 SLM**。（本案：DRAM 3-6%、compute 已贴 2.20 锚点 ⇒ 整铲判死，省下一铲 GPU 与一次数值面风险。）
+**正面产出保留**：`tools/wb_slm_budget.csv`（12,288 B 的两段来源 + 逐段军规 30 判定）与 **(b1) 的机器级仪器**（barrier 18→18、14/18 段逐字节相同、`.text` 差异中位 3 B）——**任何以后的 SLM/别名手术都要过这台仪器**。
+
+
+# §105 **换序墙（候选 5：刀 1 / 刀 3）最小机制清单 —— 四件事：动哪层、最小改动点（文件+行号+现有函数）、风险（怎么避开 §56b 的 R4/R6/R9）、判据（怎么证明换序后逐位不变）。不写收益预测**　2026-11-04 08:5x（纯 host，零 GPU）
+**为什么这张表存在**：`tools/shapes_alive_next.csv` 里跨链合并类标了 `需要记录/计划层换序（军规 43）`；刀 1 已经死过一次（§56b 的 R4/R6/R9 三条反证），**死因不是数值，是"图的形状本身是正确性的一部分"**。
+## 1) 要动的层：**recorder 的邻接/依赖标注**（不是执行层）
+- **最小改动点**：`libxmx_sycl.cpp:123-143` 的 `g_cmds_touch` / `pgraph_ids`@127 / `pgraph_extra`@135 / `pg_push`@140 —— 现在它们只存**设备指针集合**（"同址即冲突"），**没有"这一组 op 允许被合并成一个 closure"的语义**。加一个与 `g_cmds` 同长的 `g_cmds_group`（int，默认 0），在 `pg_push` 里 push 当前组号 ⇒ **三向量同长同序（军规 57！）**。
+- **先例可抄**：`S6Chain`@553 与 `s6_take_*`/`s6_gap`@582、`A5Chain`/`a5_take_wres`（本案）都已经在做"跨 op 记账 + 在最后一个 op 处改写 body"，**但它们都不改变 closure 的数量与次序**。换序类第一次要改的是**次序/分组** ⇒ 所以组号必须显式化，而不是靠 cmd 索引差（`gap<=4` 那种容差在换序后不再成立）。
+- **风险（对应 R9）**：**"重写本身就改图"** ⇒ 任何"把两条腿并成一条"的做法都会改变 cgraph 的节点数与 touch 集 ⇒ 必须 (a) 只允许**同组内**合并，(b) 合并后仍 push **一条** closure（不减少 closure 数，body 内合并），照 A5/S6 的 "all six or none" 规矩（@528-532：**部分 no-op 禁止**）。
+## 2) 要动的层：**capture 期合法性检查（宁 refuse 不猜）**
+- **最小改动点**：现成的 **skip-chains 守卫就是模板**：`g_skipped_cmds`@1411、三条 REFUSED 打印 @1423（`cmds/names` 长度不齐）、@1430（**"name offset not a whole recording"** = 军规 57 那次的警笛）、@1471（链不终止/不 pure 就 refuse）、汇总 @1482（`chains_skipped/refused/closures_noop/passes`）。合并类应当**复用同一个函数结构**：在 `xmx_graph_capture`@1923 之前跑一遍"分组合法性 pass"，**不合法就打 REFUSED 并退回拆腿路**，绝不猜。
+- **要新增的判据**（换序特有）：① 组内每条腿的 **touch 指针集必须两两相交或明确声明可并行**（`g_cmds_touch` 已有数据）；② 组的**输入面在合并前不得被别的组改写**（**R4 的直接教训**：成员输入面 `Araw/Braw/skip/cos/as/bs/a16r` 在 pack 之后、合并发射之前被改写 ⇒ 必须有输入保护或拒绝合并）；③ 合并不得改变**别的 closure 的 pool 取块序列**（**R6**：持有一个 pool 块就会改变后来者的取块次序 ⇒ 见第 3 件）。
+- **风险**：`NR_SKIP_MAP=1`@1374 这类 witness 只覆盖 skip 路 ⇒ 合并路要自己的 `NR_*_TRACE`（照 `[a5-fire]`/`[a5-geom]`/`[a5-op]` 三件套的形状做：**fire + 逐 op 的 id/bytes/ptr**）。
+## 3) 要动的层：**pool 取块序列的 witness（把 R6 变成可测的东西）**
+- **现成材料**：`g_cmds_poolblk`@124（**record-time 已经存了每个 closure 的 scratch 块列表**！）、`pool_get`@446 / `pool_put`@462 / `pool_clear`@471、`g_pool_sz`@200（ptr -> bucket/slot）、`g_pool_mallocs`@444（miss 数）。
+- **最小改动点**：在 `pg_push`@140 旁边把 `g_pg_curblk`@125 的快照存进 `g_cmds_poolblk`（**已有字段，只需在合并改动后重放一遍对照**），再加 presence-gated 打印：`[poolseq] cmd=<n> blocks=<ptr,…>` ⇒ **换序前后两臂逐行 diff**，任何一条 closure 的取块序列变了就是 R6 命中 ⇒ **当场 refuse，不进图**。
+- **风险**：合并腿若**跨 closure 持有** pool 块（拿一块、到下一条腿才 put），后来者的 bucket 匹配就变 ⇒ 规矩：**合并体内部自己 get/put，边界上块数必须与拆腿时完全一致**（witness 可证）。
+## 4) 要动的层：**编译期回退开关（不只是运行期 env）**
+- **先例**：`T_SKIP_CHAINS_DEF`（@795 注释指向 `tools/shipped_build.defs`，经 `tools/patch_testdefs.py` 注入）+ 本案新加的 `T_ATT5_FUSE_DEF`（`a5_on()` 的默认值 = 宏值，`NR_*=0` 仍是逃生门）。
+- **最小改动点**：合并类一律加 `T_<KIND>_FUSE_DEF=0/1` 进 `tools/shipped_build.defs`，**默认 0 出变体、验证过再换 1**；运行期 env 保留做 A/B（`ab.ps1` v3 每腿自清 NR_* ⇒ 两侧都不设 env 的读数才代表出货态，军规 59 的 ③）。
+- **风险**：**身份守卫**必须读单一出处（军规 62，`out\SHIPPED_MD5.txt`），否则每次转正都会假 RED；**三向量同长同序**（军规 57）在换序类里最容易破 —— 换序天然会改 `g_cmds`/`g_cmd_names` 的对齐。
+## 判据（怎么证明"换序后逐位不变"）—— 全部现成，按顺序跑
+1. **双档 1301 EXACT**（拆腿档 = `DD49827D…`；合并档也必须同一颗）+ **`[skip-chains]` 三向量计数两侧一字不差**（军规 57）；
+2. **`[poolseq]` 两臂逐行 diff = 空**（R6 的直接反证）；
+3. **touch 集对照**：`NR_PG_TOUCHDUMP` 两臂 diff ⇒ 只允许"组内合并"带来的成员变化，**不允许出现第三方 closure 的指针重叠改变**（§94 的读法：同址 = 串行化约束，不是数据危险，但**换序会改变约束图本身** ⇒ 必须留账）；
+4. **`NR_SELFREP=1000` bad=0**（军规 60，仪器 `builds\nr_replay_sr.exe = 9FB2ED24…` 现成）+ **≥4 独立进程 distinct md5=1**（军规 31）；
+5. **40 门**（守卫读单一出处 ⇒ 应 40/40）→ **帧 16 对**（两侧都不设 env）；
+6. **逐 op 对账**：`NR_RUN_TIMING` 两臂（军规 40：家族价只可排序，绝对值逐 op 实测）。
+**不写收益预测**（军规 26/35a/54）：刀 1 / 刀 3 的"帧 −5.19 / −6.79"是**旧分摊账的排序值**，本清单只给机制与判据。
