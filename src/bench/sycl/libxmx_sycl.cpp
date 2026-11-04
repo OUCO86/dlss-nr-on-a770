@@ -1267,6 +1267,14 @@ int xmx_buf_create_kind(unsigned long long bytes, int kind) {
     if (!p) FAILMSG("out of device memory");
     int id = g_nextbuf++;
     g_bufs[id] = { p, (size_t)bytes, (size_t)(kind == 0 ? 2 : kind), false, g_gen };
+    if (getenv("NR_BUFNEW")) {   // presence-gated, host print only (rules 4/9)
+        // during_closure = how many closures have been pushed so far, i.e. which op was being
+        // recorded when this buffer appeared. (An earlier draft indexed g_cmd_names with an
+        // out-of-range expression -- caught by inspection before any run.)
+        std::printf("[bufnew] id=%d bytes=%zu kind=%d recording=%d during_closure=%zu\n",
+                    id, (size_t)bytes, kind, g_recording ? 1 : 0, g_cmds.size());
+        std::fflush(stdout);
+    }
     mem_probe(id, p, bytes, "buf");   // section 100 D11 (defined with the ze world)
     return id;
 }
@@ -1375,6 +1383,8 @@ static int import_handle(unsigned long long handle, unsigned long long bytes, in
                                               (unsigned)kind, (unsigned)r);
     int id = g_nextbuf++;
     g_bufs[id] = { p, (size_t)bytes, (size_t)esz, true, g_gen };
+    if (getenv("NR_BUFNEW")) { std::printf("[bufnew] id=%d bytes=%zu esz=%zu IMPORTED during_closure=%zu\n",
+                            id, (size_t)bytes, (size_t)esz, g_cmds.size()); std::fflush(stdout); }
     return id;
 }
 int xmx_buf_import_win32(unsigned long long handle, unsigned long long bytes, int esz) {
