@@ -136,7 +136,15 @@ static int g_group_cur = 0;                             // assigned by a later c
 static std::vector<int> g_pg_pending_ids;               // id mirror of g_pg_pending
 static std::vector<std::vector<int>> g_pg_ids_snap;      // per-closure id snapshot (print-only)
 static void pg_note_ids(const std::initializer_list<int>& ids) {
-    for (int id : ids) if (id >= 0) g_pg_pending_ids.push_back(id);
+    // Only ids that resolve to a live buffer are worth printing. Some call sites pass geometry
+    // or flag words in the same initializer list; those leaked into the witness as huge fake ids
+    // (134221248 = the pooling flag bit, etc.) whose value is not stable across processes, which
+    // made an arm-to-arm touch diff look non-empty when it was empty. Mirror the pointer logic.
+    for (int id : ids) {
+        if (id < 0) continue;
+        auto it = g_bufs.find(id);
+        if (it != g_bufs.end() && it->second.p) g_pg_pending_ids.push_back(id);
+    }
 }
 static void pgraph_ids(std::initializer_list<int> ids) {
     g_pg_pending.clear();
@@ -2067,12 +2075,81 @@ static void group_census_report(int graph_idx) {
     }
     std::fflush(stdout);
 }
+// ---- B step 2 (i): the minimal REORDER mechanism (knife2b #108). ---------------------------
+// Knife 1 died in section 56b because a MERGE silently changed what other closures read (R4:
+// a member input rewritten between pack and the merged launch; R6: holding a pool block changes
+// later closures' fetch sequence; R9: the rewrite itself is a graph change). The census (#106)
+// then proved no merge-relevant family is adjacent, so any merge needs a reorder first.
+// This is the smallest possible reorder: move ONE closure from index FROM to index TO, atomically
+// across every record-parallel vector (rule 57 keeps holding, and [vec-align] proves it).
+// NR_BMERGE_ORDER is presence-gated: unset => the function returns before touching anything.
+// Spec: comma-separated "<from>><to>", e.g. "569>571,236>238".
+static std::vector<std::pair<int,int>> g_order_moves;   // what was actually applied
+static void bmerge_order_apply() {
+    g_order_moves.clear();
+    const char* spec = getenv("NR_BMERGE_ORDER");
+    if (!spec || !*spec) return;
+    size_t n = g_cmds.size();
+    size_t noff = g_cmd_names.size() >= n ? g_cmd_names.size() - n : 0;   // names keep both recordings
+    const char* p = spec;
+    while (*p) {
+        while (*p == ' ' || *p == ',') ++p;
+        if (!*p) break;
+        int from = atoi(p);
+        const char* q = strchr(p, '>');
+        if (!q) break;
+        int to = atoi(q + 1);
+        p = q + 1; while (*p && *p != ',') ++p;
+        if (from < 0 || to < 0 || (size_t)from >= n || (size_t)to >= n || from == to) continue;
+        auto move_at = [&](auto& vec, size_t off) {
+            auto it = vec.begin() + (long)(off + (size_t)from);
+            auto v = *it;
+            vec.erase(it);
+            vec.insert(vec.begin() + (long)(off + (size_t)to), v);
+        };
+        move_at(g_cmds, 0); move_at(g_cmds_touch, 0); move_at(g_cmds_group, 0);
+        move_at(g_cmds_poolblk, 0); move_at(g_pg_ids_snap, 0); move_at(g_cmd_names, noff);
+        g_order_moves.push_back(std::make_pair(from, to));
+    }
+}
+static void bmerge_order_report() {
+    if (g_order_moves.empty()) return;
+    std::printf("[border] moves=%zu", g_order_moves.size());
+    for (auto& mv : g_order_moves) std::printf(" %d>%d", mv.first, mv.second);
+    std::printf("\n");
+    for (auto& mv : g_order_moves) {
+        int lo = mv.first < mv.second ? mv.first : mv.second;
+        int hi = mv.first < mv.second ? mv.second : mv.first;
+        std::printf("[border-span] %d..%d names=", lo, hi);
+        size_t noff2 = g_cmd_names.size() >= g_cmds.size() ? g_cmd_names.size() - g_cmds.size() : 0;
+        for (int i = lo; i <= hi; ++i) std::printf(" %s", g_cmd_names[noff2 + (size_t)i]);
+        std::printf("\n");
+    }
+    std::fflush(stdout);
+}
+// The [pgt] dump above is printed inside pg_push, i.e. at RECORD time -- a reorder applied at
+// capture time is invisible to it. This dump runs on the frozen vectors, after the reorder, so
+// the declared-set check (s6/k1_declare.md) can actually see the permutation. Presence-gated.
+static void pgraph_final_dump() {
+    if (!getenv("NR_PG_FINAL")) return;
+    size_t n = g_cmds.size();
+    size_t noff = g_cmd_names.size() >= n ? g_cmd_names.size() - n : 0;
+    for (size_t i = 0; i < n; ++i) {
+        std::printf("[pgt-final] cmd=%zu name=%s ids=", i, g_cmd_names[noff + i]);
+        for (int id : g_pg_ids_snap[i]) std::printf(" %d", id);
+        std::printf("\n");
+    }
+    std::fflush(stdout);
+}
 int xmx_graph_capture(void) {
     if (!g_recording) FAILMSG("not recording");
     // NR_SKIP_CHAINS: whole-chain no-ops, applied to the frozen closure list BEFORE the
     // graph is stored (default empty => this function is never entered; see the block above).
     skip_chains_apply(g_cmds, g_cmd_names, (int)g_graphs.size());
     bmerge_apply(g_cmds);      // KNIFE 1: runs AFTER the skip pass, so skipped legs cannot merge
+    bmerge_order_apply();      // B step 2 (i): presence-gated REORDER (NR_BMERGE_ORDER), default off
+    bmerge_order_report();     // what it moved, so the declared-set check has something to read
+    pgraph_final_dump();       // the FROZEN touch sets, i.e. after any reorder -- [pgt] cannot show it
     rb_report((int)g_graphs.size());      // NR_RES_BYTE census (no-op when the switch is unset)
     group_census_report((int)g_graphs.size());   // B step 1: report-only (NR_GROUP_TRACE)
     g_graphs.push_back(std::move(g_cmds)); g_graph_names.push_back(std::move(g_cmd_names));
