@@ -1,0 +1,13 @@
+arm,switch_off,mechanism,steady_ms,base_ms,off_delta_ms_per_frame,1301,status,launch_count_proxy_delta
+L_base,baseline (all default-ON mechanisms active),,56.97,56.97,+0.00,EXACT,baseline,
+L_ffnchip,NR_FFN_CHIP,"ffn one-launch chip kernel (4.4x, bit-exact)",63.05,56.97,+6.08,EXACT,"LIVE, off-cost >= 1.0 ms -> needs 16-pair confirm",
+L_ffntile,NR_FFN_TILE,expand publish == projection pack_a (tile chain),82.52,56.97,+25.55,EXACT,"LIVE, off-cost >= 1.0 ms -> needs 16-pair confirm",
+L_gamerge,NR_GA_MERGE,global_attention merge,57.58,56.97,+0.61,EXACT,"UNRESOLVED (< ~1.0 ms, do NOT write 'contribution ~0')",
+L_gatile,NR_GA_TILE,global_attention tiled softmax,57.35,56.97,+0.38,EXACT,"UNRESOLVED (< ~1.0 ms, do NOT write 'contribution ~0')",
+L_wamerge,NR_WA_MERGE,window_attention merge,57.51,56.97,+0.54,EXACT,"UNRESOLVED (< ~1.0 ms, do NOT write 'contribution ~0')",
+L_wbfuse,NR_WB_FUSE,window_block fuse,57.05,56.97,+0.08,EXACT,"UNRESOLVED (< ~1.0 ms, do NOT write 'contribution ~0')",
+L_gfold,NR_G_FOLD,f16 gemm publish folded into the gemm store,61.96,56.97,+4.99,EXACT,"LIVE, off-cost >= 1.0 ms -> needs 16-pair confirm",
+
+NOTE,all eight arms are 1301-EXACT => the byte test CANNOT decide liveness for BIT-EXACT fusions: turning them off recomputes the same values by a longer path. The byte test only proves the two forms agree. Liveness here = the time delta.
+NOTE,"off_delta from a SINGLE walk = a SIEVE only (rule 35b): arms >= ~1.0 ms need ab.ps1 -Pairs 16 on/off confirmation; arms below that are marked UNRESOLVED, never 'contribution ~0'."
+NOTE,"these are costs of REMOVING a shipped fusion, i.e. evidence the mechanism is live and already banked -- they are NOT recoverable gains."

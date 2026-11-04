@@ -1632,3 +1632,32 @@ B3-b 我按 `pe_k3_roofgroup.py` 报的"SRP_GRP=45"跑了 3 个进程，**日志
 2. **B3-b 的缺形（130560×32×128）也不补**——没有消费者（军规 26/35a 的"别为不存在的手术备料"）；
 3. **改跑一张"机制覆盖实测表"**（**每个默认 ON 开关跑一个逃生臂 walk**：`NR_X=0` vs 默认，看 1301 是否变 + 帧时变化 ⇒ 证明该机制**真的在帧里生效**、以及它**已经贡献了多少**）：11 个开关 × 1 walk ≈ **25 min GPU + 间隔 ≈ 40 min**，产出 `tools/mechanism_liveness.csv` ⇒ **这才是把 §116 排序表修对的证据**，也是下一铲（残差家族融合）的定价底料；
 4. 或者**直接换靶到 `gemm_int8_residual` 家族**（20.06 ms/68 腿，覆盖表里唯一"整族没融合开关"的大族）做链内融合设计——但按新流程，**先单价后引擎**，而单价要先有融合臂的 bench 核（新设计）。
+
+
+# §118 **存活表（8 臂，每臂 1 walk）+ 发射数代理（**判红：不可用**）+ `NR_LEG3_STG` 的 1301 判定**（EXACT，无收益 ⇒ 不是候选）**　2026-11-05 04:2x-05:4x
+## 1) `tools/mechanism_liveness.csv`（关掉默认 ON 机制的代价 = 该机制**已经吃进帧**的证据；**不是可回收收益**）
+| 臂 | 机制 | 稳态 ms/帧 | **off-差** | 1301 | 状态 |
+|---|---|---|---|---|---|
+| L_base | 全默认 | **56.97** | — | EXACT | 基线 |
+| **L_ffntile** | `NR_FFN_TILE=0` | 82.52 | **+25.55 ms** | EXACT | **LIVE**（≥1.0 ⇒ 若要定案需 16 对） |
+| **L_ffnchip** | `NR_FFN_CHIP=0` | 63.05 | **+6.08 ms** | EXACT | **LIVE** |
+| **L_gfold** | `NR_G_FOLD=0` | 61.96 | **+4.99 ms** | EXACT | **LIVE** |
+| L_gamerge | `NR_GA_MERGE=0` | 57.58 | +0.61 | EXACT | **未分辨** |
+| L_wamerge | `NR_WA_MERGE=0` | 57.51 | +0.54 | EXACT | **未分辨** |
+| L_gatile | `NR_GA_TILE=0` | 57.35 | +0.38 | EXACT | **未分辨** |
+| L_wbfuse | `NR_WB_FUSE=0` | 57.05 | **+0.08** | EXACT | **未分辨**（几乎不动 ⇒ 这个开关在本帧基本不做事） |
+**★ 一条判据修正（我原来设计的"1301 变 = 活着"在这里失效，必须写死）**：**八个臂的 1301 全部 EXACT `DD49827D…`** ⇒ 因为**这些融合是逐位等价的**（关掉只是换一条更长的路算同样的值）⇒ **字节测试只能证明"两形一致"，不能证明"参与不参与"** ⇒ **存活判据 = 时间差**（字节不变是**好事**：说明这些机制是数值中性的）。
+**读出的大事实**：**`ffn` 的 tile+chip 两环已经吃进 ~31.6 ms/帧**（25.55 + 6.08）、**`gemm` 的 publish 折叠吃进 ~5.0 ms** ⇒ **B3 的"把 ffn 融成一核"不是待 harvest 的钱，是已经 harvest 的钱**（与 §117 的源码结论一致）；**`window_block` 的 `NR_WB_FUSE` 只值 +0.08 ms ⇒ 那个 18.19 ms 的家族并不靠这个开关活着** ⇒ 与 §105 "wb 两腿既不绑带宽也不绑 XMX" 相互印证。
+## 2) 发射数代理 `tools/launch_map.csv` —— **判红：这个代理不可用**（如实）
+用现成的 `NR_SUBMIT_PROBE`（按家族汇总每闭包 CPU enqueue 时间）跑四臂：base 11.0 ms、FFN_TILE off **5.5**、FFN_CHIP off **5.0**、G_FOLD off **6.6** ⇒ **每个家族的 enqueue 都近乎减半**（连与开关无关的家族也 -0.3~-1.3）⇒ **这是冷启动/首跑效应主导，不是机制效应** ⇒ **不能用来排"还剩几次发射"**。
+⇒ **真要这张图，需要一台每闭包发射计数器**（在 `single_task/parallel_for/memcpy/memset` 上加 presence-gated 计数，或用一个转发的 queue 包装类）：**设计已想清**（~15 个转发方法 + 一个 `g_lc_cur` 游标 + capture 期打点），**但要动 7,000 行 TU 的公共路径 ⇒ 我按军规 70/77 的规矩不当作顺手小事**，建议单独一铲（估 40-60 min，含 `build_shipped` 基座与门链）。
+## 3) `NR_LEG3_STG`（覆盖表里唯一"已写好但默认 OFF"的开关）—— **不是候选**
+**先读语义（源码 6340-6395）**：它把 window_block 第三相 `f16v3::gemm_resid_pub` 的**直写 plan 目标面**改成 **先写 pool staging、再一次 device→device memcpy** ⇒ 动机是绕开 compute-to-compute 的 coherent drain ⇒ **改的是搬运路径，不改累加顺序/量化** ✓
+**账上早已判过**：注释原文 **"the 33MB staging + memcpy is a PURE EXTRA cost: the same-heat A/B says it is speed-NEUTRAL (228 both ways) … Default OFF (kept as the mechanism witness)"**
+**本铲补一次实测确认**：`M_leg3`（`NR_LEG3_STG=1`，出货件）⇒ **1301 EXACT `DD49827D…`** ✓（数值中性成立）；稳态 **57.01-57.44 ms** vs 基线 56.97 ⇒ **ON 不比 OFF 快**（差 +0.04~+0.47，未分辨偏正）⇒ **按你的判读线（≥ −0.15 ⇒ 停下）：这一铲不成立 ⇒ 不跑 16 对**（省 ~30 min GPU，且账上已有同热 A/B 的 228/228 读数）。
+## 4) 本盒 GPU 记账
+存活表 8 walk（~22 min）+ 发射代理 4 walk + LEG3 1 walk（~13 min）= **~35 min**，批间 60 s、批后冷却已做；进程 0；两槽 `3BAECF2A…` 未动、三金标未动、`out\SHIPPED_MD5.txt` 未动；产物 `tools/mechanism_liveness.csv`、`tools/launch_map.csv`（带 RED 注）、`tools/fusion_coverage.csv`、`tools/ffn_fusion_slm.csv`；脚本 `s6/{pe_liveness.ps1,pe_liveness_read,pe_launchmap.ps1,pe_launch_read,pe_fusion_coverage,pe_ffn_slm,pe_res_body,pe_tags,pe_default_on}.py|ps1`。
+## 5) 对下一铲的判断（不越权，只把数摆出来）
+- **融合路线的"大头"已经全部吃进**（tile/chip/fold/merge 们：31.6 + 5.0 ms 已在帧里）；**剩下能数的空间要先有真的发射图才知道有多大** ⇒ **发射计数器 = 下一铲的第一步**；
+- **`window_block` 18.19 ms 与 `gemm_int8_residual` 20.06 ms 是两个"开关不做事"的家族** ⇒ 它们的钱不在"消环节"上（wb 的开关只值 0.08），**在单环节内部**（§105 的 SLM/occupancy 审计已经对 wb 判过"既不绑带宽也不绑 XMX"）⇒ **若还要挖，方向是 kernel 级（相位内的访存/填充），不是融合级**；
+- **B3 正式结案：靶已被 NR_FFN_CHIP/NR_FFN_TILE 收割**（不跑 c、不补屋顶）。
