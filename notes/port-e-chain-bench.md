@@ -1176,3 +1176,42 @@ FAIL 要求 out/libxmx.dll 与 oneapi/libxmx_sycl.dll 必须 ABB969FE（你没�
 **= 候选 1（WB 驻留重做）**，理由：(i) 18.19 ms 串行 / 只有 10 个 closure ⇒ **单位 closure 价值最高**（1.8 ms/发）；(ii) 有历史实测下界 −0.365 ms/32 对，不是空想；(iii) 不跨链换序 ⇒ 不碰军规 43 的雷区；(iv) 它的前置（barrier_audit 两栏 + SELFREP 臂）**已经在手里**（`nr_replay_sr` 就是现成仪器）。
 **开工顺序**：先纯 host 做 SLM 预算表（45,056 → 32,768 差 12,288 B 从哪来：tile 形状 / 双缓冲 / stage 复用），再改 bench 件量一版 occupancy，最后才进 `builds\` 出变体并走双档 1301 + SELFREP + 16 对。
 **若你要更稳的**：候选 2 的**重新定价**是纯 host（用 `RT_shipped.timing.txt` + 合成体 bench），零 GPU 也能交一铲。
+
+
+# §101 **候选 4（C256 / C512 att 腿）的三项约束判定 —— 备查，本铲不做**　2026-11-04 08:1x（纯 host）
+**判定 = 现在不能把 att5 形态套上去；三条约束里两条直接不合格。**
+1. **heads / tokens**：`att5::fused<C,HEADS,PHASES,…>` 的几何锁是 **heads=2、tokens=64、C=64**（`s6b_att.cpp` 里 `Shape` 有 `static_assert` 把模板参数与 M 档绑死）。转正件里 10 个 `xmx_rec_window_block` 的自带几何是 **C=32 / heads=1 / tokens=64**（`libxmx_sycl.cpp:5410`）⇒ **与 att5 的 C=64/heads=2 不是同一族**；而 C256/C512 的 att 腿（`xmx_rec_gemm_int8_qkv` + `xmx_rec_window_attention`）在 chain_map 里是 **C=256: heads=? / C=512: heads=?**（tier 列已给 M 与 C），**要套 att5 必须先证明 heads/tokens 与 fragment 布局一致**，否则 P8 的 fragment 面越界。
+2. **SLM**：att5 核在 C=64 已经是 **32,768 B**（`att5::fused` 台账 slm=32768，2 个驻留 WG/SM）；**C128 实测 41,984 B ⇒ 越 32KB 崖**，且 bench 上 C128 的 att 合一形态 **+51% 更差**（§66/§67 的档价）⇒ **C256/C512 只会更大**（fragment 面与 KV tile 随 C 线性/超线性涨）⇒ **不进图**。
+3. **数值面**：att5 的 P11 只实现 **epi=1 + narrow + half_skip** 一种出口；C256/C512 的残元腿 flags 分布未测（要按 §87 的 `[a5-geom]`/`wres-TUPLE` 普查一遍才知道有几条能对上）⇒ **在拿到普查之前不许写预测收益**（父的要求）。
+**结论写法（进表）**：`C256 13.39 ms / C512 1.76 ms 串行 = 表上最大的两块活站，但 att5 形态在此二 tier 的三项约束里 SLM 一项已被 C128 实验证否、heads/tokens 需重新证明 ⇒ 判定 = 先做该 tier 的 bench 合成体并打赢拆腿 REF，才允许讨论进图；本铲不做，不给预测帧值。`
+**顺手可做的零风险前置（若以后要点刀）**：把 C256/C512 的 `wres-TUPLE` 普查跑一遍（`[a5-geom]` 已有 104 行数据 ⇒ **纯 host 就能列出这两个 tier 的 epi/narrow/half 分布**）⇒ 这样"能不能对上出口形态"先有数，再谈 SLM。
+
+
+# §102 **WB 驻留重做 (a)：SLM 预算表已出（`E:\DSH\tools\wb_slm_budget.csv`）+ 三条硬前置的 verdict**　2026-11-04 08:1x-08:2x（纯 host，零 GPU）
+**先说对象的身份（免得打错靶）**：`xmx_rec_window_block` 在 plan 里 **20 步 = 2 次录制 × 10**；按 flags 分路（`s6/pe_wb_census.py`，flags 解码 @5391-5409：pooling=0x800000、head=0x1000000、narrow=0x1000、epi=(f>>8)&0xF）：
+ - **v4ph(pool) 1 条**（8160 窗、544x960、across120）+ **v4ph(head) 1 条**（8349 窗、across121、pad262148）⇒ **只有这 2 条走 `wbv4ph::launch_v4ph`（SLM 45,056）**；
+ - 其余 **8 条 = non-pool/head**（2040-2135 窗、272x480）⇒ 走另一条路（**不是 45,056 那个核**）。
+**逐 closure 实测（转正件 `3BAECF2A…`，`NR_RUN_TIMING`，`s6/RT_shipped.timing.txt`）**：`c1 = 4.243 ms`、`c690 = 4.278 ms` ⇒ **两条 v4ph 巨人 = 8.52 ms**，占 `window_block` 家族 18.19 ms 的 **47%**；另 8 条各 1.16-1.28 ms。
+⇒ **这一铲的靶 = 那 2 条巨人 closure（8.52 ms 串行 / 帧）**，不是整个 18.19 ms 家族。
+
+## 前置 1：`barrier_audit.py` 两栏（`tools/barrier_audit.py --emit-csv E:\DSH\tools\barrier_audit_wb.csv`，38 行，退出码 0 = **反证两例通过、仪器有牙** ✓）
+| 核 | WG/SG 栅栏 | **verdict_source** | **verdict_machine** |
+|---|---|---|---|
+| `wbv4ph::launch_v4ph`（window_block_v4ph.hpp） | **WG=1 / SG=16** | **OK** ✓ | **PARTIAL**（2026-11-02 的旧账：`.text` 里 18 条 signal barrier，**没做逐字节对照**）|
+| `wbv4::launch_v4full`（window_block_v4.hpp） | WG=1 / SG=13 | OK ✓ | PARTIAL（15 条，同上）|
+⇒ **诚实结论：source 栏干净、machine 栏只是 PARTIAL ⇒ 这一栏没清账。** 处置：**(b) 出 occupancy 台账时按军规 34 补做机器级**（改完源码后重跑 audit + 台账列含 simd/module_id 去重 + 对新旧 `.text` 做 barrier 计数与逐字节对照）；**在 machine 栏补清之前不出 `builds\` 变体**（父的前置）。
+**关键结构事实（决定后面所有动作）**：v4ph **只有一个 WG 栅栏**（line 202，注释写明 "KTO/VPO shared for P3/P5"），其余 16 条全是 SG 级 `esimd::barrier()` ⇒ **跨 SG 的交接只有 KTO/VPO 两处，都被这唯一一条 WG 栅栏盖住**。
+
+## 前置 2：别名手术只用**拆槽/挪相**，**加 barrier 的方案一律标 `不采纳`**
+表里已按此写：**KTO 与 VPO 的槽被显式标 `KEEP + 拒绝在 P6/P7 复用`**，理由写死：现有那条 WG 栅栏在 P3 读**之前**，若把这两个槽挪给 P6 用，就**必须新增一条 WG 栅栏** ⇒ **直接 `不采纳`** ✓（这正是 §40/§41 当年 RACE_REUSE 的形态）。
+
+## 前置 3：军规 30 逐段（谁写、谁读、何时读、槽是否重叠）—— 见 CSV 的 `writers/readers/overlap_now` 三列
+**12,288 B 的差额由两段凑齐（且两段互相独立）**：
+1. **−4,096：`AQO` 让位给 `ATO`**（P0-P2 之后 AQO 死；ATO 只在 P6 活；**两边都是 SG-local**（写读都在 `+sgid*1024` 自己的片）⇒ **不需要任何新栅栏** ✓）
+2. **−8,192：`SCR` 的 per-SG 高水位 4,096 → 2,048**（把 **P3 scores / P4 softmax / P5 attnV 拆成两个 8 行半块**：现在每 SG 的 scores 块 = 16 行 x 64 列 x 4 B = 4,096；拆半 = 2,048 ⇒ 4 SG 共省 8,192。**SCR 的每一次使用都是 `+ sgid*SCR_SG` ⇒ 全程 SG-local ⇒ 拆槽不引入任何跨 SG 语义** ✓）
+⇒ **45,056 − 12,288 = 32,768** ✓ 数值上正好闭合。
+**但有一处必须先量再赌**：第 2 段把热相（P3/P4/P5）的循环次数翻倍、dpas 累加器从 `simd<float,64> x4` 变成两半的 `simd<float,32> x4` ⇒ **v9b 的教训（每线程累加器进 >8 的惩罚区）说这有可能把驻留收益吃掉** ⇒ **(b) 必须成对计价（军规 54/55）：现档 45,056 / 新档 32,768 / 新档+拆槽变体，三态同形态对同一 shape 出价**。
+**停止条件（照父的规矩写死）**：**若只做第 1 段 = 40,960，够不到 32,768 ⇒ 停下回报，不算部分出货**；若第 2 段在 (b) 里价格变差 ⇒ 同样停下。
+**另两条要记的账**：
+ - **靶子只有 2 个 closure / 帧（8.52 ms 串行）** ⇒ 历史"上限 −3.9 ms 串行"对应这两条；**而历史实测只有 −0.365 ms/32 对** ⇒ **兑现率 ≈ 9%** ⇒ 说明驻留/occupancy 之外还有更强的限制（很可能是 D2H/全局带宽或 wave 划分）⇒ **(b) 之前我不承诺帧值**；
+ - **8 条 non-pool/head 走的是另一条路**（不是 45,056 的核）⇒ 本铲不动它们；若 (b) 显示 32,768 的收益主要来自 occupancy，那 8 条的 shape 也值得单独看一眼（**但那是下一铲，不在本铲范围**）。

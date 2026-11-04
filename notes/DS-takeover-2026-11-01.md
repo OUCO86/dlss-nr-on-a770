@@ -1633,3 +1633,20 @@ gates: 40 GREEN / 0 RED
 ★ **一条要紧的张力（下一铲要正面回答）**：**剩下的钱最大的两块（C256 的 13.39、C128 的 10.56）恰好是我们融合形态装不下的 tier**（C128 合一在 bench 里 **+51% 更差**、SLM 41,984 越占用崖）。
 ⇒ 所以"接更多 tier"不是开关活，而是**tiling/几何活**：要么**把 T（每 WG token 数）降下来换 SLM**、要么**把窗口切小换 across** —— 两者都会改变网格与复用因子，**必须先按 `tools/xmx_roof.csv` 的 (dtype,N,K,M) 屋顶成对实测，再谈接图**（军规 26/35a/37/54）。
 
+
+## 83. ★ WB 驻留重做 (a) 交回：**靶子重新钉小 = 只有 2 个 closure 走 45,056 B 的 `wbv4ph`（活站价值 8.52 ms 串行，占家族 47%）**；SLM 预算 12,288 B **数值上正好闭合**；三条前置 = **两条过、一条 PARTIAL（不掩盖）**
+**① 靶子更正（重要）**：plan 里 `OP_XMX_REC_WINDOW_BLOCK` 20 步 = 2 次录制 x 10；按 flags 分路（`s6/pe_wb_census.py`；解码 @5391-5409：pooling=0x800000、head=0x1000000、narrow=0x1000、epi=(f>>8)&0xF）：
+- **走 `wbv4ph::launch_v4ph`（SLM 45,056 B）的只有 2 条/帧**：`v4ph(pool)` 8160 窗 544x960 across120、`v4ph(head)` 8349 窗 across121 pad262148；
+- 其余 **8 条是 non-pool/head（2040-2135 窗、272x480）=> 不是这个核**；
+⇒ **转正件逐 closure 实测**（`NR_RUN_TIMING`）：**`c1 = 4.243 ms`、`c690 = 4.278 ms` => 两条巨人 = 8.52 ms 串行 = 家族 18.19 ms 的 47%**；另 8 条各 1.16-1.28 ms。**这一铲的活站价值 = 8.52 ms（2 个 closure/帧），不是 18.19。**
+**② 前置 1 `barrier_audit` 两栏**（`tools/barrier_audit_wb.csv` 38 行，**退出码 0 = 反证两例通过、仪器有牙** ✓）：`wbv4ph::launch_v4ph`（WG=1/SG=16）= **verdict_source OK / verdict_machine PARTIAL**（旧账 2026-11-02：`.text` 里 18 条 signal barrier，**没做逐字节对照**）；`wbv4::launch_v4full`（WG=1/SG=13）= OK / PARTIAL（15 条）。
+⇒ **诚实读数：source 栏干净，machine 栏没清账**；处置 = (b) 里补做（改完源码重跑 audit + 台账 simd/module_id 去重 + 新旧 `.text` 的 barrier 计数与逐字节对照）；**machine 栏补清之前不出 `builds\` 变体**。
+★ **结构事实**：v4ph **全核只有 1 条 WG 栅栏**（line 202，注释自陈 "KTO/VPO shared for P3/P5"），其余 16 条都是 SG 级 `esimd::barrier()` => **跨 SG 交接只有 KTO/VPO 两处，且都被这条 WG 盖住**。
+**③ 前置 2（只用拆槽/挪相）**：✓ **KTO 与 VPO 显式标 `KEEP + 拒绝在 P6/P7 复用`** —— 现有那条 WG 栅栏在 **P3 读之前**，把这两个槽挪给 P6 用就**必须新增一条 WG 栅栏** => **直接不采纳**（这正是 §40/§41 当年 RACE_REUSE 的形态）。
+**④ 前置 3（军规 30 逐段：writers / readers / overlap 三列都在表）**：**12,288 B 由两段独立凑齐**：
+1. **−4,096：`AQO` 让位给 `ATO`** —— AQO（P0 写、P1/P2 读，写读都在 `+sgid*1024` 自己的片 => **SG-local**）P2 之后死；ATO 只在 P6 活、同样 SG-local => **不需要任何新栅栏** ✓
+2. **−8,192：`SCR` 的 per-SG 高水位 4,096 -> 2,048** —— 每 SG 的 scores 块 = 16 行 x 64 列 x 4 B = 4,096（@237/238）；**把 P3/P4/P5 拆成两个 8 行半块** => 2,048/SG => 4 SG 省 8,192；**SCR 每次使用都写死 `+ sgid*SCR_SG` => 全程 SG-local => 拆槽不引入跨 SG 语义** ✓
+⇒ **45,056 − 12,288 = 32,768** ✓（`tools/wb_slm_budget.csv` 7 段列和已 python 复算：45056 -> 32768，delta 12288，unparseable = 0）
+★ **核里已有先例**：`scrC = S_PPO + sgid*2048`（line 71 注释 **"scrC aliases the PPO head, dead until softmax"**）=> **拆槽/挪相本来就是这个核的既有做法**。
+**⑤ 三条风险（都写进表）**：⑴ **两段缺一不可**：只做第 1 段 = 40,960 够不到 32,768 => **停下回报，不算部分出货**；⑵ **第 2 段有真实反噬风险**：热相（P3 scores / P4 softmax / P5 attnV）循环翻倍、dpas 累加器从 `simd<float,64> x 4` 变两半的 `simd<float,32> x 4` => **v9b 教训（每线程累加器进 >8 惩罚区）说这可能把驻留收益吃掉** => (b) 必须**三态成对计价**（现档 / 新档 / 新档+拆槽），**不拿单核价外推家族价**（军规 54/55）；⑶ **历史兑现率只有约 9%**：上限 −3.9 ms 串行 vs 实测 −0.365（32 对）=> occupancy 之外还有更强限制（D2H/全局带宽或 wave 划分）=> **(b) 之前不给帧值承诺**。
+**零 GPU**（本铲至今只跑了 40 门 12 min + RUN_TIMING 2 min，均在上一盒）；新产物 `tools/wb_slm_budget.csv`、`tools/barrier_audit_wb.csv`、`s6/pe_wb_census.py`、`s6/pe_shipped_rt_read.py`、`s6/RT_shipped.timing.txt`。
