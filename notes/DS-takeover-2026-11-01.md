@@ -1666,3 +1666,22 @@ gates: 40 GREEN / 0 RED
 ★ **仪器互证很干净**：`barrier_audit.py` 跑改后源码（`BARRIER_SRC=E:\DSH\tmp\wb_slm_shadow`）=> **所有区段 verdict_source = OK、WG=1/SG=16 不变**；而它自带的反证用例正是 **"故意 ATO->S3 => RACE_REUSE（KTO 跨 SG 读到 P3，更晚 ATO 在 P6A 写同一区域，之间没有 WG 栅栏）"** => **§102 里"拒绝复用 KTO/VPO 槽"的判断与仪器反证同形 => 不是事后找理由。**
 ★ **一条物理判断（代理给的，我采纳）**：**40,960 这一档单独进图没有意义** —— occupancy 仍 > 32,768 => **resident WG 不会 1 -> 2 => 判决线 4 注定不满足** => 所以 (b2) 若只跑两态，测出来的最多是"寻址变短的噪声价"，不会给出可转正读数。
 **本铲 GPU 约 40 s（仅两次 JIT 触发，零测量）**；产物：`tools/wb_slm_budget.csv`、`tools/barrier_audit_wb_slm.csv`、`s6/{pe_mk_wbslm,pe_wbs_srcdiff,pe_wbs_text,pe_wbs_ledger,pe_wbs_dis2,spillcheck_wb}.py`；工作区新增两个未跟踪 bench 件（`wb_v4ph_slm.hpp`、`wb_slm_stub.cpp`）已随本条入库。
+
+## 85. ★★★ (ii) 交回：**WB 驻留铲按"物理判死"收 —— 这两发已经贴在我们自己测到的同形 compute anchor 上；不是带宽限制（3-6%），occupancy 也不是主限制**
+**靶子**：`c1 = v4ph(pool) 4.243 ms`、`c690 = v4ph(head) 4.278 ms`（走 45,056 B 那个核的全部 = 2 发/帧）
+**① 读放大**：pool 的窗口网格 **68 x 120 个 8x8 = 522,240 像素 = 544 x 960** => **放大 1.000（完美平铺，没有重叠）**；head = 69 x 121（含 top4/left4 halo）=> **1.023**
+**② DRAM 流量**：输入 = windows x 64 tokens x 32 ch x 4 B = **66,846,720 B**（c1，**正好等于 1267 面，与 [a5-op] 实测一致** ✓）；输出：pool `narrow=0` => **再写一个整幅 f32 面 = 66,846,720 B**；head => 紧凑面 **8,355,840 B**。
+⇒ **c1 合计 133.7 MB / 4.243 ms = 31.5 GB/s**；**c690 76.8 MB / 4.278 ms = 17.9 GB/s**
+⇒ 对照我们自己的带宽实测（`notes/census-knifeB-2026-11-01.md` 的 bare **560 GB/s** nominal、`notes/section100-blueprint.md` 的 **446 GB/s** = 带宽贴顶）=> **这两发只用到 3.2%-5.6%**；**把权重流全按 miss L2 算**（8,192 B/窗 => +66.8 MB）也只到 **47/33 GB/s ≈ 10%** => **带宽判死：不是带宽限制 ✓**
+**③ compute**：每窗 MACs = QKV 64x96x32 + scores 64x64x32 + attnV 64x32x64 + outproj 64x32x32 = **524,288**（head 再 +64x16x32 = 557,056）=> **c1 = 8.556 GFLOP => 2.02 TFLOP/s**；**c690 = 9.298 GFLOP => 2.17 TFLOP/s**
+**④ 屋顶对照（军规 26：只用同形点、不外推）**：`tools/xmx_roof.csv` 里**有同 M/N/K 的 f16 点**：`M=64 N=64 K=32 b=320` => `gemm_b` **0.75**、`gemm_b_pub_f16` **1.31** TFLOP/s；`M=64 N=32 K=64 b=320` => **2.20 / 1.84**（batch 不同 => 只当锚点）
+=> **融合块实测 2.02-2.17 = 贴在这些同形锚点的最好值上** => **它的 gemm 部分已经和我们测过的最快拆腿 f16 gemm 一样快**；而 A770 聚合上限（表里 int8 大形状实测 **41 TFLOP/s**）离它 ~20 倍 => **"离硬件顶很远"但"离这些 tile 形状的可达成速率已经到顶"**
+**⑤ occupancy**：台账 **grf128 / simd1 / slm 45,056 / 无 spill private scratch** => 每 EU 1 个 resident WG；**32,768 是第二个能住下的门槛**
+★ **三态结论**：**不是 bandwidth-bound（3-6%）+ occupancy 不是主限制（compute 已贴同形锚点）+ 剩下的解释是"单个 WG 内的 issue/dependency"** => **把 resident 从 1 抬到 2 并不解开这个结**。
+★ **与历史数据自洽（这就是"当年为什么只兑现 9%"的答案）**：§40 那次已经把 SLM 做到 32,768、实测 **−0.365/32 对** vs 串行上限 −3.9 ms => 兑现 ~9%；**若真是 occupancy-bound，9% 说不过去；若不是，9% 正是应得的数** ✓
+**建议**：**(i)（半块拆分换那 8,192 B）不做** —— 它买的是一个**不 binding 的旋钮**，代价却是 dpas 累加器形态改动 + v9b 的 >8-acc 惩罚区（medium-high）。**这一铲按判死收，但判死的理由是物理（limit 分析），不是"没到 32,768"。**
+**保留的正面产出**：`tools/wb_slm_budget.csv`（12,288 B 的两段来源 + 逐段军规 30 判定）+ (b1) 的机器级仪器（**barrier 18->18、14/18 段逐字节相同、.text 差异中位 3 B**）——**这套仪器通用，下一铲任何 SLM/别名手术直接复用**。
+
+### 军规 63（新，正式入 B2）：**SLM / occupancy 类手术之前，先算两件事：同形 compute anchor 与 DRAM 占比**；两者都不 binding 就别动 SLM。
+本案：c1/c690 的 DRAM 只占实测带宽 3.2-5.6%（按 miss L2 算也只 10%），compute 已贴 `xmx_roof.csv` 同形锚点的最好值（2.02-2.17 vs 2.20）=> occupancy 1->2 不解结 => 历史兑现率 9% 正是应得数。
+★ **推论（下一铲的方向）**：**window_block 这两发要再快，只能换 tiling/复用因子**（更大的 N/K 复用、把窗口合并成宽 M），**不是调 SLM** —— 而这正好落在"换序墙"（军规 42/43）的射程里：**胖形状需要记录/计划层把同形腿排到相邻**。
