@@ -1240,6 +1240,70 @@ int xmx_init(void) {
 
 // int xmx_buf_create(unsigned long long bytes) — libxmx.c:96 shape. esz defaults 2 (half);
 // the gate uses create_kind to set element size for int8/f32 outputs.
+// ---- B step 3 (knife2b #110): scratch VERSIONING of the int8 packed face + row-scale plane ----
+// What it is: the plan re-uses ONE physical buffer (runtime ids 1305 = 9,142,272 B packed face,
+// 1306 = 142,848 B row scale; the plan-table twins are 1272/1273) for every quant producer and
+// its consumer. That reuse is what pins the frame into a total chain: the engine's own greedy
+// wave planner, replayed offline on the recorded touch sets, gives waves=691 / maxwidth=1 /
+// critical path = the whole serial sum (s6/pe_b3_price.py), and these two ids hold 396 of the
+// 690 consecutive links EACH. Versioning rotates the LOGICAL ids through a ring of K physical
+// groups: same bytes, same values, same producer->consumer distance -- only which allocation a
+// group lands in changes, so the dependency graph loosens for the later reorder/merge cuts.
+// GATED: NR_SCRATCH_PRIV unset/0 => sp_advance() returns at its first line and the frame is
+// bit-identical. NR_SCRATCH_PRIV_IDS overrides the id set; NR_SCRATCH_PRIV_K sets the ring
+// depth (default 4 = the approved budget: 3 extra copies x (9,142,272 + 142,848) B = 26.6 MiB;
+// slot 0 reuses today's buffer, so nothing leaks).
+static bool sp_on() {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("NR_SCRATCH_PRIV"); v = (e && atoi(e) != 0) ? 1 : 0; }
+    return v == 1;
+}
+// Versioning targets are chosen by ROLE = exact byte size, not by id: the plan buffers keep
+// ids 1..1301 in BOTH recordings while each recording also creates ~12 runtime scratch
+// buffers, and the chain-holding planes are runtime ids 1305 (9,142,272 B int8 packed
+// face) and 1306 (142,848 B row scale) -- created only in the second recording. Keying
+// off fixed ids therefore versioned the wrong 512-byte placeholders (extra_bytes=1536,
+// touch graph unchanged -- caught by the declared-set check in s6/pe_b3_check.py).
+// The sizes are unique across the whole [bufnew] census, so size-role matching is exact.
+// NR_SCRATCH_PRIV_SIZES overrides the list.
+static std::set<unsigned long long> sp_sizes() {
+    static std::set<unsigned long long> s;
+    if (!s.empty()) return s;
+    const char* e = getenv("NR_SCRATCH_PRIV_SIZES");
+    if (e && *e) { const char* p = e; while (p && *p) { unsigned long long v = strtoull(p, 0, 0); if (v) s.insert(v); p = strchr(p, ','); if (p) ++p; } }
+    else { s.insert(9142272ull); s.insert(142848ull); }
+    return s;
+}
+static std::set<int> g_sp_live;
+static void sp_note_created(int id, unsigned long long bytes) {
+    if (!sp_on()) return;
+    if (sp_sizes().count(bytes)) g_sp_live.insert(id);
+}
+static std::map<int, std::vector<void*>> g_sp_ring;   // logical id -> physical ring
+static std::map<int, size_t> g_sp_pos;
+static size_t g_sp_extra_bytes = 0;
+static void sp_advance() {
+    if (!sp_on()) return;
+    int K = getenv("NR_SCRATCH_PRIV_K") ? atoi(getenv("NR_SCRATCH_PRIV_K")) : 4;
+    if (K < 1) K = 1;
+    for (int id : g_sp_live) {
+        auto it = g_bufs.find(id);
+        if (it == g_bufs.end()) continue;
+        std::vector<void*>& r = g_sp_ring[id];
+        if (r.empty()) {
+            r.push_back(it->second.p);                       // slot 0 = today's buffer, nothing leaks
+            for (int kk = 1; kk < K; ++kk) {
+                void* p = sycl::malloc_device(it->second.bytes, *GQ);
+                if (!p) { std::printf("[scrpriv] REFUSED: malloc %zu B for id=%d\n", it->second.bytes, id); std::fflush(stdout); return; }
+                r.push_back(p); g_sp_extra_bytes += it->second.bytes;
+            }
+        }
+        size_t& s = g_sp_pos[id];
+        s = (s + 1) % r.size();
+        it->second.p = r[s];                                 // re-point the logical id for this group
+    }
+}
+
 // int xmx_buf_create_kind(unsigned long long bytes, int kind) -- the GAME ABI's second
 // argument is the buffer KIND (xmxres.py:283 GRAPH=0/HOST_READ=1/HOST_WRITE=2), which is
 // what a walk of the plan feeds and what the shipped libxmx.c takes. It is metadata only
@@ -1267,6 +1331,7 @@ int xmx_buf_create_kind(unsigned long long bytes, int kind) {
     if (!p) FAILMSG("out of device memory");
     int id = g_nextbuf++;
     g_bufs[id] = { p, (size_t)bytes, (size_t)(kind == 0 ? 2 : kind), false, g_gen };
+    sp_note_created(id, bytes);   // B step 3: register versioning targets by role
     if (getenv("NR_BUFNEW")) {   // presence-gated, host print only (rules 4/9)
         // during_closure = how many closures have been pushed so far, i.e. which op was being
         // recorded when this buffer appeared. (An earlier draft indexed g_cmd_names with an
@@ -1431,6 +1496,7 @@ int xmx_buf_destroy(int id) {
 }
 
 int xmx_begin(void) { ++g_gen; g_recording = true; g_cmds.clear();
+    g_sp_live.clear();   // B step 3: the versioned ids are per recording
     // B step 1 (knife2b #106): the record-scoped side vectors start empty with the stream,
     // exactly like g_cmds. Clearing only at capture was wrong: the plan records TWICE (the
     // scratch recording, then OP_XMX_ABORT, then the kept recording) and the census runs at
@@ -2140,13 +2206,25 @@ static void bmerge_order_report() {
 // The [pgt] dump above is printed inside pg_push, i.e. at RECORD time -- a reorder applied at
 // capture time is invisible to it. This dump runs on the frozen vectors, after the reorder, so
 // the declared-set check (s6/k1_declare.md) can actually see the permutation. Presence-gated.
+static std::map<void*, size_t> g_ptr_ord;   // canonical pointer ordinals (rule 64)
 static void pgraph_final_dump() {
+    g_ptr_ord.clear();
     if (!getenv("NR_PG_FINAL")) return;
     size_t n = g_cmds.size();
     size_t noff = g_cmd_names.size() >= n ? g_cmd_names.size() - n : 0;
     for (size_t i = 0; i < n; ++i) {
         std::printf("[pgt-final] cmd=%zu name=%s ids=", i, g_cmd_names[noff + i]);
         for (int id : g_pg_ids_snap[i]) std::printf(" %d", id);
+        // ... and the POINTERS, as canonical first-seen ordinals. Scratch versioning re-points a
+        // logical id to a different allocation, so the id list alone cannot show it: the engine's
+        // conflict test (pgraph_conflict) compares void*, and military rule 64 says compare
+        // sequences by ordinal, never by raw address. ptrs= is what the wave planner sees.
+        std::printf(" || ptrs=");
+        for (void* p : g_cmds_touch[i]) {
+            auto o = g_ptr_ord.find(p);
+            if (o == g_ptr_ord.end()) { o = g_ptr_ord.emplace(p, g_ptr_ord.size() + 1).first; }
+            std::printf(" %llu", (unsigned long long)o->second);
+        }
         std::printf("\n");
     }
     std::fflush(stdout);
@@ -2162,6 +2240,8 @@ int xmx_graph_capture(void) {
     pgraph_final_dump();       // the FROZEN touch sets, i.e. after any reorder -- [pgt] cannot show it
     rb_report((int)g_graphs.size());      // NR_RES_BYTE census (no-op when the switch is unset)
     group_census_report((int)g_graphs.size());   // B step 1: report-only (NR_GROUP_TRACE)
+    if (sp_on()) { std::printf("[scrpriv] versioned_ids=%zu extra_bytes=%zu (%.1f MiB)\n",
+                    g_sp_live.size(), g_sp_extra_bytes, (double)g_sp_extra_bytes / 1048576.0); std::fflush(stdout); }
     g_graphs.push_back(std::move(g_cmds)); g_graph_names.push_back(std::move(g_cmd_names));
     g_graph_touch.push_back(std::move(g_cmds_touch)); g_cmds_touch.clear();
     g_cmds.clear();
@@ -4808,6 +4888,7 @@ int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
 // whole and 16-byte aligned however the image rows lie).
 int xmx_rec_quant_window(int source, int packed, int scale, unsigned M, unsigned K,
                          unsigned height, unsigned width, unsigned across, unsigned pad) {
+    sp_advance();   // B step 3 (see the helper above)
     if (!g_recording) FAILMSG("not recording");
     static int qwstop = getenv("NR_QW_STOP") ? atoi(getenv("NR_QW_STOP")) : 0;
     if (qwstop == 9) { g_cmd_names.push_back(__func__);pg_push([](){}); return 0; }
@@ -6439,6 +6520,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
 // int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K)
 // libxmx.c:2471 shape ([c_int]*3 + [c_uint]*2). Appends the proven SYCL kernel.
 int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
+    sp_advance();   // B step 3: one ring step per producer group (no-op when off)
     if (!g_recording) FAILMSG("not recording");
     // NR_Q_STOP=9 (section 100 P7 floor ledger, time-only DIAGNOSTIC -- the frame
     // output is garbage by design here, same convention as the NR_*_STOP family;
