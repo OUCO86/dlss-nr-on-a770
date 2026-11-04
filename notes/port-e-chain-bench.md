@@ -1695,3 +1695,68 @@ B3-b 我按 `pe_k3_roofgroup.py` 报的"SRP_GRP=45"跑了 3 个进程，**日志
 | `f16 130560x96x32b1` / `130560x64x32b1`（wb 两相） | 2 / 2 | 2.322 / 2.322 |
 ⇒ **补前两个（合计 20 条腿、11.9 ms 实测）就够把 residual 家族与 ffn 家族的账闭合**；协议照父的令：**每点 ≥6 独立进程、间隔 ≥60 s、min-of-15×5、nosink、台账 `grf/simd/slm/private/spill/scratch/scrInstr` 全记、M 当轴、组号用探针自己打出的名字回验（军规 79）**。
 **现场**：零 GPU（本步）；进程 0；两槽 `3BAECF2A…`、三金标、`out\SHIPPED_MD5.txt` 未动；产物 `tools/anchor_gap.csv`；脚本 `s6/{pe_anchor_gap,pe_anchor_gap2,pe_flopsrc}.py`；账 §119。
+
+
+# §120 **新铲 ②：两个缺的相位屋顶已补（**12 进程池化**、组名回验过）+ 锚点表 v3（**加字节地板**）+ kernel 内杠杆预算表 `tools/kernel_levers.csv`　2026-11-05 05:0x-05:4x
+## (2) 补屋顶：`G54_i8_8160_128_128` 与 `G55_f16_130560_32_128`
+**先修我自己的下标错（军规 79）**：这次**从 `GROUPS` 字面量里数条目**（53 条 ⇒ 新组下标 53/54），**并在每次进程输出里回读探针自己打的组名** ⇒ 12 次全部对上（`grp=G54_i8_128…` / `G55_f16_130560_32_128`）✓
+**协议**：min-of-15×5、nosink、**每点 12 个独立进程**（第一轮 6 个的 spread 有 22-123% ⇒ 低置信 ⇒ **又跑 6 个池化到 12**，批前冷却 300 s）。台账：`grf=128 simd=1 slm=10,240/18,432 scratch=0 scratch_instr=0` ✓；**`private/spill` 仍是 `-`** ⇒ **这是工具缺口**（`mk_roof_ledger.py` 走 ocloc disasm 那条路不吐这两列；要填得读 `.state/.hw` 资源段）⇒ **如实记，不假装有数**。
+**并入台账后（`tools/xmx_roof.csv` 252 行）的低置信标注**：`int8 gemm_b 8160x128x128` **spread 143.9%**、`f16 8160x128x128` 42.0%/37.5%、`gemm_b_pub` 42.6% ⇒ **只有 `int8 gemm32_b_pub 130560x32x128`（1.2%）与 `gemm32_b`（32.5%）算硬**；**下面 residual 族的 headroom 有一部分建在这几条低置信行上 ⇒ 用前要先重测或取池内 min**（军规 35b）。
+**顺手修一个我自己的算错**：合并脚本把 TOPS 多乘了 1e3（GFLOP/ms 本身就是 TFLOP/s）⇒ **8 行 TOPS 全部改回正确值**（3.0-9.5 TOPS，与旧行同一量纲）✓
+## (1) v3：锚点 = **max(相位计算屋顶, 字节地板)**（这是 v2 缺的半边；字节地板 = 该闭包摸到的面总字节 ÷ 560 GB/s，§6.22 实测锚）
+| family | 有完整锚点的腿 | 实测 ms | **headroom = 实测 − 锚点** | 字节绑定的腿 |
+|---|---|---|---|---|
+| **`gemm_int8_residual`** | **54/54**（补了 8160×128×128 之后全锚） | 20.03 | **12.13 ms** | **46** |
+| `global_attention` | 8 | 11.48 | 10.68（**不可当可挖**：softmax/归一/merged 面搬运不在相位模型里） | 0 |
+| `gemm_int8_qkv` | 40 | 9.64 | 5.52 | 26 |
+| `gemm` (f16) | 18 | 7.00 | 3.32 | 18 |
+| `gemm_int8_batched` | 18 | 4.73 | 3.17 | 2 |
+| `window_attention` | 16 | 10.18 | 2.70 | 0 |
+| `gemm_window_int8_residual` | 18 | 11.33 | 2.24 | 18 |
+| `gemm_int8` | 10 | 2.70 | 2.08 | 8 |
+| **`window_block`** | 7 | 18.19 | **2.01（17%）** | 0 |
+| **`ffn`（新锚上）** | 8 | 6.24 | **1.61** | 0 |
+⇒ **两条判决级读数**：
+ 1. **`ffn` 补上 project 相屋顶后，headroom 只有 1.61 ms ⇒ B3/胖 ffn 彻底没肉**（它已经在 chip 一核上、且贴着相位锚点）✓✓
+ 2. **`window_block` 四相解释 83% ⇒ 不是 kernel 级余量的靶**（与 §105、§98 的 WB_FUSE +0.08 ms 三点互证）✓
+⇒ **真正的 kernel 级靶 = `gemm_int8_residual`（12.13 ms，且 46/54 条腿是**字节绑定**）+ `gemm_int8_qkv`（5.52 ms，26 条字节绑定）** ⇒ **注意"字节绑定"这半句把杠杆方向定死了：不是填充率，是流量**。
+## (3) `tools/kernel_levers.csv`（杠杆预算，**不写帧收益**）
+- **L1 int8 BM 128→64（填充）**：M=192 时 2 个行 tile ⇒ 发 256 行算 192 行 = **75% 填充**；BM=64 ⇒ 3 tile = 100%。**但 `gemm_s8_v5_kernel.hpp` 自己的注释记着第一次 BM=64 尝试是坏的**（`WI_ROWS=BM/16` 从 8 变 4，`offA=wi_row*512` 越过 SLM_A 2,048 B）⇒ **这是 WI 映射重写，不是参数翻转**；SLM_A 4,096→2,048 B、总 SLM 18,432→~16,384 B（都在 32,768 线下）；**barrier/跨-WI staging 要重派生 ⇒ 军规 30/63**；**BM=64 的 int8 形没有屋顶点 ⇒ 先补屋顶才许谈倍率**。
+- **L2 int8 BN 64→128（B 重读流量）**：46/54 条 residual 腿是字节绑定 ⇒ **这才是对的方向**：列 tile 16→8、A-tile 重读减半；SLM_B 2,048→4,096 B、总 SLM ~20,480 B（<32,768 ✓）；WI_COLS 4→8 ⇒ NT 32→64 或改映射；**s8v9 已经是 BM=64/BN=128 的现成核** ⇒ **它的屋顶点在台账里没有 ⇒ 下一步补它**（6 进程 × 2-3 形 ≈ 15 min）。
+- **L3 f16 v1→v2（4× 复用）**：**已在 P12a 被一次 3 对 A/B 判过 NEUTRAL** ⇒ 若要重开必须 ≥10 对；且 f16v2 在帧形上没有屋顶点。
+- **L4 window_block：不建议任何杠杆**（17% headroom + 三处互证）。
+- **L5 global_attention：先修锚点再谈杠杆**（softmax/搬运没有地板模型 ⇒ 10.68 ms 不是钱）。
+## 下一铲（我建议，等批）
+**补 `s8v9`（BM=64/BN=128）在帧形上的屋顶点**（`int8 192×1024×4096`、`192×192×128`、`8160×128×128` 三形 × 6 进程 ≈ 20 min GPU），**同时把 residual 那几条 spread>40% 的旧屋顶点重测到 12 进程** ⇒ 然后才允许对 L1/L2 写倍率与 bench 成对单价（军规 74）。
+## 现场
+本盒 GPU ≈ **44 min**（roof 首轮 12 进程 ≈ 20 min + 冷却 5 min + 池化 12 进程 ≈ 19 min），批间 60 s、>20 min 批后冷却已做；进程 0；两槽 `3BAECF2A…`、三金标、`out\SHIPPED_MD5.txt` 未动；产物 `tools/anchor_gap.csv`（v3，14 列含字节地板/锚点/headroom/bound）、`tools/kernel_levers.csv`、`tools/xmx_roof.csv`（+8 行、12 进程池化、TOPS 修正）、日志 `s6\SHAPE_ROOF_phase{,2}.log`、`s6\SHAPE_ROOF_ledger.csv`；脚本 `s6/{pe_anchor_gap3,pe_k4_roofgroups,pe_k4_roof.ps1,pe_k4_roof2.ps1,pe_roof_merge,pe_roof_merge2,pe_roof_fixtops,pe_levers,pe_kern_geom,pe_lever_src,pe_probe_order}.py|ps1`；账 §119/§120。
+
+
+# §121 **新铲 A+B：台账工具的 private/spill 真相（**§60 那个"private 6,304-6,464 B"其实是 **SCRATCH 字节**，标签错**）+ 两颗牙都验过 + `tools/traffic_breakdown.csv`（**字节花在输出面/残差面上，加宽 tile 只能砍 1-6%**）**　2026-11-05 05:2x-05:5x
+## A：把工具缺口查到底（零 GPU）
+**审计结论**（`.ze_info` 全文 + 两个工具并排跑）：ocloc **1.73** 在这批 zebin 上每核只吐 `grf_count / simd_size / slm_size / barrier_count`，**外加一个只在真有 scratch 时出现的 `type: scratch … size: N` 块**；**`private_size` / `spill_size` 这两个键根本不存在** ⇒ 过去所有表里的 `-` 是"键不存在"，不是"值为 0"。
+⇒ **`spillcheck_port.py` 里 `g('private_size')/g('spill_size')` 永远返回 `-`，而 6,304-6,464 这些数是从 `type: scratch … size:` 来的 ⇒ 它们是 **SCRATCH 字节**，被 §60 的账写成了 "private 6,304-6,464 B" ⇒ 标签错**（结论不变、而且更硬：scratch 是走 DRAM 的溢出，比 private 更糟；`port::fused` 依然过不了健康闸第 4 条）。
+**修好的工具 `s6/mk_roof_ledger2.py`**（改动三处）：
+ 1. **块窗口改成"到下一个 `- name:` 为止"**（原来固定 6,000 字符，长 payload 会把资源字段推出窗外 ⇒ 这就是为什么有些行连 `slm` 都读成 `?`）；
+ 2. **列名诚实化**：`scratch_bytes`（来自 type: scratch 块）、`scratch_instr`（.asm 计数）、`private/spill` 一律写 **`n/a(ocloc1.73)`**（不再用 `-` 冒充 0）；
+ 3. **两颗牙内建**（军规 36/46/61），跑在 `E:\DSH\sycl-cache-portE` 上：
+    - **牙 1（脏核必须报非空）**：`port::fused` ⇒ **scratchB = 6,336 / 6,464、scratchInstr = 181-197** ✓ **PASS**
+    - **牙 2（净核必须报 0/0）**：`quantize_row` ⇒ **scratchB=0、instr=0（12 行）** ✓ **PASS**
+    - 顺带 `ffn2::fused / ffn3::fused / f16v2 / packdev::*` 全部 **scratchB=0、instr=0** ✓（我们自己的核干净）
+**台账刷新**：`tools/xmx_roof.csv` 的 184/252 行按新语义重写（`int8 gemm32_b 130560x32x128` 的 slm 从 `?` 修成 **15,360**、`gemm32_b_pub` 10,240、`gemm_b` 18,432 ✓；private/spill 一律 n/a）。
+## B：`tools/traffic_breakdown.csv`（零 GPU；tile 常数取出货 `gemm_s8_v5_kernel.hpp` 的 BM=128/BN=64/BK=32 ⇒ 重读因子是算术不是猜）
+**先排雷**：第一版把 **A5/qfuse 的融合与 no-op 闭包**也塞进流量模型 ⇒ 算出 **3,300-6,500 GB/s（= 560 锚点的 600-1,100%）** 的荒谬"等效带宽" ⇒ **修 = 排除带 `(A5-fused)`/`(FUSED-pack)` 标记与 ms<0.02 的腿**（7 条）⇒ 现在 159 条腿全部合理。
+| family | 腿 | A 重读 MB | B 重读 MB | 残差面读 MB | 输出面写 MB | 合计 MB | **加宽 tile 能砍** | **只有改面宽能砍** | tile 份额 |
+|---|---|---|---|---|---|---|---|---|---|
+| qkv | 39 | 10.5 | 5.2 | 0 | **172.6** | 189.2 | 5.2 | 86.3 | **5.6%** |
+| residual | 54 | 7.8 | 3.9 | **82.8** | **82.8** | 178.9 | 3.4 | 82.8 | **3.9%** |
+| winres | 38 | 2.9 | 1.5 | **85.0** | **85.0** | 176.0 | 0.9 | 85.0 | **1.1%** |
+| batched | 18 | 4.3 | 2.1 | 0 | 68.2 | 75.7 | 2.1 | 34.1 | 5.7% |
+| gemmint8 | 10 | 4.4 | 2.2 | 0 | 13.9 | 20.6 | 2.2 | 6.9 | 23.9% |
+⇒ **三条硬结论**：
+ 1. **字节花在"输出面写 + 残差面读"上**（residual/winres 两族各 ~168 MB，占合计的 **94%**）⇒ **L2（BN 64→128）最多砍 1-6% ⇒ 不是杠杆**；**而且对 N=64 的腿 BN=128 是负数（-0.03~-0.04 MB ⇒ 反而多读 B）⇒ L2 在 residual/winres 上被算术判死**。
+ 2. **改面宽（f16 2B → int8 1B）能砍的那一半 = `NR_RES_BYTE` 的路**——它当年死在时间上（0.49-0.76x），**要重开必须先过这张表 + 新屋顶**（父的令）⇒ **本表已给出它的上限：residual/winres 各 ~85 MB 的一半 ≈ 42/85 MB 量级的流量下降**。
+ 3. **最深的发现**：最大流量的腿（c18/c29/c34/c53…）**实测只跑到 15-44 GB/s = 560 锚点的 2.7-7.9%** ⇒ **它们既不贴计算屋顶、也不贴字节地板 ⇒ 是"每工作组效率/波次填充"问题**：residual 的 M=32,640/N=64/K=64 在 BM=128/BN=64 下只有 **255 个工作组**（不到一个满波）⇒ **BM 128→64 的杠杆意义从"填充率 75%→100%"升级为"工作组数 255→510（波次填满）"** ⇒ **这正是 s8v9（BM=64/BN=128）该测屋顶的理由 ⇒ 步骤 C 的靶被 B 表正面定出来了**。
+## 现场
+零 GPU（A+B 全 host）；进程 0；两槽 `3BAECF2A…`、三金标、`out\SHIPPED_MD5.txt` 未动；工作区 `M src/bench/sycl/libxmx_sycl.cpp`（诊断暖机循环，你已裁定留着）+ 新表 `tools/traffic_breakdown.csv`、`tools/xmx_roof.csv`（列刷新）、`s6/ROOF_ledger2.csv`/`ledger2_{port,roof}.csv`；脚本 `s6/{mk_roof_ledger2,pe_roof_cols,pe_traffic_breakdown,pe_traffic_fix,pe_privprov,pe_privkeys,pe_sectnames,pe_zeinfo2,pe_portze,pe_spillparse}.py`；账 §121。
+**下一步（C，已批）**：给探针加 **s8v9（BM=64/BN=128）腿**，测 `int8 192x1024x4096`、`192x192x128`、`8160x128x128` 三形（**每点 12 进程**、组名回验、private/spill 记 n/a、M 当轴）；顺带把 spread>40% 的旧行重测到 12 进程。**GPU 预算 ~40 min，开工前凉 ≥5 min。**
