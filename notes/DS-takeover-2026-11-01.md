@@ -1650,3 +1650,19 @@ gates: 40 GREEN / 0 RED
 ★ **核里已有先例**：`scrC = S_PPO + sgid*2048`（line 71 注释 **"scrC aliases the PPO head, dead until softmax"**）=> **拆槽/挪相本来就是这个核的既有做法**。
 **⑤ 三条风险（都写进表）**：⑴ **两段缺一不可**：只做第 1 段 = 40,960 够不到 32,768 => **停下回报，不算部分出货**；⑵ **第 2 段有真实反噬风险**：热相（P3 scores / P4 softmax / P5 attnV）循环翻倍、dpas 累加器从 `simd<float,64> x 4` 变两半的 `simd<float,32> x 4` => **v9b 教训（每线程累加器进 >8 惩罚区）说这可能把驻留收益吃掉** => (b) 必须**三态成对计价**（现档 / 新档 / 新档+拆槽），**不拿单核价外推家族价**（军规 54/55）；⑶ **历史兑现率只有约 9%**：上限 −3.9 ms 串行 vs 实测 −0.365（32 对）=> occupancy 之外还有更强限制（D2H/全局带宽或 wave 划分）=> **(b) 之前不给帧值承诺**。
 **零 GPU**（本铲至今只跑了 40 门 12 min + RUN_TIMING 2 min，均在上一盒）；新产物 `tools/wb_slm_budget.csv`、`tools/barrier_audit_wb.csv`、`s6/pe_wb_census.py`、`s6/pe_shipped_rt_read.py`、`s6/RT_shipped.timing.txt`。
+
+## 84. ★ (b1) 交回：**机器级 PASS（barrier 条数 18 -> 18 一字不差）**；state-2 只到 **40,960**，state-3 未做 => **照预登记判决线 3 当场停，(b2) 未跑**
+**补上 2026-11-02 缺的那件仪器**：
+1. `s6/pe_mk_wbslm.py`：从 **shipped 头逐字复制** 出 `src/bench/sycl/wb_v4ph_slm.hpp`，**只改三处**（namespace `wbv4ph -> wbv4phS`、region 常量按 `WBS_STATE` 选表、`esimd::slm_init<WBS_SLM>()`）=> 文本 diff 就这几行，**barrier 调用点 17 = 17**；
+2. `src/bench/sycl/wb_slm_stub.cpp`：只实例化核的 codegen stub（`stop_stage=0xFFFF` => 核第一行 return、指针全假 => **不执行任何访存**），跑一次只为把设备码写进缓存（两次约 20 s，**不是测量**）；
+3. `s6/pe_wbs_text.py`：按 ELF 段表从 JIT 缓存切出**本核 `.text`** 逐字节比；
+4. `s6/spillcheck_wb.py`（放宽 label 版，`s6/pe_wbs_ledger.py` 驱动）=> **拿到 ocloc 反汇编的 `.text....launch_v4ph....asm` 并数 `signal barrier`** —— 这就是当年 PARTIAL 缺的东西。
+| state | grf | simd | **slm(B)** | spill/private/scratch | asm 行数 | **signal barrier** |
+|---|---|---|---|---|---|---|
+| **1 现档（shipped 布局）** | 128 | 1 | **45,056** | - | 3,485 | **18** |
+| **2 仅 `AQO->ATO` 别名** | 128 | 1 | **40,960** | - | 3,487（**+2 行**）| **18** ✓ |
+★ **判决线 1 的硬要求满足：barrier 18 -> 18 => 没有新增栅栏**（前置 2 在机器级成立）；
+★ **ELF 段级对照**：18 段里 **14 段逐字节相同**，只有本核 `.text`（46,400 -> 46,592，**+192 B**）、`.symtab`、`.spv`（369,200 -> 369,076，−124 B）、`.ze_info` 变 => **不是"整核重写"**；`.text` 差异 = **5,911 段、最长 87 B、中位 3 B** => **正是 SLM 立即数重编码的形状**（+2 行 asm / +192 B 属寻址再折叠，不是栅栏）✓
+★ **仪器互证很干净**：`barrier_audit.py` 跑改后源码（`BARRIER_SRC=E:\DSH\tmp\wb_slm_shadow`）=> **所有区段 verdict_source = OK、WG=1/SG=16 不变**；而它自带的反证用例正是 **"故意 ATO->S3 => RACE_REUSE（KTO 跨 SG 读到 P3，更晚 ATO 在 P6A 写同一区域，之间没有 WG 栅栏）"** => **§102 里"拒绝复用 KTO/VPO 槽"的判断与仪器反证同形 => 不是事后找理由。**
+★ **一条物理判断（代理给的，我采纳）**：**40,960 这一档单独进图没有意义** —— occupancy 仍 > 32,768 => **resident WG 不会 1 -> 2 => 判决线 4 注定不满足** => 所以 (b2) 若只跑两态，测出来的最多是"寻址变短的噪声价"，不会给出可转正读数。
+**本铲 GPU 约 40 s（仅两次 JIT 触发，零测量）**；产物：`tools/wb_slm_budget.csv`、`tools/barrier_audit_wb_slm.csv`、`s6/{pe_mk_wbslm,pe_wbs_srcdiff,pe_wbs_text,pe_wbs_ledger,pe_wbs_dis2,spillcheck_wb}.py`；工作区新增两个未跟踪 bench 件（`wb_v4ph_slm.hpp`、`wb_slm_stub.cpp`）已随本条入库。

@@ -1215,3 +1215,25 @@ FAIL 要求 out/libxmx.dll 与 oneapi/libxmx_sycl.dll 必须 ABB969FE（你没�
 **另两条要记的账**：
  - **靶子只有 2 个 closure / 帧（8.52 ms 串行）** ⇒ 历史"上限 −3.9 ms 串行"对应这两条；**而历史实测只有 −0.365 ms/32 对** ⇒ **兑现率 ≈ 9%** ⇒ 说明驻留/occupancy 之外还有更强的限制（很可能是 D2H/全局带宽或 wave 划分）⇒ **(b) 之前我不承诺帧值**；
  - **8 条 non-pool/head 走的是另一条路**（不是 45,056 的核）⇒ 本铲不动它们；若 (b) 显示 32,768 的收益主要来自 occupancy，那 8 条的 shape 也值得单独看一眼（**但那是下一铲，不在本铲范围**）。
+
+
+# §103 **(b1) 机器级对照 = PASS：barrier 条数 18 → 18 一字不差、台账干净、SLM 45,056→40,960 到手；但 state-2 只到 40,960 ⇒ 按判决线 3 = 停下回报（state-3 半块拆分未做）**　2026-11-04 08:2x-08:4x（纯 CPU + 两次 20 s 的 JIT 触发，零测量）
+## 仪器怎么搭的（前一次机器级只是"数了 barrier 没逐字节"，这次补全）
+1. `s6/pe_mk_wbslm.py` 从 **shipped 头文件逐字复制** 出 `src/bench/sycl/wb_v4ph_slm.hpp`：只改三处（namespace `wbv4ph`→`wbv4phS`、region 常量按 `WBS_STATE` 选表、`esimd::slm_init<WBS_SLM>()`）⇒ **文本 diff 只有这几行**（`s6/pe_wbs_srcdiff.py` 打印），**barrier 调用点 17 = 17**；
+2. `src/bench/sycl/wb_slm_stub.cpp` = 只实例化核的 codegen stub（`stop_stage=0xFFFF` ⇒ 核第一行就 return，指针全是假值 ⇒ **不执行任何访存**），跑一次只为把设备码写进 `sycl-cache-portE`（两次 20 s，不是测量）；
+3. `s6/pe_wbs_text.py`：从 JIT 缓存的 `0.bin` 里按 ELF 段表切出 **本核的 `.text`** 直接逐字节比；
+4. `s6/spillcheck_wb.py`（`spillcheck_port.py` 的 label 放宽版，`s6/pe_wbs_ledger.py` 驱动）：拿到 **ocloc 反汇编出的 `.text.…launch_v4ph….asm`** ⇒ **数 `signal barrier`** ✓ 这就是缺失的那件仪器。
+## 读数（两态成对）
+| state | grf | simd | **slm(B)** | spill | private | scratch | asm 行数 | **signal barrier** |
+|---|---|---|---|---|---|---|---|---|
+| **1 = 现档（shipped 布局）** | 128 | 1 | **45,056** | - | - | - | 3,485 | **18** |
+| **2 = 仅 `AQO→ATO` 别名** | 128 | 1 | **40,960** ✓ | - | - | - | 3,487（**+2 行**）| **18** ✓✓ |
+**ELF 段级对照**（`pe_wbs_text.py`）：18 段里 **14 段逐字节相同**；只有本核 `.text`（46,400→46,592，**+192 B**）、`.symtab`、`.spv`（369,200→369,076，−124 B）、`.ze_info` 变 ⇒ **不是"整核重写"**；`.text` 差异 = **5,911 段、最长 87 B、中位 3 B** ⇒ 正是 SLM 立即数重编码的形状 ✓
+**判决线 1 的硬要求（barrier 条数不许变）满足：18 → 18** ⇒ **没有新增栅栏**（前置 2 在机器级也成立）✓
+**军规 30 / 仪器互证**：`barrier_audit.py` 在**改后源码**上（`BARRIER_SRC=E:\DSH\tmp\wb_slm_shadow`，把副本按原名放进去）⇒ **所有区段 verdict_source = OK，WG=1/SG=16 不变** ✓；而它自己的反证用例正是 **"故意 ATO→S3 ⇒ RACE_REUSE（KTO 跨 SG 读到 P3，更晚 ATO 在 P6A 写同一区域，之间没有 WG 栅栏）"** ⇒ **我在 §102 里拒绝复用 KTO/VPO 槽的判断，与仪器的反证形态完全同一** ⇒ 这次是"仪器先说危险、我没去碰"，不是"事后找理由" ✓
+## 现在的状态与停止点
+- **(b1) 通过**（source + machine 两栏都有实测，不再是 2026-11-02 的 PARTIAL）；
+- **但 state-2 只到 40,960**，**state-3（SCR 每 SG 4,096→2,048 的半块拆分）还没实现** ⇒ 按**判决线 3**：`只到 40,960 而 32,768 不可达 ⇒ 停下回报，不算部分出货` ⇒ **我在此停，不进 (b2) 计价**（40,960 这一档单独进图没有意义：occupancy 从 45,056→40,960 仍 >32,768，**驻留数不会从 1 变 2**，判决线 4 注定不满足）。
+**(b2) 要不要跑，等你一句话**：可跑的两条腿 = (i) 先实现 state-3（P3/P4/P5 拆 8 行半块，**这才是那 8,192 B 的来源**，也是我标了 medium-high 风险的那段：dpas 累加器从 `simd<float,64>×4` 变两半 `×4`，v9b 惩罚区）；(ii) 或者先只做 **40,960 的 per-launch 计价**（现档 vs 别名档）来**回答你 ⑥ 想要的"当年为什么只兑现 9%"**——这一条不需要 state-3，只要把探针 `wb_ga_probe.cpp` 改成调 `wbv4phS::launch_v4ph`（已有副本，两行文本改动）就能成对出价。
+**我的建议**：先做 (ii)（便宜、且它给的是**下一刀的定价依据**，判死也算赚），再做 state-3 的实现与三态对照。
+**GPU**：本铲只用了 **~40 s**（两次 stub JIT 触发，零测量）；进程 0；两槽仍 `3BAECF2A…` ✓、三金标未动 ✓、`out\SHIPPED_MD5.txt` 未动 ✓；未 commit；新产物 `wb_v4ph_slm.hpp`、`wb_slm_stub.cpp`、`s6/pe_mk_wbslm.py`、`s6/pe_wbs_srcdiff.py`、`s6/pe_wbs_text.py`、`s6/pe_wbs_ledger.py`、`s6/spillcheck_wb.py`、`tools/barrier_audit_wb_slm.csv`、`tools/wb_slm_budget.csv`。
