@@ -1613,3 +1613,23 @@ deltas: `-0.670 -0.470 -1.440 -1.080 -1.150 -0.810 -1.200 -1.030 -1.090 +0.040 -
 `deltas: -0.840 -1.650 -1.370 -1.220 -1.100 -1.190 -1.180 -1.230 -1.190 -1.120 -1.380 -1.370 -1.220 -1.090 -1.360 -1.510`
 **n=16 mean −1.251 sd 0.188 CI95 [-1.352,-1.151] 赢 16/16**，每对 `691/691` => **达"当场转正"判据（<=−1.0 且 >=10/16）**；比上一铲 −0.978 改进 **−0.273 ms**，与捡白工预测 +0.31 吻合 ✓；**sd 0.392 -> 0.188**（同热更稳）；**CI 只覆盖同热重复性，不含跨盒热漂移**。
 本盒 GPU 约 **59 min**（① 16 + ② 5 + ③ 38，批间 >=60s、>20 min 批后已冷却）。
+
+
+## 82. ★★★ **转正完全干净：全量 40 门 = 40 GREEN / 0 RED（跑在转正件本身、加载位、不 stage 不复原）**
+`bash E:/DSH/run_gates.sh`（前置 300 s 冷却，上盒 GPU ~60 min）尾部：
+```
+GREEN gate_gemm_int8
+GREEN gate_coexist
+GREEN gate_skip_graph          <-- 新守卫（读 out/SHIPPED_MD5.txt）现在 GREEN
+gates: 40 GREEN / 0 RED
+```
+**跑完槽位复核（没被动过）**：`out\libxmx.dll` = **`3BAECF2A…`**；`oneapi\libxmx_sycl.dll` = **同一颗** ✓（军规 59 ① 保持）；`out/SHIPPED_MD5.txt` = `3baecf2a4b0f49f45e2557ce4808c2cf` ✓（守卫的单一出处）；回退点 `out\libxmx.before-ATT5.keep` = **`ABB969FE…`** ✓（另有 `builds\libxmx_sycl_ABB969FE.bak{,2}.dll`）。进程 0。
+**军规 62（采纳代理建议）**：**身份守卫必须读单一出处，不许写死常数** —— 写死会让每次转正都产生一个"按设计 RED"的门，**把实质检查淹掉**，还会让人误判"变体没过 40 门"。
+
+### 82b. ★ 转正件上的**逐 op 新底账**（`NR_RUN_TIMING`，691 行，**总串行 114.63 ms**；对比 A5 前同族 135.98）
+`gemm_int8_residual 20.06 (68) / window_block 18.19 (10) / global_attention 11.48 (8) / gemm_window_int8_residual 11.36 (52) / window_attention 10.19 (45) / gemm_int8_qkv 9.65 (53) / gemm 7.03 (42) / ffn 6.24 (8) / int8_batched 4.86 (72) / quant 2.72 (80) / unary 2.96 (16) / quant(FUSED-pack) 0.38 (144) / quant_window(A5-fused) 0.03 (7)`
+**att 半区按 tier（串行 ms/帧）**：**C256 13.39 > C128 10.56 > C64 5.46（含 7 条融合 launch 自己在 wres 里的 3.75）> C512 1.76**。
+**A5-fused 覆盖 = chains 0,1,2,48,49,50,51（7 条）** ⇒ **C64 里唯一没接的是 chain 3**（就是 `epi=0 narrow=0` 那条）✓
+★ **一条要紧的张力（下一铲要正面回答）**：**剩下的钱最大的两块（C256 的 13.39、C128 的 10.56）恰好是我们融合形态装不下的 tier**（C128 合一在 bench 里 **+51% 更差**、SLM 41,984 越占用崖）。
+⇒ 所以"接更多 tier"不是开关活，而是**tiling/几何活**：要么**把 T（每 WG token 数）降下来换 SLM**、要么**把窗口切小换 across** —— 两者都会改变网格与复用因子，**必须先按 `tools/xmx_roof.csv` 的 (dtype,N,K,M) 屋顶成对实测，再谈接图**（军规 26/35a/37/54）。
+

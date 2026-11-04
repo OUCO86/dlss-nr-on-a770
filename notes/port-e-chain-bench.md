@@ -1119,3 +1119,60 @@ A mean 58.631  B mean 57.380   n=16  mean **-1.251**  sd 0.188  **CI95 [-1.352, 
 `basis = ABB969FE 基座 + commit d64fa0f（A5 接线/att5_fused_kernel.hpp/NR_SELFREP/TOUCHDUMP）+ 工作区未 commit 的 M libxmx_sycl.cpp（A5-FOLDRESCUE + T_ATT5_FUSE_DEF）与 M tools/shipped_build.defs（T_ATT5_FUSE_DEF=1）`；`/D 全串 = /DT_SKIP_CHAINS_DEF=\"18,…,32\" /DT_ATT5_FUSE_DEF=1`；`件 = builds\libxmx_att5p.dll = 3BAECF2A4B0F49F45E2557CE4808C2CF`；证据（双档 EXACT、三向量计数、SELFREP 3000 帧 0 bad、40 门口径、帧价）都在那一节里。
 **换位由父执行**（我不碰 `out\libxmx.dll`）；换位后建议再跑一次 40 门求 **40/40 GREEN**，并把新 md5 追加进 `out\DEPLOY.md5.txt`。
 **GPU 记账（本盒）**：① 验证 ≈ 16 min（rt 两臂 + 双档 + SELFREP×4）+ ② 三次 walk ≈ 5 min + ③ 40 门 ≈ 13 min + 复原单门 ≈ 0.7 min + 16 对 ≈ 24 min（含 300 s 批间冷却）⇒ **≈ 59 min**，批间均有 ≥60 s，>20 min 批后冷却已做。
+
+
+# §98 **换位已发生（两槽 = `3BAECF2A…`）+ 守卫门在新件下 RED 的实证 + 兑现率重算（串行 −2.9 ms vs att 半区原价 6.87 ms = **42%**）+ 下一铲排序**　2026-11-04 07:4x-08:0x（一次 40 s 单门，其余纯 host）
+## 1) 换位与备份
+`out\libxmx.dll` = `oneapi\libxmx_sycl.dll` = **`3BAECF2A4B0F49F45E2557CE4808C2CF`**（父执行，军规 59 的 ① 两槽一致 ✓）；旧基座备份 **`builds\libxmx_sycl_ABB969FE.bak2.dll = ABB969FE4AAF0F94AA03C3F53781EDD0`** ✓ 可回退。
+## 2) ★ 守卫门现在会 RED（实证，不是预测）
+单跑 `gate_skip_graph`（07:5x，40 s）⇒ `0 GREEN / 1 RED`。日志尾部三条 ok + 一条 FAIL：
+```
+ok  gate40_p3: 1301 EXACT vs bk.1301.skip.bin  md5=dd49827dd33a7ef07c2c17892f18970d
+ok  out/libxmx.dll 这一腿 1301 逐位相同 = 新金标 dd49827d…
+ok  oneapi/libxmx_sycl.dll 同一只字节 1301 也 = 新金标
+FAIL 要求 out/libxmx.dll 与 oneapi/libxmx_sycl.dll 必须 ABB969FE（你没有改写任何 dll）
+```
+⇒ **实质检查全过，RED 只来自写死的 ABB969FE 期望** ⇒ 要 40/40 得由**父**把守卫期望换成 `3BAECF2A…`（或改成读 `out\DEPLOY.md5.txt` 的当前条目），**我不改门**（纪律）。换完应重跑整轮 40 门。
+## 3) 仪器假象一条（防误读）
+`walk_att5p_noenv.txt` 的 `fires=0` 是**没开 `NR_ATT5_TRACE`** ⇒ witness 不打；**"不设 env 时 fires=14" 的正证是 `walk_att5p_trace.txt`（TRACE 开、FUSE 不设）= 14** ✓。
+**新军规候补（军规 61）**：**witness 计数为 0 时，先确认 witness 开关本身是开的，再谈"没 fire"** —— 否则会把仪器当成结论（与军规 52 同族：标签/开关没对上，读数是假的）。
+## 4) 兑现率重算（把 ⑥ 的"剩余活站"改成有账可依）
+- **同 build 内**的 rtcsv 对（rt2o2）：默认 **140.12** vs ON **133.05** ⇒ −7.07 ms —— **这个差不可跨 build 用**（rt2a5 的默认臂是 135.98，两 build 的默认臂差 +4 ms = 热/JIT），**只用 ON 臂跨 build 比 fold 前后：133.68 → 133.05 = −0.63 ms 串行** ✓（= 捡回 644 白工的量级，预测 0.73）。
+- **帧价才是准绳**：`ab.ps1` 实测 **−1.251 ms/帧** ⇒ 除以 0.43 的图内系数 ⇒ **串行等效 ≈ −2.9 ms/帧**；
+- **att 半区（641-645）的原价**（rt_per_closure，chain 48）= 0.0021 + 0.2922 + 0.4266 + 0.0021 + 0.2592 = **0.9822 ms/链** × 7 链 = **6.875 ms** ⇒ **兑现率 = 2.9 / 6.875 = 42%**（上一铲 2.3/6.875 = 33%）；
+- **与 bench 的差**：bench CHAIN2 vs REF13 = 0.6676 ⇒ 省 33%（串行口径），引擎里省 42% ⇒ **两边口径不同**：bench 的 REF13 是**未融合的手工拆腿**，引擎默认路的 641/644 已被 qfuse 溶解、643 走 `wa_res`  resident 融合 ⇒ **引擎的拆腿基线本来就比 bench 便宜** ⇒ 所以"bench 单价 −0.509 ms/链"到了图内只剩 ≈0.42 ms/链（−2.9/7）。**这条差异已量化，不再是暗账。**
+## 5) 下一铲排序（按已量化的余量）
+ 1. **8/8 覆盖**：第 8 条 C64 链 = `epi=0 narrow=0` ⇒ 要给 P11 加第二种 epilogue（改数值面）⇒ **收益 ≈ 1 链 = 0.42 ms 串行 ≈ 0.18 ms/帧**，**代价 = 重新过 25 检查点门 + 双档 1301 + SELFREP** ⇒ 性价比偏低，**除非顺带把 epi 形态做成参数化复用**；
+ 2. **同族推广**：C=128 tier（6 链）在 bench 上 **+51% 更差**、SLM 41,984 越 32KB 崖 ⇒ **不接**；C=256/C=512 的 att 半区**没做过合成体** ⇒ 若要接，先做 bench 合成（不进图）；
+ 3. **兑现率本身**：42% 说明图内还有 ~58% 的 att 半区开销没被这条融合吃掉（跨链调度、pool、PGRAPH wave 划分）⇒ **下一铲最值钱的一刀可能是"图内 per-closure 复核"**：现在两槽已是新件，**直接跑 `NR_RUN_TIMING=1` 的新件 + `rt_per_closure.csv` 对比**，把 641-645 的现值读成 0/近 0，并把剩下的 att 半区时间去 attributed 到具体 op（这是纯读数，不改代码）；
+ 4. **`gate_skip_graph` 守卫期望更新 + 重跑 40 门**（父的动作，我在旁边给读数）。
+
+# §98-注 **编号说明**：§84 与 §86 **没有落盘**（§84 当时被 §85 的破案直接取代；§86 的脚本有一个引号语法错、当场放弃，内容改成了 §87 开头的现场记录）。**编号空洞是有意的，不要去找它们的内容**；所有实际读数都在 §87-§98 里。
+
+
+# §99 **转正落地 + 守卫改成读单一出处 + 全量 40 门在转正件上 40 GREEN / 0 RED**　2026-11-04 07:4x-08:0x
+**父的动作**（我不碰加载位）：`out\libxmx.dll` = `oneapi\libxmx_sycl.dll` = **`3BAECF2A4B0F49F45E2557CE4808C2CF`**（= `builds\libxmx_att5p.dll`）✓ 两槽一致（军规 59 ①）；回退点 `out\libxmx.before-ATT5.keep` = **`ABB969FE…`** ✓；提交 **`65b67eb`**（用了我的 `s6/pe_c1_commitmsg.md` 草稿）；出处 `out\SHIPPED_BUILD.md` §6 已核，并复制进仓 **`notes/SHIPPED_BUILD.md`** ✓。
+**流程级修正（父做的，我记账）**：`gate_skip_graph.py` 的 `SHIP_MD5` **不再写死 ABB969FE**，改成**读 `out\SHIPPED_MD5.txt`**（内容 `3baecf2a…`），**文件缺失 = RED**（不许静默放行），**实质检查一字未改**，`py_compile` 过，入库 **`b564cb1`**。
+**为什么这条值得立案**：§89 里我为了跑 40 门只能 stage 变体、然后看着身份守卫 RED —— **每次转正都会让这道门按设计 RED，把它的实质检查（1301 逐位、跨槽一致）淹在噪声里**；换成"读单一出处"之后，身份守卫第一次能同时表达"这是当前转正件"和"你没偷改 dll"。
+**建议军规 62**：**任何"工件身份"类断言必须读单一出处文件（`out\SHIPPED_MD5.txt`），不许把 md5 常数写进门里；出处缺失必须 RED，不能默认放行。**
+**A 读数**：`bash E:/DSH/run_gates.sh`（前置 300 s 冷却，不 stage 不复原）⇒ **`gates: 40 GREEN / 0 RED`** ✓ 跑完两槽 md5 复核仍是 `3BAECF2A…` ✓。
+
+
+# §100 **剩余活站重排（新表 `tools/shapes_alive_next.csv`）：底料 = 在**转正件**上取的逐 op 清单**　2026-11-04 08:0x（纯 host + 一次 RUN_TIMING 取数）
+## 取数（`NR_RUN_TIMING=1`，件 = `out\libxmx.dll` = `3BAECF2A…`，**不设其它 env**；`s6/RT_shipped.timing.txt` 691 行）
+**逐 op 家族（串行 ms/帧，行数）**：`gemm_int8_residual 20.06(68)`、`window_block 18.19(10)`、`global_attention 11.48(8)`、`gemm_window_int8_residual 11.36(52)`、`window_attention 10.19(45)`、`gemm_int8_qkv 9.65(53)`、`gemm 7.03(42)`、`ffn 6.24(8)`、`int8_batched 4.86(72)`、`unary 2.96(16)`、`gemm_int8 2.72(24)`、**`quant 2.72(80)`**、`ffn_merge 3.55(1)`、`ffn_stem 1.72(1)`、`unary2 1.34(1)`、`quant(FUSED-pack) 0.38(144)`、`quant_window(FUSED-pack) 0.11(45)`、**`*(A5-fused) 合计 0.065(21)`** ⇒ **总计 114.63 ms**。
+**att 半区按 tier（串行 ms/帧）**：**C256 13.39** > **C128 10.56** > **C64 5.46** > **C512 1.76**（+ 不在 chain 区间内的 2.75）。
+**A5-fused 命中的链 = 0,1,2,48,49,50,51（7 条）** ⇒ **C64 tier 唯一没接的是 chain 3**（就是 §87 里 `epi=0 narrow=0 half=1` 那条）✓ 与 §98 的口径闭合。
+## 候选排序（表在 `dlss-nr-on-a770\tools\shapes_alive_next.csv`，四列 = 活站价值(串行/帧) / 需要的机制 / 要不要跨链换序(军规 43)）
+| # | 候选 | 串行 ms | 帧 ms | 换序 | 一句话 |
+|---|---|---|---|---|---|
+| 1 | **WB 驻留重做**（`window_block` 45,056→32,768 SLM） | 家族现值 **18.19** | 历史上限 −3.9 串行；**实测 −0.365/32 对** | 否 | **A5 之后最大的单一活家族**，方向有先例、有实测下界；前置 = `barrier_audit` 的 verdict_source/verdict_machine 两栏 + 军规 60 的 `NR_SELFREP` 臂 |
+| 2 | **C1 quant 折进生产者 store** | 现值只剩 **2.72**（80 行） | ≈ −1.2 上限 | 否 | **A5 + qfuse 已经把大头吃掉了**（144 行溶解成 0.38 ms）⇒ 从 §50 的 2.6-9.5 ms 缩水到 2.72；v9b 那套 fold 曾被测出更慢（宽 N 要宽 BM，64KB SLM 装不下）⇒ **先按军规 54 在合成体里重新定价，再谈实现** |
+| 3 | **A5 8/8：chain 3 的第二种 epilogue** | 该链 att 半区 0.98 | **≈ −0.22** | 否 | 要给 P11 加 epi=0 的出口形态 + 配套 skip 读 ⇒ **动数值面**（store map / skip 读），要重过 25 检查点门 + 双档 1301 + SELFREP；**性价比全表最低**，除非别的原因要顺手重构 P11 |
+| 4 | **C256 / C512 的 att 腿**（16 + 16 链） | **13.39 / 1.76** | 不给预测 | 否 | 表上最大的两块，但 **C128 已经实验过：att 合一 +51% 更差、SLM 41,984 越 32KB 崖** ⇒ 判定 = **先做 bench 合成体、在该 tier 上打赢拆腿 REF 才允许进图**；三项约束 = heads==2 / tokens==64 / SLM 上限。**不顺手写预测收益** |
+| 5 | **跨链合并类（刀 1 / 刀 3）** | n/a | n/a | **是（军规 43）** | 需要 record/plan 层换序；最小机制清单：(a) recorder 能读的邻接/依赖标注，(b) capture 期合法性检查（宁可 refuse 不许猜），(c) 逐链 pool_get/pool_pull 块序列 witness，(d) 编译期回退开关（T_*_DEF）而不只是运行期。**刀 1 已死过一次 ⇒ 排最后** |
+| — | `gemm_int8_residual 20.06` / `global_attention 11.48` | 20.06 / 11.48 | n/a | n/a | 不是 att 半区站点；S6 已把 FFN 残元能吃的吃了。**列出来是为了表的完整性，不是候选** |
+## 我建议的下一刀（等你点）
+**= 候选 1（WB 驻留重做）**，理由：(i) 18.19 ms 串行 / 只有 10 个 closure ⇒ **单位 closure 价值最高**（1.8 ms/发）；(ii) 有历史实测下界 −0.365 ms/32 对，不是空想；(iii) 不跨链换序 ⇒ 不碰军规 43 的雷区；(iv) 它的前置（barrier_audit 两栏 + SELFREP 臂）**已经在手里**（`nr_replay_sr` 就是现成仪器）。
+**开工顺序**：先纯 host 做 SLM 预算表（45,056 → 32,768 差 12,288 B 从哪来：tile 形状 / 双缓冲 / stage 复用），再改 bench 件量一版 occupancy，最后才进 `builds\` 出变体并走双档 1301 + SELFREP + 16 对。
+**若你要更稳的**：候选 2 的**重新定价**是纯 host（用 `RT_shipped.timing.txt` + 合成体 bench），零 GPU 也能交一铲。
