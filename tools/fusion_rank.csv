@@ -1,0 +1,19 @@
+family,legs_per_frame,fused_legs,total_ms,per_leg_ms,runs_ge2_containing_family,agg_run_serial_ms,agg_CEILING_low_ms,agg_CEILING_high_ms,best_chain_internal_run_scope,run_closures,run_legs,run_serial_ms,CEILING_low_ms,CEILING_high_ms,unit_value_ceiling_per_leg_ms,precedent_distance,mechanism_already_on_frame
+ffn_stem,1,0,1.717,1.7170,1,12.606,4.198,5.294,region,0..7,8,12.606,4.198,5.294,0.5247,-,?
+window_block,10,0,18.187,1.8187,4,31.782,10.584,13.349,region,0..7,8,12.606,4.198,5.294,0.5247,"wb_ga_probe.cpp + wb_v4ph_slm.hpp (bench exists, engine route not fused)","no fusion; the two v4ph legs were audited (neither bandwidth- nor XMX-bound, rule 63)"
+ffn,8,0,6.237,0.7797,3,22.722,7.566,9.543,region,0..7,8,12.606,4.198,5.294,0.5247,"s6_ffn_block4.cpp / port_ffn_fused.cpp (S6-1a, byte-diffed at C64/C128)",S6-1a fused-FFN covers ONLY the C64/HID256 and C128/HID512 chains (source: s6_family); the 8 legs priced here are the ViT front/back FFN (unfused) -- IDENTITY PINNED
+ffn_merge,1,0,3.554,3.5544,1,9.060,3.017,3.805,region,688..690,3,9.060,3.017,3.805,1.0057,-,?
+unary2,1,0,1.340,1.3403,1,7.396,2.463,3.106,region,680..687,8,7.396,2.463,3.106,0.3079,-,?
+unary,16,0,2.961,0.1851,9,10.581,3.524,4.444,region,8..15,8,2.720,0.906,1.143,0.1132,-,?
+gemm,42,0,7.032,0.1674,40,25.026,8.334,10.511,region,8..15,8,2.720,0.906,1.143,0.1132,port_e_chain.cpp CHAIN2 (measured ratio 0.667 for an 11-op chain merge),R8a batch-in-grid + P12b pub-fold ACTIVE (and #113 measured wide-diag as a LOSS here)
+quant,224,144,3.105,0.0139,60,45.057,15.004,18.924,region,8..15,8,2.720,0.906,1.143,0.1132,-,qfuse fold ACTIVE (144 legs named quant(FUSED-pack))
+gemm_int8_batched,72,0,4.859,0.0675,52,27.700,9.224,11.634,region,8..15,8,2.720,0.906,1.143,0.1132,-,P8-b block-diag wide ACTIVE on the N=32 legs
+gemm_int8_residual,68,0,20.057,0.2950,8,16.331,5.438,6.859,region,334..337,4,2.309,0.769,0.970,0.1922,no fused twin exists,"no fusion (the A4 defer-merge was illegal, #115)"
+gemm_int8_qkv,60,7,9.673,0.1612,53,35.400,11.788,14.868,region,334..337,4,2.309,0.769,0.970,0.1922,att5_fused_kernel.hpp (A5 5-in-1),A5 fused 7 legs (C64 chains 0/1/2/48/49/50/51); 53 legs split
+global_attention,8,0,11.475,1.4344,8,17.357,5.780,7.290,region,334..337,4,2.309,0.769,0.970,0.1922,"A5 att kernel (s6b_att.cpp / att5_fused_kernel.hpp) is the direct precedent -- same stage sequence, different tier",no fusion at any tier
+window_attention,52,7,10.212,0.1964,45,18.043,6.008,7.578,chain3/C64,53..54,2,1.671,0.557,0.702,0.2783,att5_fused_kernel.hpp (A5 5-in-1),A5 fused 7 legs; 45 legs split
+gemm_window_int8_residual,52,0,11.359,0.2184,38,25.573,8.516,10.741,chain9/C128,125..131,7,1.452,0.483,0.610,0.0691,no fused twin exists,no fusion
+gemm_int8,24,0,2.725,0.1135,16,1.794,0.597,0.753,region,388..391,4,0.841,0.280,0.353,0.0700,-,?
+quant_window,52,52,0.140,0.0027,0,0.000,0.000,0.000,-,,0,0.000,0.000,0.000,0,-,qfuse ACTIVE (45) + A5 folded 7
+
+NOTE,"CEILING band = 33.3% (bench CHAIN2 merge ratio 0.9413/1.4112 measured) to 42% (A5 in-frame realization measured) of the run's serial ms -- an UPPER BOUND, not a promise (rules 26/35a/54)"
