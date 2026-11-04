@@ -1760,3 +1760,30 @@ B3-b 我按 `pe_k3_roofgroup.py` 报的"SRP_GRP=45"跑了 3 个进程，**日志
 ## 现场
 零 GPU（A+B 全 host）；进程 0；两槽 `3BAECF2A…`、三金标、`out\SHIPPED_MD5.txt` 未动；工作区 `M src/bench/sycl/libxmx_sycl.cpp`（诊断暖机循环，你已裁定留着）+ 新表 `tools/traffic_breakdown.csv`、`tools/xmx_roof.csv`（列刷新）、`s6/ROOF_ledger2.csv`/`ledger2_{port,roof}.csv`；脚本 `s6/{mk_roof_ledger2,pe_roof_cols,pe_traffic_breakdown,pe_traffic_fix,pe_privprov,pe_privkeys,pe_sectnames,pe_zeinfo2,pe_portze,pe_spillparse}.py`；账 §121。
 **下一步（C，已批）**：给探针加 **s8v9（BM=64/BN=128）腿**，测 `int8 192x1024x4096`、`192x192x128`、`8160x128x128` 三形（**每点 12 进程**、组名回验、private/spill 记 n/a、M 当轴）；顺带把 spread>40% 的旧行重测到 12 进程。**GPU 预算 ~40 min，开工前凉 ≥5 min。**
+
+
+# §122 **C+D：s8v9 宽生产者屋顶已测（**12 进程、spread 0.6% ⇒ 全台账唯一"硬"点**）⇒ **它在帧形上比出货 v8 慢 3.0x（0.2345 vs 0.0786 ms），公平口径（v8+quant）下仍慢 ~1.8x ⇒ L2/宽生产者被判死**；同时 v4 的置信列暴露一个更难堪的事实：**`HARD-anchored = 0 / 258` —— 今晚所有 headroom 数全部建在 6 进程 / spread>20% 的旧屋顶行上**　2026-11-05 06:0x-06:3x
+## C 的读数（GPU 批 ~35 min，12 进程，组名回验 0 处不符）
+`tools/xmx_roof.csv` 新增/刷新（`SRP_V9=1` 给探针加了一条 s8v9 腿：`pack_a9/pack_b9` 设备打包 + `gemm_b_rq`）：
+| dtype | leg | shape | nproc | msM_med | **spread** | TOPS | grf/simd/**slm** | scratch/instr |
+|---|---|---|---|---|---|---|---|---|
+| int8 | **`gemm_b_rq_v9`** | 8160x128x128 b1 | **12** | **0.2345** | **0.6% ✓硬** | 1.140 | 128/1/**13,312 B** | 0 / 0 |
+| int8 | `gemm_b_pub`（出货 v8）| 8160x128x128 b1 | 12 | 0.0786 | 42.6% ✗ | 3.400 | 128/1/18,432 | 0 / 0 |
+| int8 | `gemm_b`（raw）| 8160x128x128 b1 | 12 | 0.0280 | **143.9%** ✗ | 9.533 | 128/1/18,432 | 0 / 0 |
+| int8 | `gemm32_b_pub` | 130560x32x128 b1 | 12 | 0.1146 | **1.2% ✓硬** | 9.333 | 128/1/10,240 | 0 / 0 |
+| f16 | `gemm_b_pub_f16` | 130560x32x128 b1 | 12 | 0.2136 | 19.6% | 5.007 | — | 0 / 0 |
+**判决（这是今晚第一个能站住的核内判决）**：
+- **v9 的 SLM 预算完全没问题**（13,312 B < 32,768 ⇒ 2 resident；比 v8 的 18,432 还小）**、scratch 0/0** ⇒ **健康面干净**；
+- **但时间上 v9 = 0.2345 ms vs v8 `gemm_b_pub` = 0.0786 ms ⇒ 慢 3.0x**；**公平口径**要加上被它吃掉的 quant 腿：8160×128 的 f16→int8 量化按字节地板只有 ~0.003-0.03 ms ⇒ **v8+quant ≤ 0.11 ms ⇒ v9 仍慢 ~1.8-2.1x** ⇒ **宽生产者（BM=64/BN=128 + 融合重量化）在本案帧形上被判死**；
+- **连带把 B 表里"工作组 255→510 填满波次"这条假设也证伪了**：v9 正是把行 tile 减半、组数翻倍的那个核 ⇒ **翻倍组数没让它更快，反而慢 3x ⇒ 这些腿的瓶颈不是波次填充**。
+## D 的置信列（`tools/anchor_gap.csv` v4，新增 `roof_confidence`）
+**硬标准（父定的）：某相屋顶必须 nproc≥12 且 spread≤20% 才算 `hard`。**
+⇒ **结果：`HARD-anchored = 0 / 258 条活闭包`；`low-conf = 197`；`no-roof = 61`。**
+⇒ **也就是说今晚报过的所有 headroom（residual 12.13、qkv 5.52、gemm 3.32、wb 2.01、ffn 1.61）全部建在 6 进程 / 高 spread 的旧屋顶行上 ⇒ 按 D 的规矩一条都不许进建议。**（旧台账 244 行是军规 35b 收紧之前测的 ⇒ 这是**历史数据的置信债**，不是今晚算错。）
+**唯一现在就是 `hard` 的两行**：`int8 gemm32_b_pub 130560x32x128`（1.2%）与 `int8 gemm_b_rq_v9 8160x128x128`（0.6%）⇒ **恰好这两行合起来就是上面那条判决**。
+## 于是 D 的"单一靶建议"变成一条**否证 + 一条明码的补置信工单**
+1. **否证**：**kernel 内几何（tile 宽/高、宽生产者融合重量化）在唯一有硬锚点的形状上没有肉**（v9 慢 1.8-3.0x）⇒ **不再提任何 L1/L2 型靶**；
+2. **B 表的算术（不依赖屋顶，因此不受置信债影响）仍然成立**：residual/winres 两族 **94% 的字节在 f16 残差面读 + 输出面写**，加宽 tile 只能砍 ≤6% ⇒ **若还要动核，只剩"改面宽"（`NR_RES_BYTE` 那条路）**；但同一张表也算出：8160×128×128 的字节地板只有 **7.7 µs**，而出货腿实测 **78.6 µs ⇒ 10 倍于地板** ⇒ **面宽最多解释这 10x 里的一半的一半 ⇒ 先补"到地板之间那 90 µs 是什么"的证据（launch/同步/occupancy），否则任何面宽刀都是赌**；
+3. **补置信工单（若你要继续这条线）**：residual/qkv/batched 三族的**帧形屋顶重测到 12 进程 + ≤20% spread**：唯一形 ≈ **10 形 × 12 进程 ≈ 40-45 min GPU** ⇒ 做完才允许再谈 headroom 排序与靶。
+## 现场与 GPU 记账
+本盒 GPU：**~35 min**（v9 屋顶 12 进程，批间 60 s，组名回验 12/12 ✓）；批后冷却已做；进程 0；两槽 `3BAECF2A…`、三金标、`out\SHIPPED_MD5.txt` 未动；探针源码新增 s8v9 腿 + 两组（`G56_i8_8640_128_128`=55、`G57_i8_9216_128_128`=56，**本轮未测**）；产物 `tools/xmx_roof.csv`（253 行，v9 点已入）、`tools/anchor_gap.csv`（v4 带置信列）、`s6/ledger2_roof2.csv`（63 条，含 s8v9 grf/slm/scratch）；脚本 `s6/{pe_v9_probe.py,pe_k5_v9.ps1,pe_v9_merge,pe_anchor_gap4,pe_v9sig2,pe_v9pack,pe_v9gate,pe_v9_domain,pe_probe_int8}.py|ps1`；账 §122。
