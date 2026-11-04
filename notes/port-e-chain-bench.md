@@ -1661,3 +1661,37 @@ B3-b 我按 `pe_k3_roofgroup.py` 报的"SRP_GRP=45"跑了 3 个进程，**日志
 - **融合路线的"大头"已经全部吃进**（tile/chip/fold/merge 们：31.6 + 5.0 ms 已在帧里）；**剩下能数的空间要先有真的发射图才知道有多大** ⇒ **发射计数器 = 下一铲的第一步**；
 - **`window_block` 18.19 ms 与 `gemm_int8_residual` 20.06 ms 是两个"开关不做事"的家族** ⇒ 它们的钱不在"消环节"上（wb 的开关只值 0.08），**在单环节内部**（§105 的 SLM/occupancy 审计已经对 wb 判过"既不绑带宽也不绑 XMX"）⇒ **若还要挖，方向是 kernel 级（相位内的访存/填充），不是融合级**；
 - **B3 正式结案：靶已被 NR_FFN_CHIP/NR_FFN_TILE 收割**（不跑 c、不补屋顶）。
+
+
+# §119 **新铲 (1)：逐闭包**锚点差距表** `tools/anchor_gap.csv`（零 GPU）——v1 错在"拿整条多相闭包去比一条 gemm 屋顶行"（把 global_attention 报成"占屋顶 2%"）；v2 按**记录器自己的 gemm 相位**求屋顶和 ⇒ 结论：**window_block 的 4 相解释了它 83% 的时间（不是靶）；`gemm_int8_residual` 42 腿有 11.12 ms 不被相位屋顶解释；`global_attention` 8 腿 10.68 ms 不被解释（但那是 softmax/归一/搬运，不是 gemm 效率）**　2026-11-05 05:0x-05:4x
+## v1 的错（先记账）
+`shapes_alive.csv` 的 `orig` 列对**多相闭包**只给一个代表形 ⇒ 我用它去查屋顶，于是 global_attention（192×192×32 b32 之类）比出一条 0.0304 ms 的屋顶 ⇒ "占屋顶 2%、可挖 11 ms" ⇒ **假信号**。
+## v2 的做法（`s6/pe_anchor_gap2.py`）
+**相位表来自源码，不是我编的**：`flop_note(...)` 的元组（ffn 两相 / qkv `(M,3C,C,1)` / batched `(M,N,K,batch)` / residual `(M,N,K,1)` / window_attention 两相 `(64,64,32,batches)+(64,32,64,batches)` / **window_block 四相** `(windows*64,96,32)+(…,64,32)+(…,32,64)+(…,32,32)`）；**global_attention 没有 flop_note** ⇒ 相位取自它的**发射调用实参**（4829 `f16v1::gemm_b(dAq,dBk,dScores,Mp,rows,32,heads)`、4866 `gemm_b(dAp,dBv,dCtx,Mp,32,rows,heads)`）。
+**规则照旧**：**只有每一相都有同形屋顶点的闭包才给"差距"数**（军规 26/35a/78，不内插）；**缺点的闭包把缺的形列进工单**。
+**结果：258 条活闭包里 177 条有完整相位屋顶。**
+## ★ 口径必须先钉死（这不是"可回收收益"）
+`above_phase_roof_ms = 实测 − Σ相位屋顶` 的含义是 **"这条闭包的时间里，有多少不被它的 gemm 相位解释"** ⇒ 对**纯 gemm 家族**（residual/qkv/batched/gemm/gemm_int8）可以读成 **kernel 效率余量**；对**多相 + 非 gemm 工作**的家族（ga 的 softmax、wb 的 gather/归一、ffn 的 gelu）**这部分是别的工作，不是浪费** ⇒ **不许把它当可挖 ms**（军规 54/74）。
+| family | 完整屋顶的腿 | 实测 ms | **不被相位屋顶解释** | 占比 | 该怎么读 |
+|---|---|---|---|---|---|
+| **`gemm_int8_residual`** | 42 | 14.348 | **11.118** | 77% | **纯 gemm 家族 ⇒ 这是真的 kernel 效率余量**（每腿 0.34 vs 相位屋顶 0.078 ⇒ 4.4 倍差距） |
+| `global_attention` | 8 | 11.475 | 10.679 | 93% | **不是效率余量**：softmax/归一/merged 面搬运没算进相位 ⇒ 要先补"非 gemm 相"的地板才能判 |
+| `gemm_int8_qkv` | 40 | 9.319 | 5.853 | 63% | 真余量（含 QKV 三面写出与归一 scatter） |
+| `gemm_window_int8_residual` | 18 | 4.765 | 4.155 | 87% | 真余量（含 gather/crop 与 publish） |
+| `gemm` (f16) | 18 | 4.553 | 3.770 | 83% | 真余量 |
+| `gemm_int8_batched` | 18 | 4.729 | 3.175 | 67% | 真余量（P8-b 宽形之后） |
+| `window_attention` | 16 | 4.328 | 2.695 | 62% | 含 softmax |
+| `gemm_int8` | 10 | 2.695 | 2.083 | 77% | 真余量 |
+| **`window_block`** | **7** | **11.622** | **2.012** | **17%** | **四相解释了 83% ⇒ wb 不是 kernel 级余量的靶**（与 §105 的"两腿 2.02-2.17 vs 锚点 2.20 TOPS"完全一致） |
+**单闭包 top**：ga c346/328/373/364/355/319/382/337（各 1.30-1.38 ms 不被解释，**先要非-gemm 地板**）→ wb c690 0.488（**已经 88.6% 贴顶 ⇒ 没肉**）→ residual c29 0.484 / c662 0.480 / c18 0.471（**每腿 0.55 ms 实测 vs 相位屋顶 0.078 ⇒ 这才是该挖的**）。
+## 步骤 (2) 的工单：缺的**同形相位屋顶**（按腿数 × 实测 ms 排）
+| 缺的相位形 | 影响腿 | 那些腿的实测 ms 合计 |
+|---|---|---|
+| `int8 8160x128x128b1` | 12 | **5.680** |
+| `f16 130560x32x128b1`（ffn 的 project 相） | 8 | **6.237** |
+| `f16 64x64x32b540` / `64x32x64b540`（wa 两相） | 6+6 | 1.979+1.979 |
+| `f16 64x64x32b576` / `64x32x64b576` | 6+6 | 2.013+2.013 |
+| `int8 8640x128x128b1` / `9216x128x128b1` | 6 / 6 | 1.538 / 1.655 |
+| `f16 130560x96x32b1` / `130560x64x32b1`（wb 两相） | 2 / 2 | 2.322 / 2.322 |
+⇒ **补前两个（合计 20 条腿、11.9 ms 实测）就够把 residual 家族与 ffn 家族的账闭合**；协议照父的令：**每点 ≥6 独立进程、间隔 ≥60 s、min-of-15×5、nosink、台账 `grf/simd/slm/private/spill/scratch/scrInstr` 全记、M 当轴、组号用探针自己打出的名字回验（军规 79）**。
+**现场**：零 GPU（本步）；进程 0；两槽 `3BAECF2A…`、三金标、`out\SHIPPED_MD5.txt` 未动；产物 `tools/anchor_gap.csv`；脚本 `s6/{pe_anchor_gap,pe_anchor_gap2,pe_flopsrc}.py`；账 §119。
