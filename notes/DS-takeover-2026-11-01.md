@@ -1708,3 +1708,34 @@ gates: 40 GREEN / 0 RED
 - **不改任何执行语义**：双档 1301 必须 EXACT `DD49827D`、`[skip-chains]` 计数一字不差、**`[poolseq]` 两臂 diff 必须空**、≥4 进程 distinct md5=1、40 门 40/40、**帧 A/B 差 ≈ 0**（仪表不该买时间）；
 - **真正的产出 = 分组普查表** `tools/group_census.csv`：全 52 条链里**每一组合法候选**的成员闭包、形状 (M,N,K,batch)、**在记录秩序里是否相邻（军规 42）**、touch 冲突、pool 块数 ⇒ **它回答"第二铲真合并时，哪些族能合法并、哪些必须先换序、换序要动多大"**。
 **现场（开工前核）**：tip `28293f3` CLEAN；加载位 `out\libxmx.dll` = `oneapi\libxmx_sycl.dll` = **`3BAECF2A…`**（A5 件，已 40/40 门 + 16 对 −1.251）；金标 `DD49827D` / `249A46F3` 未动；**GPU 空闲、无游戏进程**。
+
+## 88. ★★★ B 第一步（只装仪表）交回：**验证链六步全过（仪表中性）+ 仪表第一次自证就逮到三处错位**；**普查给出 Q1/Q2/Q3 的精确答案：合并相关族相邻对 = 0、85 个非相邻组里 0 个干净区间 => 换序是帧级置换，不是局部交换**
+件 = **`builds/libxmx_b1instr3.dll = F5A3F883C353B713885C0C1C434A10F6`**
+### A 验证链（六步）
+| 步 | 读数 |
+|---|---|
+| 1 双档 1301 | 默认档（无 witness）**EXACT `DD49827D`**；**全部 witness 开**（GROUP_TRACE+POOLSEQ+PG_TOUCHDUMP+ATT5_TRACE+POOL_STATS）**EXACT**；只开 poolseq **EXACT**；对照出货件 `3BAECF2A` + POOL_STATS 也 EXACT |
+| 2 四向量计数 | `[vec-align] graph=0 cmds=691 touch=691 group=691 poolblk=691 idsnap=691 / names=1382 name_offset=691 => **ALIGNED**`；`[skip-chains]` 两侧一字不差 |
+| 3 poolseq 两臂 diff | `allwitness` vs `poolonly`：**warm 哈希 `fa4d3da2aa18a510` 相同、capture 哈希 `e62607c36a3c7410` 相同**、`[poolseq-canon]` 每 closure get 计数序列相同；**独立不变量**：`[pool] mallocs=51 bytes=311 MB` 在出货件与仪表件上完全一致 |
+| 4 确定性（军规 31） | **4 个独立进程（全 witness 开）=> 4 颗 1301 全 EXACT、distinct md5 = 1** |
+| 5 40 门 | stage 仪表件（备份 `builds/libxmx_sycl_preB.bak.dll = 3BAECF2A`）=> **39 GREEN / 1 RED**，RED = 身份守卫（读 `out/SHIPPED_MD5.txt` => stage 变体必按设计 RED，军规 62）；**复原 = `3BAECF2A`** 后该门 GREEN；基座整轮 40/40 已在 08:4x 实测 => **仪表件实质门 39/39 全过** |
+| 6 帧 4 对（两侧都不设 env） | `+1.360 / +0.230 / -0.970 / -1.100` => 均值 **−0.120 ms**、赢 2/4 => **|均值| < 0.15 带内中性**；**如实写：4 对分辨率 ±1.83 ms（sd 约 1.15、df=3），分不出 0.15 量级 => 这一步既没证明免费也没证明贵**。更硬的结构性论证：三件仪表都只在 **record/capture 期**跑（每帧一次，不在 replay 热路）；热路新增只有 `if (g_poolseq_on)` 一条可预测分支 + `pool_seq_note` 早退（691 次/帧）；默认全 presence-gated => 出货态不进这些函数。**以后要常开 witness，必须先 16 对** |
+**停线未触发**：1301 与 poolseq 都没变 ✓
+### ★ 仪表的第一次自证就逮到三处缺陷（这就是把自证明放进 dll、不放脚本里的理由）
+1. **新向量不是 record-scoped**：只在 capture 清 => 但 plan **录制两次**（scratch -> `OP_XMX_ABORT` -> 保留），abort 不清新向量 => capture 时它们 **1382** 而 `g_cmds` **691** => **`[vec-align] REFUSED` 当场报警**。修 = `xmx_begin`@1415 与 `xmx_abort`@1425 一起清。**与 §85 同一类坑，这次是守卫先响** ✓
+2. **对齐判据写错**：把 `g_cmd_names` 也算进"同长" => 它按 shipped 设计就是两录制累积（`names=1382 name_offset=691`）=> 改成只比五个 per-capture 向量、names 单独报 => **ALIGNED** ✓
+3. **pool 哈希不能用裸指针**：驱动每次地址不同 => 同 arm 两次哈希就不一样（而 1301 逐位不变）=> 改成**首次出现序数 + bucket 尺寸**的规范序列 => 两臂哈希完全相同 ✓✓ **R6 要的是顺序与尺寸，不是地址**
+★ **另一条事实**：`g_pg_curblk`@125 在 shipped 里**从未被置非空**（"planning run" 没接线）=> `g_cmds_poolblk` 一直是空字段。代理在 run 循环（cgraph record @2071、warm 平环 @2153）给每个 closure 打 stamp，才让 `pool_get/pool_put` 能归到 closure —— **这是本铲真正新造的机制，不是"填已有字段"那么简单**
+
+### B 普查：`tools/group_census.csv`（678 行逐 closure）+ `group_census_families.csv`（90）+ `group_census_nearest_pair.csv`（90）
+**Q1 = 对合并相关族，"现在就相邻、无需换序就能合法并"= 0**：678 个同形成员行里只有 **12 行距离 1，全是 `xmx_rec_unary`（不是合并目标）**；**每个 GEMM/attention/quant 族 `adjacent_pairs = 0`**：`gemm_int8_batched` 72 成员 min_gap=2、`gemm_int8_residual` 68 min_gap=4、`quant(FUSED-pack)` 144 min_gap=2、`gemm_int8_qkv` 53 min_gap=9、`window_attention` 45 min_gap=10、`gemm_window_int8_residual` 52 min_gap=10 => **§56b 的"相邻对=0、间隔=一条链长"在全帧所有族上被机器证实** ✓
+**Q2 = 85 个非相邻组里 0 个是干净区间**（判据 = PGRAPH 自己的安全关系：touch 面相交即冲突、未注册 op 与一切冲突 => 保守方向只会高估阻塞）：最近一对的区间里总有 blocker，**外堵中位 8**，且**同族腿也常夹在中间**（C128 的 `quant(FUSED-pack)` 两两之间夹着 **96-100 条同族腿**）=> **把整族挪到一起 = 帧级置换，外堵 146-472 个 closure => 不是小动作**；R4 的靶已在 CSV 里点名（`blocker_names(first6)` 给 closure 号 + op 名；例 C256 `gemm_int8_qkv` 最近对 135..145 之间 9 个外堵）；**没有二元互挡环**，但 **>=3 条同形腿时，把 b 挪到 a 旁必然挪开另一条同族腿 c，而 c 自己也要与 a 相邻 => 这是整段链的置换问题，不是局部交换**（`same_family_legs_between` 就是它的量度）
+**Q3 = 动作量级（实测）**：最近一对要挪 closure 数 **中位 10**（多数 1-9，少数 621）、外堵中位 8、**区间内 `pool_get` 事件数中位 1（max 423）** => **换序会牵动取块序列 = 实测**，也正是 `[poolseq]` 存在的理由；**最便宜的换序点已定位**（B 第二步的最小实验对象，gap=2）：**挪 1 个 closure、外堵 1 个、区间内 pool_get 0-1 次** = `xmx_rec_gemm_int8_batched` C256 对 **568..570**、`xmx_rec_quant` C256 对 **567..569**、`quant(FUSED-pack)` C512 对 **235..237**；**att 半区（C256）最贵**：gap=10 => 挪 9 + 外堵 6-9 + 区间内 11 次 pool_get
+**没有写任何收益预测**（军规 26/35a/54）。本盒 GPU 约 45 min（含冷却）。
+
+### 88b. 我的读法与决策（写死，防漂移）
+**这一铲最大的价值是三件仪器**：`[vec-align]`（四向量对齐守卫，已在 §85 那类坑上第一次先响）、**`[poolseq]` 规范序列**（首次出现序数 + bucket 尺寸；R6 从"推断"变成可 diff 的东西）、`[grp]` 分组标注。**仪表留，不删。**
+**普查的诚实结论 = B 的大奖比想象的贵**：合并相关族**相邻对 = 0**、**0 个干净区间**、把整族挪到一起 = **帧级置换（外堵 146-472 个 closure）** => **"局部换序"这条路对刀 1/刀 3 不成立**；刀 1 当年判死的机理（closure 级重写不等价）现在有了**全帧范围的机器解释**。
+**因此 B 的第二步拆成两半，顺序固定**：
+- **(i) 最小机制实验（gap=2 三对）**：**目的 = 验证换序机制本身是否成立**，**收益预登记为 ≈ 0**（一对而已），**判据 = 先声明"预期的 `[poolseq]` 变化集合"再跑**（真换序必然改 poolseq，所以规矩改成：**声明之外的任何变化 => 当场 refuse/停**）；
+- **(ii) 纯 CPU 的"最大可合并质量"研究**：用 `[pgt]` 的 touch 依赖图，求**在依赖约束下的拓扑置换能把多少 ms 的同形腿变成相邻**（价格用 `rt_per_closure.csv` 实测值），并给出**要移动多少 closure**。**这一步给 B 第三步定价，不写帧收益承诺**（军规 54）。

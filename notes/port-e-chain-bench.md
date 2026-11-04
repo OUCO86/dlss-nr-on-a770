@@ -1278,3 +1278,67 @@ FAIL 要求 out/libxmx.dll 与 oneapi/libxmx_sycl.dll 必须 ABB969FE（你没�
 5. **40 门**（守卫读单一出处 ⇒ 应 40/40）→ **帧 16 对**（两侧都不设 env）；
 6. **逐 op 对账**：`NR_RUN_TIMING` 两臂（军规 40：家族价只可排序，绝对值逐 op 实测）。
 **不写收益预测**（军规 26/35a/54）：刀 1 / 刀 3 的"帧 −5.19 / −6.79"是**旧分摊账的排序值**，本清单只给机制与判据。
+
+
+# §106 **B 第一步（换序墙的仪表，不动发动机）：三件仪表 + 仪表自己逮到的三个缺陷 + 验证链 + `tools/group_census*.csv` 与 Q1/Q2/Q3**　2026-11-04 11:3x-12:0x
+**范围（照父的三条）**：`g_cmds_group` 分组标注（与 `g_cmds` 同长的 int，`pg_push` 里 push）；**REFUSE/report-only** 的分组普查（在 `xmx_graph_capture`@1923 之前跑）；`[poolseq]` 取块序列 witness（写进已有字段 `g_cmds_poolblk` + 每 closure 的 `[poolblk]`）。开关一律 presence-gated：`NR_GROUP_TRACE` / `NR_POOLSEQ` / `NR_PG_TOUCHDUMP`（后者是 §93 那台，这次加了 **ids** 镜像）。**本铲不合并、不改 closure 数量与次序、不动数值、不需要 `T_*_DEF`。**
+件：**`builds\libxmx_b1instr3.dll = F5A3F883C353B713885C0C1C434A10F6`**（演进链 `b1instr B1BBE7E7…` → `b1instr2 3F86B6CE…` → `b1instr3 F5A3F883…`，每步都是被仪表逮到缺陷后修的）。
+
+## ★ 仪表的第一次自证就逮到三个缺陷（这正是把自证明放进 dll、而不是放进我的脚本的理由）
+1. **新向量不是 record-scoped**：我只在 capture 里清 ⇒ 而 plan **录制两次**（scratch 录制 → `OP_XMX_ABORT` → 保留录制），`xmx_abort` 清 `g_cmds`/`g_cmds_touch` 但不清我的新向量 ⇒ capture 时它们还是 **1382** 而 `g_cmds` 是 **691** ⇒ `[vec-align] … -> REFUSED` **当场报警**。修 = 在 `xmx_begin`@1415 与 `xmx_abort`@1425 一起清（补丁 `s6/pe_b_instr5.py`）。**这与 §85 是同一类坑**（bookkeeping 错位伪装成数值 bug），差别只是这次有守卫先响。
+2. **我自己的对齐判据写错了**：把 `g_cmd_names` 也算进"同长" ⇒ 但 names 按 shipped 设计就是 **两录制累积**（`closures=691 names=1382 name_offset=691`）⇒ 判据改成**只比五个 per-capture 向量**（`cmds/touch/group/poolblk/idsnap`），names 单独报 `names=… name_offset=…` ⇒ 现在打 **`ALIGNED`** ✓
+3. **pool 哈希不能用裸指针**：驱动每次给的地址不同 ⇒ 同一 arm 两次跑哈希就不一样（而 1301 逐位不变）⇒ 改成**首次出现序数 + bucket 大小**的规范序列哈希 ⇒ 于是 `B2_allwitness` 与 `B2_poolonly` 的哈希**完全相同**（warm 段 `fa4d3da2aa18a510`、capture 段 `e62607c36a3c7410`）✓✓ 这才是 R6 要的东西：**顺序与尺寸**，不是地址。
+**另一条要记的事实**：`g_pg_curblk`@125 在 shipped 里**从未被置成非空**（"planning run" 这个概念没接线）⇒ 所以 `g_cmds_poolblk` 一直是空字段。我在 run 循环（cgraph record 循环 @2071 与 warm 平环 @2153）里**给每个 closure 打 stamp**，才让 `pool_get/pool_put` 能归到 closure 上 ⇒ 这是本铲真正新造的机制（不是"填一个已有字段"那么简单）。
+
+## 验证链（六步，仪表必须行为中性）
+| 步 | 读数 |
+|---|---|
+| **1 双档 1301** | 默认档（无 witness）**EXACT `DD49827D…`** ✓；**全部 witness 开**（GROUP_TRACE + POOLSEQ + PG_TOUCHDUMP + ATT5_TRACE + POOL_STATS）**EXACT** ✓；只开 poolseq **EXACT** ✓；对照**出货件 3BAECF2A + POOL_STATS** 也 EXACT ✓ |
+| **2 四向量计数** | `[vec-align] graph=0 cmds=691 touch=691 group=691 poolblk=691 idsnap=691 || names=1382 name_offset=691 -> ALIGNED` ✓；`[skip-chains] … chains_skipped=14 refused=0 closures_noop=168 passes=691 (unchanged)` 两侧一字不差 ✓ |
+| **3 poolseq 两臂 diff** | `B2_allwitness` vs `B2_poolonly`：**warm 哈希 `fa4d3da2aa18a510` 相同、capture 哈希 `e62607c36a3c7410` 相同**，`[poolseq-canon]` 每 closure 的 get 计数序列相同 ✓；**独立不变量**：`[pool] mallocs=51 bytes=311 MB` 在出货件与仪表件上**完全一致** ✓（仪表没有改变分配器行为）|
+| **4 确定性（军规 31）** | **4 个独立进程（全 witness 开）⇒ 4 颗 1301 全 EXACT、distinct md5 = 1** ✓ |
+| **5 40 门** | stage `b1instr3`（备份 `builds\libxmx_sycl_preB.bak.dll = 3BAECF2A…`）⇒ **39 GREEN / 1 RED**，RED = `gate_skip_graph` 的**身份守卫**（它现在读 `out\SHIPPED_MD5.txt` = `3baecf2a…` ⇒ stage 变体必然按设计 RED，见军规 62）；**复原 `oneapi\libxmx_sycl.dll` = `3BAECF2A…`** ✓ 后该门 **GREEN**；基座上整轮 40/40 已在 08:4x 那盒实测过 ✓ ⇒ **仪表件的实质门 = 39/39 全过** |
+| **6 帧 4 对** | 见 §107（本铲收尾时补读数）|
+**停线没有被触发**：1301 与 poolseq 都没有变 ✓。
+
+## 真正的产出：`tools/group_census.csv`（678 行，逐 closure）+ `tools/group_census_families.csv`（90 行）+ `tools/group_census_nearest_pair.csv`（90 行）
+生成器 `s6/pe_group_census.py` / `pe_group_families.py` / `pe_group_nearest.py`；输入 = `logs\walk_B3_allwitness.txt`（`[pgt]` 带 **ids**、`[poolblk]`、`[grp]`）+ `tools/chain_map.csv`。
+### Q1：**"现在就相邻、无需换序就能合法并"的组数 = 0（对合并相关的族）**
+- 逐 closure 表里 678 个同形成员行中只有 **12 行距离 1**，**全部是 `xmx_rec_unary`**（不是合并目标）；
+- **每一个 GEMM/attention/quant 族的 `adjacent_pairs = 0`**：`xmx_rec_gemm_int8_batched` 72 成员 min_gap=2、`xmx_rec_gemm_int8_residual` 68 成员 min_gap=4、`quant(FUSED-pack)` 144 成员 min_gap=2、`xmx_rec_gemm_int8_qkv` 53 成员 min_gap=9、`xmx_rec_window_attention` 45 成员 min_gap=10、`xmx_rec_gemm_window_int8_residual` 52 成员 min_gap=10 ⇒ **§56b 的"相邻对 = 0、成员间隔 = 一条链长"这次在全帧所有族上被机器证实** ✓
+### Q2：**换序在依赖图上"可表达"吗？—— 逐对看：85 个非相邻组里 0 个是"干净区间"**
+- 我的冲突判据 = **PGRAPH 自己的安全关系**（touch 面相交即冲突，未注册 op = 与一切冲突）⇒ 保守方向是对的（只会高估阻塞，不会漏）；
+- **最近一对的区间里也总有 blocker**：`ext` 中位 = **8**、`same-family 成员` 也常落在区间里 ⇒ 于是"把两条腿挪到相邻"必须**同时挪开区间里的 closure**；
+- **把整族挪到一起 = 帧级置换**：外堵 closure 数 **146-472 个**（族 × 形状组）⇒ **不是小动作**；
+- **R4 的靶就在这些 blocker 名单里**（CSV 的 `blocker_names(first6)` 列已给 closure 号与 op 名，例如 C256 的 `xmx_rec_gemm_int8_qkv` 最近对 135..145 之间有 9 个外堵）；
+- **环**：本次没发现"两腿互相挡"的二元环；但 **≥3 条同形腿时，把 b 挪到 a 旁边必然要挪开另一条同族腿 c，而 c 自己也要与 a 相邻 ⇒ 这是整段链的置换问题，不是局部交换**（CSV 的 `same_family_legs_between` 列就是它的量度：C128 的 `quant(FUSED-pack)` 组里两两之间夹着 **96-100 条同族腿**）。
+### Q3：**动作量级（实测，不是猜）**
+- **最近一对**：要挪的 closure 数 **中位 10**（多数组 1-9，少数 621）；**其中外堵 closure 中位 8**；**区间里的 `pool_get` 事件数中位 1**（max 423）⇒ **挪动会牵动取块序列的证据是实测的**，也正是 `[poolseq]` 存在的理由；
+- **最便宜的组**：`gap=2` 的一批（`xmx_rec_gemm_int8_batched` C256 对 568..570、`quant(FUSED-pack)` C512 对 235..237、`xmx_rec_quant` C256 对 567..569）⇒ **只需挪 1 个 closure、外堵 1 个、区间内 pool_get 0-1 次** ⇒ 如果 B 还要往前走，**从这里开始试**（刀 3 的 batched 族正是这一类）；
+- **att 半区（C256）最贵**：gap=10 ⇒ 挪 9 个 + 外堵 6-9 个 + 区间内 11 次 pool_get。
+**没有写任何收益预测**（军规 26/35a/54）。
+
+
+# §107 **B 第一步收尾：验证链第 6 步（帧 4 对）= 带内中性 −0.120 ms（但 4 对分不出 0.15 ms 的分辨率，如实写）+ 仪表代价的结构性论证 + 现场**　2026-11-04 12:0x-12:1x
+## 第 6 步读数（`ab.ps1` 4 对，A = `out\libxmx.dll` = `3BAECF2A…`，B = `b1instr3` = `F5A3F883…`，**两侧都不设 env**）
+```
+pair 1: A=61.130 B=62.490 delta=+1.360 | pair 2: A=60.950 B=61.180 delta=+0.230
+pair 3: A=62.240 B=61.270 delta=-0.970 | pair 4: A=62.120 B=61.020 delta=-1.100
+均值 -0.120 ms   赢 2/4   sd≈1.15  se≈0.575  CI95 半宽≈±1.83（df=3）
+```
+⇒ **|均值| = 0.12 < 0.15 的线 ⇒ 判"带内中性、留形不吹"**；**但必须如实写：4 对的分辨率是 ±1.83 ms，根本分不出 0.15 ms 量级的代价** ⇒ 这一步**没有证明仪表免费，也没有证明它贵**。
+**结构性的代价论证（比 4 对更硬的依据）**：
+ - 三件仪表全在 **record/capture 期**跑：`[pgt]`/`[grp]`/`[vec-align]` 只在 `pg_push` 与 `xmx_graph_capture` 里执行 ⇒ **每帧录制一次，不在 replay 热路**；
+ - 热路里新增的只有 run 循环里的一次可预测分支（`if (g_poolseq_on)`）与 `pool_seq_note` 的早退（`g_pool_cur_closure < 0`）⇒ **每 closure 一条分支、691 次/帧**；
+ - **默认全关**（presence-gated）⇒ 出货态根本不进这些函数。
+⇒ 所以"仪表不该买时间"这句话现在有了机制根据，而不只是 4 对不显著的均值。**若以后要把 witness 常开，必须先做 16 对**（4 对不够）。
+## 现场（本铲收工）
+- 件：**`builds\libxmx_b1instr3.dll = F5A3F883C353B713885C0C1C434A10F6`** = 本铲的仪表件（演进 `b1instr B1BBE7E7…` → `b1instr2 3F86B6CE…` → `b1instr3 F5A3F883…`，每一跳都是被 `[vec-align]`/哈希不一致逮到缺陷后修的）；
+- **加载位没动**：`out\libxmx.dll` = `oneapi\libxmx_sycl.dll` = **`3BAECF2A4B0F49F45E2557CE4808C2CF`** ✓（stage 过又复原，备份 `builds\libxmx_sycl_preB.bak.dll`）；`out\SHIPPED_MD5.txt` 未动 ✓；三金标未动 ✓；
+- 进程 0；本盒 GPU ≈ **45 min**（4 臂 walk 8 + 全 witness 臂 2 + 4 次确定性 8 + 40 门 12 + 复原单门 1 + 4 对 7 + 冷却 8），批间 ≥60 s、>20 min 批后冷却已做；
+- 新产物：`tools/group_census.csv`（678 行）、`tools/group_census_families.csv`（90）、`tools/group_census_nearest_pair.csv`（90）、日志 `logs\walk_B{2,3,4}*`；脚本 `s6/{pe_b_instr1..5, pe_b_verify1..3, pe_group_census, pe_group_families, pe_group_nearest}.py|ps1`；
+- 源码改动 = **只有仪表**（`M src/bench/sycl/libxmx_sycl.cpp`：`g_cmds_group`/`g_pg_pending_ids`/`g_pg_ids_snap`/`[poolseq]`/`[poolblk]`/`[vec-align]`/`group_census_report` + 三处 record-scoped 清理），**未 commit**。
+## 给下一铲（B 第二步）的三条硬事实
+1. **合并相关族的相邻对 = 0** ⇒ B 若要往前走，**必须先有换序机制**，不能先做合并；
+2. **最便宜的换序点已经定位**：`gap=2` 的那批组（`xmx_rec_gemm_int8_batched` C256 对 568..570、`xmx_rec_quant` C256 对 567..569、`quant(FUSED-pack)` C512 对 235..237）⇒ **挪 1 个 closure、外堵 1 个、区间内 pool_get 0-1 次** ⇒ 这就是 B 第二步的最小实验对象；
+3. **换序的判据仪器已经就位**：`[poolseq]` 两臂哈希 + `[pgt] ids` touch diff + 双档 1301 + SELFREP + 40 门 ⇒ **换序铲不需要再造轮子**，只需要按 §105 的六步判据跑。

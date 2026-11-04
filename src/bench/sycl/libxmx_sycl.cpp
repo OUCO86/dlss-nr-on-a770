@@ -124,8 +124,24 @@ static std::vector<std::vector<void*>> g_cmds_touch;    // parallel to g_cmds (r
 static std::vector<std::vector<void*>> g_cmds_poolblk;  // per-closure scratch blocks (planning run)
 static std::vector<void*>* g_pg_curblk = nullptr;       // non-null ONLY during the planning run
 static std::vector<void*> g_pg_pending;                 // ids resolved at record time
+// ---- B step 1 (knife2b #106): the group label + the ID side of the touch registration. ----
+// Instrumentation only: no closure is merged, reordered or dropped here. Four vectors must
+// stay the same length and the same order (military rule 57 now covers a fourth one), and
+// the [vec-align] line below proves it on every capture instead of trusting the code.
+// g_pg_pending_ids is the id mirror of g_pg_pending (which holds POINTERS): the census needs
+// ids, because a pointer cannot be traced back to a plane once two ids alias the same block
+// (knife2b #93/#94). The pointers keep driving the scheduler; the ids are print-only.
+static std::vector<int> g_cmds_group;                   // parallel to g_cmds; 0 = ungrouped
+static int g_group_cur = 0;                             // assigned by a later cut, never here
+static std::vector<int> g_pg_pending_ids;               // id mirror of g_pg_pending
+static std::vector<std::vector<int>> g_pg_ids_snap;      // per-closure id snapshot (print-only)
+static void pg_note_ids(const std::initializer_list<int>& ids) {
+    for (int id : ids) if (id >= 0) g_pg_pending_ids.push_back(id);
+}
 static void pgraph_ids(std::initializer_list<int> ids) {
     g_pg_pending.clear();
+    g_pg_pending_ids.clear();
+    pg_note_ids(ids);
     for (int id : ids) {
         if (id < 0) continue;
         auto it = g_bufs.find(id);
@@ -134,6 +150,7 @@ static void pgraph_ids(std::initializer_list<int> ids) {
 }
 static void pgraph_extra(int id) {   // a recorder adds an out-of-band touched buffer
     if (id < 0) return;
+    g_pg_pending_ids.push_back(id);
     auto it = g_bufs.find(id);
     if (it != g_bufs.end() && it->second.p) g_pg_pending.push_back(it->second.p);
 }
@@ -141,6 +158,10 @@ static void pg_push(std::function<void()> f) {
     g_cmds.push_back(std::move(f));
     g_cmds_touch.push_back(g_pg_pending.empty()
         ? std::vector<void*>{ (void*)-1 } : std::move(g_pg_pending));
+    g_cmds_group.push_back(g_group_cur);          // rule 57: the fourth vector
+    g_pg_ids_snap.push_back(g_pg_pending_ids);
+    if (g_pg_curblk) g_cmds_poolblk.push_back(*g_pg_curblk);
+    else g_cmds_poolblk.push_back(std::vector<void*>{});   // planning run not wired yet (#106)
     // NR_PG_TOUCHDUMP (knife2b #93): presence-gated record-time dump of every closure's touch
     // pointers, so "does anybody else read this plane?" becomes a lookup instead of an inference.
     // Host-print only: no device side effect, no extra op (military rules 4/9).
@@ -149,6 +170,8 @@ static void pg_push(std::function<void()> f) {
         const char* nm = ci < g_cmd_names.size() ? g_cmd_names[ci] : "?";   // names are const char*
         std::printf("[pgt] cmd=%zu name=%s touch=", ci, nm);
         for (void* q : g_cmds_touch[ci]) std::printf(" %p", q);
+        std::printf(" | ids=");
+        for (int id : g_pg_ids_snap[ci]) std::printf(" %d", id);
         std::printf("\n");
     }
     g_pg_pending.clear();
@@ -443,6 +466,69 @@ static bool g_graphrecording = false;
 static void ev_sync(sycl::event e) { if (!g_graphrecording) e.wait(); }
 static long g_pool_mallocs = 0;          // section 92: pool misses = driver malloc round-trips
 static unsigned long long g_pool_malloc_bytes = 0;
+// ---- B step 1 (knife2b #106): the pool-fetch SEQUENCE witness. -------------------------------
+// Why this exists: the scratch pool hands out the SAME block sequence every run (the section 92
+// in-order proof), and that sequence is part of engine correctness -- section 56b R6 proved that a
+// fusion which merely HOLDS a block longer changes what later closures fetch and silently breaks
+// the frame. So before any merge cut is even attempted, the sequence has to be printable and
+// hashable, and two arms must be comparable. NR_POOLSEQ is presence-gated: unset, every hook below
+// is a single branch on a false flag and nothing is printed or stored.
+static bool g_poolseq_on = false;                       // set from getenv("NR_POOLSEQ") at capture
+static int g_pool_cur_closure = -1;                     // stamped ONLY by the run loops, never by recorders
+static std::vector<std::vector<std::pair<void*, size_t>>> g_pool_cur_list;   // per closure, in run order
+static unsigned long long g_pool_hash = 146959810393466560ull;   // FNV-1a 64 over the CANONICAL sequence
+// The hash must be comparable ACROSS PROCESSES, and a raw device pointer is not: the driver
+// hands out different addresses every run (that is why the first two arms of #106 disagreed on
+// the raw-pointer hash while 1301 stayed byte-identical). So each distinct pointer gets a
+// first-seen ordinal and the hash covers (closure, kind, ordinal, bucket size) - the ORDER and
+// the SIZES, which is what section 56b R6 is actually about.
+static std::map<void*, unsigned long long> g_pool_ord;
+static unsigned long long pool_ordinal(void* p) {
+    auto it = g_pool_ord.find(p);
+    if (it != g_pool_ord.end()) return it->second;
+    unsigned long long v = g_pool_ord.size() + 1;
+    g_pool_ord[p] = v;
+    return v;
+}
+static void pool_seq_note(int kind, void* p, size_t n) {   // kind 0 = get, 1 = put
+    if (g_pool_cur_closure < 0) return;
+    unsigned long long ord = pool_ordinal(p);
+    g_pool_hash ^= (unsigned long long)g_pool_cur_closure ^ ((unsigned long long)kind << 56) ^ (ord << 8);
+    g_pool_hash *= 1099511628211ull;
+    g_pool_hash ^= (unsigned long long)n;
+    g_pool_hash *= 1099511628211ull;
+    if (kind == 0) {
+        if ((int)g_pool_cur_list.size() <= g_pool_cur_closure) g_pool_cur_list.resize(g_pool_cur_closure + 1);
+        g_pool_cur_list[g_pool_cur_closure].push_back(std::make_pair(p, n));
+        std::printf("[poolseq] op=%d get ptr=%p bytes=%zu\n", g_pool_cur_closure, p, n);
+    } else {
+        std::printf("[poolseq] op=%d put ptr=%p bytes=%zu\n", g_pool_cur_closure, p, n);
+    }
+    std::fflush(stdout);
+}
+static void pool_seq_begin(size_t nclosure) {
+    g_poolseq_on = getenv("NR_POOLSEQ") != nullptr;
+    if (!g_poolseq_on) return;
+    g_pool_cur_list.clear(); g_pool_cur_list.resize(nclosure);
+    g_pool_ord.clear();
+    g_pool_hash = 146959810393466560ull;
+}
+static void pool_seq_end(int graph_id) {
+    if (!g_poolseq_on) return;
+    g_pool_cur_closure = -1;
+    size_t gets = 0, maxb = 0;
+    for (auto& v : g_pool_cur_list) { gets += v.size(); if (v.size() > maxb) maxb = v.size(); }
+    std::printf("[poolseq-total] graph=%d closures=%zu gets=%zu maxperclosure=%zu hash=%016llx\n",
+                graph_id, g_pool_cur_list.size(), gets, maxb, g_pool_hash);
+    std::printf("[poolseq-canon] graph=%d seq=", graph_id);
+    for (size_t i = 0; i < g_pool_cur_list.size(); ++i) std::printf("%zu,", g_pool_cur_list[i].size());
+    std::printf("\n");
+    for (size_t i = 0; i < g_pool_cur_list.size(); ++i)
+        if (!g_pool_cur_list[i].empty())
+            std::printf("[poolblk] op=%zu n=%zu bytes=%zu\n", i, g_pool_cur_list[i].size(),
+                        [&]{ size_t s=0; for (auto& q : g_pool_cur_list[i]) s += q.second; return s; }());
+    std::fflush(stdout);
+}
 static void* pool_get(size_t n) {
     size_t bucket = (n + 255) / 256 * 256;
     auto& pl = g_pool[g_pg_slot & 3];
@@ -452,10 +538,12 @@ static void* pool_get(size_t n) {
         void* p = sycl::malloc_device(bucket, *GQ);
         if (p) g_pool_sz[p] = { bucket, g_pg_slot & 3 };
         if (p && bucket >= (16ull<<20)) mem_probe(-1, p, bucket, "POOL");  // D11 census
+        pool_seq_note(0, p, bucket);
         return p;
     }
     void* p = it->second.back(); it->second.pop_back();
     g_pool_sz[p] = { bucket, g_pg_slot & 3 };
+    pool_seq_note(0, p, bucket);
     return p;
 }
 
@@ -465,6 +553,7 @@ static void pool_put(void* p) {
     // Only recycle pool-tracked blocks. Anything else (a g_wcache weight block, a real
     // buffer) is owned elsewhere -- buf_destroy frees buffers, wcache frees cache blocks.
     if (it == g_pool_sz.end()) return;
+    pool_seq_note(1, p, it->second.first);
     g_pool[it->second.second][it->second.first].push_back(p);
     g_pool_sz.erase(it);
 }
@@ -1324,6 +1413,12 @@ int xmx_buf_destroy(int id) {
 }
 
 int xmx_begin(void) { ++g_gen; g_recording = true; g_cmds.clear();
+    // B step 1 (knife2b #106): the record-scoped side vectors start empty with the stream,
+    // exactly like g_cmds. Clearing only at capture was wrong: the plan records TWICE (the
+    // scratch recording, then OP_XMX_ABORT, then the kept recording) and the census runs at
+    // capture time -- so at that moment the new vectors still held both recordings (1382) while
+    // g_cmds held only the kept one (691). That is the same class of bug as section 85.
+    g_cmds_group.clear(); g_cmds_poolblk.clear(); g_pg_ids_snap.clear();
     // AUDIT FIX (10-27): the fold registries are RECORD-scoped (qcmd = an index into
     // g_cmds). A stale entry from a PREVIOUS recording -- scratch/probe recordings, or
     // a plan switch (768x448 <-> 960x544, different op streams) -- could dissolve the
@@ -1334,6 +1429,7 @@ int xmx_begin(void) { ++g_gen; g_recording = true; g_cmds.clear();
     s6_reset();   // S6: the chain candidate's cmd indices are RECORD-scoped
     return 0; }
 int xmx_abort(void) { g_recording = false; g_cmds.clear(); g_cmds_touch.clear();
+    g_cmds_group.clear(); g_cmds_poolblk.clear(); g_pg_ids_snap.clear();
     g_quant_pk.clear(); g_fused_quant.clear();
     g_pending_fold_slot = SIZE_MAX; g_fold_slot.clear();
     s6_reset();
@@ -1920,6 +2016,57 @@ static std::vector<std::vector<std::vector<void*>>> g_graph_touch;   // PGRAPH: 
 #ifdef _WIN32
 static int fence_host_wait(void);   // defined in the fence block; graph_run calls it
 #endif
+// B step 1 (knife2b #106): the family census + legality REPORT. It reads the frozen
+// record-time vectors and prints what a future merge cut would find; it changes nothing:
+// no closure is reordered, merged or dropped, and the whole function is behind
+// NR_GROUP_TRACE (unset => never entered). Legality here means "is this family already
+// adjacent in record order, and how far apart are its members" -- the two facts the
+// reorder question (Q1/Q2/Q3 in #106) turns on. The dependency blockers themselves come
+// from the [pgt] id dump, because a touch overlap between a member and an intervening
+// closure is exactly what a reorder must not break (section 56b R4/R6/R9).
+static void group_census_report(int graph_idx) {
+    if (!getenv("NR_GROUP_TRACE")) return;
+    size_t n = g_cmds.size();
+    std::printf("[vec-align] graph=%d cmds=%zu touch=%zu group=%zu poolblk=%zu idsnap=%zu || names=%zu name_offset=%zu",
+                graph_idx, n, g_cmds_touch.size(), g_cmds_group.size(),
+                g_cmds_poolblk.size(), g_pg_ids_snap.size(), g_cmd_names.size(),
+                g_cmd_names.size() >= n ? g_cmd_names.size() - n : 0);
+    // the FIVE per-capture vectors must be the same length (rule 57); g_cmd_names is the
+// shipped exception on purpose (it accumulates both recordings; name_offset points at this one)
+    bool ok = (n == g_cmds_touch.size() && n == g_cmds_group.size()
+             && n == g_cmds_poolblk.size() && n == g_pg_ids_snap.size());
+    std::printf(" -> %s\n", ok ? "ALIGNED" : "REFUSED: record-time vectors are NOT the same length");
+    if (!ok) { std::fflush(stdout); return; }
+    std::map<std::string, std::vector<size_t>> fam;
+    for (size_t i = 0; i < n; ++i) fam[std::string(g_cmd_names[i])].push_back(i);
+    for (auto& kv : fam) {
+        const std::vector<size_t>& v = kv.second;
+        int adj = 0, mingap = 1 << 30, sumgap = 0, pairs = 0;
+        for (size_t k = 0; k + 1 < v.size(); ++k) {
+            int gap = (int)(v[k + 1] - v[k]);
+            if (gap == 1) ++adj;
+            if (gap < mingap) mingap = gap;
+            sumgap += gap; ++pairs;
+        }
+        size_t conflicts = 0, sentinels = 0;
+        for (size_t a = 0; a < v.size(); ++a) {
+            const std::vector<void*>& ta = g_cmds_touch[v[a]];
+            if (ta.size() == 1 && ta[0] == (void*)-1) ++sentinels;
+            for (size_t b = 0; b < n; ++b)
+                if (b != v[a] && pgraph_conflict(ta, g_cmds_touch[b])) ++conflicts;
+        }
+        std::printf("[grp] family=%s members=%zu adjacent_pairs=%d min_gap=%d avg_gap=%.2f touch_conflicts=%zu sentinel_members=%zu group=%d",
+                    kv.first.c_str(), v.size(), adj,
+                    v.size() > 1 ? mingap : -1,
+                    pairs ? (double)sumgap / (double)pairs : 0.0, conflicts, sentinels,
+                    v.empty() ? 0 : g_cmds_group[v[0]]);
+        std::printf(" idx=");
+        for (size_t k = 0; k < v.size() && k < 16; ++k) std::printf(" %zu", v[k]);
+        std::printf(v.size() > 16 ? " ..." : "");
+        std::printf("\n");
+    }
+    std::fflush(stdout);
+}
 int xmx_graph_capture(void) {
     if (!g_recording) FAILMSG("not recording");
     // NR_SKIP_CHAINS: whole-chain no-ops, applied to the frozen closure list BEFORE the
@@ -1927,9 +2074,16 @@ int xmx_graph_capture(void) {
     skip_chains_apply(g_cmds, g_cmd_names, (int)g_graphs.size());
     bmerge_apply(g_cmds);      // KNIFE 1: runs AFTER the skip pass, so skipped legs cannot merge
     rb_report((int)g_graphs.size());      // NR_RES_BYTE census (no-op when the switch is unset)
+    group_census_report((int)g_graphs.size());   // B step 1: report-only (NR_GROUP_TRACE)
     g_graphs.push_back(std::move(g_cmds)); g_graph_names.push_back(std::move(g_cmd_names));
     g_graph_touch.push_back(std::move(g_cmds_touch)); g_cmds_touch.clear();
     g_cmds.clear();
+    // B step 1 (knife2b #106): the record-time side vectors are PER-CAPTURE, exactly like
+    // g_cmds/g_cmds_touch. g_cmd_names is the odd one out on purpose - it keeps growing across
+    // recordings and the skip pass addresses it through name_offset (the [skip-chains] header
+    // prints closures=691 names=1382 name_offset=691). Forgetting to reset the new vectors is
+    // exactly how section 85 got us: a bookkeeping desync looks like a numerics bug.
+    g_cmds_group.clear(); g_cmds_poolblk.clear(); g_pg_ids_snap.clear();
     g_quant_pk.clear(); g_fused_quant.clear();          // record-scoped registries die
     g_pending_fold_slot = SIZE_MAX; g_fold_slot.clear(); // with the stream (10-27 audit)
     s6_reset();                                          // S6 chain candidate: ditto
@@ -2068,7 +2222,12 @@ int xmx_graph_run(int id) {
                         cg.begin_recording(*GQ);
                         g_graphrecording = true;
                         int lim = getenv("NR_CGRAPH_LIMIT") ? atoi(getenv("NR_CGRAPH_LIMIT")) : (int)g_graphs[id].size();
-                        for (int fi = 0; fi < lim && fi < (int)g_graphs[id].size(); ++fi) g_graphs[id][fi]();   // record: no GPU execution
+                        pool_seq_begin(g_graphs[id].size());   // NR_POOLSEQ only; otherwise a no-op
+                        for (int fi = 0; fi < lim && fi < (int)g_graphs[id].size(); ++fi) {
+                            if (g_poolseq_on) g_pool_cur_closure = fi;
+                            g_graphs[id][fi]();   // record: no GPU execution
+                        }
+                        pool_seq_end(id);
                         g_graphrecording = false;
                         cg.end_recording(*GQ);
                         auto res = s_execgraphs.emplace(id, cg.finalize());
@@ -2150,8 +2309,13 @@ int xmx_graph_run(int id) {
             if (getenv("NR_SUBMIT_PROBE")) { std::printf("[wb-route] TOTAL this run: v2-hits=%ld split-path-hits=%ld\n", g_wb_v2.load(), g_wb_split.load()); std::fflush(stdout); }
             return passes;
         }
-        for (auto& fn : g_graphs[id]) fn();     // in-order queue: enqueue order = execution order
+        pool_seq_begin(g_graphs[id].size());   // NR_POOLSEQ only; the WARM run sequence too
+        for (size_t fi = 0; fi < g_graphs[id].size(); ++fi) {
+            if (g_poolseq_on) g_pool_cur_closure = (int)fi;
+            g_graphs[id][fi]();     // in-order queue: enqueue order = execution order
+        }
         GQ->wait();                             // one host sync for the whole graph (was ~2000)
+        pool_seq_end(id);
         s_warmed.insert(id);
         if (getenv("NR_SUBMIT_PROBE")) { std::printf("[wb-route] TOTAL this run: v2-hits=%ld split-path-hits=%ld\n", g_wb_v2.load(), g_wb_split.load()); std::fflush(stdout); }
     } catch (const std::exception& e) { FAILMSG("graph_run: %s", e.what()); }
