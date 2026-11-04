@@ -1,0 +1,399 @@
+closure,family,dtype,orig,merged,mech_type,extra_flops_factor,in_knife2_48,alive,cause,rt_ms,cur_price_ms,merged_shape_has_roof,roof_legs,recovery_alive_ms,needs_guard_change
+316,xmx_rec_gemm_int8_residual,int8,192x1024x4096b1,1536x1024x4096b1,fat-M,1.00 (no extra FLOPs),no,1,,0.4442,1.2325,yes,gemm_b;gemm_b_pub,1.1865,M-merge branch (new; needs contiguity + shared-B proof)
+325,xmx_rec_gemm_int8_residual,int8,192x1024x4096b1,1536x1024x4096b1,fat-M,1.00 (no extra FLOPs),no,1,,0.4282,1.2325,yes,gemm_b;gemm_b_pub,1.1865,M-merge branch (new; needs contiguity + shared-B proof)
+334,xmx_rec_gemm_int8_residual,int8,192x1024x4096b1,1536x1024x4096b1,fat-M,1.00 (no extra FLOPs),no,1,,0.4322,1.2325,yes,gemm_b;gemm_b_pub,1.1865,M-merge branch (new; needs contiguity + shared-B proof)
+343,xmx_rec_gemm_int8_residual,int8,192x1024x4096b1,1536x1024x4096b1,fat-M,1.00 (no extra FLOPs),no,1,,0.4360,1.2325,yes,gemm_b;gemm_b_pub,1.1865,M-merge branch (new; needs contiguity + shared-B proof)
+352,xmx_rec_gemm_int8_residual,int8,192x1024x4096b1,1536x1024x4096b1,fat-M,1.00 (no extra FLOPs),no,1,,0.4240,1.2325,yes,gemm_b;gemm_b_pub,1.1865,M-merge branch (new; needs contiguity + shared-B proof)
+361,xmx_rec_gemm_int8_residual,int8,192x1024x4096b1,1536x1024x4096b1,fat-M,1.00 (no extra FLOPs),no,1,,0.4352,1.2325,yes,gemm_b;gemm_b_pub,1.1865,M-merge branch (new; needs contiguity + shared-B proof)
+370,xmx_rec_gemm_int8_residual,int8,192x1024x4096b1,1536x1024x4096b1,fat-M,1.00 (no extra FLOPs),no,1,,0.4235,1.2325,yes,gemm_b;gemm_b_pub,1.1865,M-merge branch (new; needs contiguity + shared-B proof)
+379,xmx_rec_gemm_int8_residual,int8,192x1024x4096b1,1536x1024x4096b1,fat-M,1.00 (no extra FLOPs),no,1,,0.4291,1.2325,yes,gemm_b;gemm_b_pub,1.1865,M-merge branch (new; needs contiguity + shared-B proof)
+314,xmx_rec_gemm_int8,int8,192x4096x1024b1,1536x4096x1024b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2525,0.5029,yes,gemm_b;gemm_b_pub,0.4549,M-merge branch (new; needs contiguity + shared-B proof)
+323,xmx_rec_gemm_int8,int8,192x4096x1024b1,1536x4096x1024b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2477,0.5029,yes,gemm_b;gemm_b_pub,0.4549,M-merge branch (new; needs contiguity + shared-B proof)
+332,xmx_rec_gemm_int8,int8,192x4096x1024b1,1536x4096x1024b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2526,0.5029,yes,gemm_b;gemm_b_pub,0.4549,M-merge branch (new; needs contiguity + shared-B proof)
+341,xmx_rec_gemm_int8,int8,192x4096x1024b1,1536x4096x1024b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2514,0.5029,yes,gemm_b;gemm_b_pub,0.4549,M-merge branch (new; needs contiguity + shared-B proof)
+350,xmx_rec_gemm_int8,int8,192x4096x1024b1,1536x4096x1024b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2455,0.5029,yes,gemm_b;gemm_b_pub,0.4549,M-merge branch (new; needs contiguity + shared-B proof)
+359,xmx_rec_gemm_int8,int8,192x4096x1024b1,1536x4096x1024b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2363,0.5029,yes,gemm_b;gemm_b_pub,0.4549,M-merge branch (new; needs contiguity + shared-B proof)
+368,xmx_rec_gemm_int8,int8,192x4096x1024b1,1536x4096x1024b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2482,0.5029,yes,gemm_b;gemm_b_pub,0.4549,M-merge branch (new; needs contiguity + shared-B proof)
+377,xmx_rec_gemm_int8,int8,192x4096x1024b1,1536x4096x1024b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2746,0.5029,yes,gemm_b;gemm_b_pub,0.4549,M-merge branch (new; needs contiguity + shared-B proof)
+233,xmx_rec_gemm_int8_qkv,int8,960x1536x512b1,1728x1536x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2296,0.3614,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+245,xmx_rec_gemm_int8_qkv,int8,960x1536x512b1,1728x1536x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2274,0.3614,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+281,xmx_rec_gemm_int8_qkv,int8,960x1536x512b1,1728x1536x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2275,0.3614,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+293,xmx_rec_gemm_int8_qkv,int8,960x1536x512b1,1728x1536x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2510,0.3614,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+407,xmx_rec_gemm_int8_qkv,int8,960x1536x512b1,1728x1536x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2679,0.3614,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+419,xmx_rec_gemm_int8_qkv,int8,960x1536x512b1,1728x1536x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2261,0.3614,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+455,xmx_rec_gemm_int8_qkv,int8,960x1536x512b1,1728x1536x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2245,0.3614,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+467,xmx_rec_gemm_int8_qkv,int8,960x1536x512b1,1728x1536x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2308,0.3614,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+215,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,block-diag wide,8.00 x extra FLOPs,yes,1,,0.2333,0.2768,yes,gemm_b;gemm_b_pub_f16,0.2628,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+227,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.2720,0.2768,yes,gemm_b;gemm_b_pub_f16,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+239,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.2477,0.2768,yes,gemm_b;gemm_b_pub_f16,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+251,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.2431,0.2768,yes,gemm_b;gemm_b_pub_f16,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+263,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.2453,0.2768,yes,gemm_b;gemm_b_pub_f16,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+275,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.2415,0.2768,yes,gemm_b;gemm_b_pub_f16,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+287,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.2403,0.2768,yes,gemm_b;gemm_b_pub_f16,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+299,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.2455,0.2768,yes,gemm_b;gemm_b_pub_f16,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+389,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,block-diag wide,8.00 x extra FLOPs,yes,1,,0.2323,0.2768,yes,gemm_b;gemm_b_pub_f16,0.2628,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+401,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.2511,0.2768,yes,gemm_b;gemm_b_pub_f16,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+413,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.2391,0.2768,yes,gemm_b;gemm_b_pub_f16,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+425,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.2639,0.2768,yes,gemm_b;gemm_b_pub_f16,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+437,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.2527,0.2768,yes,gemm_b;gemm_b_pub_f16,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+449,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.2556,0.2768,yes,gemm_b;gemm_b_pub_f16,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+461,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.2389,0.2768,yes,gemm_b;gemm_b_pub_f16,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+473,xmx_rec_gemm,f16,640x256x64b8,640x2048x512b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.2653,0.2768,yes,gemm_b;gemm_b_pub_f16,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+318,xmx_rec_gemm_int8_qkv,int8,192x3072x1024b1,1536x3072x1024b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2232,0.2891,yes,gemm_b;gemm_b_pub,0.2517,M-merge branch (new; needs contiguity + shared-B proof)
+327,xmx_rec_gemm_int8_qkv,int8,192x3072x1024b1,1536x3072x1024b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2183,0.2891,yes,gemm_b;gemm_b_pub,0.2517,M-merge branch (new; needs contiguity + shared-B proof)
+336,xmx_rec_gemm_int8_qkv,int8,192x3072x1024b1,1536x3072x1024b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2146,0.2891,yes,gemm_b;gemm_b_pub,0.2517,M-merge branch (new; needs contiguity + shared-B proof)
+345,xmx_rec_gemm_int8_qkv,int8,192x3072x1024b1,1536x3072x1024b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2302,0.2891,yes,gemm_b;gemm_b_pub,0.2517,M-merge branch (new; needs contiguity + shared-B proof)
+354,xmx_rec_gemm_int8_qkv,int8,192x3072x1024b1,1536x3072x1024b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2180,0.2891,yes,gemm_b;gemm_b_pub,0.2517,M-merge branch (new; needs contiguity + shared-B proof)
+363,xmx_rec_gemm_int8_qkv,int8,192x3072x1024b1,1536x3072x1024b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2160,0.2891,yes,gemm_b;gemm_b_pub,0.2517,M-merge branch (new; needs contiguity + shared-B proof)
+372,xmx_rec_gemm_int8_qkv,int8,192x3072x1024b1,1536x3072x1024b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2217,0.2891,yes,gemm_b;gemm_b_pub,0.2517,M-merge branch (new; needs contiguity + shared-B proof)
+381,xmx_rec_gemm_int8_qkv,int8,192x3072x1024b1,1536x3072x1024b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2074,0.2891,yes,gemm_b;gemm_b_pub,0.2517,M-merge branch (new; needs contiguity + shared-B proof)
+219,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2206,0.2568,yes,gemm_b;gemm_b_pub,0.2377,M-merge branch (new; needs contiguity + shared-B proof)
+231,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2336,0.2568,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+243,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2164,0.2568,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+255,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.1992,0.2568,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+267,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2403,0.2568,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+279,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2234,0.2568,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+291,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2260,0.2568,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+303,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2056,0.2568,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+393,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2204,0.2568,yes,gemm_b;gemm_b_pub,0.2377,M-merge branch (new; needs contiguity + shared-B proof)
+405,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2274,0.2568,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+417,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2244,0.2568,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+429,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2459,0.2568,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+441,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2183,0.2568,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+453,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2617,0.2568,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+465,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2044,0.2568,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+477,xmx_rec_gemm_int8_residual,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2010,0.2568,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+138,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2326,0.2448,yes,gemm_b,0.2269,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+148,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2278,0.2448,yes,gemm_b,0.2269,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+158,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2683,0.2448,yes,gemm_b,0.2269,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+168,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2334,0.2448,yes,gemm_b,0.2269,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+178,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2680,0.2448,yes,gemm_b,0.2269,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+188,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2351,0.2448,yes,gemm_b,0.2269,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+198,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2595,0.2448,yes,gemm_b,0.2269,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+208,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2346,0.2448,yes,gemm_b,0.2269,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+494,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2250,0.2448,yes,gemm_b,0.2269,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+504,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2247,0.2448,yes,gemm_b,0.2269,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+514,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2454,0.2448,yes,gemm_b,0.2269,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+524,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2405,0.2448,yes,gemm_b,0.2269,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+534,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2403,0.2448,yes,gemm_b,0.2269,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+544,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2525,0.2448,yes,gemm_b,0.2269,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+554,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2241,0.2448,yes,gemm_b,0.2269,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+564,xmx_rec_gemm_window_int8_residual,int8,2560x256x256b1,2560x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2567,0.2448,yes,gemm_b,0.2269,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+221,xmx_rec_gemm_int8_qkv,int8,768x1536x512b1,1728x1536x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2228,0.2891,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+257,xmx_rec_gemm_int8_qkv,int8,768x1536x512b1,1728x1536x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2418,0.2891,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+269,xmx_rec_gemm_int8_qkv,int8,768x1536x512b1,1728x1536x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2255,0.2891,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+305,xmx_rec_gemm_int8_qkv,int8,768x1536x512b1,1728x1536x512b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2173,0.2891,yes,gemm_b;gemm_b_pub,0.2225,M-merge branch (new; needs contiguity + shared-B proof)
+395,xmx_rec_gemm_int8_qkv,int8,768x1536x512b1,1728x1536x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2692,0.2891,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+431,xmx_rec_gemm_int8_qkv,int8,768x1536x512b1,1728x1536x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2315,0.2891,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+443,xmx_rec_gemm_int8_qkv,int8,768x1536x512b1,1728x1536x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2331,0.2891,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+479,xmx_rec_gemm_int8_qkv,int8,768x1536x512b1,1728x1536x512b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2175,0.2891,yes,gemm_b;gemm_b_pub,0.2225,M-merge branch (new; needs contiguity + shared-B proof)
+135,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2141,0.2409,yes,gemm_b,0.2071,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+145,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2257,0.2409,yes,gemm_b,0.2071,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+155,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2399,0.2409,yes,gemm_b,0.2071,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+165,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2309,0.2409,yes,gemm_b,0.2071,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+175,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2195,0.2409,yes,gemm_b,0.2071,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+185,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2171,0.2409,yes,gemm_b,0.2071,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+195,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2207,0.2409,yes,gemm_b,0.2071,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+205,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2441,0.2409,yes,gemm_b,0.2071,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+491,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2145,0.2409,yes,gemm_b,0.2071,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+501,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.4187,0.2409,yes,gemm_b,0.2071,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+511,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2175,0.2409,yes,gemm_b,0.2071,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+521,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2138,0.2409,yes,gemm_b,0.2071,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+531,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2365,0.2409,yes,gemm_b,0.2071,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+541,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2196,0.2409,yes,gemm_b,0.2071,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+551,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2151,0.2409,yes,gemm_b,0.2071,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+561,xmx_rec_gemm_int8_qkv,int8,2560x768x256b1,2560x768x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2149,0.2409,yes,gemm_b,0.2071,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+131,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,block-diag wide,8.00 x extra FLOPs,yes,1,,0.2198,0.2206,yes,gemm_b;gemm_b_pub_f16,0.2042,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+141,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,block-diag wide,8.00 x extra FLOPs,yes,1,,0.2258,0.2206,yes,gemm_b;gemm_b_pub_f16,0.2042,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+151,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,block-diag wide,8.00 x extra FLOPs,yes,1,,0.2208,0.2206,yes,gemm_b;gemm_b_pub_f16,0.2042,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+161,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,block-diag wide,8.00 x extra FLOPs,yes,1,,0.2259,0.2206,yes,gemm_b;gemm_b_pub_f16,0.2042,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+171,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,block-diag wide,8.00 x extra FLOPs,yes,1,,0.2271,0.2206,yes,gemm_b;gemm_b_pub_f16,0.2042,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+181,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,block-diag wide,8.00 x extra FLOPs,yes,1,,0.2425,0.2206,yes,gemm_b;gemm_b_pub_f16,0.2042,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+191,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,block-diag wide,8.00 x extra FLOPs,yes,1,,0.2218,0.2206,yes,gemm_b;gemm_b_pub_f16,0.2042,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+201,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,block-diag wide,8.00 x extra FLOPs,yes,1,,0.2224,0.2206,yes,gemm_b;gemm_b_pub_f16,0.2042,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+487,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,block-diag wide,8.00 x extra FLOPs,yes,1,,0.2208,0.2206,yes,gemm_b;gemm_b_pub_f16,0.2042,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+497,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,block-diag wide,8.00 x extra FLOPs,yes,1,,0.2298,0.2206,yes,gemm_b;gemm_b_pub_f16,0.2042,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+507,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,block-diag wide,8.00 x extra FLOPs,yes,1,,0.2266,0.2206,yes,gemm_b;gemm_b_pub_f16,0.2042,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+517,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,block-diag wide,8.00 x extra FLOPs,yes,1,,0.2194,0.2206,yes,gemm_b;gemm_b_pub_f16,0.2042,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+527,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,block-diag wide,8.00 x extra FLOPs,yes,1,,0.2263,0.2206,yes,gemm_b;gemm_b_pub_f16,0.2042,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+537,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,block-diag wide,8.00 x extra FLOPs,yes,1,,0.2523,0.2206,yes,gemm_b;gemm_b_pub_f16,0.2042,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+547,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,block-diag wide,8.00 x extra FLOPs,yes,1,,0.2432,0.2206,yes,gemm_b;gemm_b_pub_f16,0.2042,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+557,xmx_rec_gemm,f16,2040x32x128b8,2040x256x1024b1,block-diag wide,8.00 x extra FLOPs,yes,1,,0.2183,0.2206,yes,gemm_b;gemm_b_pub_f16,0.2042,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+133,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2145,0.2046,yes,gemm_b,0.1884,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+143,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2110,0.2046,yes,gemm_b,0.1884,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+153,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2134,0.2046,yes,gemm_b,0.1884,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+163,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2048,0.2046,yes,gemm_b,0.1884,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+173,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2090,0.2046,yes,gemm_b,0.1884,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+183,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2142,0.2046,yes,gemm_b,0.1884,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+193,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.1997,0.2046,yes,gemm_b,0.1884,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+203,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2367,0.2046,yes,gemm_b,0.1884,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+489,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2215,0.2046,yes,gemm_b,0.1884,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+499,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2109,0.2046,yes,gemm_b,0.1884,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+509,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2154,0.2046,yes,gemm_b,0.1884,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+519,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.1967,0.2046,yes,gemm_b,0.1884,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+529,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2402,0.2046,yes,gemm_b,0.1884,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+539,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2119,0.2046,yes,gemm_b,0.1884,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+549,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.2457,0.2046,yes,gemm_b,0.1884,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+559,xmx_rec_gemm_int8_residual,int8,2040x256x256b1,2040x256x256b8,block-diag wide,1.00 x extra FLOPs,no,1,,0.1997,0.2046,yes,gemm_b,0.1884,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+65,xmx_rec_gemm_int8_residual,int8,8160x128x128b1,8160x128x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.5003,0.2046,yes,gemm_b,0.1772,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+76,xmx_rec_gemm_int8_residual,int8,8160x128x128b1,8160x128x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.4725,0.2046,yes,gemm_b,0.1772,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+87,xmx_rec_gemm_int8_residual,int8,8160x128x128b1,8160x128x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.4843,0.2046,yes,gemm_b,0.1772,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+98,xmx_rec_gemm_int8_residual,int8,8160x128x128b1,8160x128x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.5048,0.2046,yes,gemm_b,0.1772,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+109,xmx_rec_gemm_int8_residual,int8,8160x128x128b1,8160x128x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.4711,0.2046,yes,gemm_b,0.1772,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+120,xmx_rec_gemm_int8_residual,int8,8160x128x128b1,8160x128x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.4726,0.2046,yes,gemm_b,0.1772,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+572,xmx_rec_gemm_int8_residual,int8,8160x128x128b1,8160x128x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.4181,0.2046,yes,gemm_b,0.1772,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+583,xmx_rec_gemm_int8_residual,int8,8160x128x128b1,8160x128x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.4758,0.2046,yes,gemm_b,0.1772,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+594,xmx_rec_gemm_int8_residual,int8,8160x128x128b1,8160x128x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.5021,0.2046,yes,gemm_b,0.1772,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+605,xmx_rec_gemm_int8_residual,int8,8160x128x128b1,8160x128x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.4788,0.2046,yes,gemm_b,0.1772,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+616,xmx_rec_gemm_int8_residual,int8,8160x128x128b1,8160x128x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.4689,0.2046,yes,gemm_b,0.1772,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+627,xmx_rec_gemm_int8_residual,int8,8160x128x128b1,8160x128x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.4691,0.2046,yes,gemm_b,0.1772,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+78,xmx_rec_gemm_int8_qkv,int8,9216x384x128b1,9216x384x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.2750,0.2168,yes,gemm_b,0.1648,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+89,xmx_rec_gemm_int8_qkv,int8,9216x384x128b1,9216x384x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.2509,0.2168,yes,gemm_b,0.1648,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+122,xmx_rec_gemm_int8_qkv,int8,9216x384x128b1,9216x384x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.2521,0.2168,yes,gemm_b,0.1648,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+574,xmx_rec_gemm_int8_qkv,int8,9216x384x128b1,9216x384x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.2520,0.2168,yes,gemm_b,0.1648,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+607,xmx_rec_gemm_int8_qkv,int8,9216x384x128b1,9216x384x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.2722,0.2168,yes,gemm_b,0.1648,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+618,xmx_rec_gemm_int8_qkv,int8,9216x384x128b1,9216x384x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.2816,0.2168,yes,gemm_b,0.1648,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+18,xmx_rec_gemm_int8_residual,int8,32640x64x64b1,32640x64x64b1,block-diag wide,1.00 x extra FLOPs,no,1,,0.5831,0.2046,yes,gemm_b;gemm_b_pub,0.1042,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+29,xmx_rec_gemm_int8_residual,int8,32640x64x64b1,32640x64x64b1,block-diag wide,1.00 x extra FLOPs,no,1,,0.5345,0.2046,yes,gemm_b;gemm_b_pub,0.1042,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+40,xmx_rec_gemm_int8_residual,int8,32640x64x64b1,32640x64x64b1,block-diag wide,1.00 x extra FLOPs,no,1,,0.5400,0.2046,yes,gemm_b;gemm_b_pub,0.1042,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+51,xmx_rec_gemm_int8_residual,int8,32640x64x64b1,32640x64x64b1,block-diag wide,1.00 x extra FLOPs,no,1,,0.5602,0.2046,yes,gemm_b;gemm_b_pub,0.1042,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+640,xmx_rec_gemm_int8_residual,int8,32640x64x64b1,32640x64x64b1,block-diag wide,1.00 x extra FLOPs,no,1,,0.4842,0.2046,yes,gemm_b;gemm_b_pub,0.1042,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+651,xmx_rec_gemm_int8_residual,int8,32640x64x64b1,32640x64x64b1,block-diag wide,1.00 x extra FLOPs,no,1,,0.5326,0.2046,yes,gemm_b;gemm_b_pub,0.1042,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+662,xmx_rec_gemm_int8_residual,int8,32640x64x64b1,32640x64x64b1,block-diag wide,1.00 x extra FLOPs,no,1,,0.5367,0.2046,yes,gemm_b;gemm_b_pub,0.1042,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+673,xmx_rec_gemm_int8_residual,int8,32640x64x64b1,32640x64x64b1,block-diag wide,1.00 x extra FLOPs,no,1,,0.5428,0.2046,yes,gemm_b;gemm_b_pub,0.1042,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+23,xmx_rec_gemm_window_int8_residual,int8,32640x64x64b1,32640x64x64b1,block-diag wide,1.00 x extra FLOPs,no,1,,0.2551,0.1951,yes,gemm_b;gemm_b_pub,0.0947,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+645,xmx_rec_gemm_window_int8_residual,int8,32640x64x64b1,32640x64x64b1,block-diag wide,1.00 x extra FLOPs,no,1,,0.2592,0.1951,yes,gemm_b;gemm_b_pub,0.0947,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+214,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2211,0.1048,yes,gemm_b;gemm_b_pub,0.0857,M-merge branch (new; needs contiguity + shared-B proof)
+226,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2022,0.1048,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+238,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.1989,0.1048,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+250,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2002,0.1048,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+262,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.1918,0.1048,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+274,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.1960,0.1048,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+286,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2007,0.1048,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+298,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.1957,0.1048,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+388,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,1,,0.1977,0.1048,yes,gemm_b;gemm_b_pub,0.0857,M-merge branch (new; needs contiguity + shared-B proof)
+400,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.1993,0.1048,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+412,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.1934,0.1048,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+424,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2068,0.1048,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+436,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.1989,0.1048,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+448,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2248,0.1048,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+460,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2116,0.1048,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+472,xmx_rec_gemm_int8,int8,640x512x512b1,5120x512x512b1,fat-M,1.00 (no extra FLOPs),no,0,skip-chain(T2 compile-time default),0.2111,0.1048,yes,gemm_b;gemm_b_pub,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+130,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,other,,no,1,,0.2443,0.1692,yes,gemm_b;gemm_b_pub,0.0594,case by case
+140,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,other,,no,1,,0.2472,0.1692,yes,gemm_b;gemm_b_pub,0.0594,case by case
+150,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,other,,no,1,,0.2631,0.1692,yes,gemm_b;gemm_b_pub,0.0594,case by case
+160,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,other,,no,1,,0.2425,0.1692,yes,gemm_b;gemm_b_pub,0.0594,case by case
+170,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,other,,no,1,,0.2404,0.1692,yes,gemm_b;gemm_b_pub,0.0594,case by case
+180,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,other,,no,1,,0.2386,0.1692,yes,gemm_b;gemm_b_pub,0.0594,case by case
+190,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,other,,no,1,,0.2530,0.1692,yes,gemm_b;gemm_b_pub,0.0594,case by case
+200,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,other,,no,1,,0.2401,0.1692,yes,gemm_b;gemm_b_pub,0.0594,case by case
+486,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,other,,no,1,,0.2282,0.1692,yes,gemm_b;gemm_b_pub,0.0594,case by case
+496,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,other,,no,1,,0.2639,0.1692,yes,gemm_b;gemm_b_pub,0.0594,case by case
+506,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,other,,no,1,,0.2446,0.1692,yes,gemm_b;gemm_b_pub,0.0594,case by case
+516,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,other,,no,1,,0.2499,0.1692,yes,gemm_b;gemm_b_pub,0.0594,case by case
+526,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,other,,no,1,,0.2613,0.1692,yes,gemm_b;gemm_b_pub,0.0594,case by case
+536,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,other,,no,1,,0.2434,0.1692,yes,gemm_b;gemm_b_pub,0.0594,case by case
+546,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,other,,no,1,,0.2615,0.1692,yes,gemm_b;gemm_b_pub,0.0594,case by case
+556,xmx_rec_gemm_int8_batched,int8,2040x128x256b8,2040x1024x256b1,other,,no,1,,0.2622,0.1692,yes,gemm_b;gemm_b_pub,0.0594,case by case
+61,xmx_rec_gemm_int8_batched,int8,8160x128x128b4,8160x512x128b1,other,,no,0,S6-1a noop (:676-678 five chain legs),0.0021,0.1692,yes,gemm_b;gemm_b_pub,0.0,case by case
+72,xmx_rec_gemm_int8_batched,int8,8160x128x128b4,8160x512x128b1,other,,no,0,S6-1a noop (:676-678 five chain legs),0.0044,0.1692,yes,gemm_b;gemm_b_pub,0.0,case by case
+83,xmx_rec_gemm_int8_batched,int8,8160x128x128b4,8160x512x128b1,other,,no,0,S6-1a noop (:676-678 five chain legs),0.0021,0.1692,yes,gemm_b;gemm_b_pub,0.0,case by case
+94,xmx_rec_gemm_int8_batched,int8,8160x128x128b4,8160x512x128b1,other,,no,0,S6-1a noop (:676-678 five chain legs),0.0020,0.1692,yes,gemm_b;gemm_b_pub,0.0,case by case
+105,xmx_rec_gemm_int8_batched,int8,8160x128x128b4,8160x512x128b1,other,,no,0,S6-1a noop (:676-678 five chain legs),0.0021,0.1692,yes,gemm_b;gemm_b_pub,0.0,case by case
+116,xmx_rec_gemm_int8_batched,int8,8160x128x128b4,8160x512x128b1,other,,no,0,S6-1a noop (:676-678 five chain legs),0.0021,0.1692,yes,gemm_b;gemm_b_pub,0.0,case by case
+568,xmx_rec_gemm_int8_batched,int8,8160x128x128b4,8160x512x128b1,other,,no,0,S6-1a noop (:676-678 five chain legs),0.0022,0.1692,yes,gemm_b;gemm_b_pub,0.0,case by case
+579,xmx_rec_gemm_int8_batched,int8,8160x128x128b4,8160x512x128b1,other,,no,0,S6-1a noop (:676-678 five chain legs),0.0021,0.1692,yes,gemm_b;gemm_b_pub,0.0,case by case
+590,xmx_rec_gemm_int8_batched,int8,8160x128x128b4,8160x512x128b1,other,,no,0,S6-1a noop (:676-678 five chain legs),0.0021,0.1692,yes,gemm_b;gemm_b_pub,0.0,case by case
+601,xmx_rec_gemm_int8_batched,int8,8160x128x128b4,8160x512x128b1,other,,no,0,S6-1a noop (:676-678 five chain legs),0.0021,0.1692,yes,gemm_b;gemm_b_pub,0.0,case by case
+612,xmx_rec_gemm_int8_batched,int8,8160x128x128b4,8160x512x128b1,other,,no,0,S6-1a noop (:676-678 five chain legs),0.0021,0.1692,yes,gemm_b;gemm_b_pub,0.0,case by case
+623,xmx_rec_gemm_int8_batched,int8,8160x128x128b4,8160x512x128b1,other,,no,0,S6-1a noop (:676-678 five chain legs),0.0020,0.1692,yes,gemm_b;gemm_b_pub,0.0,case by case
+31,xmx_rec_gemm_int8_qkv,int8,35712x192x64b1,35712x192x64b1,block-diag wide,1.00 x extra FLOPs,no,1,,0.2974,0.2101,yes,gemm_b;gemm_b_pub,0.0215,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+653,xmx_rec_gemm_int8_qkv,int8,35712x192x64b1,35712x192x64b1,block-diag wide,1.00 x extra FLOPs,no,1,,0.2965,0.2101,yes,gemm_b;gemm_b_pub,0.0215,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+63,xmx_rec_gemm_int8_batched,int8,8160x32x128b4,8160x128x512b1,block-diag wide,4.00 x extra FLOPs,no,0,S6-1a noop (:676-678 five chain legs),0.0021,0.0423,yes,gemm_b;gemm_b_pub,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+74,xmx_rec_gemm_int8_batched,int8,8160x32x128b4,8160x128x512b1,block-diag wide,4.00 x extra FLOPs,no,0,S6-1a noop (:676-678 five chain legs),0.0021,0.0423,yes,gemm_b;gemm_b_pub,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+85,xmx_rec_gemm_int8_batched,int8,8160x32x128b4,8160x128x512b1,block-diag wide,4.00 x extra FLOPs,no,0,S6-1a noop (:676-678 five chain legs),0.0020,0.0423,yes,gemm_b;gemm_b_pub,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+96,xmx_rec_gemm_int8_batched,int8,8160x32x128b4,8160x128x512b1,block-diag wide,4.00 x extra FLOPs,no,0,S6-1a noop (:676-678 five chain legs),0.0020,0.0423,yes,gemm_b;gemm_b_pub,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+107,xmx_rec_gemm_int8_batched,int8,8160x32x128b4,8160x128x512b1,block-diag wide,4.00 x extra FLOPs,no,0,S6-1a noop (:676-678 five chain legs),0.0020,0.0423,yes,gemm_b;gemm_b_pub,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+118,xmx_rec_gemm_int8_batched,int8,8160x32x128b4,8160x128x512b1,block-diag wide,4.00 x extra FLOPs,no,0,S6-1a noop (:676-678 five chain legs),0.0020,0.0423,yes,gemm_b;gemm_b_pub,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+570,xmx_rec_gemm_int8_batched,int8,8160x32x128b4,8160x128x512b1,block-diag wide,4.00 x extra FLOPs,no,0,S6-1a noop (:676-678 five chain legs),0.0021,0.0423,yes,gemm_b;gemm_b_pub,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+581,xmx_rec_gemm_int8_batched,int8,8160x32x128b4,8160x128x512b1,block-diag wide,4.00 x extra FLOPs,no,0,S6-1a noop (:676-678 five chain legs),0.0020,0.0423,yes,gemm_b;gemm_b_pub,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+592,xmx_rec_gemm_int8_batched,int8,8160x32x128b4,8160x128x512b1,block-diag wide,4.00 x extra FLOPs,no,0,S6-1a noop (:676-678 five chain legs),0.0021,0.0423,yes,gemm_b;gemm_b_pub,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+603,xmx_rec_gemm_int8_batched,int8,8160x32x128b4,8160x128x512b1,block-diag wide,4.00 x extra FLOPs,no,0,S6-1a noop (:676-678 five chain legs),0.0020,0.0423,yes,gemm_b;gemm_b_pub,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+614,xmx_rec_gemm_int8_batched,int8,8160x32x128b4,8160x128x512b1,block-diag wide,4.00 x extra FLOPs,no,0,S6-1a noop (:676-678 five chain legs),0.0021,0.0423,yes,gemm_b;gemm_b_pub,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+625,xmx_rec_gemm_int8_batched,int8,8160x32x128b4,8160x128x512b1,block-diag wide,4.00 x extra FLOPs,no,0,S6-1a noop (:676-678 five chain legs),0.0020,0.0423,yes,gemm_b;gemm_b_pub,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+217,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,block-diag wide,8.00 x extra FLOPs,yes,1,,0.1743,0.0265,yes,gemm_b;gemm_b_pub,0.0097,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+229,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.1780,0.0265,yes,gemm_b;gemm_b_pub,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+241,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.1729,0.0265,yes,gemm_b;gemm_b_pub,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+253,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.1667,0.0265,yes,gemm_b;gemm_b_pub,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+265,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.2016,0.0265,yes,gemm_b;gemm_b_pub,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+277,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.1766,0.0265,yes,gemm_b;gemm_b_pub,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+289,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.1907,0.0265,yes,gemm_b;gemm_b_pub,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+301,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.1752,0.0265,yes,gemm_b;gemm_b_pub,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+391,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,block-diag wide,8.00 x extra FLOPs,yes,1,,0.1723,0.0265,yes,gemm_b;gemm_b_pub,0.0097,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+403,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.1763,0.0265,yes,gemm_b;gemm_b_pub,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+415,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.1902,0.0265,yes,gemm_b;gemm_b_pub,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+427,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.1934,0.0265,yes,gemm_b;gemm_b_pub,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+439,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.1796,0.0265,yes,gemm_b;gemm_b_pub,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+451,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.1735,0.0265,yes,gemm_b;gemm_b_pub,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+463,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.2075,0.0265,yes,gemm_b;gemm_b_pub,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+475,xmx_rec_gemm_int8_batched,int8,640x64x256b8,640x512x2048b1,block-diag wide,8.00 x extra FLOPs,yes,0,skip-chain(T2 compile-time default),0.2148,0.0265,yes,gemm_b;gemm_b_pub,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+14,xmx_rec_gemm_int8_batched,int8,32640x128x64b2,32640x256x64b1,other,,no,0,S6-1a noop (:676-678 five chain legs),0.0021,0.1692,yes,gemm_b;gemm_b_pub,0.0,case by case
+25,xmx_rec_gemm_int8_batched,int8,32640x128x64b2,32640x256x64b1,other,,no,0,S6-1a noop (:676-678 five chain legs),0.0021,0.1692,yes,gemm_b;gemm_b_pub,0.0,case by case
+36,xmx_rec_gemm_int8_batched,int8,32640x128x64b2,32640x256x64b1,other,,no,0,S6-1a noop (:676-678 five chain legs),0.0021,0.1692,yes,gemm_b;gemm_b_pub,0.0,case by case
+47,xmx_rec_gemm_int8_batched,int8,32640x128x64b2,32640x256x64b1,other,,no,0,S6-1a noop (:676-678 five chain legs),0.0021,0.1692,yes,gemm_b;gemm_b_pub,0.0,case by case
+636,xmx_rec_gemm_int8_batched,int8,32640x128x64b2,32640x256x64b1,other,,no,0,S6-1a noop (:676-678 five chain legs),0.0021,0.1692,yes,gemm_b;gemm_b_pub,0.0,case by case
+647,xmx_rec_gemm_int8_batched,int8,32640x128x64b2,32640x256x64b1,other,,no,0,S6-1a noop (:676-678 five chain legs),0.0020,0.1692,yes,gemm_b;gemm_b_pub,0.0,case by case
+658,xmx_rec_gemm_int8_batched,int8,32640x128x64b2,32640x256x64b1,other,,no,0,S6-1a noop (:676-678 five chain legs),0.0020,0.1692,yes,gemm_b;gemm_b_pub,0.0,case by case
+669,xmx_rec_gemm_int8_batched,int8,32640x128x64b2,32640x256x64b1,other,,no,0,S6-1a noop (:676-678 five chain legs),0.0021,0.1692,yes,gemm_b;gemm_b_pub,0.0,case by case
+0,xmx_rec_ffn_stem,f16,522240x32x128b1,,unparsed,,no,1,,1.6740,1.7,NO,,0.0,-
+1,xmx_rec_window_block,f16,522240x96x32b1,,unparsed,,no,1,,4.2602,4.7672,NO,,0.0,-
+2,xmx_rec_ffn,f16,130560x128x32b1,,unparsed,,no,1,,0.7274,0.7,NO,,0.0,-
+3,xmx_rec_window_block,f16,130560x96x32b1,,unparsed,,no,1,,1.1506,1.1918,NO,,0.0,-
+4,xmx_rec_ffn,f16,130560x128x32b1,,unparsed,,no,1,,0.6977,0.7,NO,,0.0,-
+5,xmx_rec_window_block,f16,136640x96x32b1,,unparsed,,no,1,,1.2271,1.2473,NO,,0.0,-
+6,xmx_rec_ffn,f16,130560x128x32b1,,unparsed,,no,1,,0.7097,0.7,NO,,0.0,-
+7,xmx_rec_window_block,f16,132736x96x32b1,,unparsed,,no,1,,1.1641,1.2117,NO,,0.0,-
+8,xmx_rec_ffn,f16,130560x128x32b1,,unparsed,,no,1,,0.6733,0.7,NO,,0.0,-
+9,xmx_rec_window_block,f16,134400x96x32b1,,unparsed,,no,1,,1.1874,1.2268,NO,,0.0,-
+12,xmx_rec_gemm,f16,32640x64x32b1,,unparsed,,no,1,,0.2119,0.2206,NO,,0.0,-
+16,xmx_rec_gemm_int8_batched,int8,32640x32x128b2,32640x64x256b1,block-diag wide,2.00 x extra FLOPs,no,0,S6-1a noop (:676-678 five chain legs),0.0020,0.0846,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+20,xmx_rec_gemm_int8_qkv,int8,32640x192x64b1,,unparsed,,no,1,,0.2936,0.192,NO,,0.0,-
+21,xmx_rec_window_attention,f16,64x64x32b1020,,unparsed,,no,1,,1.0169,0.7282,NO,,0.0,-
+27,xmx_rec_gemm_int8_batched,int8,32640x32x128b2,32640x64x256b1,block-diag wide,2.00 x extra FLOPs,no,0,S6-1a noop (:676-678 five chain legs),0.0020,0.0846,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+32,xmx_rec_window_attention,f16,64x64x32b1116,,unparsed,,no,1,,0.4638,0.7967,NO,,0.0,-
+34,xmx_rec_gemm_window_int8_residual,int8,35712x64x64b1,35712x64x64b1,block-diag wide,1.00 x extra FLOPs,no,1,,0.2728,0.2134,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+38,xmx_rec_gemm_int8_batched,int8,32640x32x128b2,32640x64x256b1,block-diag wide,2.00 x extra FLOPs,no,0,S6-1a noop (:676-678 five chain legs),0.0020,0.0846,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+42,xmx_rec_gemm_int8_qkv,int8,33728x192x64b1,,unparsed,,no,1,,0.2890,0.1984,NO,,0.0,-
+43,xmx_rec_window_attention,f16,64x64x32b1054,,unparsed,,no,1,,0.4301,0.7525,NO,,0.0,-
+45,xmx_rec_gemm_window_int8_residual,int8,33728x64x64b1,33728x64x64b1,block-diag wide,1.00 x extra FLOPs,no,1,,0.2646,0.2016,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+49,xmx_rec_gemm_int8_batched,int8,32640x32x128b2,32640x64x256b1,block-diag wide,2.00 x extra FLOPs,no,0,S6-1a noop (:676-678 five chain legs),0.0020,0.0846,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+53,xmx_rec_gemm_int8_qkv,int8,34560x192x64b1,,unparsed,,no,1,,0.2967,0.2033,NO,,0.0,-
+54,xmx_rec_window_attention,f16,64x64x32b1080,,unparsed,,no,1,,0.4187,0.771,NO,,0.0,-
+56,xmx_rec_gemm_window_int8_residual,int8,34560x64x64b1,34560x64x64b1,block-diag wide,1.00 x extra FLOPs,no,1,,0.2665,0.2066,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+59,xmx_rec_gemm,f16,8160x128x64b1,,unparsed,,no,1,,0.1769,0.2206,NO,,0.0,-
+67,xmx_rec_gemm_int8_qkv,int8,8640x384x128b1,8640x384x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.2528,0.2033,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+68,xmx_rec_window_attention,f16,64x64x32b540,,unparsed,,no,1,,0.3256,0.3855,NO,,0.0,-
+70,xmx_rec_gemm_window_int8_residual,int8,8640x128x128b1,8640x128x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.2453,0.2066,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+79,xmx_rec_window_attention,f16,64x64x32b576,,unparsed,,no,1,,0.3168,0.4112,NO,,0.0,-
+81,xmx_rec_gemm_window_int8_residual,int8,9216x128x128b1,9216x128x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.2577,0.2203,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+90,xmx_rec_window_attention,f16,64x64x32b576,,unparsed,,no,1,,0.3233,0.4112,NO,,0.0,-
+92,xmx_rec_gemm_window_int8_residual,int8,9216x128x128b1,9216x128x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.2451,0.2203,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+100,xmx_rec_gemm_int8_qkv,int8,8640x384x128b1,8640x384x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.2521,0.2033,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+101,xmx_rec_window_attention,f16,64x64x32b540,,unparsed,,no,1,,0.3134,0.3855,NO,,0.0,-
+103,xmx_rec_gemm_window_int8_residual,int8,8640x128x128b1,8640x128x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.2427,0.2066,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+111,xmx_rec_gemm_int8_qkv,int8,8640x384x128b1,8640x384x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.2463,0.2033,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+112,xmx_rec_window_attention,f16,64x64x32b540,,unparsed,,no,1,,0.3167,0.3855,NO,,0.0,-
+114,xmx_rec_gemm_window_int8_residual,int8,8640x128x128b1,8640x128x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.2418,0.2066,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+123,xmx_rec_window_attention,f16,64x64x32b576,,unparsed,,no,1,,0.3603,0.4112,NO,,0.0,-
+125,xmx_rec_gemm_window_int8_residual,int8,9216x128x128b1,9216x128x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.2550,0.2203,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+128,xmx_rec_gemm,f16,2040x256x128b1,,unparsed,,no,1,,0.1916,0.2206,NO,,0.0,-
+136,xmx_rec_window_attention,f16,64x64x32b320,,unparsed,,no,1,,0.2976,0.2285,NO,,0.0,-
+146,xmx_rec_window_attention,f16,64x64x32b320,,unparsed,,no,1,,0.2765,0.2285,NO,,0.0,-
+156,xmx_rec_window_attention,f16,64x64x32b320,,unparsed,,no,1,,0.2613,0.2285,NO,,0.0,-
+166,xmx_rec_window_attention,f16,64x64x32b320,,unparsed,,no,1,,0.2542,0.2285,NO,,0.0,-
+176,xmx_rec_window_attention,f16,64x64x32b320,,unparsed,,no,1,,0.2872,0.2285,NO,,0.0,-
+186,xmx_rec_window_attention,f16,64x64x32b320,,unparsed,,no,1,,0.2679,0.2285,NO,,0.0,-
+196,xmx_rec_window_attention,f16,64x64x32b320,,unparsed,,no,1,,0.2658,0.2285,NO,,0.0,-
+206,xmx_rec_window_attention,f16,64x64x32b320,,unparsed,,no,1,,0.3063,0.2285,NO,,0.0,-
+212,xmx_rec_gemm,f16,640x512x256b1,,unparsed,,no,1,,0.1867,0.2768,NO,,0.0,-
+222,xmx_rec_window_attention,f16,64x64x32b192,,unparsed,,no,0,skip-chain(T2 compile-time default),0.2760,0.1371,NO,,0.0,-
+224,xmx_rec_gemm_window_int8_residual,int8,768x512x512b1,,unparsed,,no,0,skip-chain(T2 compile-time default),0.2351,0.2938,NO,,0.0,-
+234,xmx_rec_window_attention,f16,64x64x32b240,,unparsed,,no,0,skip-chain(T2 compile-time default),0.2515,0.1713,NO,,0.0,-
+236,xmx_rec_gemm_window_int8_residual,int8,960x512x512b1,,unparsed,,no,0,skip-chain(T2 compile-time default),0.2437,0.3672,NO,,0.0,-
+246,xmx_rec_window_attention,f16,64x64x32b240,,unparsed,,no,0,skip-chain(T2 compile-time default),0.2591,0.1713,NO,,0.0,-
+248,xmx_rec_gemm_window_int8_residual,int8,960x512x512b1,,unparsed,,no,0,skip-chain(T2 compile-time default),0.2688,0.3672,NO,,0.0,-
+258,xmx_rec_window_attention,f16,64x64x32b192,,unparsed,,no,0,skip-chain(T2 compile-time default),0.1378,0.1371,NO,,0.0,-
+260,xmx_rec_gemm_window_int8_residual,int8,768x512x512b1,,unparsed,,no,0,skip-chain(T2 compile-time default),0.2464,0.2938,NO,,0.0,-
+270,xmx_rec_window_attention,f16,64x64x32b192,,unparsed,,no,0,skip-chain(T2 compile-time default),0.2601,0.1371,NO,,0.0,-
+272,xmx_rec_gemm_window_int8_residual,int8,768x512x512b1,,unparsed,,no,0,skip-chain(T2 compile-time default),0.2349,0.2938,NO,,0.0,-
+282,xmx_rec_window_attention,f16,64x64x32b240,,unparsed,,no,0,skip-chain(T2 compile-time default),0.1385,0.1713,NO,,0.0,-
+284,xmx_rec_gemm_window_int8_residual,int8,960x512x512b1,,unparsed,,no,0,skip-chain(T2 compile-time default),0.2487,0.3672,NO,,0.0,-
+294,xmx_rec_window_attention,f16,64x64x32b240,,unparsed,,no,0,skip-chain(T2 compile-time default),0.2541,0.1713,NO,,0.0,-
+296,xmx_rec_gemm_window_int8_residual,int8,960x512x512b1,,unparsed,,no,0,skip-chain(T2 compile-time default),0.2457,0.3672,NO,,0.0,-
+306,xmx_rec_window_attention,f16,64x64x32b192,,unparsed,,no,1,,0.1372,0.1371,NO,,0.0,-
+308,xmx_rec_gemm_window_int8_residual,int8,768x512x512b1,,unparsed,,no,1,,0.2610,0.2938,NO,,0.0,-
+312,xmx_rec_gemm,f16,192x1024x512b1,,unparsed,,no,1,,0.2225,0.3322,NO,,0.0,-
+319,xmx_rec_global_attention,int8,192x192x32b32,,unparsed,,no,1,,1.4094,1.4625,NO,,0.0,-
+321,xmx_rec_gemm_int8_residual,int8,192x1024x1024b1,1536x1024x1024b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2487,0.3081,NO,,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+328,xmx_rec_global_attention,int8,192x192x32b32,,unparsed,,no,1,,1.4125,1.4625,NO,,0.0,-
+330,xmx_rec_gemm_int8_residual,int8,192x1024x1024b1,1536x1024x1024b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2391,0.3081,NO,,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+337,xmx_rec_global_attention,int8,192x192x32b32,,unparsed,,no,1,,1.4267,1.4625,NO,,0.0,-
+339,xmx_rec_gemm_int8_residual,int8,192x1024x1024b1,1536x1024x1024b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2431,0.3081,NO,,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+346,xmx_rec_global_attention,int8,192x192x32b32,,unparsed,,no,1,,1.4509,1.4625,NO,,0.0,-
+348,xmx_rec_gemm_int8_residual,int8,192x1024x1024b1,1536x1024x1024b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2411,0.3081,NO,,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+355,xmx_rec_global_attention,int8,192x192x32b32,,unparsed,,no,1,,1.4104,1.4625,NO,,0.0,-
+357,xmx_rec_gemm_int8_residual,int8,192x1024x1024b1,1536x1024x1024b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2465,0.3081,NO,,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+364,xmx_rec_global_attention,int8,192x192x32b32,,unparsed,,no,1,,1.4237,1.4625,NO,,0.0,-
+366,xmx_rec_gemm_int8_residual,int8,192x1024x1024b1,1536x1024x1024b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2620,0.3081,NO,,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+373,xmx_rec_global_attention,int8,192x192x32b32,,unparsed,,no,1,,1.4046,1.4625,NO,,0.0,-
+375,xmx_rec_gemm_int8_residual,int8,192x1024x1024b1,1536x1024x1024b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2450,0.3081,NO,,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+382,xmx_rec_global_attention,int8,192x192x32b32,,unparsed,,no,1,,1.4301,1.4625,NO,,0.0,-
+384,xmx_rec_gemm_int8_residual,int8,192x1024x1024b1,1536x1024x1024b1,fat-M,1.00 (no extra FLOPs),no,1,,0.2466,0.3081,NO,,0.0,M-merge branch (new; needs contiguity + shared-B proof)
+385,xmx_rec_gemm,f16,192x512x1024b1,,unparsed,,no,1,,0.2286,0.3322,NO,,0.0,-
+396,xmx_rec_window_attention,f16,64x64x32b192,,unparsed,,no,0,skip-chain(T2 compile-time default),0.2382,0.1371,NO,,0.0,-
+398,xmx_rec_gemm_window_int8_residual,int8,768x512x512b1,,unparsed,,no,0,skip-chain(T2 compile-time default),0.2534,0.2938,NO,,0.0,-
+408,xmx_rec_window_attention,f16,64x64x32b240,,unparsed,,no,0,skip-chain(T2 compile-time default),0.2609,0.1713,NO,,0.0,-
+410,xmx_rec_gemm_window_int8_residual,int8,960x512x512b1,,unparsed,,no,0,skip-chain(T2 compile-time default),0.2403,0.3672,NO,,0.0,-
+420,xmx_rec_window_attention,f16,64x64x32b240,,unparsed,,no,0,skip-chain(T2 compile-time default),0.2553,0.1713,NO,,0.0,-
+422,xmx_rec_gemm_window_int8_residual,int8,960x512x512b1,,unparsed,,no,0,skip-chain(T2 compile-time default),0.2399,0.3672,NO,,0.0,-
+432,xmx_rec_window_attention,f16,64x64x32b192,,unparsed,,no,0,skip-chain(T2 compile-time default),0.2446,0.1371,NO,,0.0,-
+434,xmx_rec_gemm_window_int8_residual,int8,768x512x512b1,,unparsed,,no,0,skip-chain(T2 compile-time default),0.2369,0.2938,NO,,0.0,-
+444,xmx_rec_window_attention,f16,64x64x32b192,,unparsed,,no,0,skip-chain(T2 compile-time default),0.1389,0.1371,NO,,0.0,-
+446,xmx_rec_gemm_window_int8_residual,int8,768x512x512b1,,unparsed,,no,0,skip-chain(T2 compile-time default),0.2475,0.2938,NO,,0.0,-
+456,xmx_rec_window_attention,f16,64x64x32b240,,unparsed,,no,0,skip-chain(T2 compile-time default),0.2499,0.1713,NO,,0.0,-
+458,xmx_rec_gemm_window_int8_residual,int8,960x512x512b1,,unparsed,,no,0,skip-chain(T2 compile-time default),0.2377,0.3672,NO,,0.0,-
+468,xmx_rec_window_attention,f16,64x64x32b240,,unparsed,,no,0,skip-chain(T2 compile-time default),0.2824,0.1713,NO,,0.0,-
+470,xmx_rec_gemm_window_int8_residual,int8,960x512x512b1,,unparsed,,no,0,skip-chain(T2 compile-time default),0.2650,0.3672,NO,,0.0,-
+480,xmx_rec_window_attention,f16,64x64x32b192,,unparsed,,no,1,,0.2478,0.1371,NO,,0.0,-
+482,xmx_rec_gemm_window_int8_residual,int8,768x512x512b1,,unparsed,,no,1,,0.2423,0.2938,NO,,0.0,-
+483,xmx_rec_gemm,f16,640x256x512b1,,unparsed,,no,1,,0.2152,0.2768,NO,,0.0,-
+492,xmx_rec_window_attention,f16,64x64x32b320,,unparsed,,no,1,,0.2647,0.2285,NO,,0.0,-
+502,xmx_rec_window_attention,f16,64x64x32b320,,unparsed,,no,1,,0.2814,0.2285,NO,,0.0,-
+512,xmx_rec_window_attention,f16,64x64x32b320,,unparsed,,no,1,,0.2574,0.2285,NO,,0.0,-
+522,xmx_rec_window_attention,f16,64x64x32b320,,unparsed,,no,1,,0.2589,0.2285,NO,,0.0,-
+532,xmx_rec_window_attention,f16,64x64x32b320,,unparsed,,no,1,,0.2754,0.2285,NO,,0.0,-
+542,xmx_rec_window_attention,f16,64x64x32b320,,unparsed,,no,1,,0.2602,0.2285,NO,,0.0,-
+552,xmx_rec_window_attention,f16,64x64x32b320,,unparsed,,no,1,,0.2656,0.2285,NO,,0.0,-
+562,xmx_rec_window_attention,f16,64x64x32b320,,unparsed,,no,1,,0.2587,0.2285,NO,,0.0,-
+565,xmx_rec_gemm,f16,2040x128x256b1,,unparsed,,no,1,,0.2150,0.2206,NO,,0.0,-
+575,xmx_rec_window_attention,f16,64x64x32b576,,unparsed,,no,1,,0.3271,0.4112,NO,,0.0,-
+577,xmx_rec_gemm_window_int8_residual,int8,9216x128x128b1,9216x128x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.2686,0.2203,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+585,xmx_rec_gemm_int8_qkv,int8,8640x384x128b1,8640x384x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.2474,0.2033,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+586,xmx_rec_window_attention,f16,64x64x32b540,,unparsed,,no,1,,0.3163,0.3855,NO,,0.0,-
+588,xmx_rec_gemm_window_int8_residual,int8,8640x128x128b1,8640x128x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.2436,0.2066,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+596,xmx_rec_gemm_int8_qkv,int8,8640x384x128b1,8640x384x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.2509,0.2033,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+597,xmx_rec_window_attention,f16,64x64x32b540,,unparsed,,no,1,,0.3459,0.3855,NO,,0.0,-
+599,xmx_rec_gemm_window_int8_residual,int8,8640x128x128b1,8640x128x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.2749,0.2066,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+608,xmx_rec_window_attention,f16,64x64x32b576,,unparsed,,no,1,,0.3209,0.4112,NO,,0.0,-
+610,xmx_rec_gemm_window_int8_residual,int8,9216x128x128b1,9216x128x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.2415,0.2203,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+619,xmx_rec_window_attention,f16,64x64x32b576,,unparsed,,no,1,,0.3176,0.4112,NO,,0.0,-
+621,xmx_rec_gemm_window_int8_residual,int8,9216x128x128b1,9216x128x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.2463,0.2203,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+629,xmx_rec_gemm_int8_qkv,int8,8640x384x128b1,8640x384x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.2461,0.2033,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+630,xmx_rec_window_attention,f16,64x64x32b540,,unparsed,,no,1,,0.3137,0.3855,NO,,0.0,-
+632,xmx_rec_gemm_window_int8_residual,int8,8640x128x128b1,8640x128x128b4,block-diag wide,1.00 x extra FLOPs,no,1,,0.2435,0.2066,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+633,xmx_rec_gemm,f16,8160x64x128b1,,unparsed,,no,1,,0.2611,0.2206,NO,,0.0,-
+638,xmx_rec_gemm_int8_batched,int8,32640x32x128b2,32640x64x256b1,block-diag wide,2.00 x extra FLOPs,no,0,S6-1a noop (:676-678 five chain legs),0.0021,0.0846,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+642,xmx_rec_gemm_int8_qkv,int8,32640x192x64b1,,unparsed,,no,1,,0.2922,0.192,NO,,0.0,-
+643,xmx_rec_window_attention,f16,64x64x32b1020,,unparsed,,no,1,,0.4266,0.7282,NO,,0.0,-
+649,xmx_rec_gemm_int8_batched,int8,32640x32x128b2,32640x64x256b1,block-diag wide,2.00 x extra FLOPs,no,0,S6-1a noop (:676-678 five chain legs),0.0020,0.0846,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+654,xmx_rec_window_attention,f16,64x64x32b1116,,unparsed,,no,1,,0.4222,0.7967,NO,,0.0,-
+656,xmx_rec_gemm_window_int8_residual,int8,35712x64x64b1,35712x64x64b1,block-diag wide,1.00 x extra FLOPs,no,1,,0.2635,0.2134,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+660,xmx_rec_gemm_int8_batched,int8,32640x32x128b2,32640x64x256b1,block-diag wide,2.00 x extra FLOPs,no,0,S6-1a noop (:676-678 five chain legs),0.0020,0.0846,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+664,xmx_rec_gemm_int8_qkv,int8,33728x192x64b1,,unparsed,,no,1,,0.2972,0.1984,NO,,0.0,-
+665,xmx_rec_window_attention,f16,64x64x32b1054,,unparsed,,no,1,,0.4174,0.7525,NO,,0.0,-
+667,xmx_rec_gemm_window_int8_residual,int8,33728x64x64b1,33728x64x64b1,block-diag wide,1.00 x extra FLOPs,no,1,,0.2673,0.2016,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+671,xmx_rec_gemm_int8_batched,int8,32640x32x128b2,32640x64x256b1,block-diag wide,2.00 x extra FLOPs,no,0,S6-1a noop (:676-678 five chain legs),0.0020,0.0846,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+675,xmx_rec_gemm_int8_qkv,int8,34560x192x64b1,,unparsed,,no,1,,0.2984,0.2033,NO,,0.0,-
+676,xmx_rec_window_attention,f16,64x64x32b1080,,unparsed,,no,1,,0.4226,0.771,NO,,0.0,-
+678,xmx_rec_gemm_window_int8_residual,int8,34560x64x64b1,34560x64x64b1,block-diag wide,1.00 x extra FLOPs,no,1,,0.2756,0.2066,NO,,0.0,"MEASURED DEAD (S0 diff!=0, S1/S2 ratio<1)"
+679,xmx_rec_gemm,f16,32640x32x64b1,,unparsed,,no,1,,0.2162,0.2206,NO,,0.0,-
+681,xmx_rec_ffn,f16,130560x128x32b1,,unparsed,,no,1,,0.4605,0.7,NO,,0.0,-
+682,xmx_rec_window_block,f16,130560x96x32b1,,unparsed,,no,1,,1.1671,1.1918,NO,,0.0,-
+683,xmx_rec_ffn,f16,130560x128x32b1,,unparsed,,no,1,,0.4489,0.7,NO,,0.0,-
+684,xmx_rec_window_block,f16,136640x96x32b1,,unparsed,,no,1,,1.2261,1.2473,NO,,0.0,-
+685,xmx_rec_ffn,f16,130560x128x32b1,,unparsed,,no,1,,0.4884,0.7,NO,,0.0,-
+686,xmx_rec_window_block,f16,132736x96x32b1,,unparsed,,no,1,,1.1658,1.2117,NO,,0.0,-
+687,xmx_rec_ffn,f16,130560x128x32b1,,unparsed,,no,1,,0.7663,0.7,NO,,0.0,-
+688,xmx_rec_window_block,f16,134400x96x32b1,,unparsed,,no,1,,1.2117,1.2268,NO,,0.0,-
+689,xmx_rec_ffn_merge,f16,522240x128x32b1,,unparsed,,no,1,,3.5491,3.7,NO,,0.0,-
+690,xmx_rec_window_block,f16,534336x96x32b1,,unparsed,,no,1,,4.1594,4.8776,NO,,0.0,-
