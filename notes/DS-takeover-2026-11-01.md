@@ -2461,3 +2461,30 @@ quant 用 `qr_kernel`（无臂）；wa 的 softmax 在 **LFW/att5 融合核内�
 **114**：**读数打架先搜仓内旧账，再上仪器**（本案 `s6/wbga.md §9c` 2026-11-02 已测出探针 TU 与帧内两档价，我隔了两天才翻到）。
 **115**：**形态类改动要分两笔账：搬运形态（存到哪、少几趟）与数学形态（每元素算什么）**。(b0) 实测：搬运形态档位只值 +0.209 ms/帧（8 对，符号 6/8 一致，与历史 +0.38 同号同量级）=> **不许用"该相作用面 ms"暗示数学那一半也会被消掉**。
 **116**：**写 esimd 跨 lane fold 之前必须确认运行期 sub-group 宽度**（`sg.get_local_range()`）：本案 shipped softmax 实例 `simd=8`，按 32 lane 设计的 fold 距离（1..7、8/16/24）全部越界、语义不成立；且"1 item = 1 行"不等于"只用 1 个 lane"（编译器已把行内循环 8 宽化）。
+
+## 115. ★★★★★ **(1) 布局审计交回（`tools/layout_interleave_audit.csv`，28 个面类；写者 `RT_ms(上界)` 合计 38.12 ms）——审计自己反驳了"`sc<ldc` 是最大自挖坑"这个假设的一半，并把第一刀改写成一句可测的话**
+### 结论一：**交错不是内存布局问题**
+`gemm_s8_v8_kernel.hpp`：**`static const int BM = 128, BN = 64, BK = 32, NT = 32;`** => **一个 work-group 只写一行的 64 列**；`libxmx_sycl.cpp:4117/4148` 传的是 **`ldc=N`、`sc=Mp*N`** => **面的 pitch 本身没有交错**；
+⇒ **"改成每组行连续"不需要改任何布局**（pitch / `pack_b` / publish 寻址全不动），**只需要宽生产者 `BN >= N`**（军规 117）。
+### 前 8 行（按解锁 ms 排）
+| 写者族 | 面形(MxNxKbB) | 腿 | BN | 行被拆给几个 WG | 写者 RT_ms(上界) | 族级行 scope 量化点 | 面 MB |
+|---|---|---|---|---|---|---|---|
+| `gemm_window_int8_residual` | 2560x256x256b1 | 16 | 64 | **4** | 3.87 | 14（0.631 ms）| 0.66 |
+| `gemm_int8_residual` | **8160x128x128b1** | 12 | 64 | **2** | **5.72** | (128 档 12 点) | 1.04 |
+| `gemm_window_int8_residual` | 9216x128x128b1 | 6 | 64 | 2 | 1.51 | 14（0.631）| 1.18 |
+| `gemm_window_int8_residual` | 8640x128x128b1 | 6 | 64 | 2 | 1.49 | 14（0.631）| 1.11 |
+| `gemm_int8_qkv` | 2560x768x256b1 | 16 | 96 | 8 | 3.76 | 14（0.630）| 1.97 |
+| `gemm_int8_residual` | 192x1024x4096b1 | 8 | 64 | **16** | 3.45 | - | 0.20 |
+| `gemm_int8` | 192x4096x1024b1 | 8 | 64 | **64** | 2.01 | - | 0.79 |
+| `gemm_int8_qkv` | 192x3072x1024b1 | 8 | 96 | 32 | 1.75 | - | 0.59 |
+### ★ 结论二（审计自己的反证，防它误导下一铲）
+- **N=128 那档（写者 RT 最大：5.72 + 3.0 ≈ 8.7 ms）：宽生产者我们已经造过 = s8v9（BM=64/BN=128），实测慢 3.0x（§102）** => **这一档的束缚不是 `sc<ldc`，是宽 tile 的占用/累加器成本**；
+- **N>=256 档（28 个行级量化点 / 1.26 ms + 十几 ms 写者）：从没造过 BN>=256 的生产者 => 这条路未测**；代价项已列进 `layout_change_cost`：`SLM_B = BK x BN = 32 x 256 = 8 KB`（+ SLM_A）、累加器 `WI_ROWS x WI_COLS x 12 > 8` => **v9b 惩罚区**、**占用非单调（BN=32 实测 2.1x 快、BN=128 实测 3.0x 慢、BN=256 未知）**（军规 118）；
+- **N>=1024 档（192x1024x4096、192x4096x1024）：行被拆给 16-64 个 WG => "就地算 max"基本无望**，要 B case (2) 的**跨 WG 两段式（partial-max + fixup）**。
+⇒ **第一刀被改写成一句可测的话**：**"在 N=256 / 512 两档，宽生产者（BN=N）比 BN=64 快还是慢？"** —— 这是**屋顶臂问题**（bench 里把 BN 参数化测两档），比改引擎便宜（6 形 x 6 进程约 40 分钟，等批）。
+### 口径改名已做（军规 112 文档化）
+- **`tools/frame_factor.md` 重写**：0.50 标成**跨路径比**（RT = plain-path 墙钟上界；出货是 cgraph），新增一节 **"帧内价的唯一定义 = 帧级 A/B 实测差"**；三档口径命名 **`RT_ms(上界)` / `region_ms(TU)` / `frame_ms`**；
+- **列名已改**：`anchor_gap.csv`（`measured_ms -> RT_ms_upper`、`hard_roof_ms -> region_ms_TU_roof`、`headroom_ms -> headroom_ms_RT_upper`）、`hop_budget.csv`（-> `RT_ms_upper_move_closure`）、`kernel_scorecard.csv`（`serial_ms -> RT_ms_upper`、`our_ms -> region_ms_TU`、`bar_ms -> frame_ms_ref_published`）。
+### 军规 117/118（入 B2）
+**117**：**"行被拆给多个 WG"通常是 tile 宽度问题，不是内存布局问题**：先查 `ldc/sc` 是否本来就是连续 pitch（本案 `ldc=N`、`sc=Mp*N` 无交错），再看 `BM/BN/BK` 常量。=> 想"每组行连续"只需宽生产者 `BN>=N`，不需要动 pitch/pack/publish 寻址。
+**118**：**tile 宽度的占用效应非单调，禁止用相邻档位外推**：本案 BN=32 实测 2.1x 快、BN=128 实测 3.0x 慢、BN=256 未知；累加器 `WI_ROWS x WI_COLS x 12 > 8` 落在 v9b 惩罚区，`SLM_B = BK x BN` 线性涨。=> 每一档都要单独测屋顶。

@@ -7,7 +7,6 @@ L_gatile,NR_GA_TILE,global_attention tiled softmax,57.35,56.97,+0.38,EXACT,"UNRE
 L_wamerge,NR_WA_MERGE,window_attention merge,57.51,56.97,+0.54,EXACT,"UNRESOLVED (< ~1.0 ms, do NOT write 'contribution ~0')",
 L_wbfuse,NR_WB_FUSE,window_block fuse,57.05,56.97,+0.08,EXACT,"UNRESOLVED (< ~1.0 ms, do NOT write 'contribution ~0')",
 L_gfold,NR_G_FOLD,f16 gemm publish folded into the gemm store,61.96,56.97,+4.99,EXACT,"LIVE, off-cost >= 1.0 ms -> needs 16-pair confirm",
-
-NOTE,all eight arms are 1301-EXACT => the byte test CANNOT decide liveness for BIT-EXACT fusions: turning them off recomputes the same values by a longer path. The byte test only proves the two forms agree. Liveness here = the time delta.
-NOTE,"off_delta from a SINGLE walk = a SIEVE only (rule 35b): arms >= ~1.0 ms need ab.ps1 -Pairs 16 on/off confirmation; arms below that are marked UNRESOLVED, never 'contribution ~0'."
-NOTE,"these are costs of REMOVING a shipped fusion, i.e. evidence the mechanism is live and already banked -- they are NOT recoverable gains."
+NOTE,all eight arms are 1301-EXACT => the byte test CANNOT decide liveness for BIT-EXACT fusions: turning them off recomputes the same values by a longer path. The byte test only proves the two forms agree. Liveness here = the time delta.,,,,,,,
+NOTE,"off_delta from a SINGLE walk = a SIEVE only (rule 35b): arms >= ~1.0 ms need ab.ps1 -Pairs 16 on/off confirmation; arms below that are marked UNRESOLVED, never 'contribution ~0'.",,,,,,,
+NOTE,"these are costs of REMOVING a shipped fusion, i.e. evidence the mechanism is live and already banked -- they are NOT recoverable gains.",,,,,,,
