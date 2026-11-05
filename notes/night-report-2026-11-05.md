@@ -1874,3 +1874,105 @@ GPU 批**正在跑**（4 形 × 12 进程，预计 ~105 min，每轮组名回验
 - **前置证据状态**：屋顶 ✓（HARD 0.0370）、容量曲线 ✓（加组免费）、A/B/C/D 分解 ✓；**还缺**：(a) 引擎侧 BN=32 的 **pack_b 布局**与 `gemm32_*` 的 stride 约束是否满足这些形状（N=128 时 BN=32 ⇒ 4 个列 tile ⇒ 需要确认 B 打包与 sc/ldc 兼容）；(b) **bench 成对单价**（军规 74：现路 vs BN=32 路由，**≥10 进程/形、同进程配对、逐字节 diff=0、计价腿 private/spill/scratch=0**）。
 ## 现场
 进程 0；两槽 `3BAECF2A…`、三金标、`out\SHIPPED_MD5.txt` 未动；探针 exe = 770,048 B（含 cap/anat/force32 腿，**bench 专用，不进 dll**）；产物 `tools/anchor_gap.csv`（v5）、`tools/capacity_curve.csv`、`tools/leg70us_decomp.csv`、`tools/xmx_roof.csv`（255 行，池化后）；日志 `s6\SHAPE_ROOF_{phase,phase2,v9,conf,cap,f32}.log`；脚本 `s6/{pe_conf_batch.ps1,pe_cap_batch.ps1,pe_conf_merge,pe_cap_merge,pe_pool_all,pe_anchor_gap5,pe_gap5_fix,pe_gap5_fix2,pe_cap_add2,pe_force32_add,pe_decomp_write,pe_splitk_find}.py|ps1`；账 §125。
+
+
+# §126 **铲 (a) 读码判决：BN=32 路由在 N=128 上"合法且画质零代价"，但**我今晚那条 2.1x 是跟非出货臂比的**——出货 N=128 走的是 `gemm_b_pub_slm`（§100 C2 的 acc-via-SLM 尾，SLM 32,768 B），**屋顶表里根本没有它的行**；而且 `NR_G32_PUB=1` 对 N=128 **不会触发**（pubslm 分支先 return）。文件 `notes/bn32_routing_feas.md`　2026-11-05 08:5x-09:1x
+## 四问四答（全部带行号原文）
+**Q1 pack/stride**：`gemm_s8_v8_kernel.hpp` 里 **`void pack_b32(...) { pack_b(B, Bp, N, K); }`**，注释原话 **"identical map to pack_b -- it already takes N as a parameter (N/8=4 tiles at 32)"** ⇒ **BN=32 与 BN=64 用的是同一份打包 B**（8 列 tile × 32 深 k-block 的布局，BN 只决定一个工作组吃几个 tile）⇒ 设备侧 `packdev::gather_pack_b_b`（引擎 3983 行）一套打包服务两条路。
+⇒ **顺带修我自己的台账标注**：`gemm32_b_pub_forced` 那几行我写了"按 BN=64 打包 ⇒ 数值无意义"——**错**，pack_b32 就是 pack_b ⇒ **数值有效**；已改（`tools/xmx_roof.csv`）。
+**Q2 出口同址**：两条尾都算 `size_t out = (size_t)g*sc + (size_t)rr0*ldc + gc;`（`gemm_b_pub` 还有 rr1 的第二 8 行半），narrow/epi 链同为 `pub_vec_v8<16>(epi, convert<float>(acc)*rs*cs)` ⇒ **逐字节同址 ✓ 不必停线**。
+**Q3 归约顺序**：两核 k 循环都是 `for (int b = 0; b < kb_n; ++b`（升序，kb_n=K/32）、累加链都是 `dpas<8,8,int32_t>(c00..c11)`；**BN 改的是 WI→列 的归属（`WI_COLS=BN/16`，`gemm32_b_pub` 用 `COL_BANDS=BN32/16`），不是每个元素的 k 序** ⇒ **每个输出元素的 int32 累加序列完全相同 ⇒ 逐位等价（画质零代价）**；最终仍要 1301 双 EXACT 才算证。
+**Q4 N=32 先例与要放宽的条件**：`libxmx_sycl.cpp:4148-4151` 的 guard **本来就吃 N=128**（`N%32==0 && epi∈{0,1,3,4}`）；**挡住它的是分支顺序**：`4108-4117` 的 `pubslm && N == 128u ⇒ gemm_b_pub_slm` 先 return；4137-4144 的注释还记着 N=32 那 20 条被 P8-b wide-merge 提前吃掉（"rebuilt dll 里探针打零次 ⇒ proof, not inference"）。⇒ **要跑 BN=32 只能 `NR_PUB_SLM=0 + NR_G32_PUB=1`（一次动两个变量），或者改码把 g32pub 排到前面（实现未批）**。
+## ★ 最重要的自纠：**② 那条 2.1x 的比较对象错了**
+出货 N=128 臂 = **`s8v8::gemm_b_pub_slm<HALF>`**（4110-4117；注释：**BIT-EXACT diff 0，0.148→0.112 / 0.227→0.210 / 0.196→0.150 在帧的三个 N=128 形状上**；**SLM `HALF ? 18432 : 32768`**）⇒ 我的屋顶表里只有 `gemm_b_pub`（0.0782）与 `gemm32_b_pub_forced`（0.0370）⇒ **"BN=32 比 BN=64 快 2.1x"只在"寄存器尾 vs 寄存器尾"之间成立**，**跟出货臂（SLM 尾）比还没测过**。
+⇒ **所以 (b) 之前必须先补两件事**：
+ 1. **`gemm_b_pub_slm` 的屋顶行**（8160/8640/9216×128×128 b1 + 帧里真实的多组形 `32640x128x64 b2`、`8160x128x128 b4`）；
+ 2. **SLM=32,768 的容量曲线**（出货 pub_slm 每 EU 只能驻 2 组，我测的曲线是 18,432 B ⇒ 3 组）——**填充百分比要按 2-resident 重算**。
+## 这个角落已经踩过两次 occupancy 坑（读码顺手挖出来，别丢）
+* `4111-4113`：**N=64 不配 SLM 尾**——"the 32KB stage costs occupancy there (0.033→0.074, the v9c lesson)"；
+* `3870-3872`：**v9b（BM=32 宽 N 合并）0.53-0.80 ms vs v8 `gemm_b_pub_slm` 0.11-0.21 ms**，而且 "the v9b default was MASKING C2（那些调用根本没走到 pub_slm）"。
+⇒ **结论：填充杠杆必须跟 `pub_slm` 比，否则就是在重复这两次坑**（军规 90 的用法：先定比较对象，再谈倍率）。
+## 三态判定（交父）
+**`合法（画质零代价）` 但 (b) 的对照臂必须是 `gemm_b_pub_slm`，且它没有屋顶 ⇒ 先补屋顶再谈价**；若父要的是"现在就给价"，那只能给"BN=32 vs 非出货 BN=64 寄存器尾 = 2.1x"这一条，**不能当引擎收益**（军规 74/90）。
+## 现场
+零 GPU（本步全读码）；进程 0；两槽 `3BAECF2A…`、三金标、`out\SHIPPED_MD5.txt` 未动；新文件 `notes/bn32_routing_feas.md`；`tools/xmx_roof.csv` 的 `_forced` 标注已修；脚本 `s6/{pe_bn32_read,pe_bn32_route,pe_bn32_full,pe_bn32_exact,pe_pubslm,pe_note_fix_forced}.py`；账 §126。
+
+
+# §127 **(b) 前置 ①② 开工：抓到一条真 bug——我在探针里用 CRT `free()` 释放 `sycl::malloc_device` 指针 ⇒ 进程在打印完那几条腿之后崩溃 ⇒ 三批屋顶（v9 / force32 / pub_slm）全是**截断跑**；修好（18 处 → `sycl::free(p,q)`）+ 一次 smoke run 给出 **DIFFARM 三臂逐字节全 0**（(a) 的读码判定被实测确认）⇒ 5 形 × 12 进程重跑中　2026-11-05 08:1x-08:3x
+## 抓到的东西（顺序与证据）
+1. **症状**：`pe_pslm_batch.ps1` 第一轮里 **`int8 gemm_b`/`gemm_b_pub`/`gemm32_*_forced` 三条腿的行不见了，也没有 `=== done grp=` 收尾行** ⇒ 进程在中途死掉；而**它已经打印的腿（cap32、pub_slm）数值看着正常** ⇒ 一开始差点被当成"腿没编进去"。
+2. **定位**：`pe_free_check.py` 数出探针里 **`free(` 18 处 / `sycl::free(` 11 处**——**18 处裸 `free()` 全是我加的腿**（v9、force32、pubslm），而探针自己的代码一直用 `sycl::free(p, q)` ⇒ **对设备指针调 CRT free ⇒ 进程崩**。
+3. **波及面（如实）**：**§119/§122 的 v9 批、§124 的 force32 批、以及本铲第一次 pub_slm 批都是截断跑**——
+   - **已打印的那些行的计时是有效的**（崩溃发生在打印之后、后续腿之前）⇒ v9=0.2345（spread 0.6%）、gemm32_b_pub_forced=0.0370（2.2%）**仍然可用**；
+   - 但**同批里排在它们后面的腿根本没跑到** ⇒ 那几形的 `gemm_b_pub` 行只有 conf 批的 12 进程、且**cap/anat 腿混批时后面的行丢失** ⇒ 台账里若干 nproc 数偏小。
+4. **修**：`pe_free_fix.py` 把 18 处裸 `free(x)` 改成 `sycl::free(x, q)`（余 0 处），重编 `exit=0`，exe **829,952 B @08:16:25 md5 69F58243…**。
+## Smoke run（1 进程，SRP_G=3 R=10，只为验腿，不进台账）
+```
+DIFFARM;M=8160;N=128;K=128;b=1;pubslm_vs_pubslmH=0;pubslm_vs_gemm_b_pub=0;pubslm_vs_gemm32_b_pub=0
+```
+⇒ **四条臂（`gemm_b_pub_slm<0>` / `<1>` / `gemm_b_pub` / `gemm32_b_pub`）在同一份 A/B 打包下输出逐字节完全相同 ⇒ §126 (a) 的"BN 不改归约顺序 ⇒ 画质零代价"被实测确认**（不是只靠读码）。
+首读（**非协议档**，G=3/R=10，只作方向）：`pub_slm(HALF=0) 0.0744`、`pub_slmH 0.0715`、`gemm_b_pub 0.0790`、`gemm32_b_pub 0.0370` ⇒ **pub_slm / gemm32 ≈ 2.0 ⇒ 高于 1.3 预登记线**；**另注意出货 SLM 尾只比寄存器尾快 ~6%（0.0744 vs 0.0790），与 §100 注释里"0.148→0.112"的幅度不同 ⇒ 那个收益是形状相关的**（他们的三个 N=128 形是 b2/b4 多组形，我这里是 b1）——**这条留给 12 进程批定案**。
+## 现在在跑
+`pe_pslm_batch.ps1`：**5 形 × 12 进程**（G27_batched_8160_128_128_b4 / G29_batched_32640_128_64_b2 / G54_i8_8160_128_128 / G56_i8_8640_128_128 / G57_i8_9216_128_128），每进程内同时产出：f16 两腿、int8 `gemm_b`/`gemm_b_pub`、`gemm32_b(_pub)_forced`、**`gemm_b_pub_slm` 与 `gemm_b_pub_slmH` 分开两行**、**cap32 空核 64/128/256/512/1024（SLM 32,768 = 每 EU 2 驻）**、以及 b==1 时的 **DIFFARM 逐字节对拍**；协议 min-of-15×5、nosink、进程间 60 s、组间 300 s 冷却、组名回验、开工断言 exe+md5、无输出即中止（军规 93）⇒ **预计 ~92 min**（08:2x → ~09:5x），交回 ①② 约 10:1x，**在 10:45 之内**。
+## 现场
+进程：仅该批；两槽 `3BAECF2A…`、三金标、`out\SHIPPED_MD5.txt` 未动；探针 exe = 829,952 B md5 `69F58243…`；脚本 `s6/{pe_pslm_add,pe_free_check,pe_free_fix,pe_pslm_batch.ps1,pe_pslm_merge,pe_ratio3,pe_pubslm_sig}.py|ps1`；日志 `s6\pslm_sanity.log`、`s6\SHAPE_ROOF_pslm.log`（重跑中）；账 §127。
+
+
+# §128 **(b) 前置①② 落地 + ③ 的 b1 三臂读数：hard-vs-hard 两形 ratio = **1.09 / 1.14 < 1.3** ⇒ **填充杠杆（BN=32）在 N=128 上判死**；三臂**逐字节全等**（3 形 × 12 次）；**同 SLM(32,768) 的实测容量曲线**补上（64→2.50 µs … 1024→3.40 µs）；**`shipped_arm` 列进台账**　2026-11-05 09:4x-10:0x
+## 批与完整性（军规 99 的事后校验器已建）
+`s6/pe_batch_audit.py`：**60 进程、`partial = 0/60`**、每个进程都有 `=== done grp=`、组名回验 0 mismatch（`sycl::free` 修好之后）。
+**DIFFARM（三臂逐字节对拍，b==1 时探针内建）**：`8160/8640/9216 ×128×128 b1` **各 12 次，全部 0/0/0** ⇒ `tools/three_arm_diff.csv` ⇒ **(a) 的"BN 不改归约顺序 ⇒ 画质零代价"由 36 次实测确认**（`pubslm<0>` vs `pubslm<1>` vs `gemm_b_pub` vs `gemm32_b_pub`）。
+## ① 出货臂 `gemm_b_pub_slm` 的屋顶（HALF 两档分行，未合并）
+| shape | HALF=0（SLM 32,768） | HALF=1（SLM 18,432） | 寄存器尾 `gemm_b_pub` | **BN=32 `gemm32_b_pub_forced`** |
+|---|---|---|---|---|
+| 8160×128×128 b1 | 0.0759（**62.0% ⇒ 不硬**） | 0.0729（23.0%） | 0.0784（22.7%） | **0.0371（1.4% ⇒ HARD）** |
+| 8640×128×128 b1 | 0.0455（79.4%） | **0.0441（2.1% ⇒ HARD）** | 0.0490（74.8%） | **0.0418（1.2% ⇒ HARD）** |
+| 9216×128×128 b1 | **0.0496（4.1% ⇒ HARD）** | **0.0468（5.0% ⇒ HARD）** | 0.0538（69.2%） | **0.0436（2.1% ⇒ HARD）** |
+| **8160×128×128 b4** | **0.1477（2.8% ⇒ HARD）** | 0.1454（37.0%） | —（b>1 之前无此腿） | **补测中** |
+| **32640×128×64 b2** | **0.2088（17.9% ⇒ HARD）** | **0.2061（4.8% ⇒ HARD）** | — | **补测中** |
+## ② 同 SLM 的实测容量曲线（`tools/capacity_curve_slm32k.csv`，每点 n=65 进程）
+空核、NT=32、**SLM 32,768 B/组**（= 出货 `pub_slm` HALF=0 的足迹，每 EU 2 驻）：**64→2.50、128→3.00、256→2.70、512→2.90、1024→3.40 µs**（spread 7.7-13.0%）。
+⇒ **SLM 翻倍不改变"加组几乎免费"**（512 组与 128 组同价；1024 组只贵 13%）⇒ 军规 96 要求的"用与出货臂同 SLM 的实测曲线"补上了。
+⇒ **按它重算填充**：**b1 相位形（residual/qkv 的 128 组）确实只占实测容量的 13-25%**；**但帧里真实的 batched N=128 形是 b4=512 组、b2=1024 组 ⇒ 已经在满波附近** ⇒ **"填充不足"不是 batched 族出货路径的病**（这一条把 §125 的推论范围收窄了）。
+## ③ 三臂 ratio（b1；预登记线 1.3）
+| shape | 出货臂 | BN=32 | ratio | 判定 |
+|---|---|---|---|---|
+| 8160×128×128 b1 | 0.0759（**分母不硬**） | 0.0371（硬） | 2.05 | **不能用**（比较对象不硬 ⇒ 军规 90/97） |
+| 8640×128×128 b1 | 0.0441（slmH，硬） | 0.0418（硬） | **1.09** | **< 1.3 ⇒ 判死** |
+| 9216×128×128 b1 | 0.0496（硬） | 0.0436（硬） | **1.14** | **< 1.3 ⇒ 判死** |
+**顺带（你 (3) 第三条）**：**`pub_slm` 只比寄存器尾快 3-9%**（1.033/1.077/1.085）⇒ 今晚 headroom 表用 `gemm_b_pub` 当锚点的偏差只有 ~5%（锚点偏低 ⇒ headroom 略偏大）；**§100 注释里 0.148→0.112（1.32x）是 b2/b4 多组形上的收益，不是 b1** ⇒ 已在 `shipped_arm` 列注明。
+## `shipped_arm` 列（`tools/xmx_roof.csv`，279 行）
+每条腿标注它在引擎里的身份与可达性：`SHIPPED for N=128 batched (4117 pubslm && N==128u, HALF=0)` / `register tail: shipped for N%64 legs other than N=128 batched, and for N=128 when NR_PUB_SLM=0` / `SHIPPED for N=32 via NR_G32_PUB (4148) -- today unreachable` / `NOT shipped: probe-forced BN=32 (pack_b32 IS pack_b => operands/values valid)` / `NOT shipped: s8v9 behind if(false && ...)` / `raw int32 C: never the shipped exit form` / `SHIPPED f16 route (NR_G_FOLD)` ⇒ **以后取锚点按列走，不再拿错臂**（军规 97 的机器化）。
+## 待收
+`pe_g32mg_batch.ps1`（G27 b4 + G29 b2 各 12 进程，源码已把 BN=32 pub 腿放宽到多组形：`sc=Mp8*N`、`ldc=N`，与 pub_slm 同布局；编译 `exit=0`，exe 832,512 B @09:42:42）⇒ **落了就定案：若 b4/b2 的 ratio 也 <1.3 ⇒ 核内几何整条线结案**；若 ≥1.3 ⇒ 说明填充只在"组数少的 b1 相位形"上有效，那要改的对象是 **residual/qkv 的相位核配置**，不是 batched 路由（另立铲）。
+## 现场
+本盒 GPU：pslm 批 60 进程 ≈ **66 min** + g32mg 批 24 进程 ≈ **26 min**（预计）；进程间 60 s、组间 300 s 冷却；两槽 `3BAECF2A…`、三金标、`out\SHIPPED_MD5.txt` 未动；脚本 `s6/{pe_pslm_add,pe_pslm_batch.ps1,pe_batch_audit,pe_pslm_merge,pe_ratio3,pe_shipped_arm_col,pe_free_check,pe_free_fix,pe_g32mg_add,pe_g32mg_batch.ps1,pe_pubslm_sig}.py|ps1`；账 §128。
+
+
+# §129 **③ 定案：多组形（帧里真实的 batched N=128）两条 ratio = **1.012 / 1.012**（双臂都 HARD）⇒ **核内几何（BN 宽窄 / 组数）在 N=128 全线判死**；唯一 >1.3 的 8160×128×128 b1 是**分母不硬 + 该形 BN=64 腿本身可疑**（0.078 对 8640/9216 的 0.049/0.054，三批一致）⇒ 列为**待查异常**，不当杠杆**　2026-11-05 10:0x-10:2x
+## 读数（`pe_g32mg_batch.ps1`：G27 + G29 各 12 进程；`pe_batch_audit.py` ⇒ **24 进程、partial 0/24**；组名回验 0 mismatch）
+| 形（帧里真实的 batched N=128） | 出货臂 `gemm_b_pub_slm` | BN=32 `gemm32_b_pub_forced` | **ratio** | 判定（预登记线 1.3） |
+|---|---|---|---|---|
+| **8160×128×128 b4** | **0.1479（12 进程，13.4% ⇒ HARD）** | **0.1462（12，5.9% ⇒ HARD）** | **1.012** | **< 1.3 ⇒ 判死** |
+| **32640×128×64 b2** | **0.2092（12，3.9% ⇒ HARD）** | **0.2067（12，4.2% ⇒ HARD）** | **1.012** | **< 1.3 ⇒ 判死** |
+补测把源码里的 BN=32 pub 腿放宽到多组形（`sc = Mp8*N`、`ldc = N`，与 pub_slm 同布局；`pack_b32` 就是 `pack_b` ⇒ 操作数有效），编译 `exit=0`（exe 832,512 B @09:42:42）。
+## 全部五形 ratio 汇总（hard 标注）
+| shape | 出货臂 | BN=32 | ratio | 备注 |
+|---|---|---|---|---|
+| 8160×128×128 **b1** | 0.0759（**62% ⇒ 不硬**） | 0.0371（硬） | 2.05 | **不能进建议**（分母不硬，军规 90/97）；且该形 BN=64 家族三批一致测到 ~0.078，而 8640/9216 只有 0.049/0.054 ⇒ **8160 是可疑 outlier，列为待查异常** |
+| 8640×128×128 b1 | 0.0441 slmH（硬）/0.0455 H0 | 0.0418（硬） | 1.09 / 1.03 | **判死** |
+| 9216×128×128 b1 | 0.0496（硬） | 0.0436（硬） | 1.14 | **判死** |
+| 8160×128×128 b4 | 0.1479（硬） | 0.1462（硬） | **1.012** | **判死** |
+| 32640×128×64 b2 | 0.2092（硬） | 0.2067（硬） | **1.012** | **判死** |
+⇒ **五形里四条 hard-vs-hard 全部 ≤1.14 ⇒ 按预登记：填充杠杆在 N=128 上判死，核内几何（BN 宽窄、组数、SLM 尾 vs 寄存器尾、v9 宽生产者）整条线结案。**
+⇒ **与容量曲线自洽**：帧里真实的 batched 形本来就是 **512/1024 组**（b4/b2）⇒ 已在实测满波附近 ⇒ **没有填充可捡**；只有 b1 相位形（residual/qkv 的 128 组）填充低，但那些腿走的是别的核（`gemm_b/gemm_b_pub`），**要改的是相位核配置，不是 batched 路由** ⇒ 若将来动它，先解释 8160 那条 outlier。
+## 顺带定案的两条（(3) 第三条）
+- **`pub_slm` vs 寄存器尾 `gemm_b_pub`**：b1 形 1.03-1.09x（小）、**b4 形 0.1479 vs 未测（b>1 无该腿）、b2 形 0.2092 vs 未测** ⇒ §100 注释的 1.32x 只在他们当时的三个 N=128 形上成立，**不是普适**；已按 `shipped_arm` 列写进台账（281 行）。
+- **今晚 headroom 表用 `gemm_b_pub` 当锚点的偏差 ≈ 3-9%**（锚点偏低 ⇒ headroom 略偏大）⇒ 已在 §128/§129 注明，**不影响"哪条腿值得挖"的排序**。
+## 本盒总 GPU
+pslm 批 60 进程 ≈ **66 min** + g32mg 批 24 进程 ≈ **26 min** = **~92 min**；进程间 60 s、组间 300 s 冷却；**批中未重建被测件**（编译都在批与批之间）。
+## 收线
+**下一铲只剩两条候选，都不该现在花 GPU**：
+ (i) **8160 outlier 的归因**（12-24 进程 ≈ 15-25 min，便宜，但只解释一个形状的异常，不指向收益）；
+ (ii) **面宽 `NR_RES_BYTE`**（画质刀：要过三关 + `db_meter` + `block_collapse` + 用户点头；B 表说它砍 94% 字节里的一半，但 D 臂说流量只占 7-17% ⇒ **上限被自己的算术压住**）。
+**我这条铲到此结案，等父定方向。**
