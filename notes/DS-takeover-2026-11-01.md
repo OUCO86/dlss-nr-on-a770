@@ -2579,3 +2579,17 @@ first row=0 col=0  baseline=113  D=117
 ### 下一铲（已定死，不再猜）：**每闭包发射级仪表**
 `single_task / parallel_for / memcpy / memset` presence-gated 计数 + `[hop]`（每闭包写面/读面次数与字节）+ **清零前后两臂逐闭包 diff** => **把"还剩几次发射、每条腿的时间构成"变成实测**（军规 104 的执法仪器）。
 ### 军规 123（入 B2）：**关掉一个机制之前，必须先证明"对拍的两侧是同一个量"**；否则 `diff != 0` 可能只是口径不同义。本案：D 暂存"未缩放"中间值 vs 基线发布"已缩放"成品面。
+
+## 120. ★★★★ **发射级 + hop 仪表源码就位（本铲至今没跑 walk；只编不链不跑，`out\libxmx.dll` 仍 `3BAECF2A…`）**。账 = §140（2285 行）
+### 做了什么（presence-gated `NR_LCOUNT`，默认 0 => 出货语义不变）
+- **第五向量 `g_cmds_launch`（`struct LCount{int pf,mc,ms;}`）**与 `g_cmds` 同长同序：**`pg_push` 里 push、三个 clear 站点（1505/1516/2253）一起清、`bmerge` 的 `move_at` 一起搬**（军规 57；§B step-1 的 desync 是前车之鉴）；
+- **游标 `lc_begin(i)/lc_end()` 挂在四个真正跑闭包的循环**：RT 环、submit-probe 环、**cgraph record**（`g_graphs[id][fi]()` => 计数发生在**录制期**，正是"这条闭包提交几次设备操作"的定义）、warm 环；**首遍 warm-up 故意不计数**；
+- **dump `launch_hop_dump()` 接在 `pgraph_final_dump()` 之后**（同一冻结次序打印）：`[lcount] cmd=… name=… pf= mc= ms= | [hop] planes=… bytes=… ids=…` 与 `[lcount-total] … skipped_sites=… | [hop-total] planes=… bytes=…`；**hop 全部从现成 `g_pg_ids_snap` 算，不加新录制语义**。
+### ★ 插桩策略与一次自造事故（教训入账 = 军规 124）
+**168 个计数点：pf=137 / mc=28 / ms=2，分布在 43 个 recorder/helper**。插入策略 = **只在"该行以调用前缀开始且语句完整（行尾 `;` 或 `{`）"处插**；**声明行 / 宏续行 / 无 brace 的 if-else 单语句体一律拒插**（拒插 **20 处**：3 声明 + 1 宏续行 + 16 if-else 体）。
+⇒ **第一版贪插到 199 处直接把语法打断**（`if (x)\n LC_INC(pf); call();\n else …` => `else` 前多了一条语句）；已回滚到 HEAD 重来，只编不链不跑，`icx /fsycl /c` **exit=0、errors=0**（`s6/LC_syntax5.log`）。
+### 牙 1（静态，带行号）=> 过
+`xmx_rec_global_attention` 里被计数的发射：`4889 pack_a16_b(Q)`、`4890 pack_b16_t_b(K^T)`、`4891 f16v1::gemm_b(scores)`、`4900 vit_softmax_tiled`（默认）、`4904 vit_softmax_kernel`（逃生）、`+pack_a16_b(dProbs)`（逃生）、`+pack_b16_b(V)`、`+gemm_b_merge_scale`（默认）、`+gemm_b`（逃生）、`+merge_heads parallel_for`（逃生）=> **默认路径 = 6 次发射**，与 §131/§132 六臂解剖逐一对上 => **仪表数的就是那条链，不是别的**。
+### 牙 2（期望关系先写死，walk 之后照它核）
+`[hop-total] bytes` 按 **touch 集**计（每闭包所有解析到活缓冲的 id，读写都算、含权重/图像输入）=> 与离线两张账的口径差应这样拆：`hop_budget.csv` 按面（保守）= **10,420 MB**；`hop_edges.csv` 按边 = **7,310 MB 读**（+对应写）；**预期 `[hop-total] >= 10,420 MB`，多出的部分必须能拆成 (i) 链外输入（权重/图像）被 touch、(ii) 同一面在同闭包读写双计、(iii) `pgraph_extra` 带进来的额外面 => 拆不平就是仪表错，不许拿"差不多"过**。
+### 军规 124（入 B2）：**往引擎里批量插桩必须用"只插完整语句、不碰无 brace 控制体"的窄策略，并把拒插数如实报出来**，而不是事后修语法。正案：第一版贪插 199 处把 `if (x) call(); else …` 打断成 `else` 前多一条语句；回滚 HEAD 后用窄策略插 168 处（pf=137/mc=28/ms=2）拒插 20 处，`icx /fsycl /c` exit=0 errors=0。
