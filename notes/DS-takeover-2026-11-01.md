@@ -2405,3 +2405,32 @@ min-of-15×5、nosink、进程间 60 s、组间 300 s 冷却、**组名回验**�
 **110**：**臂级与闭包级读数必须互校；出现"单臂 > 整链"先怀疑仪器再怀疑物理**。本案仪器修好后矛盾消解，并暴露下一条。
 **111**：**`rt_per_closure` 的闭包级归因不能当 GPU 时间下界**：ga 实测 2.28 ms/腿 vs 闭包归因 1.42 ms/腿（低估约 0.9 ms/腿，11.37 vs 18.2 ms 串行）=> **所有家族价格表都要按括号法复核**，此前"按家族排序"的结论要加"下界"标注。
 今日 GPU 合计约 111 分钟（ref 58 + GA 六臂 13 + 重跑 13 + 链臂 13 + COVERED 7 + REGION 7）。
+
+## 113. ★★★★★ **(a)+(c) 交回（零 GPU）：代理当场撤回 §132 那条"RT 低估 ga +60%"——方向是反的；真相是 RT 是 plain-path 墙钟括号（上界，且量的不是出货路）。同时站点普查证明：同病只有 ga 8 腿，softmax 的帧内价 <=1.07 ms/腿（不是 2.02）**
+### (c) `notes/rt_timing_bracket_audit.md`：RT 不是单事件，是**另一条路径的墙钟括号**
+源码原文（`libxmx_sycl.cpp:2278-2335`）：`NR_RUN_TIMING` 分支里每条 = **`steady_clock` 括住 `fn(); GQ->wait();`** => **CPU submit + GPU drain + 同步延迟全算进去** => **是上界，不是下界**；
+★ **且该分支在 2335 行 `return passes`，出货的 cgraph 从 2371 行才开始 => RT 表量的是 plain 逐闭包路径，不是出货路径**；
+- **旁证自洽**：plain 帧 72.6 ms、cgraph 帧 57.4 ms，而 RT 合计 **114.63 ms > 两者** => 每闭包多付一次 submit+wait；
+- ⇒ **`tools/frame_factor.md` 的 0.50 是"跨路径比"，不是重叠系数**（代理已改口，但表还在用旧说法）；
+- **对齐无错**：`s6/pe_rt_align.py` => **0/691 家族标签错位、closure 列 == 行号** => 标签可信，**是毫秒的含义被我说错了**；
+- ★ **矛盾的真正解早有独立证据，代理没先找**：`s6/wbga.md §9c`（2026-11-02）在探针 TU 里测 softmax = **2.0654-2.4330 ms**，并**从帧反推 in-frame <= 1.07 ms**，当时把剩下的 2x 记为"大 TU 的 inlining/codegen，未定位" => **今天的 2.0175 属探针 TU 档，不是帧内价**；
+- **建议重贴标签（军规 112）**：**RT = plain-path 墙钟括号 => 上界**；**isolated 单核跨度 = 该 TU 的价**；**帧内价必须帧级反推或括号复核**；**三套数不许混**；
+- **排序影响（偏差按闭包数放大）**：`quant/quant_window` 276 腿（4.04 ms）**最被抬高**；`window_attention` 52（15.89）、`gemm_int8_residual` 68（22.47）次之；`window_block` 10、`global_attention` 8、`ffn_*` 受影响最小；
+- **最小复核工单**：3 族（quant / window_attention / global_attention）x 1 形 x 6 进程 = **18 进程（<=22 min GPU）** => 产出"RT ÷ 括号法"偏差因子，贴回排序表。
+### (a) `tools/softmax_sites.csv`：同病站点只有 ga 那 8 腿
+| 站点 | 在帧? | 结构判据 |
+|---|---|---|
+| **A `smax::vit_softmax_tiled`**（定义 `softmax_kernel.hpp:214`；调用 `libxmx_sycl.cpp:4846`，`NR_GA_TILE` 默认 ON，guard `rows%16==0 && Mp==rows`）| **是，8 腿** | **1 行 = 1 work-item**（`range(heads*rows)` = 6,144 个单 item 组）；**lane 不跨列**；每元素 `vit_weight` + `cr_hadd` 树（`pair[4]->column[8]->even/odd->total`）；**存是逐元素 f16**（A-tile 里 `k16` 连跑 16 个 = 32 B 可合并却没用）=> **唯一在帧的同病站点** |
+| B `vit_softmax_kernel`（`:171` -> `:4850`）| 只在 `NR_GA_TILE=0` 逃生档 | 同结构 + 多一趟 dProbs + pack（正是 tiled 消掉的）|
+| C `softmax_kernel`（`:35`）| **引擎里无调用点**（只有 bench TU：`bench_smesimd.cpp:42` 等）| - |
+| D `softmax_i8_kernel`（`:99` -> `:7008`，recorder `xmx_rec_softmax_i8`@6986）| **plan 里 `OP_XMX_REC_SOFTMAX_I8` = 0 条 => 不在本帧** | - |
+| E `xmx_rec_vit_softmax`@5138（-> `:5151`）| **plan 里 `OP_XMX_REC_VIT_SOFTMAX` = 0 条 => 不在本帧** | - |
+| **F wa / wb 的 softmax** | **是（52 + 10 腿）** | **在融合核内部**：`att5_fused_kernel.hpp`、`libxmx_sycl.cpp:5779`（"launch_full does all 7 stages … +softmax+…"）、WA 走 LFW-fused `:5384-5471`、WB 走 `wbmega`/`NR_WB_FUSE` => **多行 band + SLM 暂存的另一种结构 => 不是同一病**（这正是 A5/att5 已经改进过的形态）|
+### 第一刀作用面（修正数）
+- 只有 **ga 8 腿**；**帧内价 <= 1.07 ms/腿**（帧级反推，`wbga.md §9c`）=> **约 8.6 ms 串行 ≈ 4.3 ms/帧**；
+- **CEILING = 帧内价 − 字节地板（0.0126 ms/腿）≈ 1.06 ms/腿 => 8.5 ms 串行 => 约 4.2 ms/帧**（**不是** §132 的 16.2-16.8 ms / 8.1-8.4 ms，那是探针 TU 档的价，两个口径混了）；
+- ★ **另一条已封死的旧刀（必须避免重走）**：softmax 的 **SIMT 宽度在 dll 上已验证** —— shipped 实例本就 **simd=8**（`s6/WBGA_ledger_dll.txt:23`）；强制 16 = **+0.362 ms/帧（更差）**、pin 8 = +0.234、N=4 运行期拒（A770 只有 8/16/32）=> **宽度没肉**（`s6/simdwidth.md` §5-§6）；
+- ⇒ **设计里真肉只剩两条**：**① 每组多行 => 6,144 组降到 768 组（调度/尾效应）；② 16 连跑 f16 合成一次 32 B 存**。两条都不改数值次序 => 逐位等价仍成立；**但收益上界约 4.2 ms/帧，不是 8.4**。
+### 军规 112/113（入 B2）
+**112**：**三套价格口径不许混**：(i) `NR_RUN_TIMING` = plain-path 每闭包 `steady_clock` 括住 `fn(); GQ->wait();` => **含 submit+drain+同步，是上界，且量的不是出货路（该分支在 2335 行 return，cgraph 从 2371 行才开始）**；(ii) **isolated 单核跨度 = 该 TU 的价**（受 inlining/codegen 影响，本案 softmax 探针 TU 2.02-2.43 ms vs 帧内 <=1.07）；(iii) **帧内价必须帧级反推或括号复核**。正案：§132 说"RT 低估 ga +60%"方向反了，已撤回。
+**113**：**动刀之前先量化"排序仪器本身的族间偏差"**：RT 偏差按闭包数放大（quant 276 腿最被抬高、wa 52 与 residual 68 次之、wb 10 / ga 8 / ffn 受影响最小）=> 用 18 进程括号法复核拿到偏差因子，再决定谁先。
