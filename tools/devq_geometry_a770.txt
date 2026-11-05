@@ -1,0 +1,9 @@
+device: Intel(R) Arc(TM) A770 Graphics
+max_work_group_size      = 1024
+max_num_sub_groups       = 128
+sub_group_sizes          = 8 16 32 
+local_mem_size           = 65536 B
+NT=32    <= max WG? yes   NT % some sub_group_size == 0? yes   => IMPLEMENTABLE
+NT=64    <= max WG? yes   NT % some sub_group_size == 0? yes   => IMPLEMENTABLE
+NT=128   <= max WG? yes   NT % some sub_group_size == 0? yes   => IMPLEMENTABLE
+NT=256   <= max WG? yes   NT % some sub_group_size == 0? yes   => IMPLEMENTABLE

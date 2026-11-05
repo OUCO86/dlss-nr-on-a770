@@ -2041,3 +2041,200 @@ GA 六臂第一版：`vit_softmax_tiled` 臂测到 **2.0178 ms（12 进程、spr
 - ⇒ **ga 的钱要么在 softmax（若连测成立），要么在闭包归因的口径里；二者必居其一**。
 ## 现场
 进程 0；两槽 `3BAECF2A…`、三金标、`out\SHIPPED_MD5.txt` 未动；探针 exe md5 `4DB0D436…`；本盒 GPU：ref 批 58 min + GA 首跑 13 min + GA 重跑 13 min ≈ **84 min**；产物 `tools/ga_autopsy.csv`；账 §131。
+
+
+# §132 **矛盾破了：`vit_softmax_tiled` 每腿真值 **2.02-2.10 ms**（REGION 臂 6 进程、1.6-1.9%）⇒ **`rt_per_closure.csv` 对 ga 的闭包级归因（1.41-1.45 ms/腿、家族 11.37 ms）低估了约 0.9 ms/腿（≈7 ms 串行）**；按预登记判读 ⇒ **第一靶 = softmax 的数据形态**（**160x 于自己的字节地板**）；顺带抓到并修好探针的**区域计时缺陷**　2026-11-05 12:5x-13:2x
+## (0) 臂形=出货形对账（零 GPU，`tools/ga_arm_shape_recon.csv`）
+六条臂的实参与 `libxmx_sycl.cpp:4834-4870` 的出货调用**逐项相同**（rows=192 / tokens=192 / heads=32 / Mp=ceil16(192)=192 / sc=heads*rows*rows / merged=rows×(heads*32)）；**八条 ga 闭包（c319/328/337/346/355/364/373/382）实参完全一致**（`CH=heads*32=1024` ⇒ 这批腿在最深档）。
+**WG 结构对账**：`softmax_kernel.hpp` 的 `vit_softmax_tiled` = **`it.get_id(0)` 一个 work-ITEM 一行**、`range(heads*rows)` ⇒ **6,144 个每组 1 项的组，每项走 192 列** ⇒ 探针与出货同一个结构（不是探针模板）。
+`gemm_b_merge_scale` 臂 **spread 222% ⇒ 标 invalid**（后来 REGION 臂把它含在里面，不再单独引用）。
+## ★ 仪器缺陷（自报，三层，全修）
+1. 第一版 `chain_*` 臂：`timeit()` 测的是**返回事件自己的 command_start..command_end** ⇒ **多发射 lambda 只报最后一条核**（`chain_all6` 0.0784 = 最后那条 gemm 的跨度）⇒ **链臂全废**；
+2. 第二版 `COVERED_*`（尾部 `ext_oneapi_submit_barrier()`）：**barrier 事件只测 barrier 自己（0.0010 ms）** ⇒ 也废；旧日志留证 `s6\SHAPE_ROOF_gacov_barrierbug.log`；
+3. 第三版正解：**`timeit_region()`：前后各一枚 barrier，区域 = `a.command_start .. b.command_end`** ⇒ 才是多发射区间的价。
+⇒ **军规候选**：**任何"链/区间"计时必须用双事件括号；返回单个事件只报最后一条核**（我今晚差点用这个错数去定靶）。
+## (1) REGION 读数（6 进程，min-of-15×5 nosink，`tools/ga_autopsy_region.csv`）
+| 臂 | ms | spread | 于自己字节地板 |
+|---|---|---|---|
+| `pack_a16_b`(Q) / `pack_b16_t_b`(K) / `pack_b16_b`(V) | 0.0015 / 0.0016 / 0.0016 | 46/80/39% | 1.1-1.2x ⇒ **打包腿健康** |
+| `f16v1::gemm_b` scores | 0.1248 | 70% | 13.7x |
+| `f16v1::gemm_b_merge_scale` attnV | 0.1326 | 62% | 23.6x |
+| **`smax::vit_softmax_tiled`（单核跨度）** | **2.0175** | **0.0%** | **159.6x** |
+| **REGION_all6（整条闭包，双括号）** | **2.2767** | **1.9%** | 107x |
+| **REGION_no_softmax（同链去掉 softmax）** | **0.1749** | 10.3% | 10.3x |
+| **REGION_softmax_only** | **2.0402** | 1.6% | 161x |
+⇒ **softmax 在链内的份额 = 2.2767 − 0.1749 = 2.1018 ms**；单核跨度 2.0175 / 括号单核 2.0402 ⇒ **三者一致 ⇒ 读数稳**。
+⇒ **按预登记第二支**：**`vit_softmax_tiled` 就是第一靶**；**连测 ≈ 2.28 ms**（不是 1.4 ms）⇒ **闭包级归因低估 ga**：八腿 × 2.28 = **18.2 ms 串行**（表里只有 11.37）⇒ **`rt_per_closure` 的逐闭包 ms 不能当"该闭包 GPU 时间"的下界**（军规候选：**臂级与闭包级读数必须互相校验，出现"单臂 > 整链"就重测仪器**）。
+## 为什么 softmax 这么贵（源码级，已读）
+`vit_softmax_tiled`：**每组一个 work-item 处理一整行 192 列** ⇒ 每列两次 `vit_weight()` + `cr_hadd` 归约树（`pair[4]`→`column[8]`→even/odd→total），**没有跨列的 SIMD 并行**；6,144 个这样的小组 ⇒ 1.18M 次标量 `vit_weight`。2.02 ms ÷ 1.18M ≈ **1.7 ns/元素** ⇒ 与"标量 + e4m3/fdiv 链"一致。
+⇒ **形态方向（未设计完，只记候选）**：**把一行拆给 32 条 lane（每组多行、lane 跨列）**，归约树按同一索引式复现 ⇒ **若能保持 `pair/column/even/odd` 的合并次序不变 ⇒ 逐位等价**；这是"把输入数据的形态转换成满足要求的形态"的正解，**不是调 tile 宽度旋钮**。
+## 今日 GPU
+ref 批 48 进程 ≈ 58 min；GA 六臂 12 进程 ≈ 13 min；GA 重跑（初始化）12 进程 ≈ 13 min；GA 链臂 12 进程 ≈ 13 min；GA COVERED 6 进程 ≈ 7 min；GA REGION 6 进程 ≈ 7 min ⇒ **本盒 ≈ 111 min**（今日累计已超 2.5 h 软上限 ⇒ 收线）。
+## 现场
+进程 0；两槽 `3BAECF2A…`、三金标 `DD49827D…`/`249A46F3…`、`out\SHIPPED_MD5.txt` 未动；探针 exe `4F13F90A…`（含 REGION 臂）；留证日志 `SHAPE_ROOF_galegs_badinit.log`、`SHAPE_ROOF_galegs_arms_only.log`、`SHAPE_ROOF_gacov_barrierbug.log`；新表 `tools/{ga_arm_shape_recon,ga_autopsy,ga_autopsy_covered,ga_autopsy_region,kernel_scorecard,hop_budget.csv,hop_edges.csv,quant_scope_audit,mixed_phase_floors,ref_bench,leg_autopsy,structural_costs_ranked,leg_asm_struct,frame_factor.md}.csv|md`、`notes/hop_zero_designs.md`；脚本 `s6/{pe_ga_recon,pe_gachain_add,pe_gacov_add,pe_garegion_add,pe_galegs_batch2.ps1,pe_ga_merge,pe_ga_cov_merge,pe_ga_reg_merge,pe_ga_hist}.py|ps1`。账 §132。
+
+
+# §133 **(c) RT 仪表审计 ⇒ 我撤回 §132 的"RT 低估 ga +60%"：`NR_RUN_TIMING` 是 **plain-path 的 host 墙钟括号（含 submit + `GQ->wait()`）并且在 2335 行 return，跑不到出货的 cgraph** ⇒ **它是上界不是下界**；**(a) softmax 站点普查 ⇒ 同病站点只有 ga 那 8 腿**（wa/wb 的 softmax 已在融合核里，是另一种结构；`vit_softmax`/`softmax_i8` 两个 recorder 在本帧 plan 里 **计数 = 0**）**　2026-11-05 13:3x-13:4x
+## (c) 见 `notes/rt_timing_bracket_audit.md`（原文引 `libxmx_sycl.cpp:2278-2335/2371`）
+1. `RT` 每条 = `steady_clock` 括住 `fn(); GQ->wait();` ⇒ **CPU submit + GPU drain + 同步延迟** ⇒ **上界**；
+2. 该分支在 **2335 行 `return passes`** ⇒ **RT 量的是 plain 逐闭包路径，不是出货的单图 replay**（后者从 2371 行才开始）⇒ **`tools/frame_factor.md` 的 0.50 是"跨路径比"，不是重叠系数**；旁证：plain 帧 72.6 ms vs cgraph 57.4 ms，而 RT 合计 114.63 > 两者 ⇒ 每闭包付一次 submit+wait；
+3. **对齐无错**：`s6/pe_rt_align.py` ⇒ **0/691 家族标签错位、closure 列 == 行号** ⇒ 标签可信，**是我把毫秒的含义说错了**。
+⇒ **撤回**：§132 说"RT 对 ga 低估 ~0.9 ms/腿"。**方向相反**：RT **高估**每闭包（含 submit/wait），而**孤立 bench 单核跨度高估该核在帧内的价**——这条早有独立证据：**`s6/wbga.md` §9c**（2026-11-02）在探针 TU 里测到 softmax **2.0654-2.4330 ms**，并**从帧反推其 in-frame 价 ≤1.07 ms**，当时把剩下的 2x 记为"大 TU 的 inlining/codegen，未定位"。我今天的 2.0175 属**探针 TU 档**，不是帧内价。
+⇒ **军规 111 要重贴标签**（建议措辞已写进 `notes/rt_timing_bracket_audit.md`）：*RT 是 plain-path 墙钟括号 ⇒ 上界；isolated 单核跨度是该 TU 的价；帧内价必须帧级反推或括号复核；两套数不许混。*
+⇒ **排序影响（上界偏差按闭包数放大）**：`quant/quant_window` 276 腿（4.04 ms）**最被抬高**、`window_attention` 52（15.89）、`gemm_int8_residual` 68（22.47）次之；`window_block` 10（17.92）、`global_attention` 8（11.37）、`ffn_*` 1+1 **受影响最小**。⇒ **最小复核工单（等批）**：3 族 × 1 形 × 6 进程 = 18 进程 ≈ 22 min，产出"RT/括号 比值"当偏差因子。
+## (a) softmax 站点普查 ⇒ `tools/softmax_sites.csv`
+| 站点 | 在帧? | 结构 |
+|---|---|---|
+| **A `smax::vit_softmax_tiled`**（`softmax_kernel.hpp:214`，call `:4846`，NR_GA_TILE 默认 ON） | **是，8 腿** | **1 行/1 work-item**（`range(heads*rows)`=6,144 个单 item 组）、**lane 不跨列**、每元素 `vit_weight + cr_hadd` 树、**存是逐元素 f16**（A-tile 里 `k16` 连跑 16 个 = 32 B 可合并但没用）⇒ **同病，且是唯一在帧的同病站点** |
+| B `vit_softmax_kernel`（`:171`，call `:4850`） | 只在 NR_GA_TILE=0 逃生档 | 同结构（还多一趟 dProbs + pack） |
+| C `softmax_kernel`（`:35`） | **无引擎调用点**（只在 bench TU） | — |
+| D `softmax_i8_kernel`（`:99`，call `:7008` in `xmx_rec_softmax_i8`@6986） | **plan 里 OP_XMX_REC_SOFTMAX_I8 = 0 条** ⇒ 不在本帧 | — |
+| E `xmx_rec_vit_softmax`@5138（call `:5151`） | **plan 里 OP_XMX_REC_VIT_SOFTMAX = 0 条** ⇒ 不在本帧 | — |
+| **F wa/wb 的 softmax** | **是，52 + 10 腿** | **在融合核内部**（`att5_fused_kernel.hpp`；`libxmx_sycl.cpp:5779` "launch_full does all 7 stages … +softmax+…"；WA 走 LFW-fused `:5384-5471`，WB 走 wbmega/NR_WB_FUSE）⇒ **多行 band + SLM 暂存的另一种结构 ⇒ 不是同一病** |
+⇒ **作用面（修正后）**：只有 **ga 8 腿**；且按 (c) 的口径修正，其**帧内价 ≤1.07 ms/腿 ⇒ ~8.6 ms 串行 ≈ 4.3 ms/frame**（**不是** §132 的 16.2-16.8 ms 串行 / 8.1-8.4 ms/帧）。**CEILING = 帧内价 − 字节地板（0.0126 ms/腿）≈ 1.06 ms/腿 ⇒ 8.5 ms 串行 ⇒ ~4.2 ms/帧**。
+⇒ **另一条已封死的旧刀**：softmax 的 **SIMT 宽度**阶梯在 dll 上已验证——**shipped 实例本就 simd=8**（`s6/WBGA_ledger_dll.txt:23`），强制 16 = **+0.362 ms/帧（更差）**、强制 8(pin) = +0.234、N=4 运行期拒（A770 只有 8/16/32）⇒ **宽度这条没肉**（`s6/simdwidth.md` §5-§6）。⇒ **我设计的杠杆只剩两条真肉**：①**每组多行 ⇒ 6,144 组降到 768 组**（调度/尾效应）；②**把 16 个连跑 f16 合成 32 B 存**（存形态）。**两者都不改数值次序 ⇒ 逐位等价仍成立**，但**收益上界是 4.2 ms/帧的 CEILING，不是 8.4**。
+## 现场
+进程 0；两槽 `3BAECF2A…`、三金标 `DD49827D…`/`249A46F3…`、`out\SHIPPED_MD5.txt` `9334C18A…` 未动；新表 `tools/softmax_sites.csv`、新注 `notes/rt_timing_bracket_audit.md`；脚本 `s6/{pe_rt_align,pe_sm_sites,pe_skip_hist}.py`；探针 exe `4F13F90A…`（含 REGION 臂）；账 §133。
+
+
+# §134 **(b0) 帧级标定实测：`NR_GA_TILE=0` vs 出货默认，8 对 ⇒ **均值 +0.209 ms（B 慢）、B 只赢 2/8** ⇒ **softmax 的"版面/搬运"档位在帧里只值 0.2 ms 级**；**(b1) 双臂已上膛但没点火：卡在 sub-group 原语的真实签名**（`shift_group_left` 是 **sub_group** 上的集合原语，而 shipped softmax 实例 **simd=8** ⇒ 我按 32 lane 设计的 fold 在 8 宽 sub-group 下越界 ⇒ **必须按 sub-group 实际宽度重排 fold**，这不是 5 分钟能改完的）**　2026-11-05 13:4x-14:0x
+## (b0) 读数（`ab.ps1` 同件、A 不设 env、B=`NR_GA_TILE=0`，8 对，passes 691/691）
+```
+pair 1 A=57.430 B=57.670 delta=+0.240     pair 5 A=57.320 B=57.550 delta=+0.230
+pair 2 A=57.950 B=57.760 delta=-0.190     pair 6 A=57.720 B=57.840 delta=+0.120
+pair 3 A=57.510 B=58.300 delta=+0.790     pair 7 A=57.840 B=57.530 delta=-0.310
+pair 4 A=57.600 B=57.820 delta=+0.220     pair 8 A=57.290 B=57.860 delta=+0.570
+== 8 对：B 赢 2 / 负 6，均值 +0.209 ms => 带内中性（ab.ps1 判据），但符号 6/8 一致
+```
+⇒ 与历史那条 `NR_GA_TILE=0` **+0.38 ms（未分辨）** 同号同量级 ⇒ **两趟（dProbs 写 + pack_a16_b）在帧里只值 ~0.2-0.4 ms**。
+⇒ **(b0) 回答了什么、没回答什么（这条要写清，别过度解读）**：
+ - **回答了**：softmax 的**版面/搬运档位**（tiled vs plain）在帧里的传导是 **0.2 ms 级** ⇒ 只改"存到哪、少几趟"的形态 ⇒ **帧价值小**；
+ - **没回答**：softmax 的**行数学本身**（每行 192 列的 `vit_weight + cr_hadd` 树）值多少 ⇒ **tiled 与 plain 都付同一份数学** ⇒ 所以 (b0) **不能**用来否定"结构形态（lane 跨列）"这一刀，也**不能**证明它；
+ - **口径争议**（8.6 vs 4.3 ms/帧）**仍未由实测定死** —— (b0) 对此不敏感。要定它得靠 (b2) 的括号法偏差因子。
+## (b1) 状态：双臂 + DIFFARM 已写进探针源码，**编译未过**（今日不再点火）
+`notes`/源码：`s6/smax2_probe.hpp`（bench-only，多行 × lane 跨列形态，逐位等价论证写在文件头）+ `s6/pe_smax_add.py`（`SMAX_OLD_region` / `SMAX_NEW_region` / `DIFFARM smax Ap_mismatch / recip_mismatch`）。
+**卡点（实测错误，不是猜测）**：`error: no matching function for call to 'shift_group_left'` ⇒ 查签名后确认：**SYCL 的 `shift_group_left/right/permute_group_by_xor` 是 `sub_group` 上的集合原语**（要 `nd.get_sub_group()`），而我按 **32 lane** 设计的 fold 距离（1..7、8/16/24）在 **shipped softmax 实例 simd=8** 的 sub-group 下**越界 ⇒ 语义不成立**；同时 `local_accessor(range, group)` 与 `sycl::access::fence_mode` 在本工具链也不存在（要 handler 形或 `fence_space`）。
+⇒ **下一铲要做的（host，明确）**：**按运行期 `sg.get_local_range()` 选 fold 方案**：8 宽 sub-group ⇒ 每 sub-group 只覆盖 8 个 pair-slot ⇒ 列 fold 的四级 pair 要跨 sub-group ⇒ 必须用 **local memory 正确写法**（`sycl::local_accessor<T,1> la(range, handler)` 在 `single_task`/命令组构造期声明，或 `group::shfl` 系列）⇒ **这是设计-实现的一次真重写，不是补一个 include**。
+## 今日 GPU（本盒）
+(b0) 8 对 × 两侧 ≈ **15 min**；GA REGION 6 进程 ≈ 7 min（§132 尾）；**(b1) 未跑**、**(b2) 未跑**。
+## 现场
+进程 0；两槽 `3BAECF2A…`、三金标 `DD49827D…`/`249A46F3…`、`out\SHIPPED_MD5.txt` `9334C18A…` **未动**；**探针 exe 仍是 `4F13F90A…`（含 REGION 臂，不含 SMAX 臂）**——源码里 SMAX 臂未编译 ⇒ **明早第一件事就是决定：修 `smax2_probe.hpp` 的 sub-group/local-memory 写法，还是先跑 (b2) 括号复核**；账 §134（约 2120 行）；`tools/softmax_sites.csv`、`notes/rt_timing_bracket_audit.md`、`notes/softmax_form_design.md`、`tools/ga_autopsy_region.csv` 全部在位。
+
+
+# §135 **(1) 布局交错审计 ⇒ `tools/layout_interleave_audit.csv`（28 个"行被拆给多个 WG"的面类，写者 RT_ms_upper 合计 38.12 ms）。★ 审计把"坑"的定性改了：**交错不是内存布局造成的，是**我们自己的 BN=64 瓦片选择**撞上网络的行宽；而且**行宽=128 那一档的宽生产者我们已经造过（s8v9）并且实测慢 3.0x** ⇒ 所以 `sc<ldc` 这条根因**在 N=128 档已被自己的数据削弱**，只在 **N≥256/1024/4096（从没造过宽生产者）** 那几档仍然开着**　2026-11-05 14:0x-14:1x
+## 表（按"解锁的 ms"排，前 8 行）
+| 写者族 | 面形 (MxNxKbB) | 腿 | shipped BN | **每组只覆盖行的 1/wg_per_row** | 写者 RT_ms(上界) | 行级量化点(族级) | 面 MB |
+|---|---|---|---|---|---|---|---|
+| `gemm_window_int8_residual` | 2560x256x256b1 | 16 | 64 | **4** | 3.87 | 14 (0.631) | 0.66 |
+| `gemm_int8_batched/residual` | 8160x128x128b1 | 12 | 64 | **2** | **5.72** | (128 档) | 1.04 |
+| `gemm_window_int8_residual` | 9216x128x128b1 / 8640x128x128b1 | 6+6 | 64 | 2 | 1.51 / 1.49 | 14 (0.631) | 1.18/1.11 |
+| `gemm_int8_qkv` | 2560x768x256b1 | 16 | 96 | 8 | 3.76 | 14 (0.630) | 1.97 |
+| `gemm_int8_residual` | 192x1024x4096b1 | 8 | 64 | **16** | 3.45 | — | 0.20 |
+| `gemm_int8` | 192x4096x1024b1 | 8 | 64 | **64** | 2.01 | — | 0.79 |
+| `gemm_int8_qkv` | 192x3072x1024b1 | 8 | 96 | 32 | 1.75 | — | 0.59 |
+⇒ **合计写者 RT_ms_upper = 38.12 ms**（= 出货串行和 114.63 的 33%，全是 plain-path 上界口径）。
+## 交错从哪来（源码依据，逐条写进表的 `interleave_origin` 列）
+`gemm_s8_v8_kernel.hpp`：**`static const int BM = 128, BN = 64, BK = 32, NT = 32;`** ⇒ 一个 work-group 只写一行的 64 列；`libxmx_sycl.cpp:4117/4148` 传的是 `ldc=N`、`sc=Mp*N` ⇒ **面的 pitch 本身没有交错 ⇒ "交错"完全是我们的瓦片宽度对行宽的比**（N/BN）。⇒ **改"每组行连续"不需要改内存布局**（pitch、pack_b、publish 寻址全不动），**只需要宽生产者 BN≥N**。
+## ★ 审计自己的反证（必须写清，别让下一铲扑空）
+- **N=128 档**（最大写者 RT：8160x128x128 的 5.72 + 8640/9216 的 3.0 ⇒ 共 ~8.7 ms）：**宽生产者已经造过 = s8v9（BM=64/BN=128）**，实测 **3.0x 慢**（§102），当时判死；⇒ **"宽生产者解锁行级量化"这条路在 N=128 档被我们自己的实测否掉了一次** ⇒ `sc<ldc` 不是这一档的束缚，**束缚是宽 tile 的占用/累加器成本**；
+- **N≥256 档**（16+6+… 腿、写者 RT 十几 ms、行级量化点 28 个 / 1.26 ms）：**从没造过 BN≥256 的生产者** ⇒ 这条路**未测**；代价项已列：`SLM_B = BK×BN = 32×256 = 8 KB`（+SLM_A）、累加器 `WI_ROWS×WI_COLS×12 > 8` ⇒ **v9b 惩罚区**、占用（BN=32 实测 2.1x **快**、BN=128 实测 3.0x **慢** ⇒ 宽度与占用不是单调关系，256 未知）；
+- ⇒ **所以第一刀的正确问法不是"清交错"，而是："在 N=256/512 这两档，宽生产者（BN=N）到底比 BN=64 快还是慢"** —— 这是一个**可以用屋顶臂直接测的问题**（bench 里把 BN 参数化，测 256/512 两档的屋顶），**比改引擎便宜得多**；
+- 顺带：`gemm_int8 192x4096x1024b1` 的 **wg/row=64** ⇒ 行级量化要跨 64 个 WG ⇒ **这一档的"就地算 max"基本无望**（除非跨 WG 两段式，即 B case (2)）。
+## 口径改名（军规 112 的文档化，已做）
+`tools/frame_factor.md` **重写**：0.50 标为**跨路径比**（RT = plain-path 墙钟上界；出货是 cgraph），并新增"**帧内价的唯一定义 = 帧级 A/B 实测差**"一节，三档口径命名 **`RT_ms(上界)` / `region_ms(TU)` / `frame_ms`**。
+列名已改：`anchor_gap.csv`（`measured_ms→RT_ms_upper`、`hard_roof_ms→region_ms_TU_roof`、`headroom_ms→headroom_ms_RT_upper`）、`hop_budget.csv`（`measured move-closure ms→RT_ms_upper_move_closure`）、`kernel_scorecard.csv`（`serial_ms→RT_ms_upper`、`our_ms→region_ms_TU`、`bar_ms→frame_ms_ref_published`）。
+## 现场
+零 GPU（本铲）；进程 0；两槽 `3BAECF2A…`、三金标、`out\SHIPPED_MD5.txt` 未动；新表 `tools/layout_interleave_audit.csv`；脚本 `s6/{pe_layout_audit,pe_layout_fix1,pe_layout_fix2,pe_col_rename,pe_ff_rewrite}.py`；账 §135。
+
+
+# §136 **(A) 生成器写完了：`s6/gemm_s8_param.hpp` = **纯 BN 参数化的宽生产者**（`s8par::gemm_b_param<BM,BN,BK>`，BM=128/BK=32 固定、BN∈{64,128,256,512}）——**编译证明 exit=0（obj 82,878 B，只 `-c` 不链接不跑）**；结构 diff 逐行列清（**只有 BN 派生的字面量变，dpas 链/累加器个数/k 循环/存储映射全字面不动**）⇒ **这才是军规 119 要的可信宽生产者实验**（s8v9 同时改 BM 与 BN 的混淆被消除）。**(2) `qr_kernel` 臂已进源码待批间编译**；**(3) `smax2_probe.hpp` 按 `sg.get_local_range()` 三档重写完成（设计+代码，不编译不跑）**；**再踩一次"失败编译会删掉探针 exe"的坑（13:52 那次），这次被 runner 的开工断言当场拦住 ⇒ 军规 93 挣到它的饭钱**　2026-11-05 14:1x-14:3x
+## (A) 生成器与产物
+- 生成器 `s6/pe_mk_bnparam.py`（唯一真源 = `gemm_s8_v8_kernel.hpp:139-204` 的 batched `gemm_b`，raw int32 C）⇒ 产物 `s6/gemm_s8_param.hpp`（6,642 B）；
+- 语法/预算验证 TU `s6/bnparam_check.cpp`：实例化 `<128,64,32> <128,128,32> <128,256,32> <128,512,32>` ⇒ `icx -fsycl -c` **exit=0**；**未链接、未跑、未进引擎**；
+- 报告 `notes/bn_param_gen_report.md`（结构 diff 表 + 预算表 + (B) 批案）。
+**改了什么（BN 派生）**：`wi_row = lid/WI_COLS`（4 ⇒ BN/16）、`NT = WI_ROWS*WI_COLS`（32/64/128/256）、A 装载宽 `A_LD = SLM_A/NT`（128/64/32/16 B）、`bp` 基址 `wg_col*(BN/8)*(BK*8)`、`slm_init<3A+3B>`。
+**没改什么（逐行同构）**：`dpas<8,8,int32_t>` 四累加器 `c00/c01/c10/c11`（**每 WI 仍是一个 16×16 quad ⇒ 宽化只加 WI 数、不加累加器 ⇒ 不进 >8 惩罚区**）、三缓冲 s8d2 深度-2 的 k 循环与 `b%3`、`esimd::barrier()`、存储行装配与 `block_store<int32_t,16>`、`pack_a/pack_b` 操作数映射（`pack_b` 本来吃 N）。
+## 预算（每 EU SLM = 64 KB，台账基准；没有档被 65,536 硬帽直接否）
+| BN | NT | SLM(3A+3B) | 驻留/EU | 累加器 | A_LD | 一行被几个 WG 覆盖（N=256/768/1024） |
+|---|---|---|---|---|---|---|
+| 64（出货） | 32 | 18,432 | **3** | 4×simd<int32,64> = 2 GR/lane | 128 | 4 / 12 / 16 |
+| 128 | 64 | 24,576 | 2 | 同 4 | 64 | 2 / 6 / 8 |
+| **256** | 128 | 36,864 | **1** | 同 4 | 32 | **1 / 3 / 4** |
+| 512 | 256 | 61,440 | 1 | 同 4 | **16**（低于 16B 块装载甜点） | 1 / 2 / 2 |
+⇒ **被检验的变量就是占用 3→2→1**；**BN=512 预期弱**（A_LD=16 B + 只剩 4 KB/EU 余量）；**BN=256 是有趣的那一档**。
+## (B) 批案（等批，GPU ≤60 min）
+同进程配对 + `timeit_region()` + 12 进程/形：① `2560×256×256b1` BN64 vs BN256（**纯 BN**）；② `2560×768×256b1` BN64 vs BN256（**标清"宽化但不是 BN=N"**，N=768 仍跨 3 组）；③ `8160×128×128b1` BN64 vs BN128 vs BN256（**把 s8v9 的 BM/BN 混淆拆开**，这才是 §102 那 3.0x 的正解）；④ **折叠合法性单独一臂**：`gemm_b_param(int32 C) → qr_kernel` vs `v9` 融合重量化，**在 int8 面 + scales 上逐字节对拍**（速度绝不代替它）。
+预登记线不变：任一 N≥256 形 `ratio = BN64/BNwide ≥ 1.3` ⇒ 谈引擎路由/新核；全 <1.3 ⇒ 宽生产者线结案（BN=32 快 2.1×、BN=128@8160 慢 3.0×、纯 BN 128/256 由这一枪定）⇒ 转 **B case (2) 跨 WG 两段式量化**。
+## (2) `qr_kernel` 臂（源码已入，**编译排在批与批之间**）
+`s6/pe_qarm_add.py` ⇒ 探针里 `qarm::run`：形状 = 最贵的 12 条 quant 腿（**M=640, K=2048**）、几何完全复刻 `qr_launch`（`words=k/8`、`per_row_ub` 取 device sub-group sizes、`rows_per_wg=256/per_row_ub`、`nd_range<2>(range(256*gx,gy), range(256,1))`、`local_accessor<float,1>(range(256), h)`）、`timeit_region()` 括号、`SRP_QARM=1` 触发 ⇒ **落批后编译，6 进程 ≈ 8-10 min 出 `tools/rt_bias_factors.csv` 第一行（quant 族 `RT_ms(上界) ÷ region_ms(TU)`）**。
+## (3) `smax2_probe.hpp`（第三刀，设计 + 代码，**不编译不跑**）
+按运行期 `sg.get_local_range()` 三档：**SUB=32** 纯 shuffle（列 fold 距离 8/16/24、块 fold 在 lane 0 用距离 1..7）；**SUB=16** `shift_group_left(8)` 折 (p0,p1)/(p2,p3) + local staging 收尾；**SUB=8** 四段 pair 跨 sub-group ⇒ 全部走 `local_accessor`（先例 = `qr_launch`）+ `nd.barrier(fence_space::local_space)`；块 fold 始终由每行一个 lane 从暂存的 8 个列值按出货次序折 ⇒ **8 宽下逐位等价仍成立**。文件头把第一版为什么失败写死（`shift_group_*` 是 **sub-group** 集合原语、距离必须 < sub-group 宽、shipped softmax 实例 **simd=8**；`local_accessor(range, group)` 与 `access::fence_mode` 本工具链不存在）。
+## ★ 又踩一次但被仪器拦住的坑（记档）
+13:52 那次 **失败编译把 `oneapi\shape_roof_probe.exe` 删了**（icx 失败即删输出，§124 的老账）⇒ 14:1x 我按旧认知说"exe 还在 4F13F90A"是**陈旧断言**；**runner 的开工断言 `Test-Path` 当场 ABORT（"ABORT: probe exe missing"）⇒ 没有产生任何空枪进程**。修：`#ifdef SMAX_ARMS` 把未完成的 SMAX 臂编译出去 ⇒ 重建 exe（`37E79D49…` @14:19:10）⇒ 批重新点火。
+⇒ **纪律补一条（军规候选）**：**"exe 存在性 + md5"必须在每次开批时现读，不许引用上一轮的读数**（我自己刚引用了陈旧 md5）。
+## 正在跑
+`pe_v9wide_batch.ps1`：三个 **N=128** 形（`8160/8640/9216 ×128×128b1`）× 12 进程、同进程配对 `gemm_b_pub_slm`（出货）vs `gemm_b_rq_v9`（宽）——**只测速度、不判折叠合法性**（v9 出 int8+scale、pub_slm 出 f16 publish 面，dtype 不同不能 memcmp）；**对照组 = 8160，必须复现 ~3.0x，否则全批作废回报**。
+## 现场
+GPU = 该批（36 进程，预计 14:5x 落）；两槽 `3BAECF2A…`、三金标 `DD49827D…`/`249A46F3…`、`out\SHIPPED_MD5.txt` 未动；探针 exe `37E79D49…`（14:19:10）；新产物 `s6/gemm_s8_param.hpp`、`s6/bnparam_check.cpp`、`notes/bn_param_gen_report.md`、`tools/bn_widening_budget.csv`、`tools/layout_interleave_audit.csv`；脚本 `s6/{pe_mk_bnparam,pe_mk_bnparam_fix,pe_qarm_add,pe_smax_guard,pe_bn_budget,pe_bn_fix,pe_layout_audit,pe_layout_fix1,pe_layout_fix2,pe_col_rename,pe_ff_rewrite}.py`、`s6/pe_v9wide_batch.ps1`；账 §136。
+
+
+# §137 **宽生产者批（3 形 × 12 进程，partial 0/36）落定：s8v9 在三个 N=128 形上全面输 —— 8160 慢 **2.46x**、8640 慢 **9.2x**、9216 慢 **4.9x**（宽臂自身 spread 0.8-1.2%，出货 pub_slm 臂 spread 68-180% ⇒ 分母噪声大但方向不会翻）⇒ **对照组复现了 §102 的 3.0x 量级 ⇒ bench 可信、批有效**；**这批只测速度、不判折叠合法性**；**真正的宽化问题（N=256/768 用纯 BN 生成器）还没测**　2026-11-05 14:2x-15:0x
+## 读数（同进程配对、min-of-15×5、nosink；`tools/xmx_roof.csv` 已含这些行）
+| 形 | 出货 `gemm_b_pub_slm` | 宽 `gemm_b_rq_v9` | 宽/出货 | 判定 |
+|---|---|---|---|---|
+| **8160×128×128b1（对照）** | 0.0960（**68.7% ⇒ 分母不硬**） | **0.2363（0.8% 硬）** | **2.46x 慢** | **对照组复现 §102 的 3.0x 量级 ⇒ bench 可信** |
+| 8640×128×128b1 | 0.0483（92.1% 不硬） | **0.4445（0.9% 硬）** | **9.2x 慢** | 宽生产者输 |
+| 9216×128×128b1 | 0.0910（180.2% 不硬） | **0.4445（1.2% 硬）** | **4.9x 慢** | 宽生产者输 |
+⇒ **按决策树第 3 行**：三个形都 `ratio < 1.3` ⇒ **宽生产者这条线在 N=128 档结案**（现在五个独立点：BN=32 快 2.1x、BN=128@8160 慢 3.0x（§102）、**纯 v9 几何@8640/9216 慢 9.2x/4.9x（本批）**）。
+## ★ 一条必须挂账的异常（不许糊）
+**v9 在 8640 与 9216 上测到完全相同的中位数 0.4445**（spread 0.9%/1.2% ⇒ 不是噪声），而 8160 是 0.2363 —— **Mp 分别是 8192/8704/9216（tile 数 128/136/144）⇒ 不该出现"两个不同形同一数"**。⇒ 可能：v9 的 grid 在这些形上撞到同一个上限、或 `Mp/BM` 之外的维（N/K/batch）把工作量钉住、或该臂在某 Mp 之后走了同一条退化路径。**下一枪若要再用 v9 的绝对值，必须先做这一条的归因**（12 进程 + 一个 `Mp` 扫描，≤15 min）；**方向性结论（宽臂慢 2.4-9.2x）不受影响，因为宽臂自身 spread <1.3%。**
+## 这批没测的东西（按你的 (B) 批案）
+- **N=256 / N=768 的宽化**：s8v9 几何非法（`N MUST equal BN=128`）⇒ 本批不能答；**答它要用 `s6/gemm_s8_param.hpp`（已生成、已编译通过，纯 BN：BM=128 固定、NT 随 BN 长、累加器恒 4）** ⇒ 那才是军规 119 要的可信实验；
+- **折叠合法性**：本批两臂 dtype 不同（`pub_slm` 出 f16 publish 面、`v9` 出 int8+scale）⇒ 无法 memcmp ⇒ 合法性的三方对拍（`gemm_b_param(int32 C) → qr_kernel → int8+scale` vs `v9` 融合）**已备好两半**：`qr_kernel` 臂已在探针源码里、**批后编译通过（exe `5C64DBC1…` @15:08:00）**。
+## 现场
+进程 0；两槽 `3BAECF2A…`、三金标 `DD49827D…`/`249A46F3…`、`out\SHIPPED_MD5.txt` 未动；**探针 exe 已换代：`37E79D49…`（跑批用）⇒ 现在 `5C64DBC1…`（含 `SRP_QARM=1` 的 quant 臂，SMAX 臂仍 `#ifdef SMAX_ARMS` 编译在外）**；今日 GPU ≈ 40 min（本批 36 进程）⇒ **累计已远超 2.5 h 软上限 ⇒ 我不再自开批**；账 §137。
+
+
+# §137-更正 **§137 的表用错了列（我自己的 merge 脚本 off-by-one：把 `msX`（组间最大）当成了 `msM`）⇒ 以台账池化值为准。更正后：对照组 8160 精确复现 §102 的 3.0x（实测 **3.11x**）⇒ 批有效；宽生产者三形全输（3.11x / 9.64x / 8.60x）；v9 的"8640 与 9216 同价"异常仍成立（0.4415 vs 0.4420）**　2026-11-05 15:0x
+## 更正后的表（`tools/xmx_roof.csv` 池化值，12 进程/点）
+| 形 | 出货 `gemm_b_pub_slm` | 宽 `gemm_b_rq_v9` | **宽/出货** |
+|---|---|---|---|
+| **8160×128×128b1（对照）** | **0.0756（19.9% ⇒ HARD）** | **0.2349（0.5% ⇒ HARD）** | **3.11x 慢** ⇒ **复现 §102 的 3.0x ⇒ bench 可信、批有效** |
+| 8640×128×128b1 | 0.0458（80.5% ⇒ 分母不硬） | **0.4415（1.0% HARD）** | **9.64x 慢** |
+| 9216×128×128b1 | 0.0514（76.9% ⇒ 分母不硬） | **0.4420（0.7% HARD）** | **8.60x 慢** |
+⇒ **判定（决策树第 3 行）**：三形都远不到 `ratio ≥ 1.3` 的赢面（宽臂反而慢 3-10x）⇒ **宽生产者线在 N=128 档结案**。现有独立点：**BN=32 快 2.1x（#104）、BN=128@8160 慢 3.0x（§102）、纯 v9 几何@8640/9216 慢 9.6x/8.6x（本批）**。
+⇒ **但注意**：这一档的"宽"是 **s8v9 的 (BM=64, BN=128) 组合**，**不是纯 BN 实验**（军规 119）⇒ 真正的纯 BN 问题（N=256/768）要用已生成并通过编译的 `s6/gemm_s8_param.hpp` 打，**本批没有答它**。
+## ★ 异常仍在（挂账，下一枪若要再用 v9 绝对值必须先归因）
+v9 在 8640 与 9216 上 **0.4415 / 0.4420（几乎同值）**，而 8160 只有 **0.2349**；Mp = 8192 / 8704 / 9216 ⇒ tile 数 128/136/144 ⇒ **不该同价** ⇒ 像是 **Mp 超过某个阈值后 v9 走到同一个退化平台**（或 grid 撞上限）。**归因工单：v9 一臂扫 Mp（8160/8448/8704/8960/9216）× 6 进程 ≈ 15-20 min**（等批）。**方向性结论不受它影响**（宽臂自身 spread ≤1.2%）。
+## 仪器自报（这条要记）
+`s6/pe_v9wide_merge.py` 的 CSVROW 正则**少一个捕获组 ⇒ 取的是 `msX`（组间最大）不是 `msM`** ⇒ 我第一版交回的数（0.0960/0.2363 等）偏大且 spread 虚高（68-180%）。**台账池化脚本（`pe_v9wide_pool.py`，复用 `pe_ref_merge.py` 的正确索引）才是准的** ⇒ 交回数以台账为准。**教训：同一批数据用两个脚本读，必须交叉核；单脚本读数不可信**（军规候选）。
+## 现场
+进程 0；两槽 `3BAECF2A…`、三金标未动；探针 exe `5C64DBC1…`（15:08:00，含 `SRP_QARM` quant 臂；SMAX 臂仍编译在外）；今日 GPU ≈ 40 min（本批）；账 §137 + §137-更正。
+
+
+# §138 **(B) 纯 BN 一枪落定（30 进程、partial 0/30、`DIFFARM BN64vsBN128=0` 在每一次两臂都跑的进程里成立）：宽生产者线彻底结案——六个独立点全指同一方向。`2560×256×256b1`：BN64 **0.0285（1.4% HARD）** vs BN128 0.0668 / BN256 0.0484 ⇒ **宽化慢 1.7-2.3x**；`2560×768×256b1`：BN64 0.0910 vs BN128 0.0915 / BN256 0.0907 ⇒ **完全持平（±0.5%）**；`8160×128×128b1`（BM 固定 128 的纯 BN 对照）：BN64 0.0269 vs BN128 0.0656 ⇒ **慢 2.44x** ⇒ **§117 口径①的 BM/BN 混淆就此拆开：慢不是 BM 造成的，是 BN 本身**　2026-11-05 15:2x-16:1x
+## 几何有效性自检（先过这台闸，按你的令；**设备读数 + ocloc 台账，不靠源码推理**）
+`s6/DEVQ_geom.txt`（A770 实测）：**`max_work_group_size = 1024`、`max_num_sub_groups = 128`、`sub_group_sizes = {8,16,32}`、`local_mem_size = 65,536 B`** ⇒ **NT=32/64/128/256 全部 ≤ 上限且能被某个 sub-group 宽整除 ⇒ 四档都 IMPLEMENTABLE**（没有档被硬帽直接否）。
+`tools/roof_asm_struct.csv`（ocloc 读运行期缓存里的 `s8par` 活实例）：
+| 实例 | **实测 SLM** | 预算表预测 | grf | simd | scratch B / instr |
+|---|---|---|---|---|---|
+| `s8par::gemm_b_param<128,64,32>` | **18,432** | 18,432 ✓ | 128 | 1（ESIMD） | **0 / 0** |
+| `s8par::gemm_b_param<128,128,32>` | **24,576** | 24,576 ✓ | 128 | 1 | **0 / 0** |
+| `s8par::gemm_b_param<128,256,32>` | **36,864** | 36,864 ✓ | 128 | 1 | **0 / 0** |
+⇒ **SLM 与预算逐档对上、无 spill、无 scratch 访存** ⇒ **读数有效**；**注意 grf 三档都顶在 128** ⇒ 宽档没有寄存器余量，但也没溢出。
+## DIFFARM 的读法（不许误读）
+- **两臂都跑的每一次：`BN64vsBN128=0`（24/24 次）** ⇒ **纯 BN 化不改一个输出值**（int32 C 逐元素全等）⇒ 生成器与出货核等价，这是 (A) 的正确性收口；
+- `grp=53`（N=128）那 5-6 行的 `BN64vsBN256=1048576 of 1048576` **不是失配**：**N=128 时 BN=256 臂被 `N % 256 == 0` 的 guard 跳过 ⇒ 那块缓冲全是 memset 的 0** ⇒ **全等差异是"没跑"的产物**。⇒ 交回时按"两臂都跑 ⇒ diff=0"报，**并把这个产物写清**（否则就是军规 121 禁止的含糊）。
+## 读数（同进程配对、`timeit_region` 括号、min-of-15×5、nosink、12 进程/点；对照形 6 进程）
+| 形 | BN=64 | BN=128 | BN=256 | **ratio = BN64 / BNwide** |
+|---|---|---|---|---|
+| `2560×256×256b1`（winres，解锁量最大） | **0.0285（1.4% ⇒ HARD）** | 0.0668（253.7% ⇒ 低置信） | 0.0484（115.1% ⇒ 低置信） | **0.43x / 0.59x ⇒ 宽化慢 1.7-2.3x** |
+| `2560×768×256b1`（qkv，**宽化但非 BN=N**：N=768 仍跨 3 组） | 0.0910（31.2% ⇒ 低置信） | **0.0915（10.4% ⇒ HARD）** | 0.0907（14.8% ⇒ HARD） | **0.99x / 1.00x ⇒ 持平** |
+| `8160×128×128b1`（对照，BM 固定 128） | **0.0269（1.1% HARD）** | **0.0656（12.1% HARD）** | —（guard 跳过） | **0.41x ⇒ 慢 2.44x** |
+⇒ **预登记判读落在第 2 行**：**没有一个 N≥256 形到 `ratio ≥ 1.3`** ⇒ **宽生产者线彻底结案**，独立点现在六个：**BN=32 快 2.1x（#104）· BN=128@8160（s8v9，BM 也变）慢 3.0x（§102）· 纯 v9 几何@8640/9216 慢 9.6x/8.6x（#137）· 纯 BN=128@8160 慢 2.44x（本批）· 纯 BN=128/256@2560×256×256 慢 2.3x/1.7x（本批）· 纯 BN=128/256@2560×768×256 持平（本批）**。
+⇒ **按你的令标注归因**：`2560×768` 上 wide 持平而 `2560×256` 上 wide 更慢 ⇒ **没有任何一档出现"更快但驻留=1"的赢面** ⇒ 不涉及"赢在别处"的特例。
+## (2) 的读数：**偏差因子不可用（如实挂账）**
+`SRP_QARM=1` 的 `qr_kernel` 臂（M=640, K=2048）region 括号 = **0.6387 ms（6 进程、0.3%）**，而同一形状在 RT 表里是 **0.1053 ms（16 条闭包）** ⇒ **RT/region = 0.16x**。
+⇒ **这不是"RT 低估"的证据，而是我的臂形不对**：审计显示那批 quant 闭包读的是 **33.55 MB 面**，而 `640×2048` 的 f16 只有 **2.62 MB** ⇒ **臂只喂了 1/13 的流量却贵 6 倍** ⇒ 臂的 grid（`rows_per_wg=8 ⇒ 80 个 WG，每线程走 256 words`）大概率严重低效。**⇒ `tools/rt_bias_factors.csv` 那一行已标 `INVALID -- do not use for re-ranking`，并写清原因**；要拿偏差因子必须先把臂形从闭包自己的流量反推（M/K/面字节），下一枪 ≤10 min。
+## 现场
+进程 0（游戏 0）；两槽 `3BAECF2A…`、三金标 `DD49827D…`/`249A46F3…`、`out\SHIPPED_MD5.txt` 未动；探针 exe `472A7AF3…`（15:23:20，含 `SRP_BNP` + `SRP_QARM`；SMAX 臂仍 `#ifdef SMAX_ARMS` 编译在外）；今日 GPU：qarm 6 进程 ≈ 6 min + bnp 30 进程 ≈ 40 min = **46 min**（累计 ≈ 4 h）；新表 `tools/rt_bias_factors.csv`（含 INVALID 标）、`tools/roof_asm_struct.csv`；`tools/xmx_roof.csv` 已并入 `gemm_b_param_BN64/128/256` 行；留证 `s6/DEVQ_geom.txt`、`s6/SHAPE_ROOF_bnp.log`、`s6/SHAPE_ROOF_qarm.log`；脚本 `s6/{pe_bnp_add,pe_bnp_groups,pe_bnp_batch.ps1,pe_bnp_pool,pe_mk_bnp_pool,pe_qarm_add,pe_qarm_batch.ps1,pe_bias_calc2,pe_mk_bnparam,pe_mk_bnparam_fix,devq.cpp,pe_devq_fix}.py|ps1|cpp`；账 §138。
