@@ -2434,3 +2434,30 @@ min-of-15×5、nosink、进程间 60 s、组间 300 s 冷却、**组名回验**�
 ### 军规 112/113（入 B2）
 **112**：**三套价格口径不许混**：(i) `NR_RUN_TIMING` = plain-path 每闭包 `steady_clock` 括住 `fn(); GQ->wait();` => **含 submit+drain+同步，是上界，且量的不是出货路（该分支在 2335 行 return，cgraph 从 2371 行才开始）**；(ii) **isolated 单核跨度 = 该 TU 的价**（受 inlining/codegen 影响，本案 softmax 探针 TU 2.02-2.43 ms vs 帧内 <=1.07）；(iii) **帧内价必须帧级反推或括号复核**。正案：§132 说"RT 低估 ga +60%"方向反了，已撤回。
 **113**：**动刀之前先量化"排序仪器本身的族间偏差"**：RT 偏差按闭包数放大（quant 276 腿最被抬高、wa 52 与 residual 68 次之、wb 10 / ga 8 / ffn 受影响最小）=> 用 18 进程括号法复核拿到偏差因子，再决定谁先。
+
+## 114. ★★★★ **(b0) 帧级标定交回；(b1)(b2) 没跑成，原因如实（真技术债，不是拖）**：softmax 的"搬运形态"档位（`NR_GA_TILE=0` vs ON）在帧里只值 **+0.209 ms（8 对，B 赢 2/8，符号 6/8 一致）**；**(b1) 卡在 sub-group 原语的真实宽度**——shipped softmax 实例是 **simd=8**，我按 32 lane 设计的 fold 距离（1..7、8/16/24）**全部越界、语义不成立**，不是补 include 而是真重写
+### (b0) 读数（`ab.ps1`，同一件 `3BAECF2A…`，A 不设 env、B = `NR_GA_TILE=0`，8 对，`passes 691/691`）
+```
+pair 1 A=57.430 B=57.670 +0.240   pair 5 A=57.320 B=57.550 +0.230
+pair 2 A=57.950 B=57.760 -0.190   pair 6 A=57.720 B=57.840 +0.120
+pair 3 A=57.510 B=58.300 +0.790   pair 7 A=57.840 B=57.530 -0.310
+pair 4 A=57.600 B=57.820 +0.220   pair 8 A=57.290 B=57.860 +0.570
+== 8 对：B 赢 2 / 负 6，均值 +0.209 ms（带内中性），符号 6/8 一致
+```
+与历史那条 `NR_GA_TILE=0` **+0.38 ms（未分辨）** 同号同量级 => **softmax 的"版面/搬运档位"（少一趟 dProbs 写 + 少一趟 pack_a16_b）在帧里只值 ~0.2-0.4 ms**。
+**这条回答了什么、没回答什么（不许过度解读）**：
+- **回答**：只改"存到哪、少几趟"的形态 => 帧价值 **0.2 ms 级** => 这类改动单独不值一铲；
+- **没回答**：softmax 的**行数学本身**（每行 192 列的 `vit_weight` + `cr_hadd` 树）值多少——**tiled 与 plain 付同一份数学** => **(b0) 既不能否定也不能证明"lane 跨列"那一刀**；
+- **口径争议（8.6 vs 4.3 ms/帧）仍未定死**，要靠 (b2) 的括号偏差因子。
+### (b1) 双臂已上膛没点火：卡在 sub-group 原语的真实签名（实测错误，不是猜）
+已写进源码：`s6/smax2_probe.hpp`（bench-only 多行 x lane 跨列形态，**逐位等价论证写在文件头**：配对 `k0=b*64+c+16j / k1=k0+8`、列 fold 次序、块 fold `even/odd` 次序、padding、`fdiv_rn`、tile 地址映射全按 shipped 行号复刻）+ `s6/pe_smax_add.py`（`SMAX_OLD_region` / `SMAX_NEW_region` / `DIFFARM smax Ap_mismatch / recip_mismatch`）。
+编译报错三轮：① `local_accessor<float,1>(range, group)` 与 `sycl::access::fence_mode` **本工具链不存在**；② 改用纯 shuffle 后：**`shift_group_left/right/permute_group_by_xor` 是 `sub_group` 集合原语**（要 `nd.get_sub_group()`），**而我按 32 lane 设计的 fold 距离在 shipped 实例 `simd=8` 的 8 宽 sub-group 下越界 => 语义不成立**；③ => **这不是补 include，是一次真重写**：必须按运行期 `sg.get_local_range()` 选 fold 方案（8 宽 => 列 fold 的四级 pair 跨 sub-group => 需要正确的 local memory 写法或分档 fold）。**代理没在盒内假装它写完 => 探针 exe 仍是 `4F13F90A…`（含 REGION 臂、不含 SMAX 臂）**
+★ **对设计的修正**：因为 shipped 实例是 **simd=8**，"1 行 = 1 item => 只用 1 个 lane"的说法**不准确**（编译器已把行内循环 8 宽化）=> **设计里剩下的真肉是：6,144 -> 768 组（调度/尾）+ 32 B 合并存**，不是"从 1 lane 提到 32 lane"
+### (b2) 没跑：quant 与 window_attention 在探针里没有可复现的臂（诚实）
+quant 用 `qr_kernel`（无臂）；wa 的 softmax 在 **LFW/att5 融合核内部**（`libxmx_sycl.cpp:5384-5471`、`:5779`），要括号复核就得把融合核七阶段在 bench 里复刻 => 不是 22 分钟能干净做到的。
+**但 ga 那族的偏差因子已免费拿到**：`RT 1.42 ms/腿（plain-path 墙钟上界）` vs `REGION_all6 2.2767 ms（探针 TU）` vs `帧级反推 <= 1.07 ms/腿`（`s6/wbga.md §9c`）=> **三档数并存在同一族上，正是军规 112 要禁止混用的样子**。
+**最小可跑的 (b2-lite)**：给探针加一条 `qr_kernel` 臂（约 20 行）+ 6 进程（约 8 min GPU）=> 出 `tools/rt_bias_factors.csv` 第一行（quant 族）；wa 挂到明早。
+### 军规 114/115/116（入 B2）
+**114**：**读数打架先搜仓内旧账，再上仪器**（本案 `s6/wbga.md §9c` 2026-11-02 已测出探针 TU 与帧内两档价，我隔了两天才翻到）。
+**115**：**形态类改动要分两笔账：搬运形态（存到哪、少几趟）与数学形态（每元素算什么）**。(b0) 实测：搬运形态档位只值 +0.209 ms/帧（8 对，符号 6/8 一致，与历史 +0.38 同号同量级）=> **不许用"该相作用面 ms"暗示数学那一半也会被消掉**。
+**116**：**写 esimd 跨 lane fold 之前必须确认运行期 sub-group 宽度**（`sg.get_local_range()`）：本案 shipped softmax 实例 `simd=8`，按 32 lane 设计的 fold 距离（1..7、8/16/24）全部越界、语义不成立；且"1 item = 1 行"不等于"只用 1 个 lane"（编译器已把行内循环 8 宽化）。
