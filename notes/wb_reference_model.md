@@ -43,7 +43,18 @@
 
 1. **主干已被模型证明正确**：**V 面 12,288 个元素逐位全等** ⇒ 我的 e4m3 量化、f16 存回、gather 映射、GEMM 累加（f64→f32 近似）都对上 ⇒ **对照器可信**。
 2. **Q/K 只差 0.24% / 0.02%，且都是 1 个 e4m3 档** ⇒ 差异集中在**归一化的 `inversesqrt` 近似**与 **dpas 累加序**两处（模型只能取"正确舍入的 1/sqrt"，参考用 GLSL `inversesqrt` = 实现质量近似）⇒ **这是可解释的模型不确定项，不是我们两条路的错**。
-3. **⇒ 真正结构性的偏离在 composition 侧**：我们的 3-leg 链走 `ctree::cosine_reciprocal`（`cosine_tree_kernel.hpp:23,49,59` = 参考的 f16 蝶形树，**与 `window_block.comp:180-191` 同构** ⇒ 所以与模型只差 1 档），而**融合 composition 走 `wbv3::cosine_recip_vec`**（`window_block_v3.hpp:85+`；调用点 `window_block_v4.hpp:298-301`：**32 个通道在 f32 域顺序 `ef_add` 累加，再一次 `eh_round`**）⇒ **求和序与数值域都不同** ⇒ **这才是 composition != chain（9/9 用例全红）的主因**。
+3. **（已被 (c2) 探针否证，保留原判断如下并更正）** ~~融合 composition 的 `wbv3::cosine_recip_vec` 与链路的 `ctree::cosine_reciprocal` 求和序/数值域不同，是 composition != chain 的主因~~。
+   **(c2) 直接读两条路的 `reciprocal` 中间量**（`builds\wb_recip_probe.exe`，源 `s6\wb_recip_probe.cpp`，tiny 384 行 K 操作数）：**ctree vs wbv3 = 0 / 384 不同（max 0 bit-ulp）⇒ 两条路的归一化倒数逐位相同** ⇒ **归一化不是分叉源**。
+   同时拿到**零噪声基线**：把**设备读回的 reciprocal** 喂进模型，并按链路真实拼写（**先 `half_round(acc)` 再 `* recip` 再 `e4m3`**）⇒ **model 复现 chain 的 K 面 0 / 12,288 差异**（先前那 26/6 的差异全在**我的模型对 norm 树的模拟**上，不在任何一条引擎路里）。
+   ⇒ **⇒ 4.29% 的 DEV-vs-DEV 分叉只能来自归一化之后的阶段**：注意力的 `weights()` 位技巧 / 分母求和序 / `e4m3` publish / 残差与存回，或 composition 自己的 gather/量化路径（它的 V 不像链那样可见）。
+
+## 3b. ★ (c3) 双臂探针 + 逐级拟合（2026-11-07 06:0x，`s6/wb_chain_fit.py`、`s6/wb_resvar.py`、`builds\wb_recip_probe.exe`）
+
+- **归一化倒数臂：两条路完全相同** —— K 行 `ctree::cosine_reciprocal` vs `wbv3::cosine_recip_vec` = **0 / 384 不同（max 0 bit-ulp）**；Q 行同样 **0 / 384** ⇒ **归一化被洗清**。
+- **首个真差异在 Q 的 scale 步**（tiny 16×24，用设备读回的 reciprocal + 参考 op 顺序）：**K = 0 / 12,288 逐位全等 ✓**、**V = 0 ✓**、**Q = 38（0.309%，首个 idx 369：model `0.1875` / device `0.2031`，1 个 e4m3 档）**。
+- **残差形式判定**（输入用链自己发布的 attended）：**一次融合 `fma`（参考 `window_block.comp:379`）⇒ target 只差 20 / 12,288（0.16%）**；**先乘后加两次舍入 ⇒ 差 720（5.86%）** ⇒ **链路的残差是融合形，与参考一致**。
+- **⇒ 归因**：链 vs 参考 ≈ **0.16%**（target）/ **0.31%**（Q），而 composition vs 链 = **4.287%**（出货几何）⇒ **约 96% 的分叉量属于融合 composition 的内部**；剩下 ~0.16-0.31% 是两路共有的 Q-scale 步。
+- **最小改动清单（未改码）**：① Q 的 scale 步（`libxmx_sycl.cpp:3018-3022` vs `window_block.comp:191-195`，需探针再读回 `sc`/`recip` 的实际位）；② composition 的注意力权重/分母/发布（`window_block_v4.hpp:298-304` vs 参考 `:275-297`、`:320-329`，候选 = 分母求和序、`mulh` 单/双舍入）；③ composition 的 gather/e4m3（`window_block_v4.hpp:61,127,164,172` vs 参考 `:133`；其 V 面需诊断件写回 plane 才可见）。
 
 ## 4. 修法提案（等批，不改码）
 
