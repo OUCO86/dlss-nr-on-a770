@@ -2741,3 +2741,39 @@ pair 4 A=57.100 B=56.590 -0.510    pair 8 A=57.760 B=56.390 -1.370
 ### 军规 134/135（入 B2）
 **134**：**JIT 缓存里同一核名可以有多份编译形；核级对照必须逐实例列（全名、不去重、不截断），并且要比指令数/操作数，不能只比资源元组**。正案：两个对照工具按名字去重（一个取 max、一个比 `ze_info` 资源集合）=> 把 -26% 读成 0%；且新旧形 `grf/simd/eu` 完全相同（128/8/8），资源集合比较看不出差异。
 **135**：**libdevice 正确舍入包装（`fmul_rn/fadd_rn/fdiv_rn`）在核内展开成整数 fixup 链，是本项目目前最大的单机制**：`pre` 37,023 -> 1,089 条（-97%）、腿级 -93%；`vit_softmax_tiled` 新增小编译形 ops -25.6%、GA 每腿 -42%、**帧 -1.074 ms（8/8）**。**修法是"家族内本地遮蔽 + `#pragma clang fp contract(off)` 区间、不写收尾 pragma"，逐位不变**；**共享 helper（`publish_kernel.hpp`）里的包装需要根手术**（`instr_census_c29.csv`：新形 5,191 ops 里 **62% 仍是 fixup**）。
+
+## 126. ★★★★★ **qkv 族本地遮蔽转正（两槽 = `E0B03E90…`，40 门全 GREEN）+ ★ 一次"空刀变对照"的重要发现：16 对协议自身有约 0.2 ms 的 B-偏置**
+### 转正读数
+- **正式件 `builds\libxmx_shiqkv2.dll` = `E0B03E90D87F0FA90DCDE6BE3BB7366E`**（3,949,056 B）；**已写入两槽**；**`out/SHIPPED_MD5.txt` = `e0b03e90d87f0fa90dcde6be3bb7366e`**；**`gates: 40 GREEN / 0 RED`**；**非 fused 1301 `DD49827D` EXACT（gate40_p1/p2/p3）**；三金标未动；回退件 `builds\keep_pre_shiqkv2_B7CBE3A2.dll`（`B7CBE3A2`）、`builds\libxmx_pre-shiplw1-3BAECF2A.keep`（`3BAECF2A`）。
+- **帧阶梯：63.5 → 58.5 → 57.3（A5）→ 56.3（smax + LW16，−1.074）→ ~56.0（qkv 刀）**
+- **刀形**：`namespace qkvloc { static inline float cr_mul/cr_add = * / + }` + 在 `xmx_rec_gemm_int8_qkv` 体内两行 `using`；**只换乘加、不换除法、不加新 pragma**（这些体本来就在 smax 那刀的未收尾 `contract(off)` 区间内）；**语言事实：块级函数定义不能遮蔽全局同名函数**（clang `function definition is not allowed here`）⇒ **必须命名空间 + 块级 `using`**。
+- **配对**：子代理 16 对 **−0.502 ms、16/16、CI95 ±0.133**；父级 8 对 **−0.381 ms、8/8**；**合计 24 对 24 胜、均值 ≈ −0.46**。
+### ★★ 空刀 = 零效应对照（今晚最重要的方法发现）
+`libxmx_res1.dll`（= qkv1 + `xmx_rec_gemm_int8_residual` 的 4 行 `using`）**其实是空刀**：普查显示 **`xmx_rec_gemm_int8_residual` 体内 `cr_mul/cr_add` 调用点 = 0**（它的算术全在 `s8v8` helper 里）⇒ 码代应与 qkv1 等价；
+**但 16 对（A=qkv1、B=res1）给出 −0.178 ms、13/16 同号、CI95 ±0.174**
+⇒ **16 对协议自身有约 0.2 ms 的系统性 B-偏置**，**且"13/16 同号"可在零效应下出现**。
+⇒ **新转正线（父级批）**：**均值 ≤ −0.4 ms 且 |均值| ≥ 2σ(批内) 且 ≥ 10/16**；**每铲开工先跑 4 对 A-vs-A2 对照**（同一份源码建两只件）测该批协议偏差与噪声；**刀的真实效应 = 刀配对均值 − 对照均值**。
+⇒ **据此 qkv 刀对外只报 −0.2 ~ −0.3 ms/帧**（−0.5 里含约 0.2 的协议偏置）；**件逐位相同 ⇒ 保留无风险**。
+### ★ 机制更正（推翻我们自己前两刀的解读）
+逐实例对照：`qkv1` 相对基线 **55 只核全部变大**、**全帧 ops 504,560 → 823,844（+63.3%）**、最大那只 `xmx_rec_gemm_int8_qkv` **25,548 → 56,190（+120%）**；**但腿级/帧级更快**。
+⇒ **libdevice 包装 = 一次 call + 一条共享 fixup 大树**；**换普通算符 = 每站点各自内联展开**：条数上升，但**没有 call 开销与依赖性的整数修正链** ⇒ **更快**。
+⇒ **这条机制的判据不是 ops 计数**（`pre`/`smax` 那两刀的 ops 下降只是同一件事的另一面）：**四闸 + 腿级 + 帧配对为准，ops 只作记录**（军规 137）。
+### 相 A 的等价性矩阵（零 GPU 穷举，决定后面什么能换）
+`tools/rn_equiv_host.csv`（1e7+ 样本，含 ±0、subnormal、tie、f16 边界 65504/65520、inf、nan）+ `tools/rn_equiv_matrix.csv`（器件侧 1 进程 2 秒）：
+| 包装 | 判定 |
+|---|---|
+| `fmul_rn` vs `*` | **0 例不等价**（含 subnormal）⇒ 可换 |
+| `fadd_rn` vs `+` | **0 例** ⇒ 可换 |
+| `fdiv_rn` vs `/` | **11 例不等价，全是产生 NaN 的操作数**（`0/0`：普通 = NaN、包装 = 0）⇒ **换除法前必须先证该处除数不可能为 0、不可能 `inf/inf`** |
+| `qr_e4m3` 普通形 vs `qr_e4m3_scalar` | **非 NaN 全域等价；NaN 处不等价（scalar 给 448）** ⇒ 涉及 NaN 的分支不许换 |
+`qr_half_round` 全域等价；e4m3 网格 tie 扫 200k 点 RNE 一致。
+### 根手术（共享 helper）挂账定论（不再试）
+尺寸级二分：`pbe4`（只让 `qr_e4m3` 保留包装）= **3,940,864 B 几乎不缩**；`pbgate`（只让 `qr_gate_activation` 保留包装）= **3,371,520 B**；**两者 fused 面完全相同地红**（features `CACD2029` ✓、**1301 `254C02B7` ✗、result `DAC32974` ✗**）；**`pub1` 与 `pub1b`（加 `noinline` 恢复调用边界）给出两个一模一样的错值**
+⇒ **病因不是收缩开关位置，而是全局替换波及其它 `cr_mul/cr_add` 消费者**（`cosine_tree`/`post`/`quantize_row`/recorder 内联体）；**`pbc` 正例证明：把替换限制在已在 `contract(off)` 区间内的文件 ⇒ 逐位不变**（军规 129 正例）。
+**13 只 `qr_*` 量化核 ops/fixup 一字不差** ⇒ 它们走 `qr_e4m3_scalar`（`publish_kernel.hpp:42-58` 的 ESIMD 手写形，本来不调 `ext::intel::math`）⇒ 改不到也不变值 ✓。
+### 族清单与顺序（`tools/cr_family_plan.csv`，零 GPU）
+12 只族按 `腿数 × 调用点数` 排序：`1 gemm_int8_qkv`（20 点 / 106 腿 / RT 12.5）**已做**；`2 gemm_int8_batched`（4 / 64 / 7.5）**点名下一刀**；`3 global_attention`（1 / 48 / 11.2）**可能空刀**；`4 window_block`（4 / 10 / 18.0）；`5 ffn`（1 / 24 / 4.9）；`6 ffn_merge`（1 / 1 / 3.4）；`7 gemm_qkv_window`（5 / 0 腿）；`8 gemm_residual`（2）；`9 unary`（7 / 0 / 2.8）；`10 merge_heads_scale`（1）；`11 unary2`（2 / 1.6）；`12 gemm_window_residual_pool`（4）。
+**全部 12 族 `cr_div_sites = 0`** ⇒ **除法/NaN 风险只在 `publish`/`smax` 里**（军规 136 的适用范围就此钉清）。
+### 纪律事故（记档）
+**第一次建正式件时，子代理第 2 族的 4 行还在工作树里** ⇒ 那只件（`485FA962`）含未验改动；**已 revert 并从干净 HEAD 重建（`E0B03E90`）全部重验**。
+⇒ **立规：父级转正期间子代理不得改仓内任何文件（单写者原则）；下一族必须先点名。**
