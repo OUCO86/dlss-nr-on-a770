@@ -16,7 +16,7 @@
      且**两个独立进程**读数相同（跨进程抖动 = 一票否决，军规 33 (d) 同一条）；
   3) `passes` 仍 691（跳块=整条链从图里移除，闭包数不许变；变了就是记账错了）。
 
-被测件 = 转正件 ABB969FE4AAF0F94AA03C3F53781EDD0：
+被测件 = 当前转正件（md5 的唯一出处 = E:/DSH/out/SHIPPED_MD5.txt，军规 62）：
   * `out/libxmx.dll`（加载位，用户实机验收过的那只）—— 进程 1、2；
   * `oneapi/libxmx_sycl.dll`（其余 39 门所 stage 的同一份字节）—— 进程 3，交叉核对。
 门**不 stage、不覆盖**任何 dll/金标；只写 `dumps/gate40_p{1,2,3}.1301.bin` 与 `logs/`。
@@ -107,7 +107,7 @@ ok(GOLDEN.exists() and md5(GOLDEN) == GOLDEN_MD5,
    "金标 %s md5=%s（=%s）" % (GOLDEN.name, GOLDEN_MD5, 'DD49827D...'))
 shipped = OUT / "libxmx.dll"
 staged = ONEAPI / "libxmx_sycl.dll"
-ok(md5(shipped) == SHIP_MD5, "被测 out/libxmx.dll md5=%s（转正件 ABB969FE...）" % md5(shipped))
+ok(md5(shipped) == SHIP_MD5, "被测 out/libxmx.dll md5=%s（应等于 out/SHIPPED_MD5.txt = %s...）" % (md5(shipped), SHIP_MD5[:8]))
 ok(md5(staged) == SHIP_MD5, "stage oneapi/libxmx_sycl.dll md5 同一只（本门不 stage、不改写）")
 
 # ---------------------------------------------------------------- 三个独立进程
@@ -173,7 +173,7 @@ m3 = md5(seen['gate40_p3'][1]) if seen['gate40_p3'][1].exists() else '-'
 ok(m1 == m2 == GOLDEN_MD5, "两个独立进程（out/libxmx.dll）1301 逐位相同且=新金标: %s / %s" % (m1, m2))
 ok(m3 == GOLDEN_MD5, "第三进程（oneapi/libxmx_sycl.dll 同一只字节）1301 也=新金标: %s" % m3)
 ok(md5(staged) == SHIP_MD5 and md5(shipped) == SHIP_MD5,
-   "门跑完后 out/libxmx.dll 与 oneapi/libxmx_sycl.dll 仍是 ABB969FE（本门没有改写任何 dll）")
+   "门跑完后 out/libxmx.dll 与 oneapi/libxmx_sycl.dll 仍等于 out/SHIPPED_MD5.txt 记录的转正件（本门没有改写任何 dll）")
 
 print("\nSKIP_GRAPH %s (%d fails)" % ("GREEN" if not fails else "RED", fails))
 sys.exit(1 if fails else 0)
