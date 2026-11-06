@@ -4334,9 +4334,23 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
 // in-place Q/K head-normalisation exactly in the epilogue's order; a second inline
 // kernel publishes (qr_e4m3) and scatters to the three half targets. Three device
 // launches inside ONE g_cmds push (passes stays +1 per plan call).
+namespace qkvloc {
+static inline float cr_mul(float x, float y) { return x * y; }
+static inline float cr_add(float x, float y) { return x + y; }
+}
 int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_scale,
                           int qkv_scale, unsigned M, unsigned channels, unsigned heads,
                           unsigned tokens, unsigned flags) {
+    // #148 (phase B, family #1 = qkv, 2026-11-06 18:0x): FUNCTION-SCOPE shadows so only this recorder's
+    // kernels see the plain spellings -- the global cr_mul/cr_add (publish_kernel.hpp) stays as today for
+    // every other consumer (the pub1/pbe4/pbgate bisect proved the red point is elsewhere; s6/layer1.md 28d).
+    // The equivalence matrix (tools/rn_equiv_matrix.csv) cleared * and + for every operand class including
+    // subnormals; division is NOT cleared (0/0 differs) => cr_div is deliberately left alone (军规 136).
+    // These recorder bodies already sit inside the unterminated contract(off) region opened by the smax cut
+    // (softmax_kernel.hpp is included at line 38, the recorders come after it), so no call site changes its
+    // contraction state -- which makes this build the parent's requested `pbc` experiment as well.
+    using qkvloc::cr_mul;    // shadows resolved by name lookup: only this recorder's kernels see them
+    using qkvloc::cr_add;
     if (!g_recording) FAILMSG("not recording");
     if (!M || !channels || (channels % 64u) || !heads || !tokens ||
         channels != heads * 32u || (M % tokens) || (flags & ~0x2000u))
