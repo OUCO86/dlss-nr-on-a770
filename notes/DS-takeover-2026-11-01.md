@@ -2795,3 +2795,20 @@ WINDOW_BLOCK RED (9 fails)
 ⇒ **per-family 门用的输入与帧 dump 不同**（`40x56 float image`、`16x24 flags=0x1008000` half image、tiny 几何、narrow 路），**这些路径上把 `fmul_rn/fadd_rn` 换成普通算符会差 1 ulp 级别（`0xaf80` vs `0xb000`）**；**而 1301（整帧 f32 流）与 fused 三面都没覆盖到这些输入** => **主闸全绿不等于逐位安全**。
 ### 军规 139（入 B2）：转正的门禁必须包含**整条 40 门链**，不能只靠 1301 + fused 三面
 **139**：**per-family 门（`gate_*`）覆盖的是帧 dump 没覆盖的输入形状与 flag 组合（tiny 几何、float image、half image、narrow/half_skip 路）**；本案 `com2` 在 1301 与 fused 三面全 EXACT、帧 -0.988 ms（8/8）过线，**却在 `gate_gemm_f16_qkv_window`（5 fails）与 `gate_window_block`（9 fails）暴露 14 处真实位差** => **任何"逐位不变"的宣称必须以 `gates: 40 GREEN / 0 RED`（staged 变体阶段允许 1 RED = 身份守卫按设计）为准**；**主闸只能证明"整帧 f32 流不变"，不能证明"所有输入路径不变"**。
+
+## 128. ★★★★★ **com2 复合刀转正：帧 56.1 -> 55.1 ms（-1.015 ms、8/8；子代理 16 对 -1.021、16/16、CI ±0.079）；40 门 40 GREEN / 0 RED。20:09 那轮 3 RED 追认为认证环境假信号（不可复现）**
+### 转正链（我做的，全部重验）
+1. `git revert a93e190`（安全处置）=> **复跑两门 + 身份门 = 3/3 GREEN**（证明 20:09 的红不是门坏）；
+2. 我自己在 scratch 里用 `s6/run_gates_scratch.sh` 把**两只 com2 件**（我的 `6AEE1ADE`、子代理的 `81F1ABBA`）各跑整条 40 门 => **两次都 40 GREEN / 0 RED**；
+3. **staged 到 `oneapi` 用共享缓存跑那两门 = GREEN；换专用空缓存（`SYCL_CACHE_DIR=E:/DSH/tmp/syclcache_fresh`）= GREEN** => **20:09 的 5+9 fails 不可复现**；当时有并发 GPU 进程（子代理在做逐实例冷缓存对照），**共享 `E:/DSH/sycl-cache` + `SYCL_CACHE_PERSISTENT=1` 下并发读写 = 最可能的假信号来源**（军规 140）；
+4. `git revert --no-edit 817c05d` 重新应用 com2（**11 个私有 namespace、22 行 using**：`gemm_qkv_windowloc`、`gemm_residualloc`、`ffnloc`、`ffn_mergeloc`、`batloc`、`qkvloc` 等，`:2945/3073/3289/3461/4002/4386…`）；
+5. 从干净 HEAD 建正式件 **`builds\libxmx_shc2b.dll` = `A05A47AB302FA4D1545F41AA46B4A260`**（3,949,056 B）；**staged + 专用空缓存跑 40 门 = `40 GREEN / 0 RED`**；**出货口径 8 对（A = `keep_pre_com2_E0B03E90`）：-0.720 / -0.900 / -1.090 / -1.510 / -1.200 / -0.940 / -0.890 / -0.870 => 均值 -1.015 ms、B 赢 8/8**；
+6. **两槽已写**：`out\libxmx.dll` = `oneapi\libxmx_sycl.dll` = `A05A47AB…`；**`out/SHIPPED_MD5.txt` = `a05a47ab302fa4d1545f41aa46b4a260`**；**复跑 40 门 = 40 GREEN / 0 RED**；三金标 `DD49827D / DD49827D / 249A46F3` 未动。
+### 码代同一性（子代理，逐实例）
+**`changed = 18 of 270`，18 只全落在被点的 10 族内**（`unary` 4 只 6,693→3,425 等、`gemm_window_residual_pool` 2、`gemm_qkv_window` 2、`unary2` 2、`gemm_int8_batched` 2、`merge_heads_scale` 2、`ffn_merge` 2、`global_attention` 2）；**其余 252 只 ops/fixup 一字不差**；全帧 ops 823,844 → 800,047（-2.9%）；`xmx_rec_ffn`、`gemm_residual` 两处 using 在该 walk 未产生核变化（空刀）。
+### 一条流程改进（采纳子代理提议，写进标准动作）
+**`gate_*.py` 从 CWD 加载 `libxmx_sycl.dll`（`gate_gemm_f16_qkv_window.py:42`），依赖由 `DSH_ONEAPI` 指路 => 变体可以复制到 `E:\DSH\tmp\gatescratch\` 里跑整条 40 门，不必碰加载位。**
+**=> 以后所有刀：交件前必须 `s6/run_gates_scratch.sh <dir> <suffix>` 跑出 `40 GREEN / 0 RED`（用专用空 `SYCL_CACHE_DIR`、串行、无并发 GPU 进程）。这同时消掉了"父级转正 vs 子代理改码"的单写者冲突。**
+### 帧阶梯（今天）
+**63.5 -> 58.5 -> 57.3（A5）-> 56.3（smax + LW16）-> 56.1（qkv 族）-> 55.1（com2 复合刀，11 处族内遮蔽）**；**今日累计 -2.2 ms/帧**，全部**逐位相同**（1301 + fused 三面 + 40 门）。
+### 军规 140（入 B2）：**门链红必须在"专用空缓存 + 串行无并发"下复跑才算数；不可复现的门红按假信号处理，但当时的安全处置（回退）仍然是对的**
