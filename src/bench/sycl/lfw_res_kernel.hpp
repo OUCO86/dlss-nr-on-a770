@@ -57,6 +57,7 @@ static inline sycl::event launch_lfw(sycl::queue& q, const int8_t* dAp, const in
                                      const float* qs, const float* dBias,
                                      unsigned windows,
                                      sycl::half* Qp, sycl::half* Kp, sycl::half* Vp) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     constexpr unsigned heads = 2u, C = 64u, NH = 192u;
     return q.submit([&](handler& h) {
         h.parallel_for(nd_range(range((size_t)windows * 16u), range(16u)),

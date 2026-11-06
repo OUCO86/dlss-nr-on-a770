@@ -66,6 +66,7 @@ static inline sycl::event launch_b6(sycl::queue& q, const int8_t* dAp, const int
                                     unsigned image_h, unsigned image_w,
                                     int8_t* DbgPKT = nullptr, float* DbgAS = nullptr,
                                     half* DbgATT = nullptr) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     constexpr unsigned heads = 2u, C = 64u, NH = 192u;
     return q.submit([&](handler& h) {
         h.parallel_for(nd_range(range((size_t)windows * 16u), range(16u)),

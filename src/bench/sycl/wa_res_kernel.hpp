@@ -34,6 +34,7 @@ namespace esimd = sycl::ext::intel::esimd;
 static inline event launch_wa_res(queue& q, const half* dQ, const half* dK, const half* dV,
                                   const half* dBv, const float* dBias, half* Out,
                                   unsigned batches, unsigned heads, bool raw_v) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     return q.submit([&](handler& h) {
         h.parallel_for(nd_range(range((size_t)batches * 16u), range(16u)),
             [=](nd_item<1> it) SYCL_ESIMD_KERNEL {

@@ -52,6 +52,7 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
     bool pooling = false, bool head = false, half* Pl = nullptr, const half* HeadWp = nullptr,
     half* HeadADump = nullptr, float* ProjFDump = nullptr, float* TotalDump = nullptr)
 {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     constexpr uint LW = 64u;
     return q.submit([&](handler& h) {
         h.parallel_for(nd_range<1>(range((size_t)windows*LW), range(LW)),

@@ -8,6 +8,7 @@ template <int LW, int CH16>   // LW threads/row; each CH16 x simd<half,16>
 inline void rg_launch(sycl::queue& q, sycl::half* a, sycl::uint2* pk, float* sc, unsigned m, unsigned k);
 template <int LW, int CH16>
 inline void rg_launch_impl(sycl::queue& q, sycl::half* a, sycl::uint2* pk, float* sc, unsigned m, unsigned k){
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     namespace esimd = sycl::ext::intel::esimd;
     q.submit([&](handler& h){
         h.parallel_for(nd_range<1>(range((size_t)m*LW), range((size_t)LW)), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {

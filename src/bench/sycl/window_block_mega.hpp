@@ -99,6 +99,7 @@ inline sycl::event launch_leg1(
     unsigned window_cols, unsigned pad_top, unsigned pad_left,
     const float* QkvScale)
 {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     // one workgroup per window row: windows*8 rows, 32 threads each
     return q.submit([&](handler& h) {
         h.parallel_for(nd_range<1>(range(windows * 8u * 32u), range(32u)),
@@ -373,6 +374,7 @@ inline sycl::event launch_leg1(
 inline sycl::event normalize_esimd(sycl::queue& q, const float* dCq,
                                    half* dQ, half* dK, half* dV,
                                    const float* qs, unsigned rows, unsigned NH, unsigned C) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     return q.submit([&](handler& h) {
         h.parallel_for(nd_range<1>(range((size_t)rows / 8u * 32u), range(32u)),
             [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
@@ -447,6 +449,7 @@ inline sycl::event normalize_esimd(sycl::queue& q, const float* dCq,
 inline sycl::event qkv_norm_esimd(sycl::queue& q, int32_t* dC,
                                   const float* as, const float* bs, const float* qs,
                                   unsigned M, unsigned heads, unsigned C, unsigned NH) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     unsigned rows = M * heads;
     return q.submit([&](handler& h) {
         h.parallel_for(nd_range<1>(range((size_t)rows / 8u * 32u), range(32u)),
@@ -526,6 +529,7 @@ inline sycl::event launch_mega256(
     unsigned windows, unsigned image_h, unsigned image_w,
     unsigned window_cols, unsigned pad_top, unsigned pad_left, const float* QkvScale)
 {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     return q.submit([&](handler& h) {
         h.parallel_for(nd_range<1>(range(windows * 256u), range(256u)),
             [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
@@ -629,6 +633,7 @@ inline sycl::event launch_full(
     unsigned epilogue, bool narrow,
     unsigned stop_stage = 0, half* DumpKV = nullptr)
 {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     return q.submit([&](handler& h) {
         h.parallel_for(nd_range<1>(range((size_t)windows * 32u), range(32u)),
             [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
@@ -1018,6 +1023,7 @@ inline sycl::event qkv_norm_scatter_esimd(sycl::queue& q, const int32_t* dC,
                                   const float* as, const float* bs, const float* qs,
                                   unsigned M, unsigned heads, unsigned C, unsigned NH,
                                   unsigned tokens) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     unsigned rows = M * heads;
     return q.submit([&](handler& h) {
         h.parallel_for(nd_range<1>(range((size_t)rows / 8u * 32u), range(32u)),
@@ -1097,6 +1103,7 @@ inline sycl::event qkv_norm_scatter_v2(sycl::queue& q, const int32_t* dC,
                                        const float* as, const float* bs, const float* qs,
                                        unsigned M, unsigned heads, unsigned C, unsigned NH,
                                        unsigned tokens) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     unsigned tasks = M * heads * 3u;      // (row, head, part): part 0=Q 1=K 2=V
     return q.parallel_for(sycl::range((size_t)tasks), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
         unsigned rh = (unsigned)it.get_id(0);
@@ -1170,6 +1177,7 @@ inline sycl::event qkv_norm_scatter_vit_esimd(sycl::queue& q, const int32_t* dC,
                                   const float* as, const float* bs, const float* qs,
                                   unsigned M, unsigned heads, unsigned C, unsigned NH,
                                   unsigned tokens, const float* recip_tab, float* dbg = nullptr) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     unsigned rows = M * heads;
     return q.submit([&](handler& h) {
         h.parallel_for(nd_range<1>(range((size_t)rows / 8u * 32u), range(32u)),

@@ -26,6 +26,7 @@ namespace packdev {
 // own guard)). Used by the residual / window-residual / int8-gemm / qkv-fallback
 // families' pack_a legs.
 static inline void pack_a_v(sycl::queue& q, const int8_t* A, int8_t* Ap, int M, int Mp, int K) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int BM = 128, BK = 32;
     int wgr = Mp / BM, kb_n = K / BK;
     size_t n = (size_t)wgr * kb_n * 8 * 512;
@@ -44,6 +45,7 @@ static inline void pack_a_v(sycl::queue& q, const int8_t* A, int8_t* Ap, int M, 
     });
 }
 static inline void pack_a(sycl::queue& q, const int8_t* A, int8_t* Ap, int M, int Mp, int K) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int BM = 128, BK = 32;
     int wgr = Mp / BM, kb_n = K / BK;
     size_t n = (size_t)wgr * kb_n * 8 * 512;   // = Mp*K
@@ -83,6 +85,7 @@ static inline void pack_a(sycl::queue& q, const int8_t* A, int8_t* Ap, int M, in
 template <int KMAX>
 static inline void pack_a_fused_sr_k(sycl::queue& q, const sycl::half* A_f16, int8_t* Ap,
                                      float* scales, int M, int Mp, int K) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int BM = 128, BK = 32;
     const int kb_n = KMAX / 32;
     q.parallel_for(sycl::range((size_t)Mp), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
@@ -122,6 +125,7 @@ static inline void pack_a_fused_sr_impl(sycl::queue& q, const sycl::half* A_f16,
 
 static inline void pack_a_fused(sycl::queue& q, const sycl::half* A_f16, int8_t* Ap,
                                 float* scales, int M, int Mp, int K) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     // B3-2 (leg map 09:5x, G2 = -5.6ms measured three times): the row-parallel
     // path below reads the f16 row TWICE (peak pass + quantize pass -- the comment
     // itself says "pass 2 hits L1": L1-hot but still every byte moved twice).
@@ -215,6 +219,7 @@ static inline void pack_a_fused(sycl::queue& q, const sycl::half* A_f16, int8_t*
 // pack_b (B stored TRANSPOSED, N x K row-major): dest = ((kk32*(N/8)+ntile)*64+kq*8+nl)*4+j
 //         src = (ntile*8+nl)*K + (kk32*32 + kq*4 + j)
 static inline void pack_b(sycl::queue& q, const int8_t* B, int8_t* Bp, int N, int K) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     int nt_n = N / 8, kk_n = K / 32;
     size_t n = (size_t)kk_n * nt_n * 64 * 4;   // = N*K
     q.parallel_for(sycl::range(n), [=](sycl::item<1> it) {
@@ -233,6 +238,8 @@ static inline void pack_b(sycl::queue& q, const int8_t* B, int8_t* Bp, int N, in
 //           + il*16 + k ; src = (tr*TS + strip*8 + il)*K + kc*TS + k. Rows >= M read zero
 //           (the host version zero-pads first -- the guard matches it and stays in-bounds).
 static inline void pack_a16_v(sycl::queue& q, const sycl::half* A, sycl::half* Ap, int M, int Mp, int K) {
+    LC_TICK();   // #145 军规 132: counted at helper entry, so no launch call site changes shape
+
     const int TS = 16;
     int tr_n = Mp / TS, kb_n = K / TS;
     size_t n = (size_t)tr_n * kb_n * 2 * 128;   // = Mp*K
@@ -251,6 +258,8 @@ static inline void pack_a16_v(sycl::queue& q, const sycl::half* A, sycl::half* A
     });
 }
 static inline void pack_a16(sycl::queue& q, const sycl::half* A, sycl::half* Ap, int M, int Mp, int K) {
+    LC_TICK();   // #145 军规 132: counted at helper entry, so no launch call site changes shape
+
     const int TS = 16;
     int tr_n = Mp / TS, kb_n = K / TS;
     size_t n = (size_t)tr_n * kb_n * 2 * 128;  // = Mp*K
@@ -273,6 +282,7 @@ static inline void pack_a16(sycl::queue& q, const sycl::half* A, sycl::half* Ap,
 // pack_b: B (K x N row-major) -> Bp, dest = ((kc*tc_n+tc)*2+js)*128 + (k/2)*16 + jl*2 + (k%2)
 //         src = (kc*TS + k)*N + tc*TS + js*8 + jl
 static inline void pack_b16(sycl::queue& q, const sycl::half* B, sycl::half* Bp, int K, int N) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int TS = 16;
     int kb_n = K / TS, tc_n = N / TS;
     size_t n = (size_t)kb_n * tc_n * 2 * 128;  // = K*N
@@ -290,6 +300,7 @@ static inline void pack_b16(sycl::queue& q, const sycl::half* B, sycl::half* Bp,
 // pack_b_t (scores leg: B stored (N,K) row-major, logical B[k][j]=Bmem[j*K+k]):
 //   same dest, src = (tc*TS + js*8 + jl)*K + kc*TS + k
 static inline void pack_b16_t(sycl::queue& q, const sycl::half* B, sycl::half* Bp, int K, int N) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int TS = 16;
     int kb_n = K / TS, tc_n = N / TS;
     size_t n = (size_t)kb_n * tc_n * 2 * 128;
@@ -313,6 +324,7 @@ static inline void pack_b16_t(sycl::queue& q, const sycl::half* B, sycl::half* B
 // Same index maps as the single-matrix versions -- bit-exact by construction. ----
 static inline void pack_a16_b(sycl::queue& q, const sycl::half* A, sycl::half* Ap,
                               int M, int Mp, int K, int batches) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int TS = 16;
     int tr_n = Mp / TS, kb_n = K / TS;
     size_t per = (size_t)tr_n * kb_n * 2 * 128;          // = Mp*K
@@ -330,6 +342,7 @@ static inline void pack_a16_b(sycl::queue& q, const sycl::half* A, sycl::half* A
 }
 static inline void pack_b16_b(sycl::queue& q, const sycl::half* B, sycl::half* Bp,
                               int K, int N, int batches) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int TS = 16;
     int kb_n = K / TS, tc_n = N / TS;
     size_t per = (size_t)kb_n * tc_n * 2 * 128;          // = K*N
@@ -348,6 +361,7 @@ static inline void pack_b16_b(sycl::queue& q, const sycl::half* B, sycl::half* B
 }
 static inline void pack_b16_t_b(sycl::queue& q, const sycl::half* B, sycl::half* Bp,
                                 int K, int N, int batches) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int TS = 16;
     int kb_n = K / TS, tc_n = N / TS;
     size_t per = (size_t)kb_n * tc_n * 2 * 128;
@@ -373,6 +387,7 @@ static inline void pack_b16_t_b(sycl::queue& q, const sycl::half* B, sycl::half*
 //   gather_b: dB[n*K+k] = Braw[g*sb + (n0+n)*ldb + k]   (n<ncount, k<K; n0 = column block)
 static inline void gather_a(sycl::queue& q, const int8_t* Araw, int8_t* dA,
                             int M, int K, int lda, size_t sa, int g) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     q.parallel_for(sycl::range((size_t)M * K), [=](sycl::item<1> it) {
         size_t i = it.get_id(0); int r = (int)(i / K), k = (int)(i % K);
         dA[i] = Araw[(size_t)g * sa + (size_t)r * lda + k];
@@ -380,6 +395,7 @@ static inline void gather_a(sycl::queue& q, const int8_t* Araw, int8_t* dA,
 }
 static inline void gather_b(sycl::queue& q, const int8_t* Braw, int8_t* dB,
                             int n0, int ncount, int K, int ldb, size_t sb, int g) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     q.parallel_for(sycl::range((size_t)ncount * K), [=](sycl::item<1> it) {
         size_t i = it.get_id(0); int r = (int)(i / K), k = (int)(i % K);
         dB[i] = Braw[(size_t)g * sb + (size_t)(n0 + r) * ldb + k];
@@ -393,6 +409,7 @@ static inline void gather_b(sycl::queue& q, const int8_t* Braw, int8_t* dB,
 //   gather_b16_t (transposed B, N x K): dB[j*K+k] = Braw[ob + g*sb + j*ldb + k]
 static inline void gather_a16(sycl::queue& q, const sycl::half* Araw, sycl::half* dA,
                               int M, int K, int lda, size_t sa, size_t oa, int g) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     q.parallel_for(sycl::range((size_t)M * K), [=](sycl::item<1> it) {
         size_t i = it.get_id(0); int r = (int)(i / K), k = (int)(i % K);
         dA[i] = Araw[oa + (size_t)g * sa + (size_t)r * lda + k];
@@ -400,6 +417,7 @@ static inline void gather_a16(sycl::queue& q, const sycl::half* Araw, sycl::half
 }
 static inline void gather_b16(sycl::queue& q, const sycl::half* Braw, sycl::half* dB,
                               int K, int N, int ldb, size_t sb, size_t ob, int g) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     q.parallel_for(sycl::range((size_t)K * N), [=](sycl::item<1> it) {
         size_t i = it.get_id(0); int k = (int)(i / N), j = (int)(i % N);
         dB[i] = Braw[ob + (size_t)g * sb + (size_t)k * ldb + j];
@@ -407,6 +425,7 @@ static inline void gather_b16(sycl::queue& q, const sycl::half* Braw, sycl::half
 }
 static inline void gather_b16_t(sycl::queue& q, const sycl::half* Braw, sycl::half* dB,
                                 int N, int K, int ldb, size_t sb, size_t ob, int g) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     q.parallel_for(sycl::range((size_t)N * K), [=](sycl::item<1> it) {
         size_t i = it.get_id(0); int j = (int)(i / K), k = (int)(i % K);
         dB[i] = Braw[ob + (size_t)g * sb + (size_t)j * ldb + k];
@@ -420,6 +439,7 @@ static inline void gather_b16_t(sycl::queue& q, const sycl::half* Braw, sycl::ha
 // bit-exact by construction against the gather+pack pair it replaces.
 static inline void gather_pack_a(sycl::queue& q, const int8_t* Araw, int8_t* Ap,
                                  int M, int Mp, int K, int lda, size_t sa, int g) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int BM = 128, BK = 32;
     int wgr = Mp / BM, kb_n = K / BK;
     size_t n = (size_t)wgr * kb_n * 8 * 512;   // = Mp*K
@@ -435,6 +455,7 @@ static inline void gather_pack_a(sycl::queue& q, const int8_t* Araw, int8_t* Ap,
 }
 static inline void gather_pack_a16(sycl::queue& q, const sycl::half* Araw, sycl::half* Ap,
                                    int M, int Mp, int K, int lda, size_t sa, size_t oa, int g) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int TS = 16;
     int tr_n = Mp / TS, kb_n = K / TS;
     size_t n = (size_t)tr_n * kb_n * 2 * 128;
@@ -457,6 +478,7 @@ static inline void gather_pack_a16(sycl::queue& q, const sycl::half* Araw, sycl:
 // consume it as one dispatch.
 static inline void gather_pack_a_b(sycl::queue& q, const int8_t* Araw, int8_t* Ap,
                                    int M, int Mp, int K, int lda, size_t sa, int batch) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int BM = 128, BK = 32;
     int wgr = Mp / BM, kb_n = K / BK;
     size_t per = (size_t)wgr * kb_n * 8 * 512;      // = Mp*K
@@ -479,6 +501,7 @@ static inline void gather_pack_a_b(sycl::queue& q, const int8_t* Araw, int8_t* A
 // 0.032->0.017 ms, byte diff 0 / every shape.
 static inline void gather_pack_a_b_v(sycl::queue& q, const int8_t* Araw, int8_t* Ap,
                                      int M, int Mp, int K, int lda, size_t sa, int batch) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int BM = 128, BK = 32;
     int wgr = Mp / BM, kb_n = K / BK;
     size_t per = (size_t)wgr * kb_n * 8 * 512;
@@ -507,6 +530,7 @@ static inline void gather_pack_a_b_v(sycl::queue& q, const int8_t* Araw, int8_t*
 static inline void pack_a_fused_b(sycl::queue& q, const sycl::half* A_f16, int8_t* Ap,
                                   float* scales, int M, int Mp, int K, int lda,
                                   size_t sa, int batch) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int BM = 128, BK = 32;
     const int kb_n = K / BK;
     const size_t per = (size_t)(Mp / BM) * kb_n * 8 * 512;   // = Mp*K per group
@@ -558,6 +582,7 @@ static inline void pack_a_fused_b(sycl::queue& q, const sycl::half* A_f16, int8_
 static inline void pack_a_fused_b1(sycl::queue& q, const sycl::half* A_f16, int8_t* Ap,
                                    float* scales, int M, int Mp, int K, int lda,
                                    size_t sa, int batch) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int BM = 128, BK = 32;
     const int kb_n = K / BK;
     const size_t per = (size_t)(Mp / BM) * kb_n * 8 * 512;   // = Mp*K per group
@@ -624,6 +649,7 @@ static inline void pack_a_fused_gather(sycl::queue& q, const sycl::half* A_f16,
                                        int M, int Mp, int K,
                                        unsigned image_h, unsigned image_w,
                                        unsigned across, unsigned pad) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int BM = 128, BK = 32;
     const int kb_n = K / BK;
     const unsigned top = pad >> 16, left = pad & 0xffffu;
@@ -679,6 +705,7 @@ static inline void pack_a_fused_gather(sycl::queue& q, const sycl::half* A_f16,
 // batch=1) -- the wide A row IS the raw row (lda==K_w contiguous).
 static inline void gather_pack_b_diag_b(sycl::queue& q, const int8_t* Braw, int8_t* Bp,
                                         int N, int K, int ldb, size_t sb, int batch) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int Nw = N * batch, Kw = K * batch;
     int nt_n = Nw / 8, kk_n = Kw / 32;
     size_t per = (size_t)kk_n * nt_n * 64 * 4;       // = Nw*Kw
@@ -699,6 +726,7 @@ static inline void gather_pack_b_diag_b(sycl::queue& q, const int8_t* Braw, int8
 }
 static inline void gather_pack_b_b(sycl::queue& q, const int8_t* Braw, int8_t* Bp,
                                    int N, int K, int ldb, size_t sb, int batch) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     int nt_n = N / 8, kk_n = K / 32;
     size_t per = (size_t)kk_n * nt_n * 64 * 4;      // = N*K
     q.parallel_for(sycl::range((size_t)batch * per), [=](sycl::item<1> it) {
@@ -718,6 +746,7 @@ static inline void gather_pack_b_b(sycl::queue& q, const int8_t* Braw, int8_t* B
 // looping them, consumed by f16v1::gemm_b as one dispatch.
 static inline void gather_pack_a16_b(sycl::queue& q, const sycl::half* Araw, sycl::half* Ap,
                                      int M, int Mp, int K, int lda, size_t sa, size_t oa, int batch) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int TS = 16;
     int tr_n = Mp / TS, kb_n = K / TS;
     size_t per = (size_t)tr_n * kb_n * 2 * 128;      // = Mp*K
@@ -759,6 +788,7 @@ static inline void gather_pack_a16_b(sycl::queue& q, const sycl::half* Araw, syc
 }
 static inline void gather_pack_b16_b(sycl::queue& q, const sycl::half* Braw, sycl::half* Bp,
                                      int K, int N, int ldb, size_t sb, size_t ob, int batch) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int TS = 16;
     int kb_n = K / TS, tc_n = N / TS;
     size_t per = (size_t)kb_n * tc_n * 2 * 128;      // = K*N
@@ -775,6 +805,7 @@ static inline void gather_pack_b16_b(sycl::queue& q, const sycl::half* Braw, syc
 }
 static inline void gather_pack_b16_t_b(sycl::queue& q, const sycl::half* Braw, sycl::half* Bp,
                                        int K, int N, int ldb, size_t sb, size_t ob, int batch) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int TS = 16;
     int kb_n = K / TS, tc_n = N / TS;
     size_t per = (size_t)kb_n * tc_n * 2 * 128;

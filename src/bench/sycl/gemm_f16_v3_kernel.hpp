@@ -65,6 +65,7 @@ static inline sycl::event gemm_resid_pub(sycl::queue& q, const half* Ap, const h
                                          bool pool_outlet = false, half* Pool = nullptr,
                                          bool tail = true, bool skip_image = false,
                                          int no_e4m3 = 0, bool contig_store = false) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int N = 32;
     int tr_n = Mp / TS, kb_n = K / TS;
     // section 100 D3 (the senior's acc-via-SLM pattern, gemm_staged.comp:309-322):

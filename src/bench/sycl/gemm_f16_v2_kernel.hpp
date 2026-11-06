@@ -34,6 +34,7 @@ static const int TS = 16, BM = 64, BK = 16;
 template <int BN>
 static inline sycl::event gemm_b2(sycl::queue& q, const half* Ap, const half* Bp,
                                   float* C, int Mp, int N, int K, int batches) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int WIR = BM / TS, WIC = BN / TS, NT = WIR * WIC;   // 4 x (BN/16)
     const int SLM_A = BM * BK * 2;         // BYTES: 2048
     const int SLM_B = BK * BN * 2;         // BN=64: 2048, BN=32: 1024
@@ -121,6 +122,7 @@ static inline sycl::event gemm_b2(sycl::queue& q, const half* Ap, const half* Bp
 static inline sycl::event gemm_b2_merge(sycl::queue& q, const half* Ap, const half* Bp,
                                         half* Out, int Mp, int N, int K, int batches,
                                         int heads) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int MERGE_BN = 32;   // the attnV leg is BN=32 (N=32)
     const int WIR = BM / TS, WIC = MERGE_BN / TS, NT = WIR * WIC;   // MERGE_BN=32 -> WIC=2, NT=8
     const int SLM_A = BM * BK * 2;

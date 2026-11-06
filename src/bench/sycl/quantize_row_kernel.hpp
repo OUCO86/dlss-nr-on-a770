@@ -157,6 +157,7 @@ inline void qr_launch(sycl::queue& q, sycl::device& dev, K kern,
                       unsigned m, unsigned k, unsigned flags,
                       unsigned image_h, unsigned image_w, unsigned window_cols, unsigned window_pad,
                       float* dprod, float* drecip) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     unsigned words = k / 8u;
     auto sgs = dev.get_info<sycl::info::device::sub_group_sizes>();
     unsigned SUB_max = 1u; for (unsigned s : sgs) if (s > SUB_max) SUB_max = s;
@@ -338,6 +339,7 @@ inline auto qr_kernel_rowgroup() {
 inline void qr_launch_esimd(sycl::queue& q, sycl::device& dev,
                             sycl::half* dsrc, sycl::uint2* dpack, float* dscale,
                             unsigned m, unsigned k, sycl::event *out_ev = nullptr) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     // ROW-THREAD dispatch (section 99): exact small-K shapes get the senior geometry.
     // out_ev (bench-only, defaulted): the last enqueued event, for GPU-side timing.
     if (k == 64u)  { if(out_ev) *out_ev = q.parallel_for(sycl::range(m), qr_kernel_rowthread<64>()(dsrc, dpack, dscale, m, k)); else q.parallel_for(sycl::range(m), qr_kernel_rowthread<64>()(dsrc, dpack, dscale, m, k)); return; }

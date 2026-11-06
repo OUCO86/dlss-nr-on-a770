@@ -59,6 +59,7 @@ static inline void pack_b(const int8_t* B, int8_t* Bp, int N, int K) {
 // the launch: v1's gemm_s8 verbatim (Mp = padded M, N %64, K %32). C32 = Mp x N int32.
 static inline sycl::event gemm(sycl::queue& q, const int8_t* Ap, const int8_t* Bp,
                                int32_t* C32, int Mp, int N, int K) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     int wg = (Mp / BM) * (N / BN);
     return q.submit([&](handler& h) {
         h.parallel_for(nd_range(range(wg * NT), range(NT)), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
@@ -138,6 +139,7 @@ static inline void pack_b32(const int8_t* B, int8_t* Bp, int N, int K) {
 // under-filled ones (the M=640 batch=8 = 8x160-thread pathology the user caught).
 static inline sycl::event gemm_b(sycl::queue& q, const int8_t* Ap, const int8_t* Bp,
                                  int32_t* C32, int Mp, int N, int K, int batch) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     int wg = (Mp / BM) * (N / BN);
     size_t apb = (size_t)Mp * K, bpb = (size_t)N * K, cb = (size_t)Mp * N;
     return q.submit([&](handler& h) {
@@ -208,6 +210,7 @@ static inline sycl::event gemm_b(sycl::queue& q, const int8_t* Ap, const int8_t*
 // construction. For the batched family's N=32 shapes.
 static inline sycl::event gemm32_b(sycl::queue& q, const int8_t* Ap, const int8_t* Bp,
                                    int32_t* C32, int Mp, int N, int K, int batch) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int BN32 = 32, NT32 = 16, WI_ROWS = BM / 16, WI_COLS = BN32 / 16;
     const int SLM_A32 = BM * BK, SLM_B32 = BK * BN32;
     const int SLM_B32_BASE = 2 * SLM_A32;
@@ -279,6 +282,7 @@ static inline sycl::event gemm32_b(sycl::queue& q, const int8_t* Ap, const int8_
 
 static inline sycl::event gemm32(sycl::queue& q, const int8_t* Ap, const int8_t* Bp,
                                  int32_t* C32, int Mp, int N, int K) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int BN32 = 32, NT32 = 16, WI_ROWS = BM / 16, WI_COLS = BN32 / 16;
     const int SLM_A32 = BM * BK, SLM_B32 = BK * BN32;
     const int SLM_B32_BASE = 2 * SLM_A32;
@@ -449,6 +453,7 @@ static inline sycl::event gemm_b_pub(sycl::queue& q, const int8_t* Ap, const int
                                      int M, int Mp, int N, int K, int batch,
                                      size_t sc, unsigned ldc, unsigned scale_stride,
                                      unsigned col_stride, bool narrow, unsigned epi) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     int wg = (Mp / BM) * (N / BN);
     size_t apb = (size_t)Mp * K, bpb = (size_t)N * K;
     return q.submit([&](handler& h) {
@@ -585,6 +590,7 @@ static inline sycl::event gemm32_b_pub(sycl::queue& q, const int8_t* Ap, const i
                                        int M, int Mp, int N, int K, int batch,
                                        size_t sc, unsigned ldc, unsigned scale_stride,
                                        unsigned col_stride, bool narrow, unsigned epi) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int BN32 = 32, NT32P = 32, ROW_BANDS = BM / 8, COL_BANDS = BN32 / 16;
     const int SLM_A32 = BM * BK, SLM_B32 = BK * BN32;      // 4096 / 1024 bytes per buffer
     const int A_PER = SLM_A32 / NT32P;                    // 128 B of A per thread
@@ -683,6 +689,7 @@ static inline sycl::event gemm_b_pub_slm(sycl::queue& q, const int8_t* Ap, const
                                      int M, int Mp, int N, int K, int batch,
                                      size_t sc, unsigned ldc, unsigned scale_stride,
                                      unsigned col_stride, bool narrow, unsigned epi) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     int wg = (Mp / BM) * (N / BN);
     size_t apb = (size_t)Mp * K, bpb = (size_t)N * K;
     // the tile's int32 C-stage in BYTES. Full = the tile layout, BM*BN*4 = 32768.
@@ -864,6 +871,7 @@ static inline sycl::event gemm_b_res(sycl::queue& q, const int8_t* Ap, const int
                                      const void* skip, const float* cos,
                                      int M, int Mp, int N, int K,
                                      bool narrow, bool half_skip, unsigned epi) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     int wg = (Mp / BM) * (N / BN);
     size_t apb = (size_t)Mp * K, bpb = (size_t)N * K;
     return q.submit([&](handler& h) {
@@ -992,6 +1000,7 @@ struct S8ResDesc { const int8_t* A; const int8_t* B; void* C;
 static inline sycl::event gemm_b_res_batch(sycl::queue& q, const S8ResDesc* desc,
                                            int M, int Mp, int N, int K, int batch,
                                            bool narrow, bool half_skip, unsigned epi) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     int wg = (Mp / BM) * (N / BN);
     return q.submit([&](handler& h) {
         h.parallel_for(nd_range(range((size_t)wg * batch * NT), range(NT)), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
@@ -1133,6 +1142,7 @@ static inline sycl::event gemm_b_res8(sycl::queue& q, const int8_t* Ap, const in
                                       const int8_t* skip8, const float* skipScales,
                                       const float* cos,
                                       int M, int Mp, int N, int K) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     int wg = (Mp / BM) * (N / BN);
     size_t apb = (size_t)Mp * K, bpb = (size_t)N * K;
     return q.submit([&](handler& h) {
@@ -1264,6 +1274,7 @@ static inline sycl::event gemm_b_res_window(sycl::queue& q, const int8_t* Ap, co
                                      bool narrow, bool half_skip, unsigned epi,
                                      unsigned across, unsigned top, unsigned left,
                                      unsigned image_h, unsigned image_w) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     int wg = (Mp / BM) * (N / BN);
     size_t apb = (size_t)Mp * K, bpb = (size_t)N * K;
     return q.submit([&](handler& h) {

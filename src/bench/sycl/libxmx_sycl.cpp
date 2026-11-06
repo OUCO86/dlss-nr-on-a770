@@ -17,6 +17,21 @@
 #include <sycl/sycl.hpp>
 #include <sycl/ext/oneapi/experimental/graph.hpp>
 #include <level_zero/ze_api.h>
+// #145 (军规 132, 2026-11-06): the launch census must not put statements or blocks around a launch
+// call site. Measured on the shipped 口径 with ab.ps1 v3: libxmx_bis4 (pre-#121 source, rebuilt today
+// with the same icx recipe) is +0.016 ms vs the artifact (3/5), while bis4 vs libxmx_bis5 (the 27-hunk
+// #121 delta alone, same toolchain, same batch) is +4.950 ms, 0/8. Compiling the counters out
+// (lcount20) and removing the id mirror + sixth vector (lcount21) both stay +4.8/+4.9 ms; all 170
+// device kernels have identical GEN instruction counts and [hop-total] is byte-identical
+// (3396 planes / 30,786,624,936 B); the serial NR_RUN_TIMING path shows the same +5 ms (109-110 vs
+// 114-115). => host-side launch-helper inlining/layout, ~+7 us per launch over ~690 launches. The tick
+// therefore lives at LAUNCH-HELPER ENTRY (declared here, before the kernel headers) and the per-closure
+// pf is the delta lc_begin/lc_end take around each closure. No launch call site changes shape.
+static bool g_lcount_on = false;      // NR_LCOUNT gate, set in xmx_begin
+static int  g_lc_cur = -1;            // the closure currently executing (-1 = not counted)
+static long g_lc_ticks = 0;           // helper entries charged to the current closure
+static long g_lc_tick0 = 0;           // the reading when the current closure started
+#define LC_TICK() do { if (g_lcount_on && g_lc_cur >= 0) ++g_lc_ticks; } while (0)
 #include "quantize_row_kernel.hpp"
 #include "publish_kernel.hpp"
 #include "cosine_tree_kernel.hpp"
@@ -153,16 +168,16 @@ static std::vector<LCount> g_cmds_launch;      // parallel to g_cmds (rule 57: t
 // growing across recordings and is addressed through name_offset, which is one entry off when a
 // closure is recorded exactly once (the fused pre: pre_done refuses the second recording).
 static std::vector<const char*> g_cmds_name;
-static int  g_lc_cur = -1;                     // the closure currently executing (-1 = not counting)
-static bool g_lcount_on = false;               // NR_LCOUNT gate, set in xmx_begin
 static long g_lc_skipped = 0;                  // launch sites the narrow policy refused to instrument
-#define LC_INC(field) do { if (g_lcount_on && g_lc_vec && g_lc_cur >= 0 && (size_t)g_lc_cur < g_lc_vec->size()) \
-                            (*g_lc_vec)[(size_t)g_lc_cur].field++; } while (0)
 static std::vector<LCount>* g_lc_vec = nullptr;   // the counters of the graph currently replaying
 #define LC_ADD(field, v) do { if (g_lcount_on && g_lc_vec && g_lc_cur >= 0 && (size_t)g_lc_cur < g_lc_vec->size()) \
                             (*g_lc_vec)[(size_t)g_lc_cur].field += (v); } while (0)
-static void lc_begin(int i) { if (g_lcount_on) g_lc_cur = i; }
-static void lc_end()        { g_lc_cur = -1; }
+static void lc_begin(int i) { if (g_lcount_on) { g_lc_cur = i; g_lc_tick0 = g_lc_ticks; } }
+static void lc_end() {
+    if (g_lcount_on && g_lc_cur >= 0 && g_lc_vec && (size_t)g_lc_cur < g_lc_vec->size())
+        (*g_lc_vec)[(size_t)g_lc_cur].pf = (int)(g_lc_ticks - g_lc_tick0);
+    g_lc_cur = -1;
+}
 static void pg_note_ids(const std::initializer_list<int>& ids) {
     // Only ids that resolve to a live buffer are worth printing. Some call sites pass geometry
     // or flag words in the same initializer list; those leaked into the witness as huge fake ids
@@ -368,9 +383,9 @@ static const float* vit_recip_tab() {
             h[u] = (float)sycl::half(r);                     // qr_half_round
         }
         tab = (float*)sycl::malloc_device(65536u * 4u, *GQ);
-        LC_INC(mc); GQ->memcpy(tab, h.data(), 65536u * 4u).wait();
+         GQ->memcpy(tab, h.data(), 65536u * 4u).wait();
         if (getenv("NR_VITDBG")) { float chk[4] = {0,0,0,0};
-            LC_INC(mc); GQ->memcpy(chk, (const float*)tab + 0x4400u, 16).wait();
+             GQ->memcpy(chk, (const float*)tab + 0x4400u, 16).wait();
             printf("[vitdbg] tab=%p host[0x4400]=%.6g dev readback=%.6g %.6g (expect 0.5)\n",
                    (void*)tab, (double)h[0x4400], (double)chk[0], (double)chk[1]); }
     }
@@ -638,7 +653,7 @@ static int8_t* cached_pack_b_i8(int bufid, const int8_t* B, int N, int K) {
     auto it = g_wcache.find(wk);
     if (it != g_wcache.end()) return (int8_t*)it->second;
     int8_t* p = (int8_t*)sycl::malloc_device((size_t)N * K, *GQ);
-    LC_INC(pf); packdev::pack_b(*GQ, B, p, N, K);
+     packdev::pack_b(*GQ, B, p, N, K);
     g_wcache[wk] = p;
     return p;
 }
@@ -838,7 +853,7 @@ static int8_t* s6_pack_bexp_wide(const S6Fuse& f) {
     auto it = g_wcache.find(wk);
     if (it != g_wcache.end()) return (int8_t*)it->second;
     int8_t* p = (int8_t*)sycl::malloc_device((size_t)f.HID * f.C, *GQ);
-    LC_INC(pf); packdev::gather_pack_b_b(*GQ, f.BexpRaw, p, (int)f.HID, (int)f.C, f.ldb_e, 0, 1);
+     packdev::gather_pack_b_b(*GQ, f.BexpRaw, p, (int)f.HID, (int)f.C, f.ldb_e, 0, 1);
     g_wcache[wk] = p;
     return p;
 }
@@ -847,7 +862,7 @@ static int8_t* s6_pack_bproj_wide(const S6Fuse& f) {
     auto it = g_wcache.find(wk);
     if (it != g_wcache.end()) return (int8_t*)it->second;
     int8_t* p = (int8_t*)sycl::malloc_device((size_t)f.C * f.HID, *GQ);
-    LC_INC(pf); packdev::gather_pack_b_diag_b(*GQ, f.BprojRaw, p, f.Np, f.Kp, f.ldb_p,
+     packdev::gather_pack_b_diag_b(*GQ, f.BprojRaw, p, f.Np, f.Kp, f.ldb_p,
                                   f.sb_p, f.batchp);
     g_wcache[wk] = p;
     return p;
@@ -1130,7 +1145,7 @@ static void a5_att_run(const A5Fuse& f) {
     const int8_t* dBp = cached_pack_b_i8(f.wqkv, Wq, (int)(3u * f.C), (int)f.C);
     const int8_t* dOp = cached_pack_b_i8(f.wo, Wo, (int)f.C, (int)f.C);
     att5::Outlets o;                 // DUMP=false: every outlet stays null and folds away
-    LC_INC(pf); att5::fused<64, 2, 5, false, false>(*GQ, dImg, dBp, bs, qs, bias, dOp, bs2, cp, Out2,
+     att5::fused<64, 2, 5, false, false>(*GQ, dImg, dBp, bs, qs, bias, dOp, bs2, cp, Out2,
                                         Q, Kk, V, f.windows, f.across, f.top, f.left,
                                         f.ih, f.iw, o);
 }
@@ -1139,7 +1154,7 @@ static sycl::half* cached_pack_b_f16(int bufid, const sycl::half* B, int K, int 
     auto it = g_wcache.find(wk);
     if (it != g_wcache.end()) return (sycl::half*)it->second;
     sycl::half* p = (sycl::half*)sycl::malloc_device((size_t)K * N * 2, *GQ);
-    LC_INC(pf); packdev::pack_b16(*GQ, B, p, K, N);
+     packdev::pack_b16(*GQ, B, p, K, N);
     g_wcache[wk] = p;
     return p;
 }
@@ -1148,7 +1163,7 @@ static sycl::half* cached_pack_b_f16_t(int bufid, const sycl::half* B, int K, in
     auto it = g_wcache.find(wk);
     if (it != g_wcache.end()) return (sycl::half*)it->second;
     sycl::half* p = (sycl::half*)sycl::malloc_device((size_t)K * N * 2, *GQ);
-    LC_INC(pf); packdev::pack_b16_t(*GQ, B, p, K, N);
+     packdev::pack_b16_t(*GQ, B, p, K, N);
     g_wcache[wk] = p;
     return p;
 }
@@ -1515,7 +1530,7 @@ int xmx_buf_download(int id, void* dst, unsigned long long off, unsigned long lo
 int xmx_buf_zero(int id) {
     if (!GQ) FAILMSG("not initialised");
     auto it = g_bufs.find(id); if (it == g_bufs.end()) FAILMSG("no such buffer");
-    LC_INC(ms); GQ->memset(it->second.p, 0, it->second.bytes).wait();
+     GQ->memset(it->second.p, 0, it->second.bytes).wait();
     return 0;
 }
 int xmx_buf_destroy(int id) {
@@ -1859,9 +1874,8 @@ static void bmerge_apply(std::vector<std::function<void()>>& cmds) {
                     // the plumbing are fine and ONLY the deferral of the write is unsafe (chain k+1
                     // reads chain k's residual output, so moving that write later poisons the image).
                     static int keep = getenv("NR_BMERGE_KEEP") ? atoi(getenv("NR_BMERGE_KEEP")) : 0;
-                    if (keep)
-                        { LC_INC(pf); s8v8::gemm_b_res(*GQ, dAp, dBp, s.Cout, s.as, s.bs, s.skp, s.cp,
-                                         s.M, s.Mp, s.N, s.K, s.narrow, s.half_skip, s.epi); }
+                    if (keep)s8v8::gemm_b_res(*GQ, dAp, dBp, s.Cout, s.as, s.bs, s.skp, s.cp,
+                                         s.M, s.Mp, s.N, s.K, s.narrow, s.half_skip, s.epi);
                     if (put_back_now) pool_put(dAp);
                     if ((int)gr->held.size() < gr->n) return;      // gemm deferred to the last member
                     // The descriptor table must NOT come from the scratch pool: a pool block is
@@ -1871,7 +1885,7 @@ static void bmerge_apply(std::vector<std::function<void()>>& cmds) {
                     // byte-exact in the probe -- s6/BMERGE_twin_F*.log). A dedicated allocation,
                     // uploaded once at capture and never recycled, is stable across replays.
                     s8v8::S8ResDesc* dtab = gr->dtab;   // allocated at rewrite time
-                    LC_INC(pf); s8v8::gemm_b_res_batch(*GQ, dtab, s.M, s.Mp, s.N, s.K, gr->n,
+                     s8v8::gemm_b_res_batch(*GQ, dtab, s.M, s.Mp, s.N, s.K, gr->n,
                                            s.narrow, s.half_skip, s.epi);
                     // faces stay allocated (dedicated, reused by the same group every pass)
                 };
@@ -1990,7 +2004,7 @@ extern "C++" {
 template <int MODE>
 static void rb_qdq(sycl::half* p, unsigned rows, unsigned cols, unsigned gran, float post) {
     const unsigned groups = (rows + gran - 1u) / gran;
-    LC_INC(pf); GQ->parallel_for(sycl::range<1>(groups), [=](sycl::item<1> it) {
+     GQ->parallel_for(sycl::range<1>(groups), [=](sycl::item<1> it) {
         const unsigned r0 = (unsigned)it.get_id(0) * gran;
         const unsigned r1 = (r0 + gran < rows) ? r0 + gran : rows;
         // one scale per (gran rows x cols) window
@@ -2837,8 +2851,7 @@ int xmx_rec_pre(int colour, int motion, int history, int features, int plan,
                         pitch, source_h, source_w, flags };
     g_cmd_names.push_back(__func__);
     pg_push([=]() {
-        LC_INC(pf);
-        // #141 layer 1: explicit work-group size (0 = the shipped basic parallel_for). The guard
+                // #141 layer 1: explicit work-group size (0 = the shipped basic parallel_for). The guard
         // inside pre_at (pixel >= A.m) is what makes the rounded-up global range safe; the body,
         // its order and every value are untouched -- only the partition is fixed by construction.
         static int pre_nt = getenv("NR_PRE_NT") ? atoi(getenv("NR_PRE_NT")) : 0;
@@ -2892,7 +2905,7 @@ int xmx_rec_post(int colour, int head, int history, int result, int table, int n
                           pitch, source_h, source_w };
     g_cmd_names.push_back(__func__);
     pg_push([=]() {
-        LC_INC(pf); GQ->parallel_for(sycl::range((size_t)pixels), postpass::post_kernel(A));
+         GQ->parallel_for(sycl::range((size_t)pixels), postpass::post_kernel(A));
     });
     return 0;
 }
@@ -2976,18 +2989,18 @@ int xmx_rec_gemm_qkv_window(int image, int weight, int q, int k, int v, int scal
         std::memcpy(hApad.data(), hA.data(), (size_t)M * C * 2);
         std::vector<sycl::half> hB((size_t)C * NH), hAp((size_t)Mp * C), hBp((size_t)C * NH);
         ev_sync(GQ->memcpy(hB.data(), Wraw, (size_t)C * NH * 2));
-        LC_INC(pf); f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)C);
-        LC_INC(pf); f16v1::pack_b(hB.data(), hBp.data(), (int)C, (int)NH);
+         f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)C);
+         f16v1::pack_b(hB.data(), hBp.data(), (int)C, (int)NH);
         sycl::half* dAp = (sycl::half*)pool_get((size_t)Mp * C * 2);
         sycl::half* dBp = (sycl::half*)pool_get((size_t)C * NH * 2);
         float* dC = (float*)pool_get((size_t)Mp * NH * 4);
         ev_sync(GQ->memcpy(dAp, hAp.data(), (size_t)Mp * C * 2));
         ev_sync(GQ->memcpy(dBp, hBp.data(), (size_t)C * NH * 2));
-        LC_INC(pf); f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)NH, (int)C);
+         f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)NH, (int)C);
         // qkv_epilogue: in-place Q/K head norm on the f32 acc (QKV_READ = float(stage)),
         // then publish e4m3 -> half scatter. One device pass per (row, head) for the norm,
         // then the publish/scatter pass.
-        LC_INC(pf); GQ->parallel_for(sycl::range((size_t)M * heads), [=](sycl::item<1> it) {
+         GQ->parallel_for(sycl::range((size_t)M * heads), [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             unsigned r = (unsigned)(i / heads), head = (unsigned)(i % heads);
             float row32[32];
@@ -3014,7 +3027,7 @@ int xmx_rec_gemm_qkv_window(int image, int weight, int q, int k, int v, int scal
             }
             // V: no norm, the raw acc value stays (QKV_READ returns it).
         });
-        LC_INC(pf); GQ->parallel_for(sycl::range((size_t)M * NH), [=](sycl::item<1> it) {
+         GQ->parallel_for(sycl::range((size_t)M * NH), [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             unsigned r = (unsigned)(i / NH), n = (unsigned)(i % NH);
             unsigned part = n / C, col = n % C, head = col / 32u;
@@ -3071,15 +3084,15 @@ int xmx_rec_gemm_residual(int a, int b, int c, int skip, int cosine,
         ev_sync(GQ->memcpy(hA.data(), Araw, (size_t)M * K * 2));
         std::memcpy(hApad.data(), hA.data(), (size_t)M * K * 2);
         ev_sync(GQ->memcpy(hB.data(), Braw, nb * 2));
-        LC_INC(pf); f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
-        LC_INC(pf); f16v1::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
+         f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
+         f16v1::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
         sycl::half* dAp = (sycl::half*)pool_get(na * 2);
         sycl::half* dBp = (sycl::half*)pool_get(nb * 2);
         float* dC = (float*)pool_get((size_t)Mp * N * 4);
         ev_sync(GQ->memcpy(dAp, hAp.data(), na * 2));
         ev_sync(GQ->memcpy(dBp, hBp.data(), nb * 2));
-        LC_INC(pf); f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K);
-        LC_INC(pf); GQ->parallel_for(sycl::range((size_t)M * N),
+         f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K);
+         GQ->parallel_for(sycl::range((size_t)M * N),
                          [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             unsigned col = (unsigned)(i % N);
@@ -3153,15 +3166,15 @@ int xmx_rec_gemm_window_residual(int a, int b, int c, int skip, int cosine,
         ev_sync(GQ->memcpy(hA.data(), Araw, (size_t)M * K * 2));
         std::memcpy(hApad.data(), hA.data(), (size_t)M * K * 2);
         ev_sync(GQ->memcpy(hB.data(), Braw, nb * 2));
-        LC_INC(pf); f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
-        LC_INC(pf); f16v1::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
+         f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
+         f16v1::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
         sycl::half* dAp = (sycl::half*)pool_get(na * 2);
         sycl::half* dBp = (sycl::half*)pool_get(nb * 2);
         float* dC = (float*)pool_get((size_t)Mp * N * 4);
         ev_sync(GQ->memcpy(dAp, hAp.data(), na * 2));
         ev_sync(GQ->memcpy(dBp, hBp.data(), nb * 2));
-        LC_INC(pf); f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K);
-        LC_INC(pf); GQ->parallel_for(sycl::range(blk_elems),
+         f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K);
+         GQ->parallel_for(sycl::range(blk_elems),
                          [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             unsigned r = (unsigned)(i / N), col = (unsigned)(i % N);
@@ -3295,7 +3308,7 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
         // queue: every read kernel is enqueued before the pool_put that recycles its
         // buffer, so cross-pass scratch reuse is safe; one wait at the end of the pass.
         sycl::half* dAp = (sycl::half*)pool_get((size_t)Mp * cin * 2);
-        LC_INC(pf); packdev::pack_a16(*GQ, Araw, dAp, (int)M, Mp, (int)cin);
+         packdev::pack_a16(*GQ, Araw, dAp, (int)M, Mp, (int)cin);
         sycl::half* dEp = cached_pack_b_f16(expand, Eraw, (int)cin, (int)hidden);   // weight
         // P3 (section 100): the expand's published halves ARE the projection's pack_a16
         // A tile -- (tr,tc) of the expand == (tr,kc=tc) of the projection, same 16x16
@@ -3329,16 +3342,16 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
                     if (lw16c) ffnc::launch_ffn_chip_cs2<16,false>(*GQ, Araw, dEp, dPp, (float*)Cout, (int)M, Mp, skp, cp, half_skip, ff3, ff9);
                     else       ffnc::launch_ffn_chip_cs2<32,false>(*GQ, Araw, dEp, dPp, (float*)Cout, (int)M, Mp, skp, cp, half_skip, ff3, ff9);
                 } else
-                LC_INC(pf); CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, Araw, dEp, dPp, (float*)Cout, (int)M, Mp, skp, cp, half_skip, fjoin, ff3, ff9),
+                 CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, Araw, dEp, dPp, (float*)Cout, (int)M, Mp, skp, cp, half_skip, fjoin, ff3, ff9),
                                  ffnc::launch_ffn_chip<16>(*GQ, Araw, dEp, dPp, (float*)Cout, (int)M, Mp, skp, cp, half_skip, fjoin, ff3, ff9));
                 return;
             }
             float* dC2 = (float*)pool_get((size_t)Mp * cin * 4);
-            LC_INC(pf); CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, Araw, dEp, dPp, dC2, (int)M, Mp), ffnc::launch_ffn_chip<16>(*GQ, Araw, dEp, dPp, dC2, (int)M, Mp));
+             CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, Araw, dEp, dPp, dC2, (int)M, Mp), ffnc::launch_ffn_chip<16>(*GQ, Araw, dEp, dPp, dC2, (int)M, Mp));
             // the residual + publish tail stays SPLIT (the gate's f32-skip 131/8192
             // caught the in-kernel contracted fma -- sycl::fma is the authority,
             // section 92's gemm_res lesson, third time proven).
-            LC_INC(pf); GQ->parallel_for(sycl::range((size_t)M * cin), [=](sycl::item<1> it) {
+             GQ->parallel_for(sycl::range((size_t)M * cin), [=](sycl::item<1> it) {
                 size_t i2 = it.get_id(0);
                 unsigned col = (unsigned)(i2 % cin);
                 float total = dC2[i2];
@@ -3353,13 +3366,13 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
         }
         if (ffntile) {
             sycl::half* dHp = (sycl::half*)pool_get((size_t)Mp * hidden * 2);
-            LC_INC(pf); f16v1::gemm_pub_pa16(*GQ, dAp, dEp, dHp, (int)M, Mp, (int)hidden, (int)cin, 3u);
+             f16v1::gemm_pub_pa16(*GQ, dAp, dEp, dHp, (int)M, Mp, (int)hidden, (int)cin, 3u);
             pool_put(dAp);   // dEp is cache-owned (weight)
             sycl::half* dPp = cached_pack_b_f16(projection, Praw, (int)hidden, (int)cin);   // weight
             float* dC2 = (float*)pool_get((size_t)Mp * cin * 4);
-            LC_INC(pf); f16v1::gemm(*GQ, dHp, dPp, dC2, Mp, (int)cin, (int)hidden);
+             f16v1::gemm(*GQ, dHp, dPp, dC2, Mp, (int)cin, (int)hidden);
             pool_put(dHp);
-            LC_INC(pf); GQ->parallel_for(sycl::range((size_t)M * cin), [=](sycl::item<1> it) {
+             GQ->parallel_for(sycl::range((size_t)M * cin), [=](sycl::item<1> it) {
                 size_t i = it.get_id(0);
                 unsigned col = (unsigned)(i % cin);
                 float total = dC2[i];
@@ -3377,15 +3390,15 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
         // DERIVED (section 92): fuse publish(3) (gate_activation + e4m3) into the gemm
         // store -- kills the dC1 float scratch + the separate publish pass. pub_esimd(3u)
         // is the same gate+e4m3 chain proven bit-exact by the batched epi3 win.
-        LC_INC(pf); f16v1::gemm_pub(*GQ, dAp, dEp, dH, (int)M, Mp, (int)hidden, (int)cin, 3u);
+         f16v1::gemm_pub(*GQ, dAp, dEp, dH, (int)M, Mp, (int)hidden, (int)cin, 3u);
         pool_put(dAp);   // dEp is cache-owned (weight)
         // ---- pass 2: projection gemm_residual(hidden16, projection -> out) ----
         sycl::half* dHp = (sycl::half*)pool_get((size_t)Mp * hidden * 2);
         float* dC2 = (float*)pool_get((size_t)Mp * cin * 4);
-        LC_INC(pf); packdev::pack_a16(*GQ, dH, dHp, (int)M, Mp, (int)hidden);   // dH on device
+         packdev::pack_a16(*GQ, dH, dHp, (int)M, Mp, (int)hidden);   // dH on device
         sycl::half* dPp = cached_pack_b_f16(projection, Praw, (int)hidden, (int)cin);   // weight
-        LC_INC(pf); f16v1::gemm(*GQ, dHp, dPp, dC2, Mp, (int)cin, (int)hidden);
-        LC_INC(pf); GQ->parallel_for(sycl::range((size_t)M * cin), [=](sycl::item<1> it) {
+         f16v1::gemm(*GQ, dHp, dPp, dC2, Mp, (int)cin, (int)hidden);
+         GQ->parallel_for(sycl::range((size_t)M * cin), [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             unsigned col = (unsigned)(i % cin);
             float total = dC2[i];
@@ -3470,7 +3483,7 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
         // ---- pass A: merged4 on device -> dMerged f32 (the skip) + e4m3-half -> host ----
         float* dMerged = (float*)pool_get((size_t)M * 32 * 4);   // raw, kept for pass C
         sycl::half* dM16 = (sycl::half*)pool_get((size_t)M * 32 * 2);
-        LC_INC(pf); GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
+         GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             unsigned c = (unsigned)(i % 32u), pixel = (unsigned)(i / 32u);
             unsigned x = pixel % width, y = pixel / width;
@@ -3518,7 +3531,7 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
                 if (lw16m) ffnc::launch_ffn_chip_cs2<16,false>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp, false, ff3m, ff9m);
                 else       ffnc::launch_ffn_chip_cs2<32,false>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp, false, ff3m, ff9m);
             } else
-            LC_INC(pf); CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp, false, fjoinm, ff3m, ff9m), ffnc::launch_ffn_chip<16>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp, false, fjoinm, ff3m, ff9m));
+             CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp, false, fjoinm, ff3m, ff9m), ffnc::launch_ffn_chip<16>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp, false, fjoinm, ff3m, ff9m));
             pool_put(dM16);   // dA2 was never packed on this path; dB2/dPp2 cache-owned
             pool_put(dMerged);
             return;
@@ -3526,7 +3539,7 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
         if (merge_chip) {
             sycl::half* dPp2 = cached_pack_b_f16(projection, Praw, 128, 32);
             float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
-            LC_INC(pf); ffnc::launch_ffn_chip<32>(*GQ, dM16, dB2, dPp2, dC2, (int)M, Mp);
+             ffnc::launch_ffn_chip<32>(*GQ, dM16, dB2, dPp2, dC2, (int)M, Mp);
             pool_put(dM16);   // dA2 was never packed on this path; dB2/dPp2 cache-owned
             ffn_tail_res(*GQ, dMerged, dC2, cp, Cout, M, narrow, epi);
             pool_put(dC2);
@@ -3535,11 +3548,11 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
         }
         if (ffntile2) {
             sycl::half* dA3 = (sycl::half*)pool_get((size_t)Mp * 128 * 2);
-            LC_INC(pf); f16v1::gemm_pub_pa16(*GQ, dA2, dB2, dA3, (int)M, Mp, 128, 32, 3u);
+             f16v1::gemm_pub_pa16(*GQ, dA2, dB2, dA3, (int)M, Mp, 128, 32, 3u);
             pool_put(dM16); pool_put(dA2);   // dB2 cache-owned
             float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
             sycl::half* dB3 = cached_pack_b_f16(projection, Praw, 128, 32);   // weight
-            LC_INC(pf); f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128);
+             f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128);
             pool_put(dA3);
             ffn_tail_res(*GQ, dMerged, dC2, cp, Cout, M, narrow, epi);
             pool_put(dC2);   // dB3 is cache-owned (weight)
@@ -3547,14 +3560,14 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
             return;
         }
         sycl::half* dHid = (sycl::half*)pool_get((size_t)M * 128 * 2);
-        LC_INC(pf); f16v1::gemm_pub(*GQ, dA2, dB2, dHid, (int)M, Mp, 128, 32, 3u);
+         f16v1::gemm_pub(*GQ, dA2, dB2, dHid, (int)M, Mp, 128, 32, 3u);
         pool_put(dM16); pool_put(dA2);   // dB2 is cache-owned (weight)
         // ---- pass C: projection gemm(hidden, projection -> f32) + raw-merged residual ----
         sycl::half* dA3 = (sycl::half*)pool_get((size_t)Mp * 128 * 2);
         float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
-        LC_INC(pf); packdev::pack_a16(*GQ, dHid, dA3, (int)M, Mp, 128);   // dHid on device
+         packdev::pack_a16(*GQ, dHid, dA3, (int)M, Mp, 128);   // dHid on device
         sycl::half* dB3 = cached_pack_b_f16(projection, Praw, 128, 32);   // weight
-        LC_INC(pf); f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128);
+         f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128);
         pool_put(dHid);
         ffn_tail_res(*GQ, dMerged, dC2, cp, Cout, M, narrow, epi);
         pool_put(dA3); pool_put(dC2);   // dB3 is cache-owned (weight)
@@ -3618,7 +3631,7 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
         // downloaded Fraw/Arw/Eraw/Praw AND both intermediates to host and re-uploaded
         // packed operands (the 324ms). dS stays the raw f32 stem (pass C's residual).
         sycl::half* dA = (sycl::half*)pool_get((size_t)Mp * 16 * 2);
-        LC_INC(pf); packdev::pack_a16(*GQ, Fraw, dA, (int)M, Mp, 16);
+         packdev::pack_a16(*GQ, Fraw, dA, (int)M, Mp, 16);
         sycl::half* dB = cached_pack_b_f16(adapter, Arw, 16, 32);   // weight
         // P8-n / B1 brick 1: the STEM MEGAKERNEL -- one launch, the adapter gemm
         // in-pass, the 16x32 f32 tile + its e4m3 A-map + the hidden stage all in
@@ -3666,15 +3679,15 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
         // NR_FFN_DUAL=0 = escape hatch to gemm + the publish loop.
         static bool dual = !getenv("NR_FFN_DUAL") || atoi(getenv("NR_FFN_DUAL")) != 0;
         if (dual) {
-            LC_INC(pf); f16v1::gemm_dual_pub(*GQ, dA, dB, dS, dH16, (int)M, Mp, 32, 16);
+             f16v1::gemm_dual_pub(*GQ, dA, dB, dS, dH16, (int)M, Mp, 32, 16);
             pool_put(dA);   // dB is cache-owned (weight)
             static int sstop1 = getenv("NR_STEM_STOP") ? atoi(getenv("NR_STEM_STOP")) : 0;
             if (sstop1 == 1) { pool_put(dH16); pool_put(dS); return; }   // P8-n ledger: pass A only
         } else {
-        LC_INC(pf); f16v1::gemm(*GQ, dA, dB, dS, Mp, 32, 16);
+         f16v1::gemm(*GQ, dA, dB, dS, Mp, 32, 16);
         pool_put(dA);   // dB is cache-owned (weight)
         // publish = E4M3 only, on device; dH16 stays for pass B's pack_a.
-        LC_INC(pf); GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
+         GQ->parallel_for(sycl::range((size_t)M * 32), [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             dH16[i] = sycl::half(qr_e4m3(dS[i]));
         });
@@ -3700,15 +3713,15 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
                 static bool chipcss = !getenv("NR_CHIP_CS") || atoi(getenv("NR_CHIP_CS")) != 0;
                 if (chipcss) {
                     static bool lw16s = getenv("NR_CHIP_LW16") && atoi(getenv("NR_CHIP_LW16")) != 0;
-                    if (lw16s) { LC_INC(pf); ffnc::launch_ffn_chip_cs2<16,false>(*GQ, dH16, dB2, dPp3, (float*)Cout, (int)M, Mp, dS, cp); }
-                    else       { LC_INC(pf); ffnc::launch_ffn_chip_cs2<32,false>(*GQ, dH16, dB2, dPp3, (float*)Cout, (int)M, Mp, dS, cp); }
+                    if (lw16s)ffnc::launch_ffn_chip_cs2<16,false>(*GQ, dH16, dB2, dPp3, (float*)Cout, (int)M, Mp, dS, cp);
+                    else       {  ffnc::launch_ffn_chip_cs2<32,false>(*GQ, dH16, dB2, dPp3, (float*)Cout, (int)M, Mp, dS, cp); }
                 } else
-                LC_INC(pf); CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, dH16, dB2, dPp3, (float*)Cout, (int)M, Mp, dS, cp), ffnc::launch_ffn_chip<16>(*GQ, dH16, dB2, dPp3, (float*)Cout, (int)M, Mp, dS, cp));
+                 CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, dH16, dB2, dPp3, (float*)Cout, (int)M, Mp, dS, cp), ffnc::launch_ffn_chip<16>(*GQ, dH16, dB2, dPp3, (float*)Cout, (int)M, Mp, dS, cp));
                 pool_put(dH16); pool_put(dA2); pool_put(dS);   // dC2 never allocated
                 return;
             }
             float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
-            LC_INC(pf); ffnc::launch_ffn_chip<32>(*GQ, dH16, dB2, dPp3, dC2, (int)M, Mp);
+             ffnc::launch_ffn_chip<32>(*GQ, dH16, dB2, dPp3, dC2, (int)M, Mp);
             static int sstop = getenv("NR_STEM_STOP") ? atoi(getenv("NR_STEM_STOP")) : 0;
             if (sstop == 2) { pool_put(dH16); pool_put(dA2); pool_put(dC2); pool_put(dS); return; }  // skip the residual tail
             pool_put(dH16); pool_put(dA2);   // dB2/dPp3 cache-owned
@@ -3719,11 +3732,11 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
         }
         if (ffntile3) {
             sycl::half* dA3 = (sycl::half*)pool_get((size_t)Mp * 128 * 2);
-            LC_INC(pf); f16v1::gemm_pub_pa16(*GQ, dA2, dB2, dA3, (int)M, Mp, 128, 32, 3u);
+             f16v1::gemm_pub_pa16(*GQ, dA2, dB2, dA3, (int)M, Mp, 128, 32, 3u);
             pool_put(dH16); pool_put(dA2);   // dB2 is cache-owned (weight)
             float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
             sycl::half* dB3 = cached_pack_b_f16(projection, Praw, 128, 32);   // weight
-            LC_INC(pf); f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128);
+             f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128);
             pool_put(dA3);
             ffn_tail_res(*GQ, dS, dC2, cp, Cout, M, narrow, epi);
             pool_put(dC2);   // dB3 is cache-owned (weight)
@@ -3731,12 +3744,12 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
             return;
         }
         sycl::half* dHid = (sycl::half*)pool_get((size_t)M * 128 * 2);
-        LC_INC(pf); f16v1::gemm_pub(*GQ, dA2, dB2, dHid, (int)M, Mp, 128, 32, 3u);
+         f16v1::gemm_pub(*GQ, dA2, dB2, dHid, (int)M, Mp, 128, 32, 3u);
         pool_put(dH16); pool_put(dA2);   // dB2 is cache-owned (weight)
         // ---- pass C: projection gemm(hidden, projection -> f32) + raw-stem residual ----
         sycl::half* dA3 = (sycl::half*)pool_get((size_t)Mp * 128 * 2);
         float* dC2 = (float*)pool_get((size_t)Mp * 32 * 4);
-        LC_INC(pf); packdev::pack_a16(*GQ, dHid, dA3, (int)M, Mp, 128);   // dHid on device
+         packdev::pack_a16(*GQ, dHid, dA3, (int)M, Mp, 128);   // dHid on device
         sycl::half* dB3 = cached_pack_b_f16(projection, Praw, 128, 32);   // weight
         // pass C stays SPLIT (section 93): gemm_res fusion gave ZERO speed (462->464,
         // noise) because pass C is not publish-bound (its publish was already fused in
@@ -3744,7 +3757,7 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
         // (compile error) and ESIMD's sk*cos+acc differs from the device sycl::fma by
         // 1 ULP at e4m3 boundaries (bench_res: 3/4177920). bench_fma/bench_res kept as
         // the isolation instruments that proved this.
-        LC_INC(pf); f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128);
+         f16v1::gemm(*GQ, dA3, dB3, dC2, Mp, 32, 128);
         pool_put(dHid);
         ffn_tail_res(*GQ, dS, dC2, cp, Cout, M, narrow, epi);
         pool_put(dA3); pool_put(dC2);   // dB3 is cache-owned (weight)
@@ -3818,7 +3831,7 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
         float* dC = nullptr;   // B5-2: allocated ONLY on the split escape path now
         static int gst2 = getenv("NR_G_STOP") ? atoi(getenv("NR_G_STOP")) : 0;
         if (gst2 != 2)   // stop1/stop3 run the pack; stop2 = floor only
-        LC_INC(pf); packdev::gather_pack_a16_b(*GQ, Araw, dAp, (int)M, Mp2, (int)K, (int)lda_e, sa, oa, (int)nb);
+         packdev::gather_pack_a16_b(*GQ, Araw, dAp, (int)M, Mp2, (int)K, (int)lda_e, sa, oa, (int)nb);
         WKey wk{ b, (int)N, (int)K, (int)(nb * 2 + (transposed ? 1 : 0)) };
         auto wc = g_wcache.find(wk);
         sycl::half* dBp;
@@ -3851,7 +3864,7 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
         // at 14ms/frame. Guard relaxed to !compact (the compact head keeps its own
         // column-cull semantics); the kernel is the same code path.
         if (gfold && gst == 0 && !compact) {
-            LC_INC(pf); f16v1::gemm_b_pub_f16(*GQ, dAp, dBp, Cout, (int)M, Mp2, (int)N, (int)K, (int)nb,
+             f16v1::gemm_b_pub_f16(*GQ, dAp, dBp, Cout, (int)M, Mp2, (int)N, (int)K, (int)nb,
                                   epi, narrow, oc, sc, ldc_e, lda_e);
             pool_put(dAp);   // dC never existed on this path
             return;
@@ -3862,8 +3875,7 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
         else if (v2_ok)                    f16v2::gemm_b2<32>(*GQ, dAp, dBp, dC, Mp2, (int)N, (int)K, (int)nb);
         else                               f16v1::gemm_b(*GQ, dAp, dBp, dC, Mp2, (int)N, (int)K, (int)nb);
         static int gst3 = getenv("NR_G_STOP") ? atoi(getenv("NR_G_STOP")) : 0;   // 3 = skip the publish pass (gemm only): the fold-value probe
-        if (gst3 < 3)
-        { LC_INC(pf); GQ->parallel_for(sycl::range(nb * (size_t)M * N),
+        if (gst3 < 3)GQ->parallel_for(sycl::range(nb * (size_t)M * N),
                          [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             size_t mn = (size_t)M * N;
@@ -3874,7 +3886,7 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
             size_t out = oc + g * sc + (size_t)r * ldc_e + col;
             if (narrow) ((sycl::half*)Cout)[out] = sycl::half(value);
             else        ((float*)Cout)[out] = value;
-        }); }
+        });
         }
         pool_put(dAp); pool_put(dC);   // dBp is cache-owned (the whole batched weight)
     });
@@ -3929,7 +3941,7 @@ int xmx_rec_gemm_int8(int a, int b, int c, int a_scale, int b_scale,
         // DERIVED (section 92): pure publish (dequant + qr_publish, no residual fma) and
         // N%64==0 is a hard requirement -- exactly gemm_b_pub's shape (batch=1, dense ldc=N,
         // scale_stride/col_stride 0). Kills the int32 dC scratch + the separate publish pass.
-        LC_INC(pf); s8v8::gemm_b_pub(*GQ, dAp, dBp, Cout, as, bs, (int)M, Mp, (int)N, (int)K,
+         s8v8::gemm_b_pub(*GQ, dAp, dBp, Cout, as, bs, (int)M, Mp, (int)N, (int)K,
                          1, (size_t)M * N, N, 0u, 0u, narrow, epi);
         pool_put(dAp);   // dBp is cache-owned (cached_pack_b_i8), not pooled
     });
@@ -4048,7 +4060,7 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
             const unsigned Nw = N * batch, Kw = K * batch;
             if (bstop2 < 2) {
                 if (getenv("NR_BPACK_TRACE")) printf("[bwide] M=%u Nw=%u Kw=%u\n", M, Nw, Kw);
-                LC_INC(pf); packdev::gather_pack_a_b_v(*GQ, Araw, dAp, (int)M, Mp, (int)Kw, (int)Kw, 0, 1);
+                 packdev::gather_pack_a_b_v(*GQ, Araw, dAp, (int)M, Mp, (int)Kw, (int)Kw, 0, 1);
             }
             if (bstop2 >= 1) { pool_put(dAp); return; }
             WKey wkW{ b, (int)N, (int)K, 10000 + (int)batch };   // diag-layout cache key
@@ -4057,10 +4069,10 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
             if (wcW != g_wcache.end()) dBpW = (int8_t*)wcW->second;
             else {
                 dBpW = (int8_t*)sycl::malloc_device((size_t)Nw * Kw, *GQ);
-                LC_INC(pf); packdev::gather_pack_b_diag_b(*GQ, Braw, dBpW, (int)N, (int)K, (int)ldb_e, sb, (int)batch);
+                 packdev::gather_pack_b_diag_b(*GQ, Braw, dBpW, (int)N, (int)K, (int)ldb_e, sb, (int)batch);
                 g_wcache[wkW] = dBpW;
             }
-            LC_INC(pf); s8v8::gemm_b_pub(*GQ, dAp, dBpW, Cout, as, bs, (int)M, Mp, (int)Nw, (int)Kw,
+             s8v8::gemm_b_pub(*GQ, dAp, dBpW, Cout, as, bs, (int)M, Mp, (int)Nw, (int)Kw,
                              1, (size_t)0, Nw, 0u, 0u, narrow, epi);
             pool_put(dAp);
             return;
@@ -4072,16 +4084,15 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
             if (qfmode == 2) { /* TIME-ONLY attribution: skip the fused pack entirely
                 (output WRONG by design) -> isolates the pack kernel's cost from
                 the quant-dissolve bookkeeping */ }
-            else if (qfmode == 1 && b1_form)
-                { LC_INC(pf); packdev::pack_a_fused_b1(*GQ, a16b, dAp, (float*)ias->second.p, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch); }
+            else if (qfmode == 1 && b1_form)packdev::pack_a_fused_b1(*GQ, a16b, dAp, (float*)ias->second.p, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch);
             else
-                { LC_INC(pf); packdev::pack_a_fused_b(*GQ, a16b, dAp, (float*)ias->second.p, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch); }
+                {  packdev::pack_a_fused_b(*GQ, a16b, dAp, (float*)ias->second.p, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch); }
             // NR_BG_FOLD_LIVE=1 = the liveness witness the fold needs: scale the a_scale array
             // the fused pack just wrote by 0.5. If the fold path is really what feeds the
             // frame, 1301 MUST move; if it stays EXACT the fold is a dud, not a win.
             if (qfmode != 2 && getenv("NR_BG_FOLD_LIVE")) {
                 float* sc_p = (float*)ias->second.p;
-                LC_INC(pf); GQ->parallel_for(sycl::range((size_t)M), [=](sycl::item<1> i) {
+                 GQ->parallel_for(sycl::range((size_t)M), [=](sycl::item<1> i) {
                     sc_p[i.get_id(0)] = sc_p[i.get_id(0)] * 0.5f; });
             } }
         else { bgp++; if (getenv("NR_BPACK_TRACE") && bgp <= 8) printf("[bpack] gather M=%u N=%u K=%u b=%u sa=%u lda=%u\n", M, N, K, batch, (unsigned)sa, lda_e);
@@ -4089,10 +4100,9 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
             // frame: lda=K mult32, sa in {0,128,256} -- and the operand buffers are
             // 64B device allocs). NR_BPACK_VEC=0 = escape hatch to the scalar form.
             static bool bvec = !getenv("NR_BPACK_VEC") || atoi(getenv("NR_BPACK_VEC")) != 0;
-            if (bvec && (lda_e % 16u) == 0u && (sa % 16u) == 0u)
-                { LC_INC(pf); packdev::gather_pack_a_b_v(*GQ, Araw, dAp, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch); }
+            if (bvec && (lda_e % 16u) == 0u && (sa % 16u) == 0u)packdev::gather_pack_a_b_v(*GQ, Araw, dAp, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch);
             else
-                { LC_INC(pf); packdev::gather_pack_a_b(*GQ, Araw, dAp, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch); } }
+                {  packdev::gather_pack_a_b(*GQ, Araw, dAp, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch); } }
         if (getenv("NR_BPACK_STATS")) { static int once=0; if(++once==144) printf("[bpack] fused_hits=%ld gather_hits=%ld\n", bfp, bgp); }
         }
         // the whole batched B is one weight: pack once (all groups), cache, reuse.
@@ -4103,7 +4113,7 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
             dBp = (int8_t*)wc->second;
         } else {
             dBp = (int8_t*)sycl::malloc_device((size_t)batch * N * K, *GQ);
-            LC_INC(pf); packdev::gather_pack_b_b(*GQ, Braw, dBp, (int)N, (int)K, (int)ldb_e, sb, (int)batch);
+             packdev::gather_pack_b_b(*GQ, Braw, dBp, (int)N, (int)K, (int)ldb_e, sb, (int)batch);
             g_wcache[wk] = dBp;
         }
         // DERIVED + CORRECTED (section 92): gemm_b_pub replaces BOTH the gemm AND the
@@ -4133,17 +4143,17 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
         // bench_v9 BIT-EXACT gate stay as the building block for single-group N=128 shapes.
         if (false && N == 128u && (K % 32u) == 0u && (epi == 1u || epi == 3u) && narrow) {
             int8_t* dAp9 = (int8_t*)pool_get((size_t)batch * Mp * K);
-            LC_INC(pf); s8v9::pack_a9(*GQ, Araw, dAp9, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch);
+             s8v9::pack_a9(*GQ, Araw, dAp9, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch);
             WKey wk9{ b, (int)N, (int)K, 1000 + (int)batch };   // v9 layout (row-major B), distinct key
             auto wc9 = g_wcache.find(wk9);
             int8_t* dBp9;
             if (wc9 != g_wcache.end()) dBp9 = (int8_t*)wc9->second;
             else {
                 dBp9 = (int8_t*)sycl::malloc_device((size_t)batch * K * N, *GQ);
-                LC_INC(pf); s8v9::pack_b9(*GQ, Braw, dBp9, (int)K, (int)N, (int)ldb_e, sb, (int)batch);
+                 s8v9::pack_b9(*GQ, Braw, dBp9, (int)K, (int)N, (int)ldb_e, sb, (int)batch);
                 g_wcache[wk9] = dBp9;
             }
-            LC_INC(pf); s8v9::gemm_b_rq(*GQ, dAp9, dBp9, (int8_t*)Cout, (float*)as,
+             s8v9::gemm_b_rq(*GQ, dAp9, dBp9, (int8_t*)Cout, (float*)as,
                             as, bs, (int)M, Mp, (int)N, (int)K, (int)batch,
                             sc, ldc_, scale_stride, (sb != 0u) ? N : 0u, epi);
             pool_put(dAp9);
@@ -4177,25 +4187,25 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
             epi == 3u && narrow && (K % 32u) == 0u) {   // int8 batched B is ALWAYS (N x K) transposed
             int Mp32 = (int)(((M + 31u) / 32u) * 32u);
             int8_t* dAp9b = (int8_t*)pool_get((size_t)Mp32 * K);
-            LC_INC(pf); s8v9b::pack_a9b(*GQ, Araw, dAp9b, (int)M, Mp32, (int)K, (int)lda_e);
+             s8v9b::pack_a9b(*GQ, Araw, dAp9b, (int)M, Mp32, (int)K, (int)lda_e);
             WKey wk9b{ b, (int)N, (int)K, 2000 + (int)batch };   // concatenated (K x ldc) layout
             auto wc9b = g_wcache.find(wk9b);
             int8_t* dBp9b;
             if (wc9b != g_wcache.end()) dBp9b = (int8_t*)wc9b->second;
             else {
                 dBp9b = (int8_t*)sycl::malloc_device((size_t)K * ldc_, *GQ);
-                LC_INC(pf); s8v9b::pack_b9b(*GQ, Braw, dBp9b, (int)K, (int)N, (int)ldc_, (int)ldb_e, sb, (int)batch);
+                 s8v9b::pack_b9b(*GQ, Braw, dBp9b, (int)K, (int)N, (int)ldc_, (int)ldb_e, sb, (int)batch);
                 g_wcache[wk9b] = dBp9b;
             }
             float* ns9b = (float*)ias->second.p;   // a_scale (scale_stride=0: shared)
             if (getenv("NR_PACK_DUMP")) { static bool pdone=false; if(!pdone){pdone=true;
                 std::vector<int8_t> h9(2048), h8(2048);
-                LC_INC(mc); GQ->memcpy(h9.data(), dAp9b, 2048).wait();
-                LC_INC(mc); GQ->memcpy(h8.data(), dAp, 2048).wait();
+                 GQ->memcpy(h9.data(), dAp9b, 2048).wait();
+                 GQ->memcpy(h8.data(), dAp, 2048).wait();
                 int d9=0,d8=0; for(int i=0;i<2048;++i) if(h9[i]!=h8[i]){d9++; if(d9<4)printf("[A9b] i=%d 9b=%d v8=%d\n",i,(int)h9[i],(int)h8[i]);}
                 printf("[A9b] first-2KB diff=%d (Mp32=%d Mp=%d K=%d)\n",d9,Mp32,Mp,K);
-                LC_INC(mc); GQ->memcpy(h9.data(), dBp9b, 2048).wait();
-                LC_INC(mc); GQ->memcpy(h8.data(), dBp, 2048).wait();
+                 GQ->memcpy(h9.data(), dBp9b, 2048).wait();
+                 GQ->memcpy(h8.data(), dBp, 2048).wait();
                 int e9=0; for(int i=0;i<2048;++i) if(h9[i]!=h8[i]){e9++; if(e9<4)printf("[B9b] i=%d 9b=%d v8=%d\n",i,(int)h9[i],(int)h8[i]);}
                 printf("[B9b] first-2KB diff=%d\n",e9); } }
             ++v9b_calls;
@@ -4217,14 +4227,12 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
                 printf("  r1c0-7:"); for(int i=256;i<264;++i) printf(" %d",(int)hp[i]);
                 printf("  sc0-7:"); for(int i=0;i<8;++i) printf(" %.6g",hsc[i]); printf("\n"); } }
             if (fb.packed) {   // FOLD: int8+scale straight into the quant's buffers
-                if (ldc_ == 256u)
-                    { LC_INC(pf); s8v9b::gemm_b_rq9b<256,true>(*GQ, dAp9b, dBp9b, (sycl::half*)fb.packed, (float*)fb.scale, as, bs, (int)M, Mp32, (int)K, epi); }
+                if (ldc_ == 256u)s8v9b::gemm_b_rq9b<256,true>(*GQ, dAp9b, dBp9b, (sycl::half*)fb.packed, (float*)fb.scale, as, bs, (int)M, Mp32, (int)K, epi);
                 else
-                    { LC_INC(pf); s8v9b::gemm_b_rq9b<512,true>(*GQ, dAp9b, dBp9b, (sycl::half*)fb.packed, (float*)fb.scale, as, bs, (int)M, Mp32, (int)K, epi); }
-            } else if (ldc_ == 256u)
-                { LC_INC(pf); s8v9b::gemm_b_rq9b<256,false>(*GQ, dAp9b, dBp9b, (sycl::half*)Cout, ns9b, as, bs, (int)M, Mp32, (int)K, epi); }
+                    {  s8v9b::gemm_b_rq9b<512,true>(*GQ, dAp9b, dBp9b, (sycl::half*)fb.packed, (float*)fb.scale, as, bs, (int)M, Mp32, (int)K, epi); }
+            } else if (ldc_ == 256u)s8v9b::gemm_b_rq9b<256,false>(*GQ, dAp9b, dBp9b, (sycl::half*)Cout, ns9b, as, bs, (int)M, Mp32, (int)K, epi);
             else
-                { LC_INC(pf); s8v9b::gemm_b_rq9b<512,false>(*GQ, dAp9b, dBp9b, (sycl::half*)Cout, ns9b, as, bs, (int)M, Mp32, (int)K, epi); }
+                {  s8v9b::gemm_b_rq9b<512,false>(*GQ, dAp9b, dBp9b, (sycl::half*)Cout, ns9b, as, bs, (int)M, Mp32, (int)K, epi); }
             pool_put(dAp9b);
             return;
         }
@@ -4237,11 +4245,10 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
             static bool pubslm = getenv("NR_PUB_SLM") ? atoi(getenv("NR_PUB_SLM")) != 0 : true;
             static int bstop = getenv("NR_B_STOP") ? atoi(getenv("NR_B_STOP")) : 0;   // section 100 ledger probe (time-only): 1 = pack only, 2 = pack skipped too
             if (bstop >= 1) { pool_put(dAp); return; }
-            if (pubslm && N == 128u)
-                { LC_INC(pf); s8v8::gemm_b_pub_slm<false>(*GQ, dAp, dBp, Cout, as, bs, (int)M, Mp, (int)N, (int)K,
-                                 (int)batch, sc, ldc_, scale_stride, (sb != 0u) ? N : 0u, narrow, epi); }
+            if (pubslm && N == 128u)s8v8::gemm_b_pub_slm<false>(*GQ, dAp, dBp, Cout, as, bs, (int)M, Mp, (int)N, (int)K,
+                                 (int)batch, sc, ldc_, scale_stride, (sb != 0u) ? N : 0u, narrow, epi);
             else
-                { LC_INC(pf); s8v8::gemm_b_pub(*GQ, dAp, dBp, Cout, as, bs, (int)M, Mp, (int)N, (int)K,
+                {  s8v8::gemm_b_pub(*GQ, dAp, dBp, Cout, as, bs, (int)M, Mp, (int)N, (int)K,
                              (int)batch, sc, ldc_, scale_stride, (sb != 0u) ? N : 0u, narrow, epi); }
             pool_put(dAp);   // dBp is cache-owned (the whole batched weight)
             return;
@@ -4270,7 +4277,7 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
         // added inside the kernel (military rules 4/9) -- the switch is closure-level only.
         static bool g32pub = getenv("NR_G32_PUB") ? atoi(getenv("NR_G32_PUB")) != 0 : false;
         if (g32pub && (N % 32u) == 0u && (epi == 0u || epi == 1u || epi == 3u || epi == 4u)) {
-            LC_INC(pf); s8v8::gemm32_b_pub(*GQ, dAp, dBp, Cout, as, bs, (int)M, Mp, (int)N, (int)K,
+             s8v8::gemm32_b_pub(*GQ, dAp, dBp, Cout, as, bs, (int)M, Mp, (int)N, (int)K,
                                (int)batch, sc, ldc_, scale_stride, (sb != 0u) ? N : 0u, narrow, epi);
             pool_put(dAp);   // dBp is cache-owned (the whole batched weight); dC never existed
             return;
@@ -4279,7 +4286,7 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
         if ((N % 64u) == 0u) s8v8::gemm_b(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K, (int)batch);
         else                 s8v8::gemm32_b(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K, (int)batch);
         // publish: one launch over all groups (dequant scales indexed per group).
-        LC_INC(pf); GQ->parallel_for(sycl::range((size_t)batch * M * N), [=](sycl::item<1> it) {
+         GQ->parallel_for(sycl::range((size_t)batch * M * N), [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             unsigned mn = M * N;
             unsigned g = (unsigned)(i / mn); size_t rem = i % mn;
@@ -4402,10 +4409,10 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
             if (fused_q) {
                 auto itsrc = g_bufs.find(qfq.src);
                 if (itsrc == g_bufs.end()) throw std::runtime_error("qkv fused-gather: image src not live");
-                LC_INC(pf); packdev::pack_a_fused_gather(*GQ, (const sycl::half*)itsrc->second.p, dAp,
+                 packdev::pack_a_fused_gather(*GQ, (const sycl::half*)itsrc->second.p, dAp,
                     (float*)as, (int)M, Mp, (int)C, qfq.image_h, qfq.image_w, qfq.across, qfq.pad);
             } else
-                { LC_INC(pf); packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)C); }
+                {  packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)C); }
         }
         int8_t* dBp = cached_pack_b_i8(b, Braw, (int)NH, (int)C);   // weight: pack once
         // P5 (section 100): the resident QKV epilogue -- deq+butterfly+e4m3+scatter
@@ -4424,11 +4431,10 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
         static bool qres_on = !getenv("NR_QKV_RES") || atoi(getenv("NR_QKV_RES")) != 0;
         const bool qres_ok = qres_on && (C % 64u) == 0u && NH == 3u * C && heads == C / 32u && tokens > 0u;
         if (qkvstop < 2) {
-            if (qres_ok)
-                { LC_INC(pf); qres::gemm_qkv_res(*GQ, dAp, dBp, Q, Kk, V, as, bs, qs, (int)M, Mp, (int)C, (int)NH, (int)heads, (int)tokens, vit, vit_recip_tab()); }
+            if (qres_ok)qres::gemm_qkv_res(*GQ, dAp, dBp, Q, Kk, V, as, bs, qs, (int)M, Mp, (int)C, (int)NH, (int)heads, (int)tokens, vit, vit_recip_tab());
             else {
                 dC = (int32_t*)pool_get((size_t)Mp * NH * 4);   // split path ONLY
-                LC_INC(pf); s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)NH, (int)C);
+                 s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)NH, (int)C);
             }
         }
         if (qres_ok) goto qkv_done;
@@ -4442,8 +4448,7 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
             // kernel -- no dC float-bits round-trip, one fewer launch. Non-vit only.
             if (qkvstop < 1) {
                 static int qres_v2 = getenv("NR_QKV_RESV2") ? atoi(getenv("NR_QKV_RESV2")) : 0;   // P6 v2 FALSIFIED (ESIMD arrays spill: 186-187 vs 178-180); 3 = v3 scalar-contiguous probe
-                if (qres_v2 == 3)
-                    { LC_INC(pf); GQ->parallel_for(sycl::range((size_t)M * heads), [=](sycl::item<1> it) {
+                if (qres_v2 == 3)GQ->parallel_for(sycl::range((size_t)M * heads), [=](sycl::item<1> it) {
                         unsigned rh = (unsigned)it.get_id(0);
                         unsigned r = rh / heads, head = rh % heads;
                         const float rs = as[r];
@@ -4466,11 +4471,10 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
                             Kk[at + i] = sycl::half(qr_e4m3_scalar(wbmega::eh_mul(hk[i], rk)));
                             V[at + i] = sycl::half(qr_e4m3_scalar(hv[i]));
                         }
-                    }); }
-                else if (qres_v2 == 2)
-                    { LC_INC(pf); wbmega::qkv_norm_scatter_v2(*GQ, dC, Q, Kk, V, as, bs, qs, M, heads, C, NH, tokens); }
+                    });
+                else if (qres_v2 == 2)wbmega::qkv_norm_scatter_v2(*GQ, dC, Q, Kk, V, as, bs, qs, M, heads, C, NH, tokens);
                 else
-                    { LC_INC(pf); wbmega::qkv_norm_scatter_esimd(*GQ, dC, Q, Kk, V, as, bs, qs, M, heads, C, NH, tokens); }
+                    {  wbmega::qkv_norm_scatter_esimd(*GQ, dC, Q, Kk, V, as, bs, qs, M, heads, C, NH, tokens); }
             }
         } else if (!getenv("NR_QKV_VITES") || atoi(getenv("NR_QKV_VITES")) != 0) {   // P11 PROMOTED (this window): the 449-root-cause CLOSED by bench_vitcmp's clean device comparison -- norm/recip/hq were ALL bit-exact vs the scalar reference; the flips were the TRIPLE-NESTED eh_mul(eh_mul(eh_mul(...))) chain being rewritten in-kernel (skipped intermediate half-round, RZ-direction half-ULP). The STEPPED named-temp form (t1=hq*recip, t2=t1*VIT_ROOT, t3=t2*sc) is 0/6144 EXACT in the bench. LESSON (blueprint P1 family): every proven eh chain step needs its OWN named temp adjacent to the use -- nesting is NOT safe in ESIMD, same class as the phi/scope FMA-contraction trap. Default ON, escape NR_QKV_VITES=0.
             // P11 (section 100): the VIT tail on the v1 lane structure (merged
@@ -4483,7 +4487,7 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
                   static float* dbg_prev = nullptr;
                   if (dbg_prev) sycl::free(dbg_prev, *GQ);
                   dbg_prev = dbg; }
-              LC_INC(pf); wbmega::qkv_norm_scatter_vit_esimd(*GQ, dC, Q, Kk, V, as, bs, qs, M, heads, C, NH, tokens, vit_recip_tab(), dbg);
+               wbmega::qkv_norm_scatter_vit_esimd(*GQ, dC, Q, Kk, V, as, bs, qs, M, heads, C, NH, tokens, vit_recip_tab(), dbg);
               // NR_VITDUMP (P11 frame-0%-hunt): the FIRST vit call's full inputs
               // (dC Mp*NH int32, as, bs, qs) + the lane kernel's outputs (Q/K/V
               // M*C halfs) to vitdump.bin, for the bench to replay on REAL frame
@@ -4494,13 +4498,13 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
                       std::vector<int32_t> iC((size_t)Mp*NH);
                       std::vector<float> ias(M), ibs(NH), iqs(heads);
                       std::vector<sycl::half> oQ((size_t)M*C), oK((size_t)M*C), oV((size_t)M*C);
-                      LC_INC(mc); GQ->memcpy(iC.data(), dC, iC.size()*4).wait();
-                      LC_INC(mc); GQ->memcpy(ias.data(), as, (size_t)M*4).wait();
-                      LC_INC(mc); GQ->memcpy(ibs.data(), bs, (size_t)NH*4).wait();
-                      LC_INC(mc); GQ->memcpy(iqs.data(), qs, (size_t)heads*4).wait();
-                      LC_INC(mc); GQ->memcpy(oQ.data(), Q, (size_t)M*C*2).wait();
-                      LC_INC(mc); GQ->memcpy(oK.data(), Kk, (size_t)M*C*2).wait();
-                      LC_INC(mc); GQ->memcpy(oV.data(), V, (size_t)M*C*2).wait();
+                       GQ->memcpy(iC.data(), dC, iC.size()*4).wait();
+                       GQ->memcpy(ias.data(), as, (size_t)M*4).wait();
+                       GQ->memcpy(ibs.data(), bs, (size_t)NH*4).wait();
+                       GQ->memcpy(iqs.data(), qs, (size_t)heads*4).wait();
+                       GQ->memcpy(oQ.data(), Q, (size_t)M*C*2).wait();
+                       GQ->memcpy(oK.data(), Kk, (size_t)M*C*2).wait();
+                       GQ->memcpy(oV.data(), V, (size_t)M*C*2).wait();
                       FILE* f = fopen("vitdump.bin", "wb");
                       unsigned hdr[5] = {M, C, heads, tokens, NH};
                       fwrite(hdr, 4, 5, f);
@@ -4510,7 +4514,7 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
                       fwrite(oV.data(), 2, (size_t)M*C, f); fclose(f);
                       printf("[vitdump] M=%u C=%u heads=%u tokens=%u NH=%u -> vitdump.bin\n", M, C, heads, tokens, NH); } }
               if (dbg) { std::vector<float> hv((size_t)M * heads * 4u * 64u);
-                  LC_INC(mc); GQ->memcpy(hv.data(), dbg, hv.size()*4).wait();
+                   GQ->memcpy(hv.data(), dbg, hv.size()*4).wait();
                   for (unsigned i = 0; i < 8u && i < M*heads; ++i)
                       printf("[vitdbg-LANE] rh=%u recipQ=%.9g recipK=%.9g hq0(l0)=%.6g hq0(l1)=%.6g\n", i, hv[(i*4u+0u)*64u+1u], hv[(i*4u+0u)*64u+3u], hv[(i*4u+0u)*64u+4u], hv[(i*4u+1u)*64u+4u]); } }
         } else if (getenv("NR_QKV_VIT1") && atoi(getenv("NR_QKV_VIT1")) != 0) {
@@ -4520,7 +4524,7 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
         // VIT_ROOT/scale + e4m3 + scatter, all in registers -- dC write-back
         // AND the stage-3 pass vanish. Arithmetic VERBATIM from the two passes
         // below (qr_half_round/cr_mul/ctree::vit_reciprocal/VIT_ROOT order kept).
-        LC_INC(pf); GQ->parallel_for(sycl::range((size_t)M * heads),
+         GQ->parallel_for(sycl::range((size_t)M * heads),
                          [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             unsigned r = (unsigned)(i / heads), head = (unsigned)(i % heads);
@@ -4556,7 +4560,7 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
         });
         } else {
         float* vdbg = getenv("NR_VITDBG") ? (float*)sycl::malloc_device((size_t)M * heads * 16u, *GQ) : nullptr;
-        LC_INC(pf); GQ->parallel_for(sycl::range((size_t)M * heads),
+         GQ->parallel_for(sycl::range((size_t)M * heads),
                          [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             unsigned r = (unsigned)(i / heads), head = (unsigned)(i % heads);
@@ -4600,7 +4604,7 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
             }
         });
         // stage 3 (vit path only): publish e4m3 -> half, scatter (w,h,t,32).
-        LC_INC(pf); GQ->parallel_for(sycl::range((size_t)M * NH),
+         GQ->parallel_for(sycl::range((size_t)M * NH),
                          [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             unsigned r = (unsigned)(i / NH), n = (unsigned)(i % NH);
@@ -4613,7 +4617,7 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
         });
         if (vdbg) {
             std::vector<float> hv((size_t)M * heads * 16u);
-            LC_INC(mc); GQ->memcpy(hv.data(), vdbg, hv.size()*4).wait();
+             GQ->memcpy(hv.data(), vdbg, hv.size()*4).wait();
             for (unsigned i2 = 0; i2 < 8u && i2 < hv.size()/4u; ++i2)
                 printf("[vitdbg-SCALAR] rh=%u recipQ=%.9g recipK=%.9g\n", i2, hv[i2*4+2], hv[i2*4+3]);
             sycl::free(vdbg, *GQ); }
@@ -4716,7 +4720,7 @@ int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale,
         // epilogue's sycl::fma(skip,cos,stage) maps to ESIMD's auto-contracted sk*cp+stage
         // (one fused rounding, the gate_esimd lesson used correctly). N%64==0 is already a
         // hard requirement of this op, so every call qualifies. GEMM_INT8_RESIDUAL judges.
-        LC_INC(pf); s8v8::gemm_b_res(*GQ, dAp, dBp, Cout, as, bs, skp, cp, (int)M, Mp, (int)N, (int)K,
+         s8v8::gemm_b_res(*GQ, dAp, dBp, Cout, as, bs, skp, cp, (int)M, Mp, (int)N, (int)K,
                          narrow, half_skip, epi);
         pool_put(dAp);   // dBp is cache-owned (the weight)
     });
@@ -4836,10 +4840,10 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
             if (B.S.fq) {
                 auto itsrc = g_bufs.find(B.S.qfq.src);
                 if (itsrc == g_bufs.end()) throw std::runtime_error("b6 fused-gather: image src not live");
-                LC_INC(pf); packdev::pack_a_fused_gather(*GQ, (const sycl::half*)itsrc->second.p, dAp,
+                 packdev::pack_a_fused_gather(*GQ, (const sycl::half*)itsrc->second.p, dAp,
                     (float*)B.S.as, (int)B.S.M, (int)B.S.Mp, (int)B.S.C, B.S.qfq.image_h, B.S.qfq.image_w, B.S.qfq.across, B.S.qfq.pad);
             } else
-                { LC_INC(pf); packdev::pack_a(*GQ, B.S.Araw, dAp, (int)B.S.M, (int)B.S.Mp, (int)B.S.C); }
+                {  packdev::pack_a(*GQ, B.S.Araw, dAp, (int)B.S.M, (int)B.S.Mp, (int)B.S.C); }
             int8_t* dBp = cached_pack_b_i8(B.S.b, B.S.Braw, (int)(3u * B.S.C), (int)B.S.C);
             // the outproj weight: cached pack_b of the wres's B (transposed N x K
             // raw -> the pack_b map the gemm consumes; cached_pack_b_i8 keys on
@@ -4892,9 +4896,9 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
         if (wrstop < 2) {
         if (fused_w) {   // P2: the closure captured (fused_w, srcid_w) by value at
             sycl::half* a16w = (sycl::half*)sized(srcid_w, (size_t)M * K * 2u, "A(f16 fused)");
-            LC_INC(pf); packdev::pack_a_fused(*GQ, a16w, dAp, (float*)as, (int)M, Mp, (int)K);
+             packdev::pack_a_fused(*GQ, a16w, dAp, (float*)as, (int)M, Mp, (int)K);
         } else
-        { LC_INC(pf); packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K); }
+        {  packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K); }
         }
         int8_t* dBp = cached_pack_b_i8(b, Braw, (int)N, (int)K);   // weight: pack once
         if (wrstop >= 1) { pool_put(dAp); return; }
@@ -4902,7 +4906,7 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
         // window variant maps the gemm row (window*64+token) to the image slot with the
         // same bounds cull the split pass did, and reads skip at that slot. N%64==0 is a
         // hard requirement of this op. WINDOW_INT8_RESIDUAL gate is the judge.
-        LC_INC(pf); s8v8::gemm_b_res_window(*GQ, dAp, dBp, Cout, as, bs, skp, cp, (int)M, Mp, (int)N, (int)K,
+         s8v8::gemm_b_res_window(*GQ, dAp, dBp, Cout, as, bs, skp, cp, (int)M, Mp, (int)N, (int)K,
                                 narrow, half_skip, epi, across, top, left, height, width);
         pool_put(dAp);   // dBp is cache-owned (the weight)
     });
@@ -4954,9 +4958,9 @@ int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
         sycl::half* dAp = (sycl::half*)pool_get((size_t)heads * Mp * rows * 2);
         sycl::half* dBv = (sycl::half*)pool_get((size_t)heads * rows * 32u * 2);
         // scores leg: Q(rows x 32) @ K^T(32 x rows) -> rows x rows. K stored (rows,32)=(N,K).
-        LC_INC(pf); packdev::pack_a16_b(*GQ, Q, dAq, (int)rows, Mp, 32, (int)heads);
-        LC_INC(pf); packdev::pack_b16_t_b(*GQ, Kk, dBk, 32, (int)rows, (int)heads);
-        LC_INC(pf); f16v1::gemm_b(*GQ, dAq, dBk, dScores, Mp, (int)rows, 32, (int)heads);
+         packdev::pack_a16_b(*GQ, Q, dAq, (int)rows, Mp, 32, (int)heads);
+         packdev::pack_b16_t_b(*GQ, Kk, dBk, 32, (int)rows, (int)heads);
+         f16v1::gemm_b(*GQ, dAq, dBk, dScores, Mp, (int)rows, 32, (int)heads);
         // vit_softmax over heads*rows rows, tokens cols, stride=rows -- one launch.
         // P4 (section 100): the softmax STORE lands straight in attnV's pack_a16_b
         // A-tile layout (vit_softmax_tiled -- same values, same lever as P3a's
@@ -4964,17 +4968,15 @@ int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
         // scratch, 33MB/call at rows=2040) AND the pack_a16_b pass both vanish.
         // Gate NR_GA_TILE (default ON once the three gates pass; =0 escape hatch).
         static bool gat = !getenv("NR_GA_TILE") || atoi(getenv("NR_GA_TILE")) != 0;
-        if (gat && (rows % 16u) == 0u && Mp == (int)rows) {
-            LC_INC(pf); GQ->parallel_for(sycl::range((size_t)heads * rows),
-                             smax::vit_softmax_tiled()(dScores, dAp, dRecip, heads * rows, tokens, rows));
-        } else {
+        if (gat && (rows % 16u) == 0u && Mp == (int)rows)GQ->parallel_for(sycl::range((size_t)heads * rows),
+                             smax::vit_softmax_tiled()(dScores, dAp, dRecip, heads * rows, tokens, rows)); else {
             dProbs = (sycl::half*)pool_get(sc * 2);   // split escape only
-            LC_INC(pf); GQ->parallel_for(sycl::range((size_t)heads * rows),
+             GQ->parallel_for(sycl::range((size_t)heads * rows),
                              smax::vit_softmax_kernel()(dScores, dProbs, dRecip, heads * rows, tokens, rows));
             // attnV leg: P(rows x rows) @ V(rows x 32) -> rows x 32. V stored (rows,32)=(K,N).
-            LC_INC(pf); packdev::pack_a16_b(*GQ, dProbs, dAp, (int)rows, Mp, (int)rows, (int)heads);
+             packdev::pack_a16_b(*GQ, dProbs, dAp, (int)rows, Mp, (int)rows, (int)heads);
         }
-        LC_INC(pf); packdev::pack_b16_b(*GQ, V, dBv, (int)rows, 32, (int)heads);
+         packdev::pack_b16_b(*GQ, V, dBv, (int)rows, 32, (int)heads);
         // P9-twin (section 100): attnV + merge_heads_scale FOLDED (gemm_b_merge_scale):
         // half_round -> *recip -> half_round -> e4m3 lands ON the accumulator and
         // scatters straight into the merged (rows, heads*32) half layout -- dCtx
@@ -4989,13 +4991,11 @@ int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
         static bool gam = !getenv("NR_GA_MERGE") || atoi(getenv("NR_GA_MERGE")) != 0;
         float* dCtx = nullptr;
         pool_put(dAq); pool_put(dBk); pool_put(dAp); pool_put(dBv);
-        if (gam && Mp == (int)rows && (rows % 16u) == 0u) {
-            LC_INC(pf); f16v1::gemm_b_merge_scale(*GQ, dAp, dBv, (sycl::half*)M, dRecip, Mp, 32, (int)rows, (int)heads);
-        } else {
+        if (gam && Mp == (int)rows && (rows % 16u) == 0u)f16v1::gemm_b_merge_scale(*GQ, dAp, dBv, (sycl::half*)M, dRecip, Mp, 32, (int)rows, (int)heads); else {
         dCtx = (float*)pool_get(cx * 4);   // split path only
-        LC_INC(pf); f16v1::gemm_b(*GQ, dAp, dBv, dCtx, Mp, 32, (int)rows, (int)heads);
+         f16v1::gemm_b(*GQ, dAp, dBv, dCtx, Mp, 32, (int)rows, (int)heads);
         // merge_heads_scale: (1,rows,heads*32) with scale=reciprocal (heads*rows), e4m3, half
-        LC_INC(pf); GQ->parallel_for(sycl::range((size_t)rows * CH), [=](sycl::item<1> it) {
+         GQ->parallel_for(sycl::range((size_t)rows * CH), [=](sycl::item<1> it) {
             unsigned index = (unsigned)it.get_id(0);
             unsigned c = index % CH, token = index / CH;
             size_t at = (size_t)(c / 32u) * rows + token;   // window=0: at=(0*heads + c/32)*rows + token
@@ -5033,7 +5033,7 @@ int xmx_rec_quant_window(int source, int packed, int scale, unsigned M, unsigned
     float* sc = (float*)c->second.p;
     g_cmd_names.push_back(__func__);
     pg_push([=]() {
-        LC_INC(pf); qr_launch(*GQ, *GD, qr_kernel(), a, pk, sc, M, K, 0x400000u,
+         qr_launch(*GQ, *GD, qr_kernel(), a, pk, sc, M, K, 0x400000u,
                   height, width, across, pad, nullptr, nullptr);
     });
     if (qfuse_on())   // P4b: register the GATHERED pk for a downstream QKV take
@@ -5088,7 +5088,7 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
         static bool uvec = !getenv("NR_UNARY_VEC") || atoi(getenv("NR_UNARY_VEC")) != 0;
         if (uvec && (N % 16u) == 0u && !a_half) {
             pg_push([=]() {
-                LC_INC(pf); GQ->parallel_for(sycl::range((size_t)N / 16u), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
+                 GQ->parallel_for(sycl::range((size_t)N / 16u), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
                     namespace esimd = sycl::ext::intel::esimd;
                     size_t i = (size_t)it.get_id(0) * 16u;
                     esimd::simd<float,16> v = esimd::block_load<float,16>(
@@ -5100,7 +5100,7 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
             return 0;
         }
         pg_push([=]() {
-            LC_INC(pf); GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
+             GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
                 size_t i = it.get_id(0);
                 ((sycl::half*)C)[i] = sycl::half(qr_e4m3(((const float*)A)[i]));
             });
@@ -5118,7 +5118,7 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
         static bool uvec3 = !getenv("NR_UNARY_VEC") || atoi(getenv("NR_UNARY_VEC")) != 0;
         if (uvec3 && !a_half && narrow && epi == 1u && (CH % 16u) == 0u && (N % 16u) == 0u) {
             pg_push([=]() {
-                LC_INC(pf); GQ->parallel_for(sycl::range((size_t)N / 16u), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
+                 GQ->parallel_for(sycl::range((size_t)N / 16u), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
                     namespace esimd = sycl::ext::intel::esimd;
                     size_t index = (size_t)it.get_id(0) * 16u;
                     unsigned ch = CH, width = SB;
@@ -5137,7 +5137,7 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
             return 0;
         }
         pg_push([=]() {
-            LC_INC(pf); GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
+             GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
                 size_t index = it.get_id(0);
                 unsigned ch = CH, width = SB;
                 unsigned cc = (unsigned)(index % ch), rest = (unsigned)(index / ch);
@@ -5165,7 +5165,7 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
         static bool uvec2 = !getenv("NR_UNARY_VEC") || atoi(getenv("NR_UNARY_VEC")) != 0;
         if (uvec2 && !a_half && b_half && narrow && epi == 1u && (CH % 16u) == 0u && (N % 16u) == 0u) {
             pg_push([=]() {
-                LC_INC(pf); GQ->parallel_for(sycl::range((size_t)N / 16u), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
+                 GQ->parallel_for(sycl::range((size_t)N / 16u), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
                     namespace esimd = sycl::ext::intel::esimd;
                     size_t index = (size_t)it.get_id(0) * 16u;
                     unsigned ch = CH, target = SA, source = SB;
@@ -5185,7 +5185,7 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
             return 0;
         }
         pg_push([=]() {
-            LC_INC(pf); GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
+             GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
                 size_t index = it.get_id(0);
                 unsigned ch = CH, target = SA, source = SB;
                 unsigned cc = (unsigned)(index % ch), rest = (unsigned)(index / ch);
@@ -5207,7 +5207,7 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
         static bool uvec4 = getenv("NR_UNARY_VEC2") != nullptr && atoi(getenv("NR_UNARY_VEC2")) != 0;   // U-4 VERDICT 16-pair: 6w/10l mean +0.42 = NEGATIVE -> default OFF (asset kept)
         if (uvec4 && !a_half && !narrow && epi == 0u && (CH % 16u) == 0u && (N % 16u) == 0u) {
             pg_push([=]() {
-                LC_INC(pf); GQ->parallel_for(sycl::range((size_t)N / 16u), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
+                 GQ->parallel_for(sycl::range((size_t)N / 16u), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
                     namespace esimd = sycl::ext::intel::esimd;
                     size_t index = (size_t)it.get_id(0) * 16u;
                     unsigned ch = CH, height = SA, width = SB, padded = SC;
@@ -5223,7 +5223,7 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
             return 0;
         }
         pg_push([=]() {
-            LC_INC(pf); GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
+             GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
                 size_t index = it.get_id(0);
                 unsigned ch = CH, height = SA, width = SB, padded = SC;
                 unsigned cc = (unsigned)(index % ch), rest = (unsigned)(index / ch);
@@ -5270,7 +5270,7 @@ int xmx_rec_vit_softmax(int source, int dst, int reciprocal, unsigned rows,
     float* rp = (float*)rc->second.p;
     g_cmd_names.push_back(__func__);
     pg_push([=]() {
-        LC_INC(pf); GQ->parallel_for(sycl::range((size_t)rows),
+         GQ->parallel_for(sycl::range((size_t)rows),
                          smax::vit_softmax_kernel()(sp, dp, rp, rows, tokens, stride));
     });
     return 0;
@@ -5287,7 +5287,7 @@ int xmx_rec_merge_heads(int source, int dst, unsigned windows, unsigned tokens,
     const unsigned n = windows * tokens * channels;
     g_cmd_names.push_back(__func__);
     pg_push([=]() {
-        LC_INC(pf); GQ->parallel_for(sycl::range((size_t)n), [=](sycl::item<1> it) {
+         GQ->parallel_for(sycl::range((size_t)n), [=](sycl::item<1> it) {
             unsigned index = (unsigned)it.get_id(0);
             unsigned c = index % channels, rest = index / channels;
             unsigned token = rest % tokens, window = rest / tokens;
@@ -5318,7 +5318,7 @@ int xmx_rec_merge_heads_scale(int source, int dst, int scale, unsigned windows,
     const unsigned n = windows * tokens * channels;
     g_cmd_names.push_back(__func__);
     pg_push([=]() {
-        LC_INC(pf); GQ->parallel_for(sycl::range((size_t)n), [=](sycl::item<1> it) {
+         GQ->parallel_for(sycl::range((size_t)n), [=](sycl::item<1> it) {
             unsigned index = (unsigned)it.get_id(0);
             unsigned c = index % channels, rest = index / channels;
             unsigned token = rest % tokens, window = rest / tokens;
@@ -5365,7 +5365,7 @@ int xmx_rec_unary2(unsigned kind, int a, int b, int c, int d, int second, unsign
     const unsigned N = n, CH = channels, SA = sa, SB = sb;
     g_cmd_names.push_back(__func__);
     pg_push([=]() {
-        LC_INC(pf); GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
+         GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
             unsigned index = (unsigned)it.get_id(0);
             unsigned cc = index % CH, rest = index / CH;
             unsigned x = rest % SA, y = rest / SA;
@@ -5573,10 +5573,10 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
             if (S.fq) {
                 auto itsrc = g_bufs.find(S.qfq.src);
                 if (itsrc == g_bufs.end()) throw std::runtime_error("lfw fused-gather: image src not live");
-                LC_INC(pf); packdev::pack_a_fused_gather(*GQ, (const sycl::half*)itsrc->second.p, dAp,
+                 packdev::pack_a_fused_gather(*GQ, (const sycl::half*)itsrc->second.p, dAp,
                     (float*)S.as, (int)S.M, (int)S.Mp, (int)S.C, S.qfq.image_h, S.qfq.image_w, S.qfq.across, S.qfq.pad);
             } else
-                { LC_INC(pf); packdev::pack_a(*GQ, S.Araw, dAp, (int)S.M, (int)S.Mp, (int)S.C); }
+                {  packdev::pack_a(*GQ, S.Araw, dAp, (int)S.M, (int)S.Mp, (int)S.C); }
             // the qkv closure no-ops under the pair, so the weight-cache fill moves
             // HERE (Braw from the stash; cached_pack_b_i8 packs once, reuses after).
             int8_t* dBp = cached_pack_b_i8(S.b, S.Braw, (int)(3u * S.C), (int)S.C);
@@ -5614,8 +5614,8 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
         static bool wares = !getenv("NR_WA_RES") || atoi(getenv("NR_WA_RES")) != 0;
         const bool wa_raw = wares && merged && Bp;
         if (!wa_raw) {
-            LC_INC(pf); packdev::pack_a16_b(*GQ, Q, dAq, 64, 64, 32, (int)batches);
-            LC_INC(pf); packdev::pack_b16_t_b(*GQ, Kk, dBk, 32, 64, (int)batches);
+             packdev::pack_a16_b(*GQ, Q, dAq, 64, 64, 32, (int)batches);
+             packdev::pack_b16_t_b(*GQ, Kk, dBk, 32, 64, (int)batches);
         }
         // section 99: v2 workgroup-SLM-tiled f16 gemm (v1 = one 16x16 tile per GLOBAL
         // load, 8 FLOP/byte = memory-bound; v2 stages BM=64 x BK=16 blocks in SLM with
@@ -5629,10 +5629,9 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
         // call has one; the null-bias case keeps the split chain). Escape NR_WA_RES=0.
         if (wa_raw) {
             static bool rawv2 = !getenv("NR_WA_RAWV") || atoi(getenv("NR_WA_RAWV")) != 0;   // P10c PROMOTED: every A/B pair beats RAW-QK by 0.8-1.2ms (the V pack launch + dBv round-trip gone); escape NR_WA_RAWV=0.
-            if (!rawv2)
-            { LC_INC(pf); packdev::pack_b16_b(*GQ, V, dBv, 64, 32, (int)batches); }   // the span below is
+            if (!rawv2)packdev::pack_b16_b(*GQ, V, dBv, 64, 32, (int)batches);   // the span below is
                                                                        // skipped -- pack V FIRST (unless P10c RAW-V)
-            LC_INC(pf); wares::launch_wa_res(*GQ, Q, Kk, V, dBv, Bp, (sycl::half*)Out, batches, heads, rawv2);
+             wares::launch_wa_res(*GQ, Q, Kk, V, dBv, Bp, (sycl::half*)Out, batches, heads, rawv2);
             pool_put(dAq); pool_put(dBk); pool_put(dAp); pool_put(dBv);
             pool_put(dScores); pool_put(dProbs); pool_put(dCtx);
             return;
@@ -5650,11 +5649,11 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
         }
         else if (!smaxplain) smax_esimd(*GQ, dScores, dProbs, batches*64u, Bp, heads);
         else
-        { LC_INC(pf); GQ->parallel_for(sycl::range((size_t)batches*64u),
+        {  GQ->parallel_for(sycl::range((size_t)batches*64u),
                          smax::softmax_kernel()(dScores, dProbs, batches*64u, 64u, Bp, heads)); }
         // attnV leg: P(64x64) @ V(64x32) -> 64x32. V stored (64 tokens,32 ch) = (K,N).
         if (!wat || smaxplain) packdev::pack_a16_b(*GQ, dProbs, dAp, 64, 64, 64, (int)batches);
-        LC_INC(pf); packdev::pack_b16_b(*GQ, V, dBv, 64, 32, (int)batches);
+         packdev::pack_b16_b(*GQ, V, dBv, 64, 32, (int)batches);
         // P9 (section 100): attnV + merge_heads FOLDED (gemm_b2_merge): the e4m3
         // publish lands ON the accumulator and scatters straight into the merged
         // (windows,64,heads*32) half layout -- dCtx (16.7MB/call f32 write+read)
@@ -5670,7 +5669,7 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
         if (merged) {
             // merge_heads: (windows,heads,64,32) -> (windows,64,heads*32), publish e4m3, half
             const unsigned CH = heads * 32u;
-            LC_INC(pf); GQ->parallel_for(sycl::range((size_t)windows*64u*CH), [=](sycl::item<1> it) {
+             GQ->parallel_for(sycl::range((size_t)windows*64u*CH), [=](sycl::item<1> it) {
                 unsigned index = (unsigned)it.get_id(0);
                 unsigned c = index % CH, rest = index / CH;
                 unsigned token = rest % 64u, window = rest / 64u;
@@ -5736,16 +5735,16 @@ int xmx_rec_gemm_window_residual_pool(int a, int b, int skip_out, int skip, int 
         ev_sync(GQ->memcpy(hA.data(), Araw, (size_t)M * K * 2));
         std::memcpy(hApad.data(), hA.data(), (size_t)M * K * 2);
         ev_sync(GQ->memcpy(hB.data(), Braw, nb * 2));
-        LC_INC(pf); f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
-        LC_INC(pf); f16v1::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
+         f16v1::pack_a(hApad.data(), hAp.data(), Mp, (int)K);
+         f16v1::pack_b(hB.data(), hBp.data(), (int)K, (int)N);
         sycl::half* dAp = (sycl::half*)pool_get(na * 2);
         sycl::half* dBp = (sycl::half*)pool_get(nb * 2);
         float* dC = (float*)pool_get((size_t)Mp * N * 4);
         float* dStage = (float*)pool_get((size_t)M * N * 4);
         ev_sync(GQ->memcpy(dAp, hAp.data(), na * 2));
         ev_sync(GQ->memcpy(dBp, hBp.data(), nb * 2));
-        LC_INC(pf); f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K);
-        LC_INC(pf); GQ->parallel_for(sycl::range(blk_elems), [=](sycl::item<1> it) {
+         f16v1::gemm(*GQ, dAp, dBp, dC, Mp, (int)N, (int)K);
+         GQ->parallel_for(sycl::range(blk_elems), [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             unsigned r = (unsigned)(i / N), col = (unsigned)(i % N);
             unsigned window = r / 64u, token = r % 64u;
@@ -5758,7 +5757,7 @@ int xmx_rec_gemm_window_residual_pool(int a, int b, int skip_out, int skip, int 
             SkipOut[out] = sycl::half(qr_e4m3(total));
             dStage[i] = total;
         });
-        LC_INC(pf); GQ->parallel_for(sycl::range((size_t)(M / 64u) * 16u * N), [=](sycl::item<1> it) {
+         GQ->parallel_for(sycl::range((size_t)(M / 64u) * 16u * N), [=](sycl::item<1> it) {
             size_t e = it.get_id(0);
             unsigned pixel = (unsigned)((e / N) % 16u), c = (unsigned)(e % N);   // pixel WITHIN the window (the flat range spans windows -- the .comp's e is per-workgroup <16*BN)
             unsigned window = (unsigned)(e / (16u * N));
@@ -5986,7 +5985,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                                 pooling, head, Pl, dWh, nullptr, dPF, dTD);
             if (dPF) {
                 std::vector<float> h(pfsz);
-                LC_INC(mc); GQ->memcpy(h.data(), dPF, h.size() * 4).wait();
+                 GQ->memcpy(h.data(), dPF, h.size() * 4).wait();
                 static int pf_n = 0; ++pf_n;
                 char fn[64]; snprintf(fn, sizeof fn, "projf_v4ph_%d.bin", pf_n);
                 FILE* fp = fopen(fn, "wb"); fwrite(h.data(), 4, h.size(), fp); fclose(fp);
@@ -5995,13 +5994,13 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             }
             if (dTD) {
                 std::vector<float> h((size_t)windows * 64u * C);
-                LC_INC(mc); GQ->memcpy(h.data(), dTD, h.size() * 4).wait();
+                 GQ->memcpy(h.data(), dTD, h.size() * 4).wait();
                 static int td_n = 0; ++td_n;
                 char fn[64]; snprintf(fn, sizeof fn, "total_v4ph_%d.bin", td_n);
                 FILE* fp = fopen(fn, "wb"); fwrite(h.data(), 4, h.size(), fp); fclose(fp);
                 printf("[dump] total v4ph #%d %zu floats\n", td_n, h.size());
                 std::vector<sycl::half> ht((size_t)height * width * C);
-                LC_INC(mc); GQ->memcpy(ht.data(), (sycl::half*)Tgt, ht.size() * 2).wait();
+                 GQ->memcpy(ht.data(), (sycl::half*)Tgt, ht.size() * 2).wait();
                 snprintf(fn, sizeof fn, "tgt_v4ph_%d.bin", td_n);
                 fp = fopen(fn, "wb"); fwrite(ht.data(), 2, ht.size(), fp); fclose(fp);
                 printf("[dump] Tgt v4ph #%d %zu halves\n", td_n, ht.size());
@@ -6020,7 +6019,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             sycl::half* dWp = cached_pack_b_f16(projection, Praw, (int)C, (int)C);
             sycl::half* dKV = nullptr;
             if (st && st < 0xFF00u) { dKV = (sycl::half*)pool_get((size_t)windows * 4096u * 2);
-                      LC_INC(pf); GQ->parallel_for(sycl::range((size_t)windows*4096u), [=](sycl::item<1> it){ dKV[(size_t)it.get_id(0)]=sycl::half(0.f); }); }
+                       GQ->parallel_for(sycl::range((size_t)windows*4096u), [=](sycl::item<1> it){ dKV[(size_t)it.get_id(0)]=sycl::half(0.f); }); }
             if (st == 65532u) return;   // floor probe: no launch
             wbv3::launch_v3(*GQ, image_half ? (const void*)ImgH : (const void*)ImgF, image_half,
                             dWq, dWp, narrow ? (sycl::half*)Tgt : nullptr,
@@ -6047,12 +6046,11 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             // anyone reads it -- verified: NR_V2_FILL=0 keeps the fused 4-run check at
             // 100.0000% bit-exact AND saves ~10ms/walk; NR_V2_FILL=1 restores the
             // deterministic fresh-zero behavior for debugging.
-            if (getenv("NR_V2_FILL") && st != 0xFFFFu)
-                { LC_INC(pf); GQ->parallel_for(sycl::range((size_t)windows * wbv2::WSL), [=](sycl::item<1> it){
-                    dWS[(size_t)it.get_id(0)] = sycl::half(0.f); }); }
+            if (getenv("NR_V2_FILL") && st != 0xFFFFu)GQ->parallel_for(sycl::range((size_t)windows * wbv2::WSL), [=](sycl::item<1> it){
+                    dWS[(size_t)it.get_id(0)] = sycl::half(0.f); });
             sycl::half* dKV = nullptr;
             if (st && st < 0xFF00u) { dKV = (sycl::half*)pool_get((size_t)windows * 4096u * 2);
-                      LC_INC(pf); GQ->parallel_for(sycl::range((size_t)windows*4096u), [=](sycl::item<1> it){ dKV[(size_t)it.get_id(0)]=sycl::half(0.f); }); }
+                       GQ->parallel_for(sycl::range((size_t)windows*4096u), [=](sycl::item<1> it){ dKV[(size_t)it.get_id(0)]=sycl::half(0.f); }); }
             if (st == 65532u) { if (dWS) pool_put(dWS); return; }   // floor probe: NO launch at all
             wbv2::launch_v2(*GQ, image_half ? (const void*)ImgH : (const void*)ImgF, image_half,
                             dWq, dWp, narrow ? (sycl::half*)Tgt : nullptr,
@@ -6123,7 +6121,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                 s_mdone = true;
                 unsigned st = (unsigned)atoi(getenv("NR_MEGA_STOP"));
                 sycl::half* dKV = (sycl::half*)pool_get((size_t)windows * 4096u * 2);
-                LC_INC(pf); wbmega::launch_full(*GQ, image_half ? (const void*)ImgH : (const void*)ImgF, image_half,
+                 wbmega::launch_full(*GQ, image_half ? (const void*)ImgH : (const void*)ImgF, image_half,
                                     dWq, dWp, narrow ? (sycl::half*)Tgt : nullptr,
                                     narrow ? nullptr : (float*)Tgt, Bp, cp, qs,
                                     windows, height, width, across, top, left, epi, narrow, st, dKV);
@@ -6136,7 +6134,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                 pool_put(dKV);
                 return;
             }
-            LC_INC(pf); wbmega::launch_full(*GQ, image_half ? (const void*)ImgH : (const void*)ImgF, image_half,
+             wbmega::launch_full(*GQ, image_half ? (const void*)ImgH : (const void*)ImgF, image_half,
                                 dWq, dWp, narrow ? (sycl::half*)Tgt : nullptr,
                                 narrow ? nullptr : (float*)Tgt, Bp, cp, qs,
                                 windows, height, width, across, top, left, epi, narrow);
@@ -6160,7 +6158,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         if (!wbplaingather && C == 32u) {
             // section 99: 32-wide ESIMD gather (image row + dA row both contiguous;
             // e4m3_vec<32> bit-exact vs qr_e4m3 scalar, bench_e4m3vec 0/4096).
-            LC_INC(pf); GQ->parallel_for(sycl::range((size_t)rows), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
+             GQ->parallel_for(sycl::range((size_t)rows), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
                 namespace esimd = sycl::ext::intel::esimd;
                 unsigned r = (unsigned)it.get_id(0);
                 unsigned window = r / tokens, token = r % tokens;
@@ -6181,7 +6179,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                 esimd::block_store<sycl::half,32>(dA + (size_t)r * C, out, esimd::overaligned_tag<16>{});
             });
         } else
-        { LC_INC(pf); GQ->parallel_for(sycl::range((size_t)rows), [=](sycl::item<1> it) {
+        {  GQ->parallel_for(sycl::range((size_t)rows), [=](sycl::item<1> it) {
             unsigned r = (unsigned)it.get_id(0);
             unsigned window = r / tokens, token = r % tokens;
             int y = (int)((window / across) * 8u + token / 8u) - (int)top;
@@ -6265,9 +6263,9 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         sycl::half* dAp2 = (sycl::half*)pool_get((size_t)windows * 64u * 64u * 2);
         sycl::half* dBv = (sycl::half*)pool_get((size_t)windows * 64u * 32u * 2);
         if (wbstop > 4u) {
-        LC_INC(pf); packdev::pack_a16_b(*GQ, dQ, dAq, 64, 64, 32, (int)windows);
-        LC_INC(pf); packdev::pack_b16_t_b(*GQ, dK, dBk, 32, 64, (int)windows);
-        LC_INC(pf); f16v1::gemm_b(*GQ, dAq, dBk, dScores, 64, 64, 32, (int)windows);
+         packdev::pack_a16_b(*GQ, dQ, dAq, 64, 64, 32, (int)windows);
+         packdev::pack_b16_t_b(*GQ, dK, dBk, 32, 64, (int)windows);
+         f16v1::gemm_b(*GQ, dAq, dBk, dScores, 64, 64, 32, (int)windows);
         }
         if (getenv("NR_DUMP_SCORES")) {   // dump split scores (Q.K^T, no bias) for comparison vs resident stop=5
             static bool s_sdone = false;
@@ -6283,7 +6281,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         if (wbstop > 5u) {
         if (!smaxplain2()) smax_esimd(*GQ, dScores, dProbs, windows*64u, Bp, 1u);
         else
-        { LC_INC(pf); GQ->parallel_for(sycl::range((size_t)windows*64u),
+        {  GQ->parallel_for(sycl::range((size_t)windows*64u),
                          smax::softmax_kernel()(dScores, dProbs, windows*64u, 64u, Bp, 1u)); }
         }
         if (getenv("NR_DUMP_PROBS")) {   // dump split softmax probs (e4m3 halves) vs mega SCR
@@ -6297,9 +6295,9 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             }
         }
         if (wbstop > 6u) {
-        LC_INC(pf); packdev::pack_a16_b(*GQ, dProbs, dAp2, 64, 64, 64, (int)windows);
-        LC_INC(pf); packdev::pack_b16_b(*GQ, dV, dBv, 64, 32, (int)windows);
-        LC_INC(pf); f16v1::gemm_b(*GQ, dAp2, dBv, dCtx, 64, 32, 64, (int)windows);
+         packdev::pack_a16_b(*GQ, dProbs, dAp2, 64, 64, 64, (int)windows);
+         packdev::pack_b16_b(*GQ, dV, dBv, 64, 32, (int)windows);
+         f16v1::gemm_b(*GQ, dAp2, dBv, dCtx, 64, 32, 64, (int)windows);
         }
         if (getenv("NR_DUMP_CTX")) {   // dump split attnV context for comparison vs resident stop=8
             static bool s_cdone = false;
@@ -6317,7 +6315,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         sycl::half* dAttended = (sycl::half*)pool_get((size_t)rows * C * 2);
         if (wbstop > 7u)
         if (!wbplaingather && C == 32u) {   // section 99: 32-wide merge (both sides contiguous)
-            { LC_INC(pf); GQ->parallel_for(sycl::range((size_t)rows), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
+            {  GQ->parallel_for(sycl::range((size_t)rows), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
                 namespace esimd = sycl::ext::intel::esimd;
                 unsigned token = (unsigned)it.get_id(0);
                 esimd::simd<float,32> v = esimd::block_load<float,32>(
@@ -6326,7 +6324,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                     esimd::convert<sycl::half>(wbv2::e4m3_vec<32>(v)), esimd::overaligned_tag<16>{});
             }); }
         } else
-        { LC_INC(pf); GQ->parallel_for(sycl::range((size_t)rows * C), [=](sycl::item<1> it) {   // merge, heads==1
+        {  GQ->parallel_for(sycl::range((size_t)rows * C), [=](sycl::item<1> it) {   // merge, heads==1
             unsigned index = (unsigned)it.get_id(0);
             unsigned c = index % C, token = index / C;
             dAttended[index] = sycl::half(qr_e4m3(dCtx[(size_t)token * 32u + c]));
@@ -6387,7 +6385,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             // values, no frame judge -- this stop exists for the TIME ledger only).
             if (wbstop == 86u) { /* leg3 empty */ }
             else {
-            LC_INC(pf); packdev::pack_a16(*GQ, dAttended, dAp3, (int)rows, Mp, (int)C);
+             packdev::pack_a16(*GQ, dAttended, dAp3, (int)rows, Mp, (int)C);
             if (wbstop != 85u) {
             if (wbstop == 87u) {
                 // section 100 D2 probe: the fused kernel with tail=false -- every
@@ -6513,13 +6511,13 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                     // direct form -- and the plan target is written ONLY by this pass
                     // (the plan census: 1265 has one writer), so those slots are the
                     // zero the create left behind. Zero the staging to match exactly.
-                    LC_INC(ms); GQ->memset(dStg, 0, img_elems * wsz2);
+                     GQ->memset(dStg, 0, img_elems * wsz2);
                     f16v3::gemm_resid_pub(*GQ, dAp3, dBp3,
                         image_half ? (const sycl::half*)ImgH : nullptr,
                         image_half ? nullptr : ImgF, image_half,
                         cp, narrow ? dStg : nullptr, narrow ? nullptr : (float*)dStg,
                         narrow, (int)rows, Mp, (int)C, height, width, across, top, left, epi);
-                    LC_INC(mc); GQ->memcpy(Tgt, dStg, img_elems * wsz2);
+                     GQ->memcpy(Tgt, dStg, img_elems * wsz2);
                     pool_put(dStg);
                 } else
                     f16v3::gemm_resid_pub(*GQ, dAp3, dBp3,
@@ -6531,8 +6529,8 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             }   // wbstop != 85u
             }   // wbstop != 86u
         } else if (wbstop > 8u) {
-        LC_INC(pf); packdev::pack_a16(*GQ, dAttended, dAp3, (int)rows, Mp, (int)C);
-        LC_INC(pf); f16v1::gemm(*GQ, dAp3, dBp3, dC3, Mp, (int)C, (int)C);
+         packdev::pack_a16(*GQ, dAttended, dAp3, (int)rows, Mp, (int)C);
+         f16v1::gemm(*GQ, dAp3, dBp3, dC3, Mp, (int)C, (int)C);
         }
         if (getenv("NR_DUMP_C3")) {   // dump split outproj dC3 for comparison vs resident stop=9
             static bool s_d3done = false;
@@ -6553,7 +6551,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                           cp, dC3, Tgt, narrow, epi, rows, height, width,
                           across, top, left, C);
         } else
-        { LC_INC(pf); GQ->parallel_for(sycl::range(blk_elems), [=](sycl::item<1> it) {
+        {  GQ->parallel_for(sycl::range(blk_elems), [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             unsigned r = (unsigned)(i / C), col = (unsigned)(i % C);
             unsigned window = r / 64u, token = r % 64u;
@@ -6581,7 +6579,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             // summed in that order (precise), *0.25, e4m3 -> half, into pooled at the
             // half-resolution image index. token = (pixel/4)*16 + (pixel%4)*2 over the
             // window's 16 pooled pixels.
-            LC_INC(pf); GQ->parallel_for(sycl::range((size_t)windows * 16u * C), [=](sycl::item<1> it) {
+             GQ->parallel_for(sycl::range((size_t)windows * 16u * C), [=](sycl::item<1> it) {
                 size_t e = it.get_id(0);
                 unsigned pixel = (unsigned)((e / C) % 16u), c = (unsigned)(e % C);   // pixel WITHIN the window (flat range spans windows)
                 unsigned window = (unsigned)(e / (16u * C));
@@ -6615,9 +6613,9 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             sycl::half* dA4 = (sycl::half*)pool_get((size_t)MpH * C * 2);
             sycl::half* dB4 = cached_pack_b_f16(pooled, HeadW, (int)C, 16);   // weight: pack once
             float* dH4 = (float*)pool_get((size_t)MpH * 16u * 4);
-            LC_INC(pf); packdev::pack_a16(*GQ, dOut16, dA4, (int)pixels, MpH, (int)C);
-            LC_INC(pf); f16v1::gemm(*GQ, dA4, dB4, dH4, MpH, 16, (int)C);
-            LC_INC(pf); GQ->parallel_for(sycl::range((size_t)pixels * 4u), [=](sycl::item<1> it) {
+             packdev::pack_a16(*GQ, dOut16, dA4, (int)pixels, MpH, (int)C);
+             f16v1::gemm(*GQ, dA4, dB4, dH4, MpH, 16, (int)C);
+             GQ->parallel_for(sycl::range((size_t)pixels * 4u), [=](sycl::item<1> it) {
                 size_t i = it.get_id(0);
                 unsigned pixel = (unsigned)(i / 4u), c = (unsigned)(i % 4u);
                 ((float*)Tgt)[i] = dH4[(size_t)pixel * 16u + c];   // compact: first four columns
@@ -6627,7 +6625,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         }
         if (dStgW) {
             std::vector<float> h((size_t)rows * C);
-            LC_INC(mc); GQ->memcpy(h.data(), dStgW, h.size() * 4).wait();
+             GQ->memcpy(h.data(), dStgW, h.size() * 4).wait();
             static int tw = 0; ++tw;
             char fn[64]; snprintf(fn, sizeof fn, "total_A2_%d.bin", tw);
             FILE* fp = fopen(fn, "wb"); fwrite(h.data(), 4, h.size(), fp); fclose(fp);
@@ -6636,7 +6634,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         }
         if (pooling && getenv("NR_DUMP_PL")) {   // the A2 published-skip Tgt (1265)
             std::vector<sycl::half> ht((size_t)height * width * C);
-            LC_INC(mc); GQ->memcpy(ht.data(), (sycl::half*)Tgt, ht.size() * 2).wait();
+             GQ->memcpy(ht.data(), (sycl::half*)Tgt, ht.size() * 2).wait();
             static int ta = 0; ++ta;
             char fn[64]; snprintf(fn, sizeof fn, "tgt_A2_%d.bin", ta);
             FILE* fp = fopen(fn, "wb"); fwrite(ht.data(), 2, ht.size(), fp); fclose(fp);
@@ -6709,9 +6707,9 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
         int asbuf = fq->second;
         if (qstop8 == 9) { pg_push([](){}); return 0; }   // (the entry guard already did 9; belt: skip the memcpy too)
         pg_push([=]() {
-            LC_INC(mc); GQ->memcpy(pk, (const int8_t*)a, (size_t)M * K);          // device int8 copy
+             GQ->memcpy(pk, (const int8_t*)a, (size_t)M * K);          // device int8 copy
             if (asbuf != scale)                                       // scales landed in a_scale's buf
-                LC_INC(mc); GQ->memcpy(sc, (const float*)g_bufs[asbuf].p, (size_t)M * 4);
+                 GQ->memcpy(sc, (const float*)g_bufs[asbuf].p, (size_t)M * 4);
         });
         return 0;
     }
@@ -6771,21 +6769,21 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
                         qr_launch_esimd(*GQ, *GD, a, (sycl::uint2*)ref, refs, M, K);
                         GQ->wait();
                         std::vector<int8_t> ha((size_t)M*K), hb((size_t)M*K);
-                        LC_INC(mc); GQ->memcpy(ha.data(), ref, (size_t)M*K); GQ->memcpy(hb.data(), wc->second.first, (size_t)M*K); GQ->wait();
+                         GQ->memcpy(ha.data(), ref, (size_t)M*K); GQ->memcpy(hb.data(), wc->second.first, (size_t)M*K); GQ->wait();
                         size_t bad=0; for(size_t i=0;i<ha.size();++i) if(ha[i]!=hb[i]) ++bad;
                         printf("[wq-verify] src=%d pk=%d M=%u K=%u CACHE-DIFF %zu/%zu %s\n", source, packed, M, K, bad, ha.size(), bad?"STALE":"ok");
                         sycl::free(ref,*GQ); sycl::free(refs,*GQ);
                     }
-                    LC_INC(mc); GQ->memcpy(pk, wc->second.first, (size_t)M * K);
-                    LC_INC(mc); GQ->memcpy(sc, wc->second.second, (size_t)M * 4u);
+                     GQ->memcpy(pk, wc->second.first, (size_t)M * K);
+                     GQ->memcpy(sc, wc->second.second, (size_t)M * 4u);
                     return;
                 }
                 qr_launch_esimd(*GQ, *GD, a, pk, sc, M, K);
                 if (!g_graphrecording) {   // snapshot only from REAL executions
                     int8_t* cbuf = (int8_t*)sycl::malloc_device((size_t)M * K, *GQ);
                     float* csbuf = (float*)sycl::malloc_device((size_t)M * 4u, *GQ);
-                    LC_INC(mc); GQ->memcpy(cbuf, pk, (size_t)M * K);
-                    LC_INC(mc); GQ->memcpy(csbuf, sc, (size_t)M * 4u);
+                     GQ->memcpy(cbuf, pk, (size_t)M * K);
+                     GQ->memcpy(csbuf, sc, (size_t)M * 4u);
                     GQ->wait();
                     wqc[kk] = { cbuf, csbuf };
                 }
@@ -6811,7 +6809,7 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
     s6_note_quant(g_cmds.size(), source, packed, scale, M, K);   // S6-1a (see above)
     a5_note_quant(g_cmds.size(), source, packed, scale, M, K);   // A5
     pg_push([=]() {
-        LC_INC(pf); qr_launch(*GQ, *GD, qr_kernel(), a, pk, sc, M, K, 0u, 0u, 0u, 0u, 0u, nullptr, nullptr);
+         qr_launch(*GQ, *GD, qr_kernel(), a, pk, sc, M, K, 0u, 0u, 0u, 0u, 0u, nullptr, nullptr);
         if (getenv("NR_PK_DUMP")) { static int pdSP=0; if(pdSP<1){pdSP++;
             GQ->wait();
             std::vector<int8_t> hp(512); GQ->memcpy(hp.data(), pk, 512).wait();
@@ -6964,7 +6962,7 @@ int xmx_rec_unary32(int source, int dst, unsigned count, unsigned epilogue) {
     unsigned n4 = count / 4u;
     g_cmd_names.push_back(__func__);
     pg_push([=]() {
-        LC_INC(pf); GQ->parallel_for(sycl::range(n4), unary_kernel()(sp, dp, n4, epilogue));
+         GQ->parallel_for(sycl::range(n4), unary_kernel()(sp, dp, n4, epilogue));
     });
     return 0;
 }
@@ -6988,7 +6986,7 @@ int xmx_rec_unary_i8(int source, int scale, int dst, unsigned count, unsigned co
     float* dp = (float*)d->second.p;
     g_cmd_names.push_back(__func__);
     pg_push([=]() {
-        LC_INC(pf); GQ->parallel_for(sycl::range(count), unary_i8_kernel()(sp, scp, dp, count, cols, epilogue));
+         GQ->parallel_for(sycl::range(count), unary_i8_kernel()(sp, scp, dp, count, cols, epilogue));
     });
     return 0;
 }
@@ -7006,7 +7004,7 @@ int xmx_rec_cosine_norm(int source, int dst, unsigned rows, unsigned vit) {
     float* dp = (float*)d->second.p;
     g_cmd_names.push_back(__func__);
     pg_push([=]() {
-        LC_INC(pf); GQ->parallel_for(sycl::range(rows),
+         GQ->parallel_for(sycl::range(rows),
                          ctree::cosine_norm_kernel()(sp, dp, rows, vit, nullptr, 0));
     });
     return 0;
@@ -7027,7 +7025,7 @@ int xmx_rec_cosine_norm_q(int source, int dst, int scale, unsigned rows, unsigne
     const float* scp = (const float*)c->second.p;
     g_cmd_names.push_back(__func__);
     pg_push([=]() {
-        LC_INC(pf); GQ->parallel_for(sycl::range(rows),
+         GQ->parallel_for(sycl::range(rows),
                          ctree::cosine_norm_kernel()(sp, dp, rows, vit, scp, heads));
     });
     return 0;
@@ -7053,7 +7051,7 @@ int xmx_rec_cosine_norm_i8(int source, int out8, int scale, unsigned rows, unsig
     float* cp = (float*)c->second.p;
     g_cmd_names.push_back(__func__);
     pg_push([=]() {
-        LC_INC(pf); GQ->parallel_for(sycl::range(rows),
+         GQ->parallel_for(sycl::range(rows),
                          ctree::cosine_norm_i8_kernel()(sp, op, cp, rows, vit, qsp, heads));
     });
     return 0;
@@ -7078,7 +7076,7 @@ int xmx_rec_softmax(int source, int dst, unsigned rows, unsigned cols) {
     sycl::half* dp = (sycl::half*)d->second.p;
     g_cmd_names.push_back(__func__);
     pg_push([=]() {
-        LC_INC(pf); GQ->parallel_for(sycl::range(rows), smax::softmax_kernel()(sp, dp, rows, cols, nullptr, 0));
+         GQ->parallel_for(sycl::range(rows), smax::softmax_kernel()(sp, dp, rows, cols, nullptr, 0));
     });
     return 0;
 }
@@ -7093,7 +7091,7 @@ int xmx_rec_softmax_bias(int source, int dst, int bias, unsigned rows, unsigned 
     const float* bp = (const float*)b->second.p;
     g_cmd_names.push_back(__func__);
     pg_push([=]() {
-        LC_INC(pf); GQ->parallel_for(sycl::range(rows), smax::softmax_kernel()(sp, dp, rows, cols, bp, heads));
+         GQ->parallel_for(sycl::range(rows), smax::softmax_kernel()(sp, dp, rows, cols, bp, heads));
     });
     return 0;
 }
@@ -7127,7 +7125,7 @@ int xmx_rec_softmax_i8(int acc, int q_scale, int k_scale, int bias, int out8, in
         // (The megakernel form keeps them in registers; this is the correctness-first path
         // gate, same staged rhythm as the rest of the skeleton.)
         sycl::half* scratch = (sycl::half*)sycl::malloc_shared((size_t)rows * cols * 2, *GQ);
-        LC_INC(pf); GQ->parallel_for(sycl::range(rows),
+         GQ->parallel_for(sycl::range(rows),
                          smax::softmax_i8_kernel()(ap, qp, kp, bp, scratch, op, scp, rows, cols));
         pool_put(scratch);
     });
@@ -7155,7 +7153,7 @@ int xmx_rec_requant_i8(int acc, int a_scale, int b_scale, int out8, int scale,
     float* scp = (float*)isc->second.p;
     g_cmd_names.push_back(__func__);
     pg_push([=]() {
-        LC_INC(pf); GQ->parallel_for(sycl::range(rows),
+         GQ->parallel_for(sycl::range(rows),
                          requant::requant_i8_kernel()(ap, as, bs, op, scp, rows, cols));
     });
     return 0;
@@ -7294,7 +7292,7 @@ int xmx_rec_qkv_scatter(int src, int dst, unsigned rows, unsigned heads, unsigne
     unsigned n = rows * heads * 32u;
     g_cmd_names.push_back(__func__);
     pg_push([=]() {
-        LC_INC(pf); GQ->parallel_for(sycl::range(n), qkv_scatter_kernel()(sp, dp, rows, heads, tokens));
+         GQ->parallel_for(sycl::range(n), qkv_scatter_kernel()(sp, dp, rows, heads, tokens));
     });
     return 0;
 }

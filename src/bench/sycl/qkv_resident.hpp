@@ -72,6 +72,7 @@ static inline sycl::event gemm_qkv_res(sycl::queue& q, const int8_t* Ap, const i
                                        const float* as, const float* bs, const float* qs,
                                        int M, int Mp, int C, int NH, int heads, int tokens,
                                        bool vit = false, const float* recip_tab = nullptr) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     using namespace s8v8;   // BM BN BK NT SLM_*
     const int wg = (Mp / BM) * (NH / BN);
     return q.submit([&](handler& h) {

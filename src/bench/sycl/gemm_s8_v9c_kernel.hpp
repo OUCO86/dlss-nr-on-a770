@@ -86,6 +86,7 @@ template<int BMv,int NTr> struct Geo { static const int BM=BMv, NT=NTr, WI_ROWS=
 template<int BMv>
 inline void pack_a9b(queue& q, const int8_t* Araw, int8_t* Ap,
                      int M, int Mp, int K, int lda) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int kb_n = K / BK;
     size_t n = (size_t)(Mp / BMv) * kb_n * (BMv / 16) * 512;
     q.parallel_for(range(n), [=](item<1> it) {
@@ -104,6 +105,7 @@ inline void pack_a9b(queue& q, const int8_t* Araw, int8_t* Ap,
 //   ntile = g*(N/8) + (j/8), nl = j%8.
 inline void pack_b9b(queue& q, const int8_t* Braw, int8_t* Bp,
                      int K, int N, int ldc, int ldb, size_t sb, int batch) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     size_t n = (size_t)(K / 32) * (ldc / 8) * 256;
     q.parallel_for(range(n), [=](item<1> it) {
         size_t d = it.get_id(0);
@@ -125,6 +127,7 @@ inline event gemm_b_rq9b(queue& q, const int8_t* Ap, const int8_t* Bp,
                          sycl::half* C8, float* ns,
                          const float* as, const float* bs,
                          int M, int Mp, int K, unsigned epi) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     // FOLD=1: C8 is reinterpreted int8* (the quant pass's PACKED buffer, M x ldc flat),
     // ns = the quant pass's SCALE buffer (float[M]). The producer writes int8+scale
     // DIRECTLY; the xmx_rec_quant closure becomes a no-op. pub is e4m3-grid exact ->

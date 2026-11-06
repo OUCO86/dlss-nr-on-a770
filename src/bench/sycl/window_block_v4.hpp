@@ -28,6 +28,7 @@ inline event launch_v4full(queue& q, const void* Img, bool image_half,
     unsigned epilogue, bool narrow,
     unsigned stop_stage = 0, half* DumpKV = nullptr)
 {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     constexpr uint LW = 64u;
     return q.submit([&](handler& h) {
         h.parallel_for(nd_range<1>(range((size_t)windows*LW), range(LW)),

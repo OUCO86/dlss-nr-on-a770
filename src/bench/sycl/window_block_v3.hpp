@@ -289,6 +289,7 @@ inline sycl::event launch_v3(
     unsigned epilogue, bool narrow,
     unsigned stop_stage = 0, half* DumpKV = nullptr)
 {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     return q.submit([&](handler& h) {
         h.parallel_for(nd_range<1>(range((size_t)windows*LW), range(LW)),
             [=](nd_item<1> it) SYCL_ESIMD_KERNEL {

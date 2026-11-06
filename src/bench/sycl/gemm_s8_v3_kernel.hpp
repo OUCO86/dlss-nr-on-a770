@@ -54,6 +54,7 @@ static inline void pack_b(const int8_t* B, int8_t* Bp, int K, int N) {
 static inline sycl::event gemm_s8(sycl::queue& q, const int8_t* Ap, const int8_t* Bp,
                                   const float* col_scale, int8_t* C8, float* new_scale,
                                   int M, int N, int K) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     int wg = (M / BM) * (N / BN);
     return q.submit([&](handler& h) {
         h.parallel_for(nd_range(range(wg * NT), range(NT)), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {

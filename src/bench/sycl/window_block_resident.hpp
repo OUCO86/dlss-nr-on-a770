@@ -63,6 +63,7 @@ inline sycl::event launch_resident(
     unsigned epilogue, bool narrow,
     unsigned stop_stage = 0, half* DumpKV = nullptr)
 {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     return q.submit([&](handler& h) {
         local_accessor<float,1> SLM(range(10304u), h);
         h.parallel_for(nd_range<1>(range((size_t)windows*64u), range(64u)),

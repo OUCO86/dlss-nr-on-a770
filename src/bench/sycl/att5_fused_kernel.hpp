@@ -55,6 +55,7 @@ static inline event fused(queue& q,
                            unsigned across, unsigned top, unsigned left,
                            unsigned image_h, unsigned image_w,
                            const Outlets& o) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     constexpr int TOK = 64, NH = 3 * C, KBN = C / 32, PPH = C / 64;   // parts per kind
     // ---- SLM map (bytes) ----
     constexpr uint X0 = 0u;

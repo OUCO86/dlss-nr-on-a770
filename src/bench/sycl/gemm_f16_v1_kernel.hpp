@@ -58,6 +58,7 @@ static inline void pack_b_t(const half* B, half* Bp, int K, int N) {
 // C = A @ B, f32 accumulate, Mp x N. Ap/Bp packed. Returns the event.
 static inline sycl::event gemm(sycl::queue& q, const half* Ap, const half* Bp,
                                float* C, int Mp, int N, int K) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     int tr_n = Mp / TS, tc_n = N / TS, kb_n = K / TS;
     return q.submit([&](handler& h) {
         h.parallel_for(range<1>((size_t)tr_n * tc_n), [=](item<1> it) SYCL_ESIMD_KERNEL {
@@ -96,6 +97,7 @@ static inline sycl::event gemm(sycl::queue& q, const half* Ap, const half* Bp,
 // bit-exact by construction against the loop it replaces.
 static inline sycl::event gemm_b(sycl::queue& q, const half* Ap, const half* Bp,
                                  float* C, int Mp, int N, int K, int batches) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     int tr_n = Mp / TS, tc_n = N / TS, kb_n = K / TS;
     size_t apb = (size_t)Mp * K, bpb = (size_t)K * N, cb = (size_t)Mp * N;
     return q.submit([&](handler& h) {
@@ -143,6 +145,7 @@ static inline sycl::event gemm_b(sycl::queue& q, const half* Ap, const half* Bp,
 static inline sycl::event gemm_b_merge_scale(sycl::queue& q, const half* Ap, const half* Bp,
                                              half* Out, const float* dRecip,
                                              int Mp, int N, int K, int batches) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     int tr_n = Mp / TS, tc_n = N / TS, kb_n = K / TS;
     size_t apb = (size_t)Mp * K, bpb = (size_t)K * N;
     const unsigned CH = (unsigned)batches * 32u;
@@ -204,6 +207,7 @@ static inline sycl::event gemm_b_pub_f16(sycl::queue& q, const half* Ap, const h
                                          void* Cout, int M, int Mp, int N, int K, int batches,
                                          unsigned epi, bool narrow, size_t oc, size_t sc,
                                          unsigned ldc, unsigned lda_unused) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     (void)lda_unused;
     int tr_n = Mp / TS, tc_n = N / TS, kb_n = K / TS;
     size_t apb = (size_t)Mp * K, bpb = (size_t)K * N;
@@ -277,6 +281,8 @@ static inline sycl::event gemm_b_pub_f16(sycl::queue& q, const half* Ap, const h
 // written to the padded C but NOT to H -- the publish loop was bounded by M*32).
 static inline sycl::event gemm_dual_pub(sycl::queue& q, const half* Ap, const half* Bp,
                                         float* C, half* H, int M, int Mp, int N, int K) {
+    LC_TICK();   // #145 军规 132: counted at helper entry, so no launch call site changes shape
+
     int tr_n = Mp / TS, tc_n = N / TS, kb_n = K / TS;
     return q.submit([&](handler& h) {
         h.parallel_for(range<1>((size_t)tr_n * tc_n), [=](item<1> it) SYCL_ESIMD_KERNEL {
@@ -319,6 +325,7 @@ static inline sycl::event gemm_dual_pub(sycl::queue& q, const half* Ap, const ha
 
 static inline sycl::event gemm_pub(sycl::queue& q, const half* Ap, const half* Bp,
                                    half* H, int M, int Mp, int N, int K, unsigned epi) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     int tr_n = Mp / TS, tc_n = N / TS, kb_n = K / TS;
     return q.submit([&](handler& h) {
         h.parallel_for(range<1>((size_t)tr_n * tc_n), [=](item<1> it) SYCL_ESIMD_KERNEL {
@@ -373,6 +380,7 @@ static inline sycl::event gemm_pub(sycl::queue& q, const half* Ap, const half* B
 static inline sycl::event gemm_pub_pa16(sycl::queue& q, const half* Ap, const half* Bp,
                                         half* Hp_tile, int M, int Mp, int N, int K,
                                         unsigned epi) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     int tr_n = Mp / TS, tc_n = N / TS, kb_n = K / TS;
     return q.submit([&](handler& h) {
         h.parallel_for(range<1>((size_t)tr_n * tc_n), [=](item<1> it) SYCL_ESIMD_KERNEL {
@@ -448,6 +456,7 @@ static inline sycl::event gemm_pub_pa16(sycl::queue& q, const half* Ap, const ha
 static inline sycl::event gemm_res(sycl::queue& q, const half* Ap, const half* Bp,
                                    void* Cout, const float* skip, const float* cos,
                                    int M, int Mp, int N, int K, bool narrow, unsigned epi) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     int tr_n = Mp / TS, tc_n = N / TS, kb_n = K / TS;
     return q.submit([&](handler& h) {
         h.parallel_for(range<1>((size_t)tr_n * tc_n), [=](item<1> it) SYCL_ESIMD_KERNEL {

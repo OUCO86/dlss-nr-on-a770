@@ -55,6 +55,7 @@ static inline float v9_div(float a, float b) {
 //    dest = ((w*kb_n + kb)*WI_ROWS + wi)*512 + row*32 + k ; w over Mp/BM.
 inline void pack_a9(queue& q, const int8_t* Araw, int8_t* Ap,
                     int M, int Mp, int K, int lda, size_t sa, int batch) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int kb_n = K / BK;
     size_t n = (size_t)batch * (Mp / BM) * kb_n * WI_ROWS * 512;
     q.parallel_for(range(n), [=](item<1> it) {
@@ -73,6 +74,7 @@ inline void pack_a9(queue& q, const int8_t* Araw, int8_t* Ap,
 //    Bp[ ((kk32*(N/8) + ntile)*64 + kq*8 + nl)*4 + j ] = B[g*sb + (kk32*32+kq*4+j)*ldb + ntile*8+nl]
 inline void pack_b9(queue& q, const int8_t* Braw, int8_t* Bp,
                     int K, int N, int ldb, size_t sb, int batch) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     size_t n = (size_t)batch * (K / 32) * (N / 8) * 256;
     q.parallel_for(range(n), [=](item<1> it) {
         size_t d = it.get_id(0);
@@ -97,6 +99,7 @@ inline event gemm_b_rq(queue& q, const int8_t* Ap, const int8_t* Bp,
                        int M, int Mp, int N, int K, int batch,
                        size_t sc, unsigned ldc, unsigned scale_stride,
                        unsigned col_stride, unsigned epi, unsigned fold = 1u) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     // store addressing EXACTLY like v8 gemm_b_pub: out = g*sc + r*ldc + col (the plan's
     // N=128 shapes have ldc=256 != N and interleaved group stride sc -- verified from
     // the plan call [M=32640 N=128 K=64 b=2 sa=0 sb=8192 sc=128 lda=64 ldb=64 ldc=256

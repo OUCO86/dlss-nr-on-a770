@@ -52,7 +52,9 @@ static inline event launch_ffn_chip(queue& q, const half* dA, const half* dEp,
                                     bool pw16 = true,
                                     bool ff9 = true,
                                     int cstop = 0,
-                                    int pers = 0) {   // B3-ffn-13 persistent WG cap (0=off)
+                                    int pers = 0) {
+    LC_TICK();   // #145 军规 132: counted at helper entry, so no launch call site changes shape
+   // B3-ffn-13 persistent WG cap (0=off)
     const unsigned cin = 32;
     int tiles = Mp / 16;
     int wgs = (tiles + LW - 1) / LW;
@@ -447,6 +449,7 @@ static inline event launch_ffn_chip_cs(queue& q, const half* dA, const half* dEp
                                     bool half_skip = false,
                                     bool pw16 = true,
                                     bool ff9 = true) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const unsigned cin = 32;
     int tiles = Mp / 16;
     const int TSL = LW / 2;                       // tile slots per WG (thread PAIRS)
@@ -623,6 +626,8 @@ static inline event launch_ffn_chip_cs2(queue& q, const half* dA, const half* dE
                                     bool half_skip = false,
                                     bool pw16 = true,
                                     bool ff9 = true) {
+    LC_TICK();   // #145 军规 132: counted at helper entry, so no launch call site changes shape
+
     const unsigned cin = 32;
     int tiles = Mp / 16;
     const int TSL = LW / 2;                       // tile slots per WG (thread PAIRS)
@@ -830,6 +835,7 @@ static inline event launch_ffn_chip_cs2(queue& q, const half* dA, const half* dE
 template <int LW = 16>
 static inline event stem_mega(queue& q, const half* dAp, const half* dAdB, const half* dEp,
                        const half* dPp, const float* cp, float* Cout, int M, int Mp) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     const int tiles = Mp / 16;
     int wgs = (tiles + LW - 1) / LW;
     return q.submit([&](handler& h) {

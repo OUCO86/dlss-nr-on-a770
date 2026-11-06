@@ -65,6 +65,7 @@ static inline sycl::event gemm_qkv_v(sycl::queue& q, const int8_t* Ap, const int
                                      const float* a_scale, const float* b_scale,
                                      sycl::half* V,
                                      int M, int channels, int heads, int tokens) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     int NB = channels / BN;                 // V's own column blocks
     int wg = (M / BM) * NB;
     return q.submit([&](handler& h) {
@@ -165,6 +166,7 @@ static inline sycl::event gemm_qkv_deq(sycl::queue& q, const int8_t* Ap, const i
                                        const float* a_scale, const float* b_scale,
                                        float* OUT,
                                        int M, int channels) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     int NB = channels / BN;
     int wg = (M / BM) * NB;
     return q.submit([&](handler& h) {
@@ -260,6 +262,7 @@ static inline sycl::event gemm_qkv_v_i8(sycl::queue& q, const int8_t* Ap, const 
                                         const float* a_scale, const float* b_scale,
                                         signed char* V8, float* v_scale,
                                         int M, int channels, int heads, int tokens) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     int NB = channels / BN;
     int wg = (M / BM) * NB;
     return q.submit([&](handler& h) {

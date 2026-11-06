@@ -49,6 +49,7 @@ static inline sycl::event launch_lfw2(sycl::queue& q, const int8_t* dAp, const i
                                       const float* qs, const float* dBias,
                                       unsigned windows, unsigned heads,
                                       sycl::half* Qp, sycl::half* Kp, sycl::half* Vp) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     constexpr unsigned C = 64u, NH = 192u, tokens = 64u;
     const unsigned batches = windows * heads;
     return q.submit([&](handler& h) {

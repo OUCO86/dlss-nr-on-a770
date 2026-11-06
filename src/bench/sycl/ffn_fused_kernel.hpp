@@ -30,6 +30,7 @@ namespace esimd = sycl::ext::intel::esimd;
 // exactly as today's pass C gemm writes it -> the split residual tail is unchanged.
 static inline event launch_ffn_fused(queue& q, const half* dAp, const half* dEp,
                                      const half* dPp, float* dC2, int M, int Mp) {
+    LC_TICK();   // #145 军规 132: launch counted at helper entry
     int tr_n = Mp / 16;
     return q.submit([&](handler& h) {
         constexpr uint LW = 64u;   // 4 subgroups of 16 lanes
