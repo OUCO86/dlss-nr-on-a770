@@ -2777,3 +2777,21 @@ pair 4 A=57.100 B=56.590 -0.510    pair 8 A=57.760 B=56.390 -1.370
 ### 纪律事故（记档）
 **第一次建正式件时，子代理第 2 族的 4 行还在工作树里** ⇒ 那只件（`485FA962`）含未验改动；**已 revert 并从干净 HEAD 重建（`E0B03E90`）全部重验**。
 ⇒ **立规：父级转正期间子代理不得改仓内任何文件（单写者原则）；下一族必须先点名。**
+
+## 127. ★★★★★ **com2 复合刀：帧 -0.988 ms（8/8）与 -1.021（16/16）都达标，但 40 门链抓出 14 处真实位差 => 不转正，源码已 revert**
+### 我做的转正动作与发现的顺序
+1. commit `a93e190`（com2：11 个私有 namespace + 11 处体内 `using`，64 行插入）=> 从干净 HEAD 建正式件 `builds\libxmx_shicom2.dll` = `6AEE1ADED7741C45C6B8810BC89E423E`；
+2. **staged 到 `oneapi` 跑 40 门 => `37 GREEN / 3 RED`：`gate_gemm_f16_qkv_window`、`gate_window_block`、`gate_skip_graph`**（第三只是身份守卫按设计，前两只是**真失败**）；
+3. **主闸仍全绿**：非 fused **1301 `DD49827D` EXACT（gate40_p1/p2/p3 三次）**、fused 三面 `CACD2029 / ADC96F5D / 872C70D0` 也 EXACT；
+4. **帧配对确实过线**：A = `E0B03E90`（keep 件）vs B = 正式件，**8 对：-1.190 / -0.990 / -0.440 / -0.690 / -1.040 / -1.070 / -1.360 / -1.120 => 均值 -0.988 ms、B 赢 8/8**（子代理 16 对 -1.021、16/16、CI ±0.079；本批对照 -0.160 => 真实约 -0.86）；
+5. **但两门失败是硬伤，已回退**：`git checkout` 复原 `oneapi` = `E0B03E90`，**复跑 `gate_gemm_f16_qkv_window` / `gate_window_block` / `gate_skip_graph` = 3/3 GREEN**（证明失败由 com2 引起，不是环境）；**源码 `git revert a93e190`**，两槽仍是 `E0B03E90`、`out/SHIPPED_MD5.txt` = `e0b03e90…` 未动、三金标未动。
+### 失败读数（真位差，不是抖动）
+```
+FAIL QKVW-40x56-float Q: 274 bad; first 100 got 0xaf80 want 0xb000
+GEMM_F16_QKV_WINDOW RED (5 fails)
+FAIL WB-16x24-head-halfimage: target differs from the 3-leg chain (16x24 flags=0x1008000)
+WINDOW_BLOCK RED (9 fails)
+```
+⇒ **per-family 门用的输入与帧 dump 不同**（`40x56 float image`、`16x24 flags=0x1008000` half image、tiny 几何、narrow 路），**这些路径上把 `fmul_rn/fadd_rn` 换成普通算符会差 1 ulp 级别（`0xaf80` vs `0xb000`）**；**而 1301（整帧 f32 流）与 fused 三面都没覆盖到这些输入** => **主闸全绿不等于逐位安全**。
+### 军规 139（入 B2）：转正的门禁必须包含**整条 40 门链**，不能只靠 1301 + fused 三面
+**139**：**per-family 门（`gate_*`）覆盖的是帧 dump 没覆盖的输入形状与 flag 组合（tiny 几何、float image、half image、narrow/half_skip 路）**；本案 `com2` 在 1301 与 fused 三面全 EXACT、帧 -0.988 ms（8/8）过线，**却在 `gate_gemm_f16_qkv_window`（5 fails）与 `gate_window_block`（9 fails）暴露 14 处真实位差** => **任何"逐位不变"的宣称必须以 `gates: 40 GREEN / 0 RED`（staged 变体阶段允许 1 RED = 身份守卫按设计）为准**；**主闸只能证明"整帧 f32 流不变"，不能证明"所有输入路径不变"**。
