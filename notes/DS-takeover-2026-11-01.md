@@ -2812,3 +2812,24 @@ WINDOW_BLOCK RED (9 fails)
 ### 帧阶梯（今天）
 **63.5 -> 58.5 -> 57.3（A5）-> 56.3（smax + LW16）-> 56.1（qkv 族）-> 55.1（com2 复合刀，11 处族内遮蔽）**；**今日累计 -2.2 ms/帧**，全部**逐位相同**（1301 + fused 三面 + 40 门）。
 ### 军规 140（入 B2）：**门链红必须在"专用空缓存 + 串行无并发"下复跑才算数；不可复现的门红按假信号处理，但当时的安全处置（回退）仍然是对的**
+
+## 129. ★★★★★ **认证环境的根问题：两条门的 golden 不可复现——冷 JIT 编译 vs 缓存里来历不明的旧 Gen，同一个 kernel 的 ops 差一倍；从 11-03 `ship1` 到今天的每一件在冷编译下都红（反例数一模一样 5 与 9）**
+### 读数（子代理在服务器断线期间证死的）
+- `s6/run_gates_scratch.sh <scratch> <suffix>` + **专用空缓存** + 串行无并发：`libxmx_com4`（post/wbres/requant/f16v1）= **38 GREEN / 2 RED**（`gate_gemm_f16_qkv_window` 5 fails、`gate_window_block` 9 fails）⇒ 当场回退；
+- **同一对门在 cold 态对下列每一件都红、且反例数完全相同（5 与 9）**：`libxmx_com2`（= 现槽源码件）、`libxmx_com2b`（去掉 qkv_window 一族）、`keep_pre_com2_E0B03E90`、`libxmx_shiplw1`（B7CBE3A2）、`lcount25`、`lcount22`（**smax 刀之前**）、`lcount4`、`bis4`（**§121 之前**）、**`ship1`（11-03 出货件）**、**`backup_shipped_slot`（11-04）**；
+- **同一只件在 hot 缓存 `E:\DSH\sycl-cache` 下 GREEN**；
+- **逐实例码代（`l1_per_instance2.py`）**：`xmx_rec_gemm_qkv_window` 体内核 **13,309 ops / 4,448 fixup（缓存旧 Gen，门绿）→ 28,066 / 8,389（今天冷编译，门红）**；`gemm_int8_qkv` **13,166 → 30,327**；
+- **编译器与驱动都没变**：`sycl9.dll` 2026.1.0（文件 10-15）、驱动 32.0.101.9150（10-08）；
+- **帧面在冷编译下完全不变**（现槽、全新空缓存）：**非 fused 1301 `DD49827D`、fused `CACD2029 / ADC96F5D / 872C70D0` 全 EXACT**，`pf=522`、`scr=1,287,057,408`、`[hop-total] 3396 planes / 30,786,624,936 B` 一字不差；
+⇒ **冷/热差异只影响门里的形状族（40x56 / 8x8 / 16x24 / half image / narrow-crop / pooling），不影响 960x544 出货形状** ⇒ **实机风险低，但认证口径必须钉死**。
+### 我的三条裁决
+1. **com2 维持转正**：帧 −1.021（16/16）与 −1.015（8/8）真实、**帧面四闸在 cold 态也 EXACT** ⇒ 红不在它身上；
+2. **认证两态并报，cold 为真值**（军规 141）：**`E:\DSH\sycl-cache` 从今起当受管工件备份 + 记 md5**，并在 `tools/` 写说明（哪些门只在 hot 下绿、为什么）；
+3. **修那两门的 golden**（脚本化 `s6/l1_regengolden.sh`）：**从现 HEAD 正式件在 cold 态重生成**，**新 golden 必须同时被 `E0B03E90 / B7CBE3A2 / 3BAECF2A / ship1 / backup_shipped_slot / lcount4 / bis4` 在 cold 态匹配**（任一不匹配 ⇒ 停下回报）；**入库带 provenance（时间 / 件 md5 / 缓存态 / icx 与 sycl9.dll 版本 / 驱动版本 / 复跑命令）**；**旧 golden 改名 `*.golden.hotcache-legacy` 保留**（军规 142）。
+### 新开的一条高价值问题（便宜但可能影响实机）
+**游戏/回放到底用哪一态？** 要读码（`libxmx_sycl.cpp` 是否自设 `SYCL_CACHE_PERSISTENT`/缓存目录，给行号；`run_gates.sh`/`walk.ps1`/`ab.ps1` 各设了什么），并实测 **同一只件 4 对 hot vs 4 对 cold 的帧配对**；**若 cold 明显更慢 ⇒ 我们的 55.1 ms 依赖缓存里的旧 Gen**，**"冷启动/换机的真实帧数"要单列挂账，并考虑随件发布预热缓存**。
+### 工具修正
+`l1_span_count.py` 把注释里的文本算成调用点（`gemm_f16_v1_kernel.hpp` 的 22 点其实是 0）⇒ **只数代码不数注释**，重出 `tools/cr_family_plan.csv`；`post_kernel.hpp` 16 点、`wbres` 6 点、`requant` 4 点仍是候选。
+### 军规 141/142（入 B2）
+**141**：**JIT 缓存态是认证环境的一部分：每份读数必须标注 `cold`（专用空 `SYCL_CACHE_DIR`）或 `hot`（受管 `E:\DSH\sycl-cache`）**；**cold 是编译确定性的真值，hot 只用于历史可比**；**受管缓存要打包备份并记 md5**。
+**142**：**golden 的可复现性是门链权威性的前提**：一条门若只在某种缓存态下绿、且其 golden 无法从冷编译复现 ⇒ **该门在其它态下的 RED 不能当证据**；**重生成 golden 必须走反证链（所有历史件在该态下都匹配新 golden），并带 provenance**。
