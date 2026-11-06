@@ -2593,3 +2593,42 @@ first row=0 col=0  baseline=113  D=117
 ### 牙 2（期望关系先写死，walk 之后照它核）
 `[hop-total] bytes` 按 **touch 集**计（每闭包所有解析到活缓冲的 id，读写都算、含权重/图像输入）=> 与离线两张账的口径差应这样拆：`hop_budget.csv` 按面（保守）= **10,420 MB**；`hop_edges.csv` 按边 = **7,310 MB 读**（+对应写）；**预期 `[hop-total] >= 10,420 MB`，多出的部分必须能拆成 (i) 链外输入（权重/图像）被 touch、(ii) 同一面在同闭包读写双计、(iii) `pgraph_extra` 带进来的额外面 => 拆不平就是仪表错，不许拿"差不多"过**。
 ### 军规 124（入 B2）：**往引擎里批量插桩必须用"只插完整语句、不碰无 brace 控制体"的窄策略，并把拒插数如实报出来**，而不是事后修语法。正案：第一版贪插 199 处把 `if (x) call(); else …` 打断成 `else` 前多一条语句；回滚 HEAD 后用窄策略插 168 处（pf=137/mc=28/ms=2）拒插 20 处，`icx /fsycl /c` exit=0 errors=0。
+
+## 121. ★★★★★ **发射级仪表 walk 跑完：`tools/launch_map.csv`（691 行）+ `launch_by_recorder.csv`（20 行）——Q1/Q2/Q3 第一次有了实测数；但两个洞如实挂账（307 是下界；牙 2 没拆平）**
+### 建变体与两轮修仪表（都记账）
+`build_shipped.ps1 -Tag lcount{,2,3,4}`（`tools/shipped_build.defs` 基座、header guard `490647A9…` ✓）=> 产物只进 `builds\`：`libxmx_lcount4.dll` md5 **`B9D1C043…`**；**`out\libxmx.dll` 全程 `3BAECF2A…` 未动**。
+- ① **dump 挂在 capture 出口 => `g_cmds` 已被 move+clear => 全 0**；修 = **capture 时把 `g_cmds_launch`/`g_pg_ids_snap` 搬进 per-graph 向量、replay 出口按 graph id 打印**；
+- ② **一次 walk 里每个闭包体执行两遍（warm in-order + cgraph record）** => GA 读出 12 = 静态 6x2；修 = **游标只留 record 那一条 => 现在计的是 graph 节点数**（正确口径）。
+### 行为中性五连（同 build 门关/门开对照 + 多进程）=> 全过
+| 检查 | 门关 | 门开 |
+|---|---|---|
+| 1301 | `DD49827DD33A…` EXACT | EXACT |
+| `[vec-align]` | `cmds=691 touch=691 group=691 poolblk=691 idsnap=691 names=1382 => ALIGNED` | 同 |
+| `[skip-chains]` | `chains_skipped=14 refused=0 closures_noop=168 passes=691` | 同 |
+| `[poolseq-total]` | `gets=438 maxperclosure=7 hash=e62607c36a3c7410` | **hash 相同** |
+| 独立进程 | - | **4 进程 1301 md5 全等（distinct=1）** |
+帧时在带内（57.3-61.5 ms）。**40 门链没跑**（它打的是 `out\libxmx.dll`，不是变体）=> **这条挂在要求的 6) 上，没做就是没做**。
+### Q1 全帧一共多少次设备提交：**307**（`pf=307 / mc=0 / ms=0`）=> **graph 内 0 次 memcpy/memset，面搬运全在内核里**；**但这是下界**（见洞 1）。
+### Q3 平均每发多少钱（`RT_ms(上界)` 口径）
+| recorder | 闭包 | 提交 | RT_ms(上界) | **ms/发** |
+|---|---|---|---|---|
+| `gemm_window_int8_residual` | 52 | 69 | 12.946 | 0.188 |
+| `gemm` | 42 | 56 | 9.736 | 0.174 |
+| **`global_attention`** | 8 | **48** | 11.368 | **0.237** |
+| `gemm_int8_residual` | 68 | 34 | 22.471 | 0.661 |
+| `gemm_int8_qkv` | 53 | 31 | 12.632 | 0.407 |
+| `window_attention` | 45 | 31 | 12.288 | 0.396 |
+| `unary` | 16 | 16 | 2.761 | 0.173 |
+| `gemm_int8` | 24 | 10 | 5.259 | 0.526 |
+| `ffn` | 8 | 8 | 4.972 | 0.622 |
+| `ffn_merge` | 1 | 1 | 3.549 | 3.549 |
+⇒ **没有任何 recorder 落在"每发 < 0.02 ms"的记账级区间** => **"再写融合核值不值"不在记账层**；**提交密度第一是 `global_attention`（6 发/闭包 x 8 = 48 发）；面字节第一是 `gemm_int8_residual`（touch 5.72 GB）**。
+### Q2 还剩哪些"可消"的发射（点名）
+榜（按提交数）：`winres 69`、`gemm 56`、**`ga 48`**、`residual 34`、`qkv 31`、`window_attention 31`、`unary 16`。
+**ga 的 48 发 = 8 闭包 x 6 发**（pack Q / pack K^T / scores gemm / softmax / pack V / attnV-merge）=> **其中 4 发是 pack**（把 f16/int8 面重排一遍再喂 gemm）=> **pack -> gemm 边是单消费者、可并**；**softmax 前后各有跨 WG 归约 => 不可并**。**每条边的第二消费者判定要拿 `launch_map.csv` 的 ids 串起来核，这一份里没做。**
+### ★ 两个必须如实挂的洞
+1. **盲点 = 32 个拒插点**（窄策略拒的）：`gemm_int8_batched` **10**、`window_block` 6、`gemm_int8_qkv` 5、`window_attention` 3、`winres` 2、其余 6 => **后果当场可见：`gemm_int8_batched` 72 闭包读出 0 发、`window_block` 0 发、`quant` 80 闭包 0 发——它们的发射全在"无 brace 的 if/else 单语句体"里** => **307 是下界**；修 = 这 32 处机械加 brace（安全可核）再走一遍（GPU ~2 min）；
+2. **牙 2 未拆平**：census touch 集 = **940 个不同 plane id / 30.79 GB**，离线按面只算到 ~150 个中间面 / **10.42 GB** => 差额主因是**引擎把 pool scratch、权重 blob、版本化 id 都登记进 touch**（离线模型只认 plan 参数里的面）=> **口径不同、不是数值错**；要核平必须先把 940 个 id 归类（权重 / 中间面 / scratch）。**没归类之前 `[hop-total]` 不能与 `hop_budget` 对表**（已按规矩标红，没用"差不多"过）。
+### 军规 125/126（入 B2）
+**125**：**仪器有已知盲点时，它给出的"总数/排序"只能当下界用**，且在用它定刀之前必须先补盲点。正案：窄策略拒插 32 处 => `gemm_int8_batched`/`window_block`/`quant` 读出 0 发 => 307 是下界 => 先机械加 brace 再走一遍（~2 min GPU）。
+**126**：**hop 对表前必须先把 plane id 归类**（权重 / 中间面 / pool scratch / 版本化 id）：引擎 touch 集 940 个 id / 30.79 GB 与离线模型 ~150 面 / 10.42 GB 不是同一口径，**不归类就不能核平、也不能拿 [hop-total] 当收益底料**。

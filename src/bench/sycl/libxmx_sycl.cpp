@@ -151,8 +151,9 @@ static std::vector<LCount> g_cmds_launch;      // parallel to g_cmds (rule 57: t
 static int  g_lc_cur = -1;                     // the closure currently executing (-1 = not counting)
 static bool g_lcount_on = false;               // NR_LCOUNT gate, set in xmx_begin
 static long g_lc_skipped = 0;                  // launch sites the narrow policy refused to instrument
-#define LC_INC(field) do { if (g_lcount_on && g_lc_cur >= 0 && (size_t)g_lc_cur < g_cmds_launch.size()) \
-                            g_cmds_launch[(size_t)g_lc_cur].field++; } while (0)
+#define LC_INC(field) do { if (g_lcount_on && g_lc_vec && g_lc_cur >= 0 && (size_t)g_lc_cur < g_lc_vec->size()) \
+                            (*g_lc_vec)[(size_t)g_lc_cur].field++; } while (0)
+static std::vector<LCount>* g_lc_vec = nullptr;   // the counters of the graph currently replaying
 static void lc_begin(int i) { if (g_lcount_on) g_lc_cur = i; }
 static void lc_end()        { g_lc_cur = -1; }
 static void pg_note_ids(const std::initializer_list<int>& ids) {
@@ -2119,6 +2120,8 @@ static void rb_report(int graphid) {
 static std::vector<std::vector<std::function<void()>>> g_graphs;
 static std::vector<std::vector<const char*>> g_graph_names;
 static std::vector<std::vector<std::vector<void*>>> g_graph_touch;   // PGRAPH: per-graph touch sets
+static std::vector<std::vector<LCount>> g_graph_launch;              // #140: per-graph launch census
+static std::vector<std::vector<std::vector<int>>> g_graph_ids;       // #140: per-graph id snapshots
 #ifdef _WIN32
 static int fence_host_wait(void);   // defined in the fence block; graph_run calls it
 #endif
@@ -2230,24 +2233,29 @@ static void bmerge_order_report() {
 // capture time is invisible to it. This dump runs on the frozen vectors, after the reorder, so
 // the declared-set check (s6/k1_declare.md) can actually see the permutation. Presence-gated.
 static std::map<void*, size_t> g_ptr_ord;   // canonical pointer ordinals (rule 64)
-static void launch_hop_dump() {
+static void launch_hop_dump(int gid) {
     if (!getenv("NR_LCOUNT")) return;
-    size_t n = g_cmds.size();
-    size_t noff = g_cmd_names.size() >= n ? g_cmd_names.size() - n : 0;
-    if (g_cmds_launch.size() != n || g_pg_ids_snap.size() != n)
-        std::printf("[lcount] VECTOR-DESYNC launch=%zu cmds=%zu ids=%zu touch=%zu\n",
-                    g_cmds_launch.size(), n, g_pg_ids_snap.size(), g_cmds_touch.size());
+    if (gid < 0 || gid >= (int)g_graphs.size()) return;
+    size_t n = g_graphs[gid].size();
+    const std::vector<LCount>* L = ((size_t)gid < g_graph_launch.size() && g_graph_launch[gid].size() == n)
+                                   ? &g_graph_launch[gid] : nullptr;
+    const std::vector<std::vector<int>>* S = ((size_t)gid < g_graph_ids.size() && g_graph_ids[gid].size() == n)
+                                             ? &g_graph_ids[gid] : nullptr;
+    if (!L || !S)
+        std::printf("[lcount] VECTOR-DESYNC graph=%d launch=%zu ids=%zu closures=%zu\n", gid,
+                    (size_t)gid < g_graph_launch.size() ? g_graph_launch[gid].size() : 0, n,
+                    (size_t)gid < g_graph_ids.size() ? g_graph_ids[gid].size() : 0);
     long long tp = 0, tm = 0, ts = 0, thopN = 0; unsigned long long thopB = 0;
-    for (size_t i = 0; i < n && i < g_cmds_launch.size(); ++i) {
-        const LCount& L = g_cmds_launch[i];
-        size_t planes = i < g_pg_ids_snap.size() ? g_pg_ids_snap[i].size() : 0;
+    for (size_t i = 0; i < n; ++i) {
+        int pfx = L ? (*L)[i].pf : 0, mcx = L ? (*L)[i].mc : 0, msx = L ? (*L)[i].ms : 0;
+        size_t planes = S ? (*S)[i].size() : 0;
         unsigned long long bytes = 0;
-        if (i < g_pg_ids_snap.size())
-            for (int id : g_pg_ids_snap[i]) { auto it = g_bufs.find(id); if (it != g_bufs.end()) bytes += it->second.bytes; }
-        tp += L.pf; tm += L.mc; ts += L.ms; thopN += (long long)planes; thopB += bytes;
+        if (S) for (int bid : (*S)[i]) { auto it = g_bufs.find(bid); if (it != g_bufs.end()) bytes += it->second.bytes; }
+        tp += pfx; tm += mcx; ts += msx; thopN += (long long)planes; thopB += bytes;
         std::printf("[lcount] cmd=%zu name=%s pf=%d mc=%d ms=%d | [hop] planes=%zu bytes=%llu", i,
-                    noff + i < g_cmd_names.size() ? g_cmd_names[noff + i] : "?", L.pf, L.mc, L.ms, planes, bytes);
-        if (i < g_pg_ids_snap.size()) { std::printf(" ids="); for (int id : g_pg_ids_snap[i]) std::printf(" %d", id); }
+                    ((size_t)gid < g_graph_names.size() && i < g_graph_names[gid].size()) ? g_graph_names[gid][i] : "?",
+                    pfx, mcx, msx, planes, bytes);
+        if (S) { std::printf(" ids="); for (int bid : (*S)[i]) std::printf(" %d", bid); }
         std::printf("\n");
     }
     std::printf("[lcount-total] closures=%zu pf=%lld mc=%lld ms=%lld skipped_sites=%ld | [hop-total] planes=%lld bytes=%llu\n",
@@ -2286,13 +2294,14 @@ int xmx_graph_capture(void) {
     bmerge_order_apply();      // B step 2 (i): presence-gated REORDER (NR_BMERGE_ORDER), default off
     bmerge_order_report();     // what it moved, so the declared-set check has something to read
     pgraph_final_dump();       // the FROZEN touch sets, i.e. after any reorder -- [pgt] cannot show it
-    launch_hop_dump();         // the launch/hop census on the same frozen order (NR_LCOUNT)
     rb_report((int)g_graphs.size());      // NR_RES_BYTE census (no-op when the switch is unset)
     group_census_report((int)g_graphs.size());   // B step 1: report-only (NR_GROUP_TRACE)
     if (sp_on()) { std::printf("[scrpriv] versioned_ids=%zu extra_bytes=%zu (%.1f MiB)\n",
                     g_sp_live.size(), g_sp_extra_bytes, (double)g_sp_extra_bytes / 1048576.0); std::fflush(stdout); }
     g_graphs.push_back(std::move(g_cmds)); g_graph_names.push_back(std::move(g_cmd_names));
     g_graph_touch.push_back(std::move(g_cmds_touch)); g_cmds_touch.clear();
+    g_graph_launch.push_back(std::move(g_cmds_launch)); g_cmds_launch.clear();   // #140
+    g_graph_ids.push_back(std::move(g_pg_ids_snap)); g_pg_ids_snap.clear();      // #140
     g_cmds.clear();
     // B step 1 (knife2b #106): the record-time side vectors are PER-CAPTURE, exactly like
     // g_cmds/g_cmds_touch. g_cmd_names is the odd one out on purpose - it keeps growing across
@@ -2311,6 +2320,8 @@ int xmx_graph_run(int id) {
     if (id < 0 || id >= (int)g_graphs.size() || g_graphs[id].empty())
         FAILMSG("graph is not live");
     int passes = (int)g_graphs[id].size();
+    g_lc_vec = ((size_t)id < g_graph_launch.size() && g_graph_launch[id].size() == g_graphs[id].size())
+               ? &g_graph_launch[id] : nullptr;
     // The fence wait (section 90): the game calls nr_net_wait (which records the
     // pending fence via xmx_extmem_wait) then nr_net_run, same thread, in order
     // (NrPipeline.cpp:648/654). The shipped engine does a DEVICE-side wait (vkQueueSubmit
@@ -2332,7 +2343,7 @@ int xmx_graph_run(int id) {
             ms.reserve(g_graphs[id].size());
             int lci = 0;
             for (auto& fn : g_graphs[id]) {
-                lc_begin(lci++);
+                lc_begin(-1);   // not the record pass: not counted (see #141)
                 auto t0 = std::chrono::steady_clock::now();
                 fn();
                 lc_end();
@@ -2384,7 +2395,8 @@ int xmx_graph_run(int id) {
             }
             if (f) std::fclose(f);
             GQ->wait();   // the closures may enqueue without per-pass waits; drain before returning
-            return passes;
+            launch_hop_dump(id); // the census is filled by the run itself: print at the replay exit
+    return passes;
         }
         // DISPATCH-OVERHEAD PROBE (section 97): split the CPU enqueue cost from the GPU
         // drain cost. If the enqueue loop alone is ~290ms, the engine is CPU-bound on the
@@ -2401,7 +2413,7 @@ int xmx_graph_run(int id) {
             std::vector<double> en; en.reserve(g_graphs[id].size());
             int lce = 0;
             for (auto& fn : g_graphs[id]) {
-                lc_begin(lce++);
+                lc_begin(-1);   // submit probe: not counted
                 auto t0 = std::chrono::steady_clock::now();
                 fn();
                 lc_end();
@@ -2421,7 +2433,8 @@ int xmx_graph_run(int id) {
             for(auto&kv:v) std::printf("   %-34s %8.1f ms\n", kv.first.c_str(), kv.second);
             std::printf("[wb-route] TOTAL this run: v2-hits=%ld split-path-hits=%ld\n", g_wb_v2.load(), g_wb_split.load());
             std::fflush(stdout);
-            return passes;
+            launch_hop_dump(id); // the census is filled by the run itself: print at the replay exit
+    return passes;
         }
         // SECTION 98: command_graph replay (the §2④ "one submit, no CPU handshake" mandate).
         // begin_recording wraps the closure loop ONCE per graph id; the in_order queue infers
@@ -2484,7 +2497,8 @@ int xmx_graph_run(int id) {
                     usecgraph = false;
                 }
                 if (getenv("NR_SUBMIT_PROBE")) { std::printf("[wb-route] TOTAL this run: v2-hits=%ld split-path-hits=%ld\n", g_wb_v2.load(), g_wb_split.load()); std::fflush(stdout); }
-                return passes;
+                launch_hop_dump(id); // the census is filled by the run itself: print at the replay exit
+    return passes;
             }
         }
         // PGRAPH wave executor (NR_PGRAPH=2/4): after the warm run, replay the
@@ -2536,12 +2550,13 @@ int xmx_graph_run(int id) {
             }
             s_warmed.insert(id);
             if (getenv("NR_SUBMIT_PROBE")) { std::printf("[wb-route] TOTAL this run: v2-hits=%ld split-path-hits=%ld\n", g_wb_v2.load(), g_wb_split.load()); std::fflush(stdout); }
-            return passes;
+            launch_hop_dump(id); // the census is filled by the run itself: print at the replay exit
+    return passes;
         }
         pool_seq_begin(g_graphs[id].size());   // NR_POOLSEQ only; the WARM run sequence too
         for (size_t fi = 0; fi < g_graphs[id].size(); ++fi) {
             if (g_poolseq_on) g_pool_cur_closure = (int)fi;
-            lc_begin((int)fi); g_graphs[id][fi](); lc_end();     // in-order queue: same order
+            lc_begin(-1); g_graphs[id][fi](); lc_end();     // warm in-order pass: not counted
         }
         GQ->wait();                             // one host sync for the whole graph (was ~2000)
         pool_seq_end(id);
@@ -2572,6 +2587,7 @@ int xmx_graph_run(int id) {
             std::fflush(stdout);
         }
     }
+    launch_hop_dump(id); // the census is filled by the run itself: print at the replay exit
     return passes;
 }
 int xmx_graph_destroy(int id) {
