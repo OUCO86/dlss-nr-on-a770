@@ -2841,7 +2841,12 @@ int xmx_rec_pre(int colour, int motion, int history, int features, int plan,
         // #141 layer 1: explicit work-group size (0 = the shipped basic parallel_for). The guard
         // inside pre_at (pixel >= A.m) is what makes the rounded-up global range safe; the body,
         // its order and every value are untouched -- only the partition is fixed by construction.
-        static int pre_nt = getenv("NR_PRE_NT") ? atoi(getenv("NR_PRE_NT")) : 32;
+        static int pre_nt = getenv("NR_PRE_NT") ? atoi(getenv("NR_PRE_NT")) : 0;
+        // #142 (2026-11-06): engine-paired A/B in the SAME batch says an explicit NT=32 nd_range is
+        // +9.6% WORSE for pre (pass0 4.7/4.7/4.7 ms -> 5.1/5.2/5.1 ms, 3/3 pairs, byte-identical).
+        // The probe's region-bracket arm measured -5% for the same change: OPPOSITE SIGN. Rule now:
+        // promotion is decided by in-engine same-batch pairing; the probe localizes only.
+        // Default 0 = the shipped basic parallel_for. NR_PRE_NT=<n> still forces an nd_range.
         if (pre_nt > 0) {
             const size_t gr = ((size_t)pixels + (size_t)pre_nt - 1) / (size_t)pre_nt * (size_t)pre_nt;
             GQ->parallel_for(sycl::nd_range(sycl::range(gr), sycl::range((size_t)pre_nt)),

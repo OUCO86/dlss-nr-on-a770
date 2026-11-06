@@ -2658,3 +2658,38 @@ ocloc 活实例：`pre` = grf128/simd8/**private_size 608 B/线程**/SLM 0；`ch
 ### 军规 127/128（入 B2）
 **127**：**改引擎源的脚本必须二进制 / `newline=""` 读写并保持原 EOL**（HEAD = LF-only）：本案一次文本模式读写把整文件改成 CRLF，导致 `build_shipped.ps1` 里 `patch_testdefs.py` 的 LF 锚点 `PATCH FAILED exit=2`。
 **128**：**hop/流量账必须把 pool scratch 计入**：`[hop]` 只算 plan 命名面时漏掉 **1.50 GB/帧** 的 scratch 搬运（stem 单发 scr = 116,981,760 B，实际搬 ≈300 MB 而旧账只报 83.6 MB）；任何"离地板几倍"的判定都要用补了 scr 的口径。
+
+## 123. ★★★★★ **第 1 层交回（§9-§20）+ ★★ 一条自找的严重事实：HEAD 谱系比现出货件慢 +4.8 ms/帧——是已入库的仪表那串引进的回归，不是新刀造成的**
+### ★ HEAD 回归（`ab.ps1` v3 出货口径，清所有 NR_*，run0 丢、run1-3 中位、对序交替）
+| 配对 | A | B | 均值 ± CI95 | B 赢 |
+|---|---|---|---|---|
+| 现出货 vs **lcount14**（只带 §120-122 仪表、**无 pre 手术**）| `3BAECF2A` 57.2 | `0D4986C3` 62.0 | **+4.814 ± 0.298 ms** | **0/8** |
+| 现出货 vs **lcount18**（仪表 + pre 手术）| 57.3 | `12D8F862` 62.3 | **+4.943 ms** | 0/16 |
+| **lcount14 vs lcount18**（手术净效应，两侧都带仪表）| 62.1 | 62.0 | **-0.076 ± 0.332 ms** | 4/8 => **带内中性** |
+⇒ **+4.8 ms 是仪表串引进的回归**（passes 两侧都 691、结构相同）=> **必须先查掉再谈任何层的 ms**；二分下一刀 = `ab.ps1 -DllA lcount11 -DllB lcount14`（约 6 分钟），可把回归缩到 **scr 记账 / cs2 括号 / NT 开关** 三处之内。
+### ① 三臂配对（`l1_batch13`，引擎 RT 括号，3 对，三面逐字节 EXACT）
+A shipped：pre 4.7/4.7/4.7、stem 3.3/3.6/3.3；B pre 显式 `NT=32`：**5.1/5.2/5.1（+9.6%）**；C `NR_CHIP_LW16=1`：pre 不变、**stem 3.2/3.2/3.2（-0.2 ms）**。
+⇒ **NT 默认已改回 0**（`libxmx_sycl.cpp:2844`，`pe_l1nt0.py`，注释带三对读数与军规）；lcount14 过闸：非 fused 1301 **EXACT DD49827D**、`[vec-align]` 七条 ALIGNED、`pf=391`（+1 = 补的 cs2 括号）、fused 三面 EXACT。
+### ② Patch B（`pre` 的 cr_* 手术）：**位相同、指令 -97.1%、腿级 -93%，但出货帧不涨**
+- 改动：`pre_kernel.hpp` 在 `namespace prepass` 本地定义 `cr_mul/cr_add/cr_div = * / +`（遮蔽 `publish_kernel.hpp:21-22` 的 libdevice 包装），区间 `#pragma clang fp contract(off)`，**不写收尾 pragma**；
+- **四闸 EXACT**：非 fused 1301 `DD49827D`（A/B 各一次）；fused features `CACD2029` / 1301 `ADC96F5D` / result `872C70D0`（4 条腿一字不差）；
+- **GEN 指令**：`prepass::pre_kernel` **37,023 -> 1,089**；作用域审计（`l1_spill_census.py … ALL`，两份独立缓存逐核对照）：**除 pre 外无实质变化**（post +7、`gemm_int8_qkv` 28,513/47,075/1,392/21,991 完全相同、`vit_softmax`/`cosine_norm` 相同、`qr_*`/`pack_a_fused` ±1~4）=> **不泄漏**；**破 1301 的元凶 = 收尾的 `contract(fast)`**；
+- **腿级（RT 括号）**：pre **4.734/4.718 -> 0.296/0.330 ms**；stem/post 不动；**RT 括号其实很紧**：319 闭包 < 0.10 ms（均值 0.0093）、min 0.002 ms => **旧结论"RT 是毫秒级松上界"加修正标记**；
+- **出货口径**：**-0.076 ± 0.332 ms（4/8）= 带内中性** => **预登记线（<=-3.0 且 >=12/16）不达标 => 不转正**（件留 `builds\libxmx_lcount18.dll`）；
+- **原因（读数支持）**：出货 cgraph 里闭包重叠，**pre 不在关键路径**；关键路径大户是 **`ffn_merge 4.66 / window_block 4.22,4.14 / ffn_stem 3.14 / global_attention 2.45`**（RT 表）——**前三条都不在第 1 层**；
+- 非 fused `walk run` 口径第 1 对：A 179.8 / B 171.6 = **-8.2 ms**（串行跑就省得下来）=> **三套口径分开列（§19 定死格式）**。
+### ③ 地板模型修正（军规 130）
+`G`（请求量 154.85 MB）**作废**：新 pre 区域等效 **0.136 ms < G 地板 0.451 ms** => **L1/L2 吸收了 gather**，**分母只能用 DRAM 字节**。
+新倍数（@343 GB/s，统一到区域等效）：**pre 0.136/0.151 vs 0.104 = 1.31/1.45x ✅**；**stem 1.44/1.59 vs 0.926 = 1.55/1.72x ⚠**；合计 **1.53/1.69x**（旧 3.75x）。
+`NR_CHIP_LW16=1` 出货口径 8 对：**-0.158 ± 0.298 ms、4/8 => 带内中性**（腿级 -0.2 ms 被重叠吃掉大半）=> **stem 的 0.05-0.22x 缺口没能靠它闭合**。
+### ④ 第 1 层六条线判定（§20）
+**① fill 过**（pre 99.6-3,188%、chip<32> 400-800%、chip<16> 800-1,600%）；**② padding 过（0.0%）**；**③ 无下游重复 过**（ids 串）；**④ H2D/D2H = 0 过**（mc/ms = 0）；**⑤ 不比参考同层贵 过**（4 发 vs 5-7、0 拷贝 vs 3 拷贝 18.8 MB、腿级 1.6-3.9 ms vs 参考 3.7-4.8 ms）；
+**⑥ 离地板 <=1.5x：pre 到线、stem 差 0.05-0.22x => 第 1 层不结案**。
+### 军规 129/130/131（入 B2）
+**129**：**局部 `#pragma clang fp …` 是词法作用域，会覆盖同 TU 后续所有核**；写"局部"FP 开关必须成对恢复，并**用逐核 GEN 指令数对照证明没泄漏**。本案：在 header 末尾加收尾 `contract(fast)` 把下游全放开融合 => **非 fused 1301 变成 ADC96F5D（不等于 DD49827D），而 features 仍 EXACT** => **逐字节主闸必须是 1301（f32 流），f16 打包的 features 只能当辅助**。
+**130**：**"离地板几倍"必须用 DRAM 字节口径**；gather/请求量只能定位不能当分母。正案：pre 实测 0.136 ms 低于按请求量算的 0.451 ms 地板（L1/L2 吸收 gather）。另附 RT 修正：**RT 括号每发开销约 0.01 ms**（319 闭包 <0.10 ms、均值 0.0093、min 0.002），**同一 pre 在 RT 与区域两括号的膨胀系数 2.18** => **RT 是紧上界但按核不同，跨口径不可互换**。
+**131**：**出货 cgraph 的帧时由关键路径决定，非关键腿的腿级节省会被重叠吸收**：pre 腿级 -93%（-4.4 ms）在出货口径只值 -0.076 ± 0.332 ms（带内中性），而在非 fused `walk run` 串行口径值 -8.2 ms。**=> 任何刀的转正判据必须是出货口径帧配对；腿级/串行口径只能用于归因与定位关键路径大户（本案关键路径：ffn_merge 4.66、window_block 4.22/4.14、ffn_stem 3.14、global_attention 2.45）。**
+### 挂账（如实）
+探针 `l1_probe.exe` 的 VERIFY/STEM/BW 臂多次 20 分钟停摆 => 逐字节闸已改到引擎里做；`web_fetch` 三次失败（api.github/github/raw 连不上）；`refs/fsr-sdk` 里没有 FSR3 HLSL；`onednn-gpu`/`llama-sycl` 的 sparse 由父级拉起。
+### 变体清单（只进 builds）
+lcount11 `256A34B4`、12 `9DC7C527`、13 `D97A64EC`、**14 `0D4986C3`（NT 默认 0，过闸）**、15 `3CC3CF99`（Patch A）、16 `B765299D`（Patch B 泄漏版）、17 `080D6671`、**18 `12D8F862`（Patch B 修正版，四闸 EXACT）**。

@@ -62,3 +62,22 @@ closure whose only job is the move (the quant / quant_window legs from tools/rt_
 - The floor is a LOWER bound: it assumes the plane is written once and read once, contiguous, at the measured 560 GB/s.
 - Weights/images entering a chain from outside are NOT counted as hops (they are inputs, not intermediate state).
 - A closure marked FUSED still appears in the chain; its move cost is booked to the producer's store instead.
+
+
+## 口径注记（2026-11-06 13:1x，第 1 层铲，实测补上的洞）
+
+`[hop-total] bytes` 只登记 **plan 面**（`g_pg_ids_snap` 里能解析到活 buffer 的 id）。
+**pool 暂存面不在其中**，而它们是真实的芯片内搬运。仪表补了 `scr=` 列（`LCount.scr`，
+`pool_get` 的两条出口记账；纯打印侧，不碰调度用的 `g_cmds_touch`）。第 1 层实测：
+
+- `xmx_rec_ffn_stem`：planes 83,575,936 B + **scr 116,981,760 B**
+  （= dA 16.71 + dS 66.85 + dH16 33.42 MB，与源码逐项对上）
+  ⇒ 这一发实际搬运 ≈ **317.5 MB（写+读）**，旧的 hop 账只看见 83.6 MB ⇒ **低估 3.8 倍**。
+- **全帧 scr = 1,500,442,624 B（1.50 GB/帧）**；`[hop-total] planes bytes = 30,786,624,936`（30.79 GB，touch 口径）。
+
+⇒ **以后每一层的地板都要带 `scr` 这一列**；本文的 10,418 MB 面账与 18.6 ms 地板**不含**这 1.50 GB 暂存。
+
+读数出处：`E:\DSH\s6\L1_fused4.log`（lcount11）、`E:\DSH\s6\L1_gate3.log`。
+行为中性已证：1301 EXACT `DD49827DD33A7EF07C2C17892F18970D`、`[vec-align] … -> ALIGNED`、
+fused 三面锚点（features `CACD202969C821D87CBDC033879CA7AB` / 1301 `ADC96F5D272501BD8FB229EB732A4C70` /
+result `872C70D098DCA8CAAC9C3DE94665EFD7`）一字不变。

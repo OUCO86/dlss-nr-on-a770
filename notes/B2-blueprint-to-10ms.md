@@ -288,3 +288,6 @@ SM_LW | 分支=b1-wblock-resident（origin 已推）。
 126. **hop 对表之前必须先把 plane id 归类**（权重 / 中间面 / pool scratch / 版本化 id）。正案：引擎 touch 集 census = 940 个不同 plane id / 30.79 GB，而离线模型只认 plan 参数里的面 => ~150 个中间面 / 10.42 GB；两者不是同一口径，不归类就不能核平，也不能拿 [hop-total] 当收益底料。
 127. **改引擎源的脚本必须二进制 / newline="" 读写并保持原 EOL**（HEAD = LF-only 7257 行）。正案：一次文本模式读写把整文件从 LF 改成 CRLF => build_shipped.ps1 的 patch_testdefs.py（LF 锚点）PATCH FAILED exit=2。归位工具 s6/pe_lc_eol.py。
 128. **hop/流量账必须把 pool scratch 计入**：[hop] 只算 plan 命名面时漏掉 1.50 GB/帧 的 scratch 搬运（ffn_stem 单发 scr = 116,981,760B：dA+dS+dH16 逐项对上；该发实际搬 ≈300MB 而旧账只报 83.6MB）。任何"离地板几倍"的判定都要用补了 scr 的口径。修法是打印侧：LCount 加 scr 字段 + pool_get 两条出口记账，不碰调度用的 g_cmds_touch。
+129. **局部 #pragma clang fp … 是词法作用域，会覆盖同 TU 后续所有核**；写局部 FP 开关必须成对恢复，并用逐核 GEN 指令数对照证明没泄漏。正案：header 末尾加收尾 contract(fast) => 非 fused 1301 变 ADC96F5D（应等于 DD49827D），而 f16 打包的 features 仍 EXACT => 逐字节主闸必须是 1301（f32 流），features 只能当辅助。
+130. **"离地板几倍"必须用 DRAM 字节口径**；gather/请求量只能定位不能当分母。正案：pre 实测 0.136ms 低于按请求量算的 0.451ms 地板（L1/L2 吸收 gather）。附 RT 修正：RT 括号每发开销约 0.01ms（319 闭包 <0.10ms、均值 0.0093、min 0.002），同一 pre 在 RT 与区域两括号膨胀系数 2.18 => RT 是紧上界但按核不同，跨口径不可互换。
+131. **出货 cgraph 的帧时由关键路径决定，非关键腿的腿级节省会被重叠吸收**：pre 腿级 -93%（-4.4ms）在出货口径只值 -0.076±0.332ms（带内中性），非 fused walk run 串行口径值 -8.2ms。=> 任何刀的转正判据必须是出货口径帧配对；腿级/串行口径只用于归因与定位关键路径大户（本案关键路径：ffn_merge 4.66、window_block 4.22/4.14、ffn_stem 3.14、global_attention 2.45）。
