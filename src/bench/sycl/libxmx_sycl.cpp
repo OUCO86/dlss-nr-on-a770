@@ -6034,7 +6034,22 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                                 dWq, dWp, narrow ? (sycl::half*)Tgt : nullptr,
                                 narrow ? nullptr : (float*)Tgt, Bp, cp, qs,
                                 windows, height, width, across, top, left, epi, narrow, st, dKV);
-            if (dKV) pool_put(dKV);
+            if (dKV) {
+                // (A)-step1 工装 #153: the v4full stage ladder (stop_stage 5/6/8/9/10/11/12) writes its
+                // witness into dKV but nothing brought it home. This download runs ONLY when NR_V2_STOP is
+                // set, i.e. the kernel already stopped early -- no arithmetic changes on any shipping path.
+                static bool s_stagedone = false;
+                if (!s_stagedone) {
+                    s_stagedone = true;
+                    std::vector<sycl::half> hst((size_t)windows * 4096u);
+                    ev_sync(GQ->memcpy(hst.data(), dKV, hst.size() * 2));
+                    char nm[64]; std::snprintf(nm, sizeof nm, "wb_stage_%u.bin", st);
+                    FILE *fp = std::fopen(nm, "wb");
+                    if (fp) { std::fwrite(hst.data(), 2, hst.size(), fp); std::fclose(fp); }
+                    std::printf("[dump] wbv4 stage=%u halves=%zu (windows=%u)\n", st, hst.size(), windows);
+                }
+                pool_put(dKV);
+            }
             return;
         }
         // section 100 P1 v4ph route (POOL): separate kernel, the senior's fold outlet.
