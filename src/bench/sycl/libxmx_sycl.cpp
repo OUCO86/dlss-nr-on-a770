@@ -2934,10 +2934,16 @@ int xmx_rec_gemm_qkv(int a,int w,int q,int k,int v,int sc,unsigned M,unsigned ch
 //       V:   value = acc (no norm);
 //       publish = e4m3(value) -> half, scatter at=((window*heads+head)*tokens+token)*32 + c%32.
 // captured window_block uses heads==1, channels==32, tokens==64.
+namespace gemm_qkv_windowloc {
+static inline float cr_mul(float x, float y) { return x * y; }
+static inline float cr_add(float x, float y) { return x + y; }
+}   // #148 com2: plain-operator shadows for xmx_rec_gemm_qkv_window (no pragma, no division)
 int xmx_rec_gemm_qkv_window(int image, int weight, int q, int k, int v, int scale,
                             unsigned M, unsigned channels, unsigned heads, unsigned tokens,
                             unsigned width, unsigned height, unsigned across, unsigned pad,
                             unsigned image_mode) {
+    using gemm_qkv_windowloc::cr_mul;   // #148 com2: only this recorder's kernels see the shadows
+    using gemm_qkv_windowloc::cr_add;
     if (!g_recording) FAILMSG("not recording");
     if (!width || !height || !across || tokens != 64u || image_mode > 3u)
         FAILMSG("invalid window-gathered QKV projection (libxmx.c:2437)");
@@ -3058,8 +3064,14 @@ int xmx_rec_gemm_qkv_window(int image, int weight, int q, int k, int v, int scal
 // the 16-row tile; padded rows never published. 0x20000 is OR'd inside the Vulkan
 // wrapper (libxmx.c:2365), the plan-layer flags never carry it -- this op IS the adding
 // variant, so there is nothing to require and nothing to copy (section 74's guard lesson).
+namespace gemm_residualloc {
+static inline float cr_mul(float x, float y) { return x * y; }
+static inline float cr_add(float x, float y) { return x + y; }
+}   // #148 com2: plain-operator shadows for xmx_rec_gemm_residual (no pragma, no division)
 int xmx_rec_gemm_residual(int a, int b, int c, int skip, int cosine,
                           unsigned M, unsigned N, unsigned K, unsigned flags) {
+    using gemm_residualloc::cr_mul;   // #148 com2: only this recorder's kernels see the shadows
+    using gemm_residualloc::cr_add;
     if (!g_recording) FAILMSG("not recording");
     if (!M || !N || !K || (N % 16u) || (K % 16u))
         FAILMSG("gemm_residual f16 needs N%%16==0, K%%16==0 (our tile)");
@@ -3268,8 +3280,14 @@ static inline void ffn_tail_res(sycl::queue& q, const float* dSkip, const float*
         else        ((float*)Cout)[i] = qr_publish(epi, total);
     });
 }
+namespace ffnloc {
+static inline float cr_mul(float x, float y) { return x * y; }
+static inline float cr_add(float x, float y) { return x + y; }
+}   // #148 com2: plain-operator shadows for xmx_rec_ffn (no pragma, no division)
 int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine,
                 unsigned M, unsigned cin, unsigned hidden, unsigned groups, unsigned flags) {
+    using ffnloc::cr_mul;   // #148 com2: only this recorder's kernels see the shadows
+    using ffnloc::cr_add;
     if (!g_recording) FAILMSG("not recording");
     static int fst = getenv("NR_F_STOP") ? atoi(getenv("NR_F_STOP")) : 0;
     if (fst == 9) { g_cmd_names.push_back(__func__);pg_push([](){}); return 0; }   // P8-k ledger: ffn split pricing (time-only)
@@ -3433,9 +3451,15 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
 // (projection: gemm(hidden, projection->f32)+fma(raw merged, cosine[col], proj)->publish)
 // are the ffn structure's two legs, identical to xmx_rec_ffn_stem's B/C (section 88).
 // captured ffn_merge: 1 call, height=544 width=960 source_width=480, flags=0 (f32-out).
+namespace ffn_mergeloc {
+static inline float cr_mul(float x, float y) { return x * y; }
+static inline float cr_add(float x, float y) { return x + y; }
+}   // #148 com2: plain-operator shadows for xmx_rec_ffn_merge (no pragma, no division)
 int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projection,
                       int out, int cosine, unsigned height, unsigned width,
                       unsigned source_width, unsigned flags) {
+    using ffn_mergeloc::cr_mul;   // #148 com2: only this recorder's kernels see the shadows
+    using ffn_mergeloc::cr_add;
     if (!g_recording) FAILMSG("not recording");
     static int fst = getenv("NR_FM_STOP") ? atoi(getenv("NR_FM_STOP")) : 0;
     if (fst == 9) { g_cmd_names.push_back(__func__);pg_push([](){}); return 0; }   // P8-k ledger: ffn split pricing (time-only)
@@ -3962,11 +3986,21 @@ int xmx_rec_gemm_int8(int a, int b, int c, int a_scale, int b_scale,
 // die when the producer owns the layout, section 9's single world), then each group runs
 // v8's BN=64 loop in column blocks of 64 with a BN=32 tail (gemm32: v7's loop geometry,
 // raw int32 store), then the gated elementwise publish lands at the ldc-strided slot.
+// #148 family order-2 (2026-11-06 19:0x, parent-nominated): gemm_int8_batched -- 4 cr_mul/cr_add sites
+// in this recorder's body, 64 legs/frame. Same template as qkv1: a private namespace + block-scope
+// using-declarations, NO new pragma (the region opened by the smax cut already covers this file), and
+// division is never touched (军规 136; this recorder has 0 cr_div sites -- tools/cr_family_plan.csv).
+namespace batloc {
+static inline float cr_mul(float x, float y) { return x * y; }
+static inline float cr_add(float x, float y) { return x + y; }
+}
 int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
                               unsigned M, unsigned N, unsigned K, unsigned batch,
                               unsigned sa, unsigned sb, unsigned sc,
                               unsigned lda, unsigned ldb, unsigned ldc,
                               unsigned scale_stride, unsigned flags) {
+    using batloc::cr_mul;
+    using batloc::cr_add;
     if (!g_recording) FAILMSG("not recording");
     if (!M || !N || !K || !batch) FAILMSG("gemm_int8_batched needs M,N,K,batch nonzero");
     if ((N % 32u) || (K % 32u)) FAILMSG("gemm_int8_batched needs N%%32==0, K%%32==0");
@@ -4938,8 +4972,14 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
 // We reproduce THAT four-pass contract. Q/K/V are (heads,rows,32) half (the QKV
 // epilogue's output); merged is (rows, heads*32) half. rows is a multiple of 16 and
 // within the tokens' 64-block (the shipped guard); the tile pads rows to 16.
+namespace global_attentionloc {
+static inline float cr_mul(float x, float y) { return x * y; }
+static inline float cr_add(float x, float y) { return x + y; }
+}   // #148 com2: plain-operator shadows for xmx_rec_global_attention (no pragma, no division)
 int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
                              unsigned tokens, unsigned heads) {
+    using global_attentionloc::cr_mul;   // #148 com2: only this recorder's kernels see the shadows
+    using global_attentionloc::cr_add;
     if (!g_recording) FAILMSG("not recording");
     if (!rows || (rows % 16u) || !tokens || tokens > rows || !heads ||
         ((rows + 63u) / 64u) != ((tokens + 63u) / 64u))
@@ -5064,9 +5104,15 @@ int xmx_rec_quant_window(int source, int packed, int scale, unsigned M, unsigned
 // (bits 8-11) then writes half iff bit 12. qr_publish is the already-gated rounding
 // chain. kind = flags & 0xFF; the plan carries the FULL flags word in arg0 (e.g. 4364
 // = 0x110C = POOL2 | narrow | b-half), so `kind` here is really the whole flags.
+namespace unaryloc {
+static inline float cr_mul(float x, float y) { return x * y; }
+static inline float cr_add(float x, float y) { return x + y; }
+}   // #148 com2: plain-operator shadows for xmx_rec_unary (no pragma, no division)
 int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
                   unsigned channels, float p0, unsigned batch, unsigned sa,
                   unsigned sb, unsigned sc, unsigned k) {
+    using unaryloc::cr_mul;   // #148 com2: only this recorder's kernels see the shadows
+    using unaryloc::cr_add;
     if (!g_recording) FAILMSG("not recording");
     static int ustop = getenv("NR_U_STOP") ? atoi(getenv("NR_U_STOP")) : 0;
     if (ustop == 9) { g_cmd_names.push_back(__func__);pg_push([](){}); return 0; }
@@ -5317,9 +5363,15 @@ int xmx_rec_merge_heads(int source, int dst, unsigned windows, unsigned tokens,
 // the 0x20000 leg (resident.comp:635-639): value = half_round(half_round(load_a) *
 // scale[at]) -- the ViT's normalisation deferred to the merge (vit_softmax wrote the
 // per-row reciprocal). scale is float[windows*heads*tokens] indexed by `at`.
+namespace merge_heads_scaleloc {
+static inline float cr_mul(float x, float y) { return x * y; }
+static inline float cr_add(float x, float y) { return x + y; }
+}   // #148 com2: plain-operator shadows for xmx_rec_merge_heads_scale (no pragma, no division)
 int xmx_rec_merge_heads_scale(int source, int dst, int scale, unsigned windows,
                               unsigned tokens, unsigned channels, unsigned heads,
                               unsigned epilogue, unsigned narrow) {
+    using merge_heads_scaleloc::cr_mul;   // #148 com2: only this recorder's kernels see the shadows
+    using merge_heads_scaleloc::cr_add;
     if (!g_recording) FAILMSG("not recording");
     if (!windows || !tokens || !channels || !heads || (channels % 32u)) FAILMSG("bad merge_heads_scale dims");
     auto s = g_bufs.find(source), d = g_bufs.find(dst), sc = g_bufs.find(scale);
@@ -5353,9 +5405,15 @@ int xmx_rec_merge_heads_scale(int source, int dst, int scale, unsigned windows,
 //   if (second) HalfBuf(second).v[index] = float16_t(e4m3(merged))   -- the RAW published
 //     skip the block 70 head reads, e4m3 only (no gate), always half.
 // Same gather/publish as the unary UPSAMPLE_ADD branch, plus the second store.
+namespace unary2loc {
+static inline float cr_mul(float x, float y) { return x * y; }
+static inline float cr_add(float x, float y) { return x + y; }
+}   // #148 com2: plain-operator shadows for xmx_rec_unary2 (no pragma, no division)
 int xmx_rec_unary2(unsigned kind, int a, int b, int c, int d, int second, unsigned n,
                    unsigned channels, float p0, unsigned batch, unsigned sa,
                    unsigned sb, unsigned sc, unsigned k) {
+    using unary2loc::cr_mul;   // #148 com2: only this recorder's kernels see the shadows
+    using unary2loc::cr_add;
     if (!g_recording) FAILMSG("not recording");
     static int ustop = getenv("NR_U_STOP") ? atoi(getenv("NR_U_STOP")) : 0;
     if (ustop == 9) { g_cmd_names.push_back(__func__);pg_push([](){}); return 0; }
@@ -5708,10 +5766,16 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
 //   pooled = e4m3(0.25 * the four taps summed in order (token, token+8, token+1, token+9))
 //            at the half-resolution image index (the window's 16 pooled pixels).
 // pool needs even extents and pads (xmxres gemm_residual_pool guard).
+namespace gemm_window_residual_poolloc {
+static inline float cr_mul(float x, float y) { return x * y; }
+static inline float cr_add(float x, float y) { return x + y; }
+}   // #148 com2: plain-operator shadows for xmx_rec_gemm_window_residual_pool (no pragma, no division)
 int xmx_rec_gemm_window_residual_pool(int a, int b, int skip_out, int skip, int cosine,
                                       int pooled, unsigned M, unsigned N, unsigned K,
                                       unsigned flags, unsigned height, unsigned width,
                                       unsigned across, unsigned pad) {
+    using gemm_window_residual_poolloc::cr_mul;   // #148 com2: only this recorder's kernels see the shadows
+    using gemm_window_residual_poolloc::cr_add;
     if (!g_recording) FAILMSG("not recording");
     if (!height || !width || !across) FAILMSG("invalid pooled window residual");
     if (!M || !N || !K || (N % 16u) || (K % 16u) || (M % 64u))
