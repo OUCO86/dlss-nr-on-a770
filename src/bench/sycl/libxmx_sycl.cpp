@@ -3239,7 +3239,7 @@ int xmx_rec_gemm_int8_fused(int a,int b,int c,int as,int bs,unsigned M,unsigned 
 // A/B tests the occupancy hypothesis (the P8-n verdict said the chip's frame
 // cost is its latency chain at 1 WG/SM -- more resident WGs might hide it).
 #define CHIP_LW_DISPATCH(call32, call16) do { \
-    static bool lw16 = getenv("NR_CHIP_LW16") && atoi(getenv("NR_CHIP_LW16")) != 0; \
+    static bool lw16 = getenv("NR_CHIP_LW16") ? (atoi(getenv("NR_CHIP_LW16")) != 0) : true; \
     if (lw16) call16 ; else call32 ; \
 } while(0)
 static inline void ffn_tail_res(sycl::queue& q, const float* dSkip, const float* dC2,
@@ -3338,7 +3338,7 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
                 static bool chipcs = !getenv("NR_CHIP_CS") || atoi(getenv("NR_CHIP_CS")) != 0;   // ffn-20 CS2 colsplit pair-WG (bench 9/9 EXACT, -10%)
                 static bool ff9 = !getenv("NR_FF9") || atoi(getenv("NR_FF9")) != 0;
                 if (chipcs) {
-                    static bool lw16c = getenv("NR_CHIP_LW16") && atoi(getenv("NR_CHIP_LW16")) != 0;
+                    static bool lw16c = getenv("NR_CHIP_LW16") ? (atoi(getenv("NR_CHIP_LW16")) != 0) : true;
                     if (lw16c) ffnc::launch_ffn_chip_cs2<16,false>(*GQ, Araw, dEp, dPp, (float*)Cout, (int)M, Mp, skp, cp, half_skip, ff3, ff9);
                     else       ffnc::launch_ffn_chip_cs2<32,false>(*GQ, Araw, dEp, dPp, (float*)Cout, (int)M, Mp, skp, cp, half_skip, ff3, ff9);
                 } else
@@ -3527,7 +3527,7 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
             static bool ff9m = !getenv("NR_FF9") || atoi(getenv("NR_FF9")) != 0;
             static bool chipcsm = !getenv("NR_CHIP_CS") || atoi(getenv("NR_CHIP_CS")) != 0;
             if (chipcsm) {
-                static bool lw16m = getenv("NR_CHIP_LW16") && atoi(getenv("NR_CHIP_LW16")) != 0;
+                static bool lw16m = getenv("NR_CHIP_LW16") ? (atoi(getenv("NR_CHIP_LW16")) != 0) : true;
                 if (lw16m) ffnc::launch_ffn_chip_cs2<16,false>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp, false, ff3m, ff9m);
                 else       ffnc::launch_ffn_chip_cs2<32,false>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp, false, ff3m, ff9m);
             } else
@@ -3712,7 +3712,7 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
             if (chipres3) {
                 static bool chipcss = !getenv("NR_CHIP_CS") || atoi(getenv("NR_CHIP_CS")) != 0;
                 if (chipcss) {
-                    static bool lw16s = getenv("NR_CHIP_LW16") && atoi(getenv("NR_CHIP_LW16")) != 0;
+                    static bool lw16s = getenv("NR_CHIP_LW16") ? (atoi(getenv("NR_CHIP_LW16")) != 0) : true;
                     if (lw16s)ffnc::launch_ffn_chip_cs2<16,false>(*GQ, dH16, dB2, dPp3, (float*)Cout, (int)M, Mp, dS, cp);
                     else       {  ffnc::launch_ffn_chip_cs2<32,false>(*GQ, dH16, dB2, dPp3, (float*)Cout, (int)M, Mp, dS, cp); }
                 } else
@@ -4968,11 +4968,9 @@ int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
         // scratch, 33MB/call at rows=2040) AND the pack_a16_b pass both vanish.
         // Gate NR_GA_TILE (default ON once the three gates pass; =0 escape hatch).
         static bool gat = !getenv("NR_GA_TILE") || atoi(getenv("NR_GA_TILE")) != 0;
-        if (gat && (rows % 16u) == 0u && Mp == (int)rows)GQ->parallel_for(sycl::range((size_t)heads * rows),
-                             smax::vit_softmax_tiled()(dScores, dAp, dRecip, heads * rows, tokens, rows)); else {
+        if (gat && (rows % 16u) == 0u && Mp == (int)rows)smax::launch_vit_softmax_tiled(*GQ, sycl::range((size_t)heads * rows), dScores, dAp, dRecip, heads * rows, tokens, rows); else {
             dProbs = (sycl::half*)pool_get(sc * 2);   // split escape only
-             GQ->parallel_for(sycl::range((size_t)heads * rows),
-                             smax::vit_softmax_kernel()(dScores, dProbs, dRecip, heads * rows, tokens, rows));
+             smax::launch_vit_softmax_kernel(*GQ, sycl::range((size_t)heads * rows), dScores, dProbs, dRecip, heads * rows, tokens, rows);
             // attnV leg: P(rows x rows) @ V(rows x 32) -> rows x 32. V stored (rows,32)=(K,N).
              packdev::pack_a16_b(*GQ, dProbs, dAp, (int)rows, Mp, (int)rows, (int)heads);
         }

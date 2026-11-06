@@ -25,6 +25,12 @@
 #include "cosine_tree_kernel.hpp"   // cr_hadd, cr_hmul (the half-domain add/mul)   // qr_half_round, cr_mul, cr_add, qr_e4m3, qr_e4m3_scalar
 
 namespace smax {
+// #146 (layer-2 family #1, 2026-11-06): local correctly-rounded shadows + contraction off for this
+// region only. L1SMAX marks the site for the ledger.
+#pragma clang fp contract(off)
+static inline float cr_mul(float a, float b) { return a * b; }
+static inline float cr_add(float a, float b) { return a + b; }
+static inline float cr_div(float a, float b) { return a / b; }
 
 static const float SOFT_SCALE     = 0.044921875f;
 static const float SOFT_BIAS      = 1.30078125f;
@@ -76,7 +82,7 @@ inline auto softmax_kernel() {
             // totals rounded to half (the astype(f16) of the sum), then the reciprocal is
             // a plain IEEE f32 divide + one round to half (golden :237-239).
             float trh = (float)sycl::half(total);
-            float recip = (float)sycl::half(sycl::ext::intel::math::fdiv_rn(1.0f, trh));
+            float recip = (float)sycl::half(cr_div(1.0f, trh));
             for (unsigned c = 0; c < cols; ++c) {
                 float w = (float)outr[c];
                 outr[c] = sycl::half(qr_e4m3(qr_half_round(cr_mul(w, recip))));
@@ -126,7 +132,7 @@ inline auto softmax_i8_kernel() {
                 wrow[c] = h0; wrow[c + 1u] = h1;
             }
             float trh = (float)sycl::half(total);
-            float recip = (float)sycl::half(sycl::ext::intel::math::fdiv_rn(1.0f, trh));
+            float recip = (float)sycl::half(cr_div(1.0f, trh));
             float rmax = 0.0f;
             for (unsigned c = 0; c < cols; ++c) {
                 float x = qr_half_round(cr_mul((float)wrow[c], recip));
@@ -195,7 +201,7 @@ inline auto vit_softmax_kernel() {
             }
             unsigned padding = blocks * 64u - tokens;
             if (padding > 0u) total = ctree::cr_hadd(total, -ctree::cr_hmul(zero, (float)padding));
-            recip[r] = qr_half_round(sycl::ext::intel::math::fdiv_rn(1.0f, total));
+            recip[r] = qr_half_round(cr_div(1.0f, total));
             sycl::half* outr = dst + (size_t)r * stride;
             for (unsigned k = 0; k < stride; ++k)
                 outr[k] = sycl::half(k < tokens ? qr_e4m3(vit_weight(row[k])) : 0.0f);
@@ -238,7 +244,7 @@ inline auto vit_softmax_tiled() {
             }
             unsigned padding = blocks * 64u - tokens;
             if (padding > 0u) total = ctree::cr_hadd(total, -ctree::cr_hmul(zero, (float)padding));
-            recip[r] = qr_half_round(sycl::ext::intel::math::fdiv_rn(1.0f, total));
+            recip[r] = qr_half_round(cr_div(1.0f, total));
             // tile addressing: head h = r / rows_, row_local srow = r % rows_ where
             // rows_ = stride (the gemm's M == K == rows; one head's block).
             unsigned rows_ = stride;
@@ -254,5 +260,21 @@ inline auto vit_softmax_tiled() {
             }
         };
     };
+}
+
+// #145 (军规 132): launch wrappers with the census tick at entry. The kernel type is
+// unchanged, so the GEN instruction census stays comparable; the recorder no longer writes a
+// parallel_for at the call site, and nothing is wrapped around a launch.
+static inline void launch_vit_softmax_tiled(sycl::queue& q, sycl::range<1> r, const float* src,
+                                            sycl::half* Ap, float* recip,
+                                            unsigned nrows, unsigned tokens, unsigned stride) {
+    LC_TICK();
+    q.parallel_for(r, vit_softmax_tiled()(src, Ap, recip, nrows, tokens, stride));
+}
+static inline void launch_vit_softmax_kernel(sycl::queue& q, sycl::range<1> r, const float* src,
+                                             sycl::half* dst, float* recip,
+                                             unsigned nrows, unsigned tokens, unsigned stride) {
+    LC_TICK();
+    q.parallel_for(r, vit_softmax_kernel()(src, dst, recip, nrows, tokens, stride));
 }
 } // namespace smax

@@ -2712,3 +2712,32 @@ lcount11 `256A34B4`、12 `9DC7C527`、13 `D97A64EC`、**14 `0D4986C3`（NT 默�
 ### 40 门冲突已按纪律停手（正确处置）
 `tools/dsh_run_gates.sh` 的 40 门全部加载 `E:/DSH/oneapi/libxmx_sycl.dll`（staged 工件），而纪律写死加载位不许子代理动 => **两条指令冲突，它按纪律行停手**。**staged 与复原由父级做**，期望 **39 GREEN / 1 RED（`gate_libxmx_sycl` 身份守卫按设计）**。
 ### 军规 132（入 B2）：**在设备发射点周围新增语句/块会改变主机侧 SYCL/L0 发射辅助的内联与布局，实测每发约 +7 us；690 发 = +4.9 ms/帧**。**插桩必须放进发射 helper 入口或独立函数，绝不在 `GQ->parallel_for(...)` 外包 `{}` 或加前置语句**。正案：§121 一次提交 = +4.95 ms/帧，被当成"刀无效"排查了约两小时；修法 = 删 186 个 `LC_INC` 语句 + 解开 15 个 `if/else` 括号，`LC_TICK()` 进 90 个 helper 入口，**pf 覆盖率反而从 390/547 升到 514/752**。
+
+## 125. ★★★★★ **第 2 层第一刀转正 => 帧 57.3 -> 56.3 ms（-1.074 ms、8/8 全胜）**。这是 A5 以来第一次帧上进账，而且**输出逐位相同（无画质风险）**
+### 转正的两件（都位相同）
+1. **`softmax_kernel.hpp` 的 `cr_*` 手术**（+26/-4 行：本地 `cr_mul/cr_add/cr_div` 遮蔽 `publish_kernel.hpp:21-22` 的 libdevice 正确舍入包装 + `#pragma clang fp contract(off)` 区间、**无收尾 pragma**、4 处 `fdiv_rn` -> `cr_div`）；
+2. **`NR_CHIP_LW16` 默认 ON**（四处判定 `libxmx_sycl.cpp:3242/3341/3530/3715` 改成 `getenv(...) ? (...) : true`，**保留 `=0` 逃生**；符合军规 59：转正的刀必须默认生效）。
+### 读数（出货口径 `ab.ps1` 同批配对，`-Pairs 8 -Runs 4`）
+```
+pair 1 A=57.300 B=56.320 -0.980    pair 5 A=57.080 B=56.320 -0.760
+pair 2 A=57.900 B=56.480 -1.420    pair 6 A=57.530 B=56.250 -1.280
+pair 3 A=57.550 B=56.320 -1.230    pair 7 A=57.290 B=56.250 -1.040
+pair 4 A=57.100 B=56.590 -0.510    pair 8 A=57.760 B=56.390 -1.370
+== 8 对：B 赢 8 / 负 0，均值 -1.074 ms；passes A/B = 691/691
+```
+**子代理侧更早的独立读数**：`lcount29`（只带 smax 刀）16 对 **-0.489 ms、15/16、CI95 ±0.183**；复合（`lcount29` + `NR_CHIP_LW16=1`）16 对 **-0.693 ms、14/16、CI95 ±0.298**；**叠加性**：预测 -0.674 vs 实测 -0.693（差 0.019 在 CI 内）=> **两把刀线性叠加**。**我这次建的是"两处都在默认里"的正式件，实测 -1.074 比复合 env 读数更好（件面不同：正式件走 `build_shipped.ps1` 的 defs 基座）。**
+### 腿级与机制（第 2 层第一刀的归因）
+- **腿级**：`global_attention` 八条腿 **2.19-2.69 -> 1.39-1.66 ms（每腿 -42%，串行合计 -8.1 ms）**；该路径 `passes=693 total` **148-168 -> 139-153 ms**；`window_block` 等其它大户两侧同值；
+- **机制钉死（逐 ELF 实例对照，`s6/l1_per_instance.py`）**：GA 实际跑的 `vit_softmax_tiled`（`…NS_4itemILi1ELb1EEEE_`）在 c29 里**新增一个小编译形**：`12,793 行/6,981 ops` -> 新增 `9,385/5,191`（**行数 -26.6%、ops -25.6%**）；包装形同型；`softmax_kernel`/`softmax_i8_kernel` 多出一条 **`simd_size=32`** 编译形；**不调包装的 `smax_esimd`/`smax_esimd_tiled` 一字不差（474/507 行）=> 手术边界正好落在该落的地方**；
+⇒ **GA 腿级 -42% 是直接效应**；**§24d/§24e 里"码代没变 / 占用耦合间接效应"两句撤回作废**；
+- **估值更正**：**softmax 在 GA 的 `RT 18.96 ms` 里只占约 42%**（不是"整族可省 95%"）；`tools/instr_census_c29.csv` 显示**新形仍有 5,191 ops、其中 fixup 占 62%** => **这些包装链在共享 helper（`publish_kernel.hpp` 的 `qr_half_round/qr_e4m3/qr_publish`）里，家族级遮蔽碰不到** => **下一族 = 根手术**。
+### 四闸与门链（转正前必过，全过）
+- **非 fused 1301 = `DD49827DD33A7EF07C2C17892F18970D` EXACT**（gate40_p1/p2/p3 三次）；**fused 三面 `CACD2029` / `ADC96F5D` / `872C70D0` EXACT**；`[vec-align]` ALIGNED；`[skip-chains] 14/0/168/691`；`scr` 1,287,057,408 / 1,500,442,624 一字不差；
+- **40 门**：staged 变体阶段 **39 GREEN / 1 RED（`gate_skip_graph` 身份守卫按设计）**；**正式件写入两槽 + 更新 `out/SHIPPED_MD5.txt` 之后：`gates: 40 GREEN / 0 RED`**；
+- **逐核 GEN 对照**：270 个核里只有 1 个差 +1 条（JIT 噪声）；`pf` 覆盖率：非 fused **522**、fused **760**（GA 的 pf 5 -> 6）。
+### 现场（新 ladder）**
+**加载位 `out\libxmx.dll` = `oneapi\libxmx_sycl.dll` = `B7CBE3A2AAED575984709097E98DB18D`（3,949,056 B）**；`out/SHIPPED_MD5.txt` = `b7cbe3a2aaed575984709097e98db18d`（**文件自身 md5 = `D427C836`**）；三金标 `DD49827D / DD49827D / 249A46F3` 未动；回退件 `builds\libxmx_pre-shiplw1-3BAECF2A.keep`、`builds\libxmx_sycl_3BAECF2A.keep`、`builds\backup_pre-gate-25.dll`、`out\libxmx.before-ATT5.keep`（`ABB969FE`）。
+**帧阶梯更新：63.5 -> 58.5（1a -3.0、T2 -4.8）-> 57.3（A5 -1.251）-> 56.3（smax 刀 + LW16，-1.074）**
+### 军规 134/135（入 B2）
+**134**：**JIT 缓存里同一核名可以有多份编译形；核级对照必须逐实例列（全名、不去重、不截断），并且要比指令数/操作数，不能只比资源元组**。正案：两个对照工具按名字去重（一个取 max、一个比 `ze_info` 资源集合）=> 把 -26% 读成 0%；且新旧形 `grf/simd/eu` 完全相同（128/8/8），资源集合比较看不出差异。
+**135**：**libdevice 正确舍入包装（`fmul_rn/fadd_rn/fdiv_rn`）在核内展开成整数 fixup 链，是本项目目前最大的单机制**：`pre` 37,023 -> 1,089 条（-97%）、腿级 -93%；`vit_softmax_tiled` 新增小编译形 ops -25.6%、GA 每腿 -42%、**帧 -1.074 ms（8/8）**。**修法是"家族内本地遮蔽 + `#pragma clang fp contract(off)` 区间、不写收尾 pragma"，逐位不变**；**共享 helper（`publish_kernel.hpp`）里的包装需要根手术**（`instr_census_c29.csv`：新形 5,191 ops 里 **62% 仍是 fixup**）。
