@@ -146,14 +146,21 @@ static std::vector<std::vector<int>> g_pg_ids_snap;      // per-closure id snaps
 // a counter is inserted only in front of a call that starts a COMPLETE statement (the line ends in
 // ';' or '{') and whose previous statement is not an unbraced if/else head. Sites that fail that
 // test are counted into g_lc_skipped and reported, so the census states its own blind spots.
-struct LCount { int pf = 0, mc = 0, ms = 0; };
+struct LCount { int pf = 0, mc = 0, ms = 0; long long scr = 0; };   // scr = pool-scratch bytes handed to this closure at run
 static std::vector<LCount> g_cmds_launch;      // parallel to g_cmds (rule 57: the fifth vector)
+// #141 (layer-1 census): the SIXTH per-capture vector. The recorder pushes its own name on the
+// line before pg_push, so snapshotting it here makes name<->numbers drift-proof. g_cmd_names keeps
+// growing across recordings and is addressed through name_offset, which is one entry off when a
+// closure is recorded exactly once (the fused pre: pre_done refuses the second recording).
+static std::vector<const char*> g_cmds_name;
 static int  g_lc_cur = -1;                     // the closure currently executing (-1 = not counting)
 static bool g_lcount_on = false;               // NR_LCOUNT gate, set in xmx_begin
 static long g_lc_skipped = 0;                  // launch sites the narrow policy refused to instrument
 #define LC_INC(field) do { if (g_lcount_on && g_lc_vec && g_lc_cur >= 0 && (size_t)g_lc_cur < g_lc_vec->size()) \
                             (*g_lc_vec)[(size_t)g_lc_cur].field++; } while (0)
 static std::vector<LCount>* g_lc_vec = nullptr;   // the counters of the graph currently replaying
+#define LC_ADD(field, v) do { if (g_lcount_on && g_lc_vec && g_lc_cur >= 0 && (size_t)g_lc_cur < g_lc_vec->size()) \
+                            (*g_lc_vec)[(size_t)g_lc_cur].field += (v); } while (0)
 static void lc_begin(int i) { if (g_lcount_on) g_lc_cur = i; }
 static void lc_end()        { g_lc_cur = -1; }
 static void pg_note_ids(const std::initializer_list<int>& ids) {
@@ -190,6 +197,7 @@ static void pg_push(std::function<void()> f) {
     g_cmds_group.push_back(g_group_cur);          // rule 57: the fourth vector
     g_pg_ids_snap.push_back(g_pg_pending_ids);
     g_cmds_launch.push_back(LCount());              // rule 57: the fifth vector, same length/order
+    g_cmds_name.push_back(g_cmd_names.empty() ? "?" : g_cmd_names.back());   // #141: the sixth
     if (g_pg_curblk) g_cmds_poolblk.push_back(*g_pg_curblk);
     else g_cmds_poolblk.push_back(std::vector<void*>{});   // planning run not wired yet (#106)
     // NR_PG_TOUCHDUMP (knife2b #93): presence-gated record-time dump of every closure's touch
@@ -205,6 +213,7 @@ static void pg_push(std::function<void()> f) {
         std::printf("\n");
     }
     g_pg_pending.clear();
+    g_pg_pending_ids.clear();   // #141: the id mirror must not leak into the NEXT closure's snapshot
 }
 static bool pgraph_conflict(const std::vector<void*>& a, const std::vector<void*>& b) {
     for (void* x : a) if (x == (void*)-1) return true;
@@ -569,11 +578,13 @@ static void* pool_get(size_t n) {
         if (p) g_pool_sz[p] = { bucket, g_pg_slot & 3 };
         if (p && bucket >= (16ull<<20)) mem_probe(-1, p, bucket, "POOL");  // D11 census
         pool_seq_note(0, p, bucket);
+        if (p) LC_ADD(scr, (long long)bucket);   // #141 hop census: scratch this closure holds
         return p;
     }
     void* p = it->second.back(); it->second.pop_back();
     g_pool_sz[p] = { bucket, g_pg_slot & 3 };
     pool_seq_note(0, p, bucket);
+    LC_ADD(scr, (long long)bucket);   // #141 hop census: scratch this closure holds
     return p;
 }
 
@@ -1525,7 +1536,7 @@ int xmx_begin(void) { g_lcount_on = getenv("NR_LCOUNT") != nullptr; g_lc_cur = -
     // scratch recording, then OP_XMX_ABORT, then the kept recording) and the census runs at
     // capture time -- so at that moment the new vectors still held both recordings (1382) while
     // g_cmds held only the kept one (691). That is the same class of bug as section 85.
-    g_cmds_group.clear(); g_cmds_poolblk.clear(); g_pg_ids_snap.clear(); g_cmds_launch.clear();
+    g_cmds_group.clear(); g_cmds_poolblk.clear(); g_pg_ids_snap.clear(); g_cmds_launch.clear(); g_cmds_name.clear();
     // AUDIT FIX (10-27): the fold registries are RECORD-scoped (qcmd = an index into
     // g_cmds). A stale entry from a PREVIOUS recording -- scratch/probe recordings, or
     // a plan switch (768x448 <-> 960x544, different op streams) -- could dissolve the
@@ -1536,7 +1547,7 @@ int xmx_begin(void) { g_lcount_on = getenv("NR_LCOUNT") != nullptr; g_lc_cur = -
     s6_reset();   // S6: the chain candidate's cmd indices are RECORD-scoped
     return 0; }
 int xmx_abort(void) { g_recording = false; g_cmds.clear(); g_cmds_touch.clear();
-    g_cmds_group.clear(); g_cmds_poolblk.clear(); g_pg_ids_snap.clear(); g_cmds_launch.clear();
+    g_cmds_group.clear(); g_cmds_poolblk.clear(); g_pg_ids_snap.clear(); g_cmds_launch.clear(); g_cmds_name.clear();
     g_quant_pk.clear(); g_fused_quant.clear();
     g_pending_fold_slot = SIZE_MAX; g_fold_slot.clear();
     s6_reset();
@@ -1849,8 +1860,8 @@ static void bmerge_apply(std::vector<std::function<void()>>& cmds) {
                     // reads chain k's residual output, so moving that write later poisons the image).
                     static int keep = getenv("NR_BMERGE_KEEP") ? atoi(getenv("NR_BMERGE_KEEP")) : 0;
                     if (keep)
-                        s8v8::gemm_b_res(*GQ, dAp, dBp, s.Cout, s.as, s.bs, s.skp, s.cp,
-                                         s.M, s.Mp, s.N, s.K, s.narrow, s.half_skip, s.epi);
+                        { LC_INC(pf); s8v8::gemm_b_res(*GQ, dAp, dBp, s.Cout, s.as, s.bs, s.skp, s.cp,
+                                         s.M, s.Mp, s.N, s.K, s.narrow, s.half_skip, s.epi); }
                     if (put_back_now) pool_put(dAp);
                     if ((int)gr->held.size() < gr->n) return;      // gemm deferred to the last member
                     // The descriptor table must NOT come from the scratch pool: a pool block is
@@ -2122,6 +2133,7 @@ static std::vector<std::vector<const char*>> g_graph_names;
 static std::vector<std::vector<std::vector<void*>>> g_graph_touch;   // PGRAPH: per-graph touch sets
 static std::vector<std::vector<LCount>> g_graph_launch;              // #140: per-graph launch census
 static std::vector<std::vector<std::vector<int>>> g_graph_ids;       // #140: per-graph id snapshots
+static std::vector<std::vector<const char*>> g_graph_name;           // #141: per-graph aligned names
 #ifdef _WIN32
 static int fence_host_wait(void);   // defined in the fence block; graph_run calls it
 #endif
@@ -2136,14 +2148,15 @@ static int fence_host_wait(void);   // defined in the fence block; graph_run cal
 static void group_census_report(int graph_idx) {
     if (!getenv("NR_GROUP_TRACE")) return;
     size_t n = g_cmds.size();
-    std::printf("[vec-align] graph=%d cmds=%zu touch=%zu group=%zu poolblk=%zu idsnap=%zu || names=%zu name_offset=%zu",
+    std::printf("[vec-align] graph=%d cmds=%zu touch=%zu group=%zu poolblk=%zu idsnap=%zu launch=%zu name=%zu || names=%zu name_offset=%zu",
                 graph_idx, n, g_cmds_touch.size(), g_cmds_group.size(),
-                g_cmds_poolblk.size(), g_pg_ids_snap.size(), g_cmd_names.size(),
+                g_cmds_poolblk.size(), g_pg_ids_snap.size(), g_cmds_launch.size(), g_cmds_name.size(), g_cmd_names.size(),
                 g_cmd_names.size() >= n ? g_cmd_names.size() - n : 0);
     // the FIVE per-capture vectors must be the same length (rule 57); g_cmd_names is the
 // shipped exception on purpose (it accumulates both recordings; name_offset points at this one)
     bool ok = (n == g_cmds_touch.size() && n == g_cmds_group.size()
-             && n == g_cmds_poolblk.size() && n == g_pg_ids_snap.size());
+             && n == g_cmds_poolblk.size() && n == g_pg_ids_snap.size()
+             && n == g_cmds_launch.size() && n == g_cmds_name.size());
     std::printf(" -> %s\n", ok ? "ALIGNED" : "REFUSED: record-time vectors are NOT the same length");
     if (!ok) { std::fflush(stdout); return; }
     std::map<std::string, std::vector<size_t>> fam;
@@ -2211,6 +2224,7 @@ static void bmerge_order_apply() {
         move_at(g_cmds, 0); move_at(g_cmds_touch, 0); move_at(g_cmds_group, 0);
         move_at(g_cmds_poolblk, 0); move_at(g_pg_ids_snap, 0); move_at(g_cmd_names, noff);
         move_at(g_cmds_launch, 0);
+        move_at(g_cmds_name, 0);   // #141: the sixth vector moves with the rest
         g_order_moves.push_back(std::make_pair(from, to));
     }
 }
@@ -2241,25 +2255,37 @@ static void launch_hop_dump(int gid) {
                                    ? &g_graph_launch[gid] : nullptr;
     const std::vector<std::vector<int>>* S = ((size_t)gid < g_graph_ids.size() && g_graph_ids[gid].size() == n)
                                              ? &g_graph_ids[gid] : nullptr;
-    if (!L || !S)
+    const std::vector<const char*>* N = ((size_t)gid < g_graph_name.size() && g_graph_name[gid].size() == n)
+                                        ? &g_graph_name[gid] : nullptr;
+    size_t noff = (g_cmd_names.size() >= n) ? g_cmd_names.size() - n : 0;
+    if (!L || !S || !N)
         std::printf("[lcount] VECTOR-DESYNC graph=%d launch=%zu ids=%zu closures=%zu\n", gid,
                     (size_t)gid < g_graph_launch.size() ? g_graph_launch[gid].size() : 0, n,
                     (size_t)gid < g_graph_ids.size() ? g_graph_ids[gid].size() : 0);
-    long long tp = 0, tm = 0, ts = 0, thopN = 0; unsigned long long thopB = 0;
+    long long tp = 0, tm = 0, ts = 0, thopN = 0, tnoop = 0, tscr = 0; unsigned long long thopB = 0;
     for (size_t i = 0; i < n; ++i) {
         int pfx = L ? (*L)[i].pf : 0, mcx = L ? (*L)[i].mc : 0, msx = L ? (*L)[i].ms : 0;
+        long long scx = L ? (*L)[i].scr : 0; tscr += scx;
         size_t planes = S ? (*S)[i].size() : 0;
         unsigned long long bytes = 0;
         if (S) for (int bid : (*S)[i]) { auto it = g_bufs.find(bid); if (it != g_bufs.end()) bytes += it->second.bytes; }
         tp += pfx; tm += mcx; ts += msx; thopN += (long long)planes; thopB += bytes;
-        std::printf("[lcount] cmd=%zu name=%s pf=%d mc=%d ms=%d | [hop] planes=%zu bytes=%llu", i,
-                    ((size_t)gid < g_graph_names.size() && i < g_graph_names[gid].size()) ? g_graph_names[gid][i] : "?",
-                    pfx, mcx, msx, planes, bytes);
+        int noop = g_skipped_cmds.count(i) ? 1 : 0; tnoop += noop;
+        const char* lbl = ((size_t)gid < g_graph_names.size() && noff + i < g_graph_names[gid].size())
+                          ? g_graph_names[gid][noff + i] : "?";
+        std::printf("[lcount] cmd=%zu name=%s lbl=%s noop=%d pf=%d mc=%d ms=%d | [hop] planes=%zu bytes=%llu scr=%lld", i,
+                    (N ? (*N)[i] : "?"), lbl,
+                    noop, pfx, mcx, msx, planes, bytes, scx);
         if (S) { std::printf(" ids="); for (int bid : (*S)[i]) std::printf(" %d", bid); }
         std::printf("\n");
     }
-    std::printf("[lcount-total] closures=%zu pf=%lld mc=%lld ms=%lld skipped_sites=%ld | [hop-total] planes=%lld bytes=%llu\n",
-                n, tp, tm, ts, g_lc_skipped, thopN, thopB);
+    // The per-id sizes, so the hop census can be split by class offline (tooth 2). Without this the
+    // log only carries per-closure byte SUMS and the classes cannot be reconciled.
+    std::printf("[bufsizes] count=%zu", g_bufs.size());
+    for (auto& kv : g_bufs) std::printf(" %d:%llu:%d:%d", kv.first, (unsigned long long)kv.second.bytes, kv.second.imported ? 1 : 0, kv.second.gen);
+    std::printf("\n");
+    std::printf("[lcount-total] closures=%zu noop=%lld live=%lld pf=%lld mc=%lld ms=%lld skipped_sites=%ld | [hop-total] planes=%lld bytes=%llu scr=%lld\n",
+                n, tnoop, (long long)n - tnoop, tp, tm, ts, g_lc_skipped, thopN, thopB, tscr);
     std::fflush(stdout);
 }
 
@@ -2302,13 +2328,14 @@ int xmx_graph_capture(void) {
     g_graph_touch.push_back(std::move(g_cmds_touch)); g_cmds_touch.clear();
     g_graph_launch.push_back(std::move(g_cmds_launch)); g_cmds_launch.clear();   // #140
     g_graph_ids.push_back(std::move(g_pg_ids_snap)); g_pg_ids_snap.clear();      // #140
+    g_graph_name.push_back(std::move(g_cmds_name)); g_cmds_name.clear();        // #141
     g_cmds.clear();
     // B step 1 (knife2b #106): the record-time side vectors are PER-CAPTURE, exactly like
     // g_cmds/g_cmds_touch. g_cmd_names is the odd one out on purpose - it keeps growing across
     // recordings and the skip pass addresses it through name_offset (the [skip-chains] header
     // prints closures=691 names=1382 name_offset=691). Forgetting to reset the new vectors is
     // exactly how section 85 got us: a bookkeeping desync looks like a numerics bug.
-    g_cmds_group.clear(); g_cmds_poolblk.clear(); g_pg_ids_snap.clear(); g_cmds_launch.clear();
+    g_cmds_group.clear(); g_cmds_poolblk.clear(); g_pg_ids_snap.clear(); g_cmds_launch.clear(); g_cmds_name.clear();
     g_quant_pk.clear(); g_fused_quant.clear();          // record-scoped registries die
     g_pending_fold_slot = SIZE_MAX; g_fold_slot.clear(); // with the stream (10-27 audit)
     s6_reset();                                          // S6 chain candidate: ditto
@@ -2801,11 +2828,30 @@ int xmx_rec_pre(int colour, int motion, int history, int features, int plan,
     sycl::half* Feat = (sycl::half*)ift->second.p;
     const float* Pl = (const float*)ip->second.p;
     const float* Tb = (const float*)itb->second.p;
+    // #141: pre/post resolve their operands at RECORD time (no pgraph_ids call), so before this
+    // fix their [hop] id string was the previous recording's leftovers. pg_note_ids feeds the
+    // PRINT-ONLY mirror; g_cmds_touch keeps the full-conflict sentinel, so the wave scheduler,
+    // the graph and the numbers are untouched.
+    pg_note_ids({ colour, motion, history, features, plan, table });
     prepass::PreArgs A{ Col, Mot, His, Feat, Pl, Tb, pixels, height, width,
                         pitch, source_h, source_w, flags };
     g_cmd_names.push_back(__func__);
     pg_push([=]() {
-        LC_INC(pf); GQ->parallel_for(sycl::range((size_t)pixels), prepass::pre_kernel(A));
+        LC_INC(pf);
+        // #141 layer 1: explicit work-group size (0 = the shipped basic parallel_for). The guard
+        // inside pre_at (pixel >= A.m) is what makes the rounded-up global range safe; the body,
+        // its order and every value are untouched -- only the partition is fixed by construction.
+        static int pre_nt = getenv("NR_PRE_NT") ? atoi(getenv("NR_PRE_NT")) : 32;
+        if (pre_nt > 0) {
+            const size_t gr = ((size_t)pixels + (size_t)pre_nt - 1) / (size_t)pre_nt * (size_t)pre_nt;
+            GQ->parallel_for(sycl::nd_range(sycl::range(gr), sycl::range((size_t)pre_nt)),
+                             [A](sycl::nd_item<1> it) {
+                unsigned p = (unsigned)it.get_global_id(0);
+                if (p >= A.m) return;
+                prepass::pre_at(A, p);
+            });
+        } else
+            GQ->parallel_for(sycl::range((size_t)pixels), prepass::pre_kernel(A));
     });
     return 0;
 }
@@ -2836,6 +2882,7 @@ int xmx_rec_post(int colour, int head, int history, int result, int table, int n
     unsigned* Res = (unsigned*)irs->second.p;
     const float* Tb = (const float*)itb->second.p;
     float* Neu = (float*)inl->second.p;
+    pg_note_ids({ colour, head, history, result, table, neural });   // #141: same print mirror
     postpass::PostArgs A{ Col, Hd, His, Res, Tb, Neu, pixels, height, width,
                           pitch, source_h, source_w };
     g_cmd_names.push_back(__func__);
@@ -3277,12 +3324,12 @@ int xmx_rec_ffn(int a, int expand, int projection, int out, int skip, int cosine
                     if (lw16c) ffnc::launch_ffn_chip_cs2<16,false>(*GQ, Araw, dEp, dPp, (float*)Cout, (int)M, Mp, skp, cp, half_skip, ff3, ff9);
                     else       ffnc::launch_ffn_chip_cs2<32,false>(*GQ, Araw, dEp, dPp, (float*)Cout, (int)M, Mp, skp, cp, half_skip, ff3, ff9);
                 } else
-                CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, Araw, dEp, dPp, (float*)Cout, (int)M, Mp, skp, cp, half_skip, fjoin, ff3, ff9),
+                LC_INC(pf); CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, Araw, dEp, dPp, (float*)Cout, (int)M, Mp, skp, cp, half_skip, fjoin, ff3, ff9),
                                  ffnc::launch_ffn_chip<16>(*GQ, Araw, dEp, dPp, (float*)Cout, (int)M, Mp, skp, cp, half_skip, fjoin, ff3, ff9));
                 return;
             }
             float* dC2 = (float*)pool_get((size_t)Mp * cin * 4);
-            CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, Araw, dEp, dPp, dC2, (int)M, Mp), ffnc::launch_ffn_chip<16>(*GQ, Araw, dEp, dPp, dC2, (int)M, Mp));
+            LC_INC(pf); CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, Araw, dEp, dPp, dC2, (int)M, Mp), ffnc::launch_ffn_chip<16>(*GQ, Araw, dEp, dPp, dC2, (int)M, Mp));
             // the residual + publish tail stays SPLIT (the gate's f32-skip 131/8192
             // caught the in-kernel contracted fma -- sycl::fma is the authority,
             // section 92's gemm_res lesson, third time proven).
@@ -3466,7 +3513,7 @@ int xmx_rec_ffn_merge(int source, int skip, int sincos, int expand, int projecti
                 if (lw16m) ffnc::launch_ffn_chip_cs2<16,false>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp, false, ff3m, ff9m);
                 else       ffnc::launch_ffn_chip_cs2<32,false>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp, false, ff3m, ff9m);
             } else
-            CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp, false, fjoinm, ff3m, ff9m), ffnc::launch_ffn_chip<16>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp, false, fjoinm, ff3m, ff9m));
+            LC_INC(pf); CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp, false, fjoinm, ff3m, ff9m), ffnc::launch_ffn_chip<16>(*GQ, dM16, dB2, dPp2, (float*)Cout, (int)M, Mp, dMerged, cp, false, fjoinm, ff3m, ff9m));
             pool_put(dM16);   // dA2 was never packed on this path; dB2/dPp2 cache-owned
             pool_put(dMerged);
             return;
@@ -3648,10 +3695,10 @@ int xmx_rec_ffn_stem(int features, int adapter, int expand, int projection, int 
                 static bool chipcss = !getenv("NR_CHIP_CS") || atoi(getenv("NR_CHIP_CS")) != 0;
                 if (chipcss) {
                     static bool lw16s = getenv("NR_CHIP_LW16") && atoi(getenv("NR_CHIP_LW16")) != 0;
-                    if (lw16s) ffnc::launch_ffn_chip_cs2<16,false>(*GQ, dH16, dB2, dPp3, (float*)Cout, (int)M, Mp, dS, cp);
-                    else       ffnc::launch_ffn_chip_cs2<32,false>(*GQ, dH16, dB2, dPp3, (float*)Cout, (int)M, Mp, dS, cp);
+                    if (lw16s) { LC_INC(pf); ffnc::launch_ffn_chip_cs2<16,false>(*GQ, dH16, dB2, dPp3, (float*)Cout, (int)M, Mp, dS, cp); }
+                    else       { LC_INC(pf); ffnc::launch_ffn_chip_cs2<32,false>(*GQ, dH16, dB2, dPp3, (float*)Cout, (int)M, Mp, dS, cp); }
                 } else
-                CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, dH16, dB2, dPp3, (float*)Cout, (int)M, Mp, dS, cp), ffnc::launch_ffn_chip<16>(*GQ, dH16, dB2, dPp3, (float*)Cout, (int)M, Mp, dS, cp));
+                LC_INC(pf); CHIP_LW_DISPATCH(ffnc::launch_ffn_chip<32>(*GQ, dH16, dB2, dPp3, (float*)Cout, (int)M, Mp, dS, cp), ffnc::launch_ffn_chip<16>(*GQ, dH16, dB2, dPp3, (float*)Cout, (int)M, Mp, dS, cp));
                 pool_put(dH16); pool_put(dA2); pool_put(dS);   // dC2 never allocated
                 return;
             }
@@ -3811,7 +3858,7 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
         else                               f16v1::gemm_b(*GQ, dAp, dBp, dC, Mp2, (int)N, (int)K, (int)nb);
         static int gst3 = getenv("NR_G_STOP") ? atoi(getenv("NR_G_STOP")) : 0;   // 3 = skip the publish pass (gemm only): the fold-value probe
         if (gst3 < 3)
-        GQ->parallel_for(sycl::range(nb * (size_t)M * N),
+        { LC_INC(pf); GQ->parallel_for(sycl::range(nb * (size_t)M * N),
                          [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             size_t mn = (size_t)M * N;
@@ -3822,7 +3869,7 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
             size_t out = oc + g * sc + (size_t)r * ldc_e + col;
             if (narrow) ((sycl::half*)Cout)[out] = sycl::half(value);
             else        ((float*)Cout)[out] = value;
-        });
+        }); }
         }
         pool_put(dAp); pool_put(dC);   // dBp is cache-owned (the whole batched weight)
     });
@@ -4021,9 +4068,9 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
                 (output WRONG by design) -> isolates the pack kernel's cost from
                 the quant-dissolve bookkeeping */ }
             else if (qfmode == 1 && b1_form)
-                packdev::pack_a_fused_b1(*GQ, a16b, dAp, (float*)ias->second.p, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch);
+                { LC_INC(pf); packdev::pack_a_fused_b1(*GQ, a16b, dAp, (float*)ias->second.p, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch); }
             else
-                packdev::pack_a_fused_b(*GQ, a16b, dAp, (float*)ias->second.p, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch);
+                { LC_INC(pf); packdev::pack_a_fused_b(*GQ, a16b, dAp, (float*)ias->second.p, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch); }
             // NR_BG_FOLD_LIVE=1 = the liveness witness the fold needs: scale the a_scale array
             // the fused pack just wrote by 0.5. If the fold path is really what feeds the
             // frame, 1301 MUST move; if it stays EXACT the fold is a dud, not a win.
@@ -4038,9 +4085,9 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
             // 64B device allocs). NR_BPACK_VEC=0 = escape hatch to the scalar form.
             static bool bvec = !getenv("NR_BPACK_VEC") || atoi(getenv("NR_BPACK_VEC")) != 0;
             if (bvec && (lda_e % 16u) == 0u && (sa % 16u) == 0u)
-                packdev::gather_pack_a_b_v(*GQ, Araw, dAp, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch);
+                { LC_INC(pf); packdev::gather_pack_a_b_v(*GQ, Araw, dAp, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch); }
             else
-                packdev::gather_pack_a_b(*GQ, Araw, dAp, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch); }
+                { LC_INC(pf); packdev::gather_pack_a_b(*GQ, Araw, dAp, (int)M, Mp, (int)K, (int)lda_e, sa, (int)batch); } }
         if (getenv("NR_BPACK_STATS")) { static int once=0; if(++once==144) printf("[bpack] fused_hits=%ld gather_hits=%ld\n", bfp, bgp); }
         }
         // the whole batched B is one weight: pack once (all groups), cache, reuse.
@@ -4166,13 +4213,13 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
                 printf("  sc0-7:"); for(int i=0;i<8;++i) printf(" %.6g",hsc[i]); printf("\n"); } }
             if (fb.packed) {   // FOLD: int8+scale straight into the quant's buffers
                 if (ldc_ == 256u)
-                    s8v9b::gemm_b_rq9b<256,true>(*GQ, dAp9b, dBp9b, (sycl::half*)fb.packed, (float*)fb.scale, as, bs, (int)M, Mp32, (int)K, epi);
+                    { LC_INC(pf); s8v9b::gemm_b_rq9b<256,true>(*GQ, dAp9b, dBp9b, (sycl::half*)fb.packed, (float*)fb.scale, as, bs, (int)M, Mp32, (int)K, epi); }
                 else
-                    s8v9b::gemm_b_rq9b<512,true>(*GQ, dAp9b, dBp9b, (sycl::half*)fb.packed, (float*)fb.scale, as, bs, (int)M, Mp32, (int)K, epi);
+                    { LC_INC(pf); s8v9b::gemm_b_rq9b<512,true>(*GQ, dAp9b, dBp9b, (sycl::half*)fb.packed, (float*)fb.scale, as, bs, (int)M, Mp32, (int)K, epi); }
             } else if (ldc_ == 256u)
-                s8v9b::gemm_b_rq9b<256,false>(*GQ, dAp9b, dBp9b, (sycl::half*)Cout, ns9b, as, bs, (int)M, Mp32, (int)K, epi);
+                { LC_INC(pf); s8v9b::gemm_b_rq9b<256,false>(*GQ, dAp9b, dBp9b, (sycl::half*)Cout, ns9b, as, bs, (int)M, Mp32, (int)K, epi); }
             else
-                s8v9b::gemm_b_rq9b<512,false>(*GQ, dAp9b, dBp9b, (sycl::half*)Cout, ns9b, as, bs, (int)M, Mp32, (int)K, epi);
+                { LC_INC(pf); s8v9b::gemm_b_rq9b<512,false>(*GQ, dAp9b, dBp9b, (sycl::half*)Cout, ns9b, as, bs, (int)M, Mp32, (int)K, epi); }
             pool_put(dAp9b);
             return;
         }
@@ -4186,11 +4233,11 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
             static int bstop = getenv("NR_B_STOP") ? atoi(getenv("NR_B_STOP")) : 0;   // section 100 ledger probe (time-only): 1 = pack only, 2 = pack skipped too
             if (bstop >= 1) { pool_put(dAp); return; }
             if (pubslm && N == 128u)
-                s8v8::gemm_b_pub_slm<false>(*GQ, dAp, dBp, Cout, as, bs, (int)M, Mp, (int)N, (int)K,
-                                 (int)batch, sc, ldc_, scale_stride, (sb != 0u) ? N : 0u, narrow, epi);
+                { LC_INC(pf); s8v8::gemm_b_pub_slm<false>(*GQ, dAp, dBp, Cout, as, bs, (int)M, Mp, (int)N, (int)K,
+                                 (int)batch, sc, ldc_, scale_stride, (sb != 0u) ? N : 0u, narrow, epi); }
             else
-                s8v8::gemm_b_pub(*GQ, dAp, dBp, Cout, as, bs, (int)M, Mp, (int)N, (int)K,
-                             (int)batch, sc, ldc_, scale_stride, (sb != 0u) ? N : 0u, narrow, epi);
+                { LC_INC(pf); s8v8::gemm_b_pub(*GQ, dAp, dBp, Cout, as, bs, (int)M, Mp, (int)N, (int)K,
+                             (int)batch, sc, ldc_, scale_stride, (sb != 0u) ? N : 0u, narrow, epi); }
             pool_put(dAp);   // dBp is cache-owned (the whole batched weight)
             return;
         }
@@ -4353,7 +4400,7 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
                 LC_INC(pf); packdev::pack_a_fused_gather(*GQ, (const sycl::half*)itsrc->second.p, dAp,
                     (float*)as, (int)M, Mp, (int)C, qfq.image_h, qfq.image_w, qfq.across, qfq.pad);
             } else
-                packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)C);
+                { LC_INC(pf); packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)C); }
         }
         int8_t* dBp = cached_pack_b_i8(b, Braw, (int)NH, (int)C);   // weight: pack once
         // P5 (section 100): the resident QKV epilogue -- deq+butterfly+e4m3+scatter
@@ -4373,7 +4420,7 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
         const bool qres_ok = qres_on && (C % 64u) == 0u && NH == 3u * C && heads == C / 32u && tokens > 0u;
         if (qkvstop < 2) {
             if (qres_ok)
-                qres::gemm_qkv_res(*GQ, dAp, dBp, Q, Kk, V, as, bs, qs, (int)M, Mp, (int)C, (int)NH, (int)heads, (int)tokens, vit, vit_recip_tab());
+                { LC_INC(pf); qres::gemm_qkv_res(*GQ, dAp, dBp, Q, Kk, V, as, bs, qs, (int)M, Mp, (int)C, (int)NH, (int)heads, (int)tokens, vit, vit_recip_tab()); }
             else {
                 dC = (int32_t*)pool_get((size_t)Mp * NH * 4);   // split path ONLY
                 LC_INC(pf); s8v8::gemm(*GQ, dAp, dBp, dC, Mp, (int)NH, (int)C);
@@ -4391,7 +4438,7 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
             if (qkvstop < 1) {
                 static int qres_v2 = getenv("NR_QKV_RESV2") ? atoi(getenv("NR_QKV_RESV2")) : 0;   // P6 v2 FALSIFIED (ESIMD arrays spill: 186-187 vs 178-180); 3 = v3 scalar-contiguous probe
                 if (qres_v2 == 3)
-                    GQ->parallel_for(sycl::range((size_t)M * heads), [=](sycl::item<1> it) {
+                    { LC_INC(pf); GQ->parallel_for(sycl::range((size_t)M * heads), [=](sycl::item<1> it) {
                         unsigned rh = (unsigned)it.get_id(0);
                         unsigned r = rh / heads, head = rh % heads;
                         const float rs = as[r];
@@ -4414,11 +4461,11 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
                             Kk[at + i] = sycl::half(qr_e4m3_scalar(wbmega::eh_mul(hk[i], rk)));
                             V[at + i] = sycl::half(qr_e4m3_scalar(hv[i]));
                         }
-                    });
+                    }); }
                 else if (qres_v2 == 2)
-                    wbmega::qkv_norm_scatter_v2(*GQ, dC, Q, Kk, V, as, bs, qs, M, heads, C, NH, tokens);
+                    { LC_INC(pf); wbmega::qkv_norm_scatter_v2(*GQ, dC, Q, Kk, V, as, bs, qs, M, heads, C, NH, tokens); }
                 else
-                    wbmega::qkv_norm_scatter_esimd(*GQ, dC, Q, Kk, V, as, bs, qs, M, heads, C, NH, tokens);
+                    { LC_INC(pf); wbmega::qkv_norm_scatter_esimd(*GQ, dC, Q, Kk, V, as, bs, qs, M, heads, C, NH, tokens); }
             }
         } else if (!getenv("NR_QKV_VITES") || atoi(getenv("NR_QKV_VITES")) != 0) {   // P11 PROMOTED (this window): the 449-root-cause CLOSED by bench_vitcmp's clean device comparison -- norm/recip/hq were ALL bit-exact vs the scalar reference; the flips were the TRIPLE-NESTED eh_mul(eh_mul(eh_mul(...))) chain being rewritten in-kernel (skipped intermediate half-round, RZ-direction half-ULP). The STEPPED named-temp form (t1=hq*recip, t2=t1*VIT_ROOT, t3=t2*sc) is 0/6144 EXACT in the bench. LESSON (blueprint P1 family): every proven eh chain step needs its OWN named temp adjacent to the use -- nesting is NOT safe in ESIMD, same class as the phi/scope FMA-contraction trap. Default ON, escape NR_QKV_VITES=0.
             // P11 (section 100): the VIT tail on the v1 lane structure (merged
@@ -4787,7 +4834,7 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
                 LC_INC(pf); packdev::pack_a_fused_gather(*GQ, (const sycl::half*)itsrc->second.p, dAp,
                     (float*)B.S.as, (int)B.S.M, (int)B.S.Mp, (int)B.S.C, B.S.qfq.image_h, B.S.qfq.image_w, B.S.qfq.across, B.S.qfq.pad);
             } else
-                packdev::pack_a(*GQ, B.S.Araw, dAp, (int)B.S.M, (int)B.S.Mp, (int)B.S.C);
+                { LC_INC(pf); packdev::pack_a(*GQ, B.S.Araw, dAp, (int)B.S.M, (int)B.S.Mp, (int)B.S.C); }
             int8_t* dBp = cached_pack_b_i8(B.S.b, B.S.Braw, (int)(3u * B.S.C), (int)B.S.C);
             // the outproj weight: cached pack_b of the wres's B (transposed N x K
             // raw -> the pack_b map the gemm consumes; cached_pack_b_i8 keys on
@@ -4842,7 +4889,7 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
             sycl::half* a16w = (sycl::half*)sized(srcid_w, (size_t)M * K * 2u, "A(f16 fused)");
             LC_INC(pf); packdev::pack_a_fused(*GQ, a16w, dAp, (float*)as, (int)M, Mp, (int)K);
         } else
-        packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K);
+        { LC_INC(pf); packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K); }
         }
         int8_t* dBp = cached_pack_b_i8(b, Braw, (int)N, (int)K);   // weight: pack once
         if (wrstop >= 1) { pool_put(dAp); return; }
@@ -5524,7 +5571,7 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
                 LC_INC(pf); packdev::pack_a_fused_gather(*GQ, (const sycl::half*)itsrc->second.p, dAp,
                     (float*)S.as, (int)S.M, (int)S.Mp, (int)S.C, S.qfq.image_h, S.qfq.image_w, S.qfq.across, S.qfq.pad);
             } else
-                packdev::pack_a(*GQ, S.Araw, dAp, (int)S.M, (int)S.Mp, (int)S.C);
+                { LC_INC(pf); packdev::pack_a(*GQ, S.Araw, dAp, (int)S.M, (int)S.Mp, (int)S.C); }
             // the qkv closure no-ops under the pair, so the weight-cache fill moves
             // HERE (Braw from the stash; cached_pack_b_i8 packs once, reuses after).
             int8_t* dBp = cached_pack_b_i8(S.b, S.Braw, (int)(3u * S.C), (int)S.C);
@@ -5578,7 +5625,7 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
         if (wa_raw) {
             static bool rawv2 = !getenv("NR_WA_RAWV") || atoi(getenv("NR_WA_RAWV")) != 0;   // P10c PROMOTED: every A/B pair beats RAW-QK by 0.8-1.2ms (the V pack launch + dBv round-trip gone); escape NR_WA_RAWV=0.
             if (!rawv2)
-            packdev::pack_b16_b(*GQ, V, dBv, 64, 32, (int)batches);   // the span below is
+            { LC_INC(pf); packdev::pack_b16_b(*GQ, V, dBv, 64, 32, (int)batches); }   // the span below is
                                                                        // skipped -- pack V FIRST (unless P10c RAW-V)
             LC_INC(pf); wares::launch_wa_res(*GQ, Q, Kk, V, dBv, Bp, (sycl::half*)Out, batches, heads, rawv2);
             pool_put(dAq); pool_put(dBk); pool_put(dAp); pool_put(dBv);
@@ -5598,8 +5645,8 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
         }
         else if (!smaxplain) smax_esimd(*GQ, dScores, dProbs, batches*64u, Bp, heads);
         else
-        GQ->parallel_for(sycl::range((size_t)batches*64u),
-                         smax::softmax_kernel()(dScores, dProbs, batches*64u, 64u, Bp, heads));
+        { LC_INC(pf); GQ->parallel_for(sycl::range((size_t)batches*64u),
+                         smax::softmax_kernel()(dScores, dProbs, batches*64u, 64u, Bp, heads)); }
         // attnV leg: P(64x64) @ V(64x32) -> 64x32. V stored (64 tokens,32 ch) = (K,N).
         if (!wat || smaxplain) packdev::pack_a16_b(*GQ, dProbs, dAp, 64, 64, 64, (int)batches);
         LC_INC(pf); packdev::pack_b16_b(*GQ, V, dBv, 64, 32, (int)batches);
@@ -5996,8 +6043,8 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
             // 100.0000% bit-exact AND saves ~10ms/walk; NR_V2_FILL=1 restores the
             // deterministic fresh-zero behavior for debugging.
             if (getenv("NR_V2_FILL") && st != 0xFFFFu)
-                GQ->parallel_for(sycl::range((size_t)windows * wbv2::WSL), [=](sycl::item<1> it){
-                    dWS[(size_t)it.get_id(0)] = sycl::half(0.f); });
+                { LC_INC(pf); GQ->parallel_for(sycl::range((size_t)windows * wbv2::WSL), [=](sycl::item<1> it){
+                    dWS[(size_t)it.get_id(0)] = sycl::half(0.f); }); }
             sycl::half* dKV = nullptr;
             if (st && st < 0xFF00u) { dKV = (sycl::half*)pool_get((size_t)windows * 4096u * 2);
                       LC_INC(pf); GQ->parallel_for(sycl::range((size_t)windows*4096u), [=](sycl::item<1> it){ dKV[(size_t)it.get_id(0)]=sycl::half(0.f); }); }
@@ -6129,7 +6176,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                 esimd::block_store<sycl::half,32>(dA + (size_t)r * C, out, esimd::overaligned_tag<16>{});
             });
         } else
-        GQ->parallel_for(sycl::range((size_t)rows), [=](sycl::item<1> it) {
+        { LC_INC(pf); GQ->parallel_for(sycl::range((size_t)rows), [=](sycl::item<1> it) {
             unsigned r = (unsigned)it.get_id(0);
             unsigned window = r / tokens, token = r % tokens;
             int y = (int)((window / across) * 8u + token / 8u) - (int)top;
@@ -6144,7 +6191,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                 val = qr_e4m3(val);                                   // publish_image always
                 dA[(size_t)r * C + c] = sycl::half(val);
             }
-        });
+        }); }
         }
         sycl::half* dAp = (sycl::half*)pool_get((size_t)Mp * C * 2);
         float* dCq = (float*)pool_get((size_t)Mp * NH * 4);
@@ -6231,8 +6278,8 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         if (wbstop > 5u) {
         if (!smaxplain2()) smax_esimd(*GQ, dScores, dProbs, windows*64u, Bp, 1u);
         else
-        GQ->parallel_for(sycl::range((size_t)windows*64u),
-                         smax::softmax_kernel()(dScores, dProbs, windows*64u, 64u, Bp, 1u));
+        { LC_INC(pf); GQ->parallel_for(sycl::range((size_t)windows*64u),
+                         smax::softmax_kernel()(dScores, dProbs, windows*64u, 64u, Bp, 1u)); }
         }
         if (getenv("NR_DUMP_PROBS")) {   // dump split softmax probs (e4m3 halves) vs mega SCR
             static bool s_pdone = false;
@@ -6265,20 +6312,20 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
         sycl::half* dAttended = (sycl::half*)pool_get((size_t)rows * C * 2);
         if (wbstop > 7u)
         if (!wbplaingather && C == 32u) {   // section 99: 32-wide merge (both sides contiguous)
-            GQ->parallel_for(sycl::range((size_t)rows), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
+            { LC_INC(pf); GQ->parallel_for(sycl::range((size_t)rows), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
                 namespace esimd = sycl::ext::intel::esimd;
                 unsigned token = (unsigned)it.get_id(0);
                 esimd::simd<float,32> v = esimd::block_load<float,32>(
                     dCtx + (size_t)token * 32u, esimd::overaligned_tag<16>{});
                 esimd::block_store<sycl::half,32>(dAttended + (size_t)token * 32u,
                     esimd::convert<sycl::half>(wbv2::e4m3_vec<32>(v)), esimd::overaligned_tag<16>{});
-            });
+            }); }
         } else
-        GQ->parallel_for(sycl::range((size_t)rows * C), [=](sycl::item<1> it) {   // merge, heads==1
+        { LC_INC(pf); GQ->parallel_for(sycl::range((size_t)rows * C), [=](sycl::item<1> it) {   // merge, heads==1
             unsigned index = (unsigned)it.get_id(0);
             unsigned c = index % C, token = index / C;
             dAttended[index] = sycl::half(qr_e4m3(dCtx[(size_t)token * 32u + c]));
-        });
+        }); }
         if (getenv("NR_DUMP_ATT")) {   // dump split attended (e4m3 of ctx) for comparison vs resident stop=7
             static bool s_adone = false;
             if (!s_adone && !pooling && !head) {
@@ -6501,7 +6548,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                           cp, dC3, Tgt, narrow, epi, rows, height, width,
                           across, top, left, C);
         } else
-        GQ->parallel_for(sycl::range(blk_elems), [=](sycl::item<1> it) {
+        { LC_INC(pf); GQ->parallel_for(sycl::range(blk_elems), [=](sycl::item<1> it) {
             size_t i = it.get_id(0);
             unsigned r = (unsigned)(i / C), col = (unsigned)(i % C);
             unsigned window = r / 64u, token = r % 64u;
@@ -6522,7 +6569,7 @@ int xmx_rec_window_block(int image, int qkv, int projection, int target, int bia
                 dStage[i] = total;
             } else if (narrow) ((sycl::half*)Tgt)[out] = sycl::half(qr_publish(epi, total));
             else               ((float*)Tgt)[out] = qr_publish(epi, total);
-        });
+        }); }
         }
         if (pooling && !fused3) {
             // the 2x2 pool (gemm_staged.comp:371-390): taps (token,token+8,token+1,token+9)

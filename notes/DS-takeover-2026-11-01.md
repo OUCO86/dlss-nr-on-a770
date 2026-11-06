@@ -2632,3 +2632,29 @@ first row=0 col=0  baseline=113  D=117
 ### 军规 125/126（入 B2）
 **125**：**仪器有已知盲点时，它给出的"总数/排序"只能当下界用**，且在用它定刀之前必须先补盲点。正案：窄策略拒插 32 处 => `gemm_int8_batched`/`window_block`/`quant` 读出 0 发 => 307 是下界 => 先机械加 brace 再走一遍（~2 min GPU）。
 **126**：**hop 对表前必须先把 plane id 归类**（权重 / 中间面 / pool scratch / 版本化 id）：引擎 touch 集 940 个 id / 30.79 GB 与离线模型 ~150 面 / 10.42 GB 不是同一口径，**不归类就不能核平、也不能拿 [hop-total] 当收益底料**。
+
+## 122. ★★★★★ **第 1 层（对接桥接的那一层）实测与社区参考到位：`{pre, ffn_stem}` = 4 次设备提交、0 memcpy/memset、3.86 ms/帧 = 真实地板 1.03 ms 的 3.75 倍 => 不达标；★ 同时补出一个被所有旧 hop 账漏掉的大数：全帧 pool scratch 搬运 = 1.50 GB/帧**
+### 范围（用 ids 串认死）
+桥接面 = `prepare_fused` 建的 **id1 colour 2,088,960B / id3 motion 4,177,920B / id6 history 6,266,880B / id4 plan 6,272,916B / id5 table 262,160B**（id2 result 属输出侧）；唯一读者 = **`xmx_rec_pre`**（写 features id1271 = 16,711,680B，**只有 1 个消费者 = `xmx_rec_ffn_stem`**）。
+**提交数按源码手工核**：`pre :2835` = **1 发**；`ffn_stem :3597 pack_a16 + :3645 gemm_dual_pub + :3679-3680 chip_cs2` = **3 发**；权重 `cached_pack_b_f16`（`:3598/3667/3673`）**0 发/帧**（缓存命中）=> **第 1 层 = 4 发、0 memcpy、0 memset**。
+### 真实地板重算（`s6/layer1.md §6b`，不是 touch 足迹口径）
+- **`pre`**：touch 口径 `U = 35.78 MB => 104 µs`；**含 gather 请求量 `G = 154.85 MB => 451 µs`（@343 GB/s）**；实测 **2.06-2.18 ms => 4.8x(G) / 20.9x(U)**；**`NT 32->1024` 只差 5% => 不是 fill 问题**（fill = 16,320 WG / 容量 512 = 3,188%）；解剖：**5-tap warp = 1.217 ms = 59%**；`fdiv_rn` 全家 0.108 ms = 5.3%；features 写 0.012 ms；三个读 ≈ 0；发射地板 0.027 ms；**~0.82 ms 当时未归因**。
+- **`ffn_stem`**：地板 **317.5 MB => 926 µs**；实测 **1.679 ms = 1.81x**；**分腿**：`packA 1.03x` ✓、`dual 1.32x` ✓、**`chip 2.32x` ✗**（stem 的钱在 chip 那一发）。
+- **两条腿合计 3.86 ms vs 地板 1.03 ms = 3.75x** => **第 1 层达标线（<=1.5x）不过**。
+### 容量与仪表（实测）
+`CAP2` 单事件法与 `tools/capacity_curve.csv` 同口径：**SLM=0/NT=32 平台到 512 WG（1024 才 +15%）=> 容量 ≈512**；**SLM=32,768/NT=32 平台到 256（512 已 +10%）=> 256-512**。
+ocloc 活实例：`pre` = grf128/simd8/**private_size 608 B/线程**/SLM 0；`chip_cs2<32>` = **slm_size 32,768**、grf128/simd1、**WG=2,040（源码显式）**；`gemm_dual_pub` = grf128/simd1、items 65,280（运行期定 NT）。
+★ **仪表洞已补**：`[hop]` 原来只算 plan 命名面，**pool scratch（D 类 id）不在账里** => LCount 加 `scr` 字段、`pool_get` 两条出口记账（打印侧，不碰调度用的 `g_cmds_touch`）；**修后 `stem scr = 116,981,760 B`（dA+dS+dH16 逐项对上）、全帧 `scr = 1.50 GB/帧`**；行为中性：1301 EXACT DD49827D、vec-align 七条 ALIGNED、三个 fused 锚点一字不变、**stem pf 从 2 修成 3**。
+### 社区参考（`E:\DSH\refs\COMMUNITY-FINDINGS.md`，每条带 `仓库:文件:行号`）
+- **参考库同层 = 3.7-4.8 ms/帧、5-7 发 + 每帧 3 次纯拷贝 ≈18.8 MB**（`gpu_image_pipeline.py:185-187`）；**warp 也是 5-tap Catmull、每 tap 4 个点载入**（`image_history.comp:49-72,75-95,98-111`，`local_size 256`，**两个分辨率各做一次**）=> **我们"折进 pre 一发、不生成中间面"已经比他们少一遍搬运、少 6 次提交**；**第 5 条线（不比参考同层贵）= 过**；
+- **省 tap 的做法只有硬件采样**：OptiScaler **BCDS：4 次硬件双线性 `SampleLevel` 顶 16 个三次权**（`output_scaling/precompile/bcds_catmull.hlsl:47-66,96-106`）与 FSR1 EASU 同型（`fsr1/fsr_easu.hlsl:26,63`）=> **硬件采样 = 定点权重 = 改数值**，只写方案不动代码；
+- **网络受限**：`web_fetch` 三次全失败（api.github / github / raw 都连不上），`onednn-gpu`、`llama-sycl` 的 sparse 拉不下来（filtered clone 要网络）=> **B 组两问（oneDNN split-K/blocking、llama.cpp dp4a tile）本轮无参考可读**，如实挂账；能读到的最近对照是 `refs/dlss-nr-on-intel/notes/improve-fusions.md:232-260`（**加占用更慢："Threads were never short; the blocks serial K loops are what the time is made of"**、**空发 1.2-4 µs**、**权重 32 列 slabs 位相同但只在部分形状赚 => 他们没采用**）。
+### 两枪的结果
+1. **`pre_at_w`（坐标分解 10->6、去 `coords[]/weights[]` 数组）= 逐位 EXACT**（fused features md5 `CACD2029…` 与 shipped 一字不差）**但时间中性**（RT 括号 pass0 两侧都 4.9 ms；ocloc **private_size 仍 608**）=> **不转正、已回退**；
+2. **显式 `NT=32` 已实现**（`libxmx_sycl.cpp:2835+`，默认 32、`NR_PRE_NT` 逃生）：探针配对 **2.171/2.192 -> 2.063/2.067 ms（-5%）**，fill 从上下界变成事实。
+### 下一枪（已设计、等批）：`pre` 的 **SLM tile+halo 取样**
+把 colour 的 `32x32`（含 halo）一次读进 SLM，**5-tap 权重与累加次序完全不变、只换取数源**；`G` 从 154.85 MB 降到 ≈35 MB；**WG 数 = 522,240/1024 ≈ 510 正好落在容量 512 的平台内**；预期 `pre` 2.06 -> **<=0.6-0.8 ms（省 1.3-1.5 ms/帧）**；**VERIFY 必须仍逐字节 EXACT**（不 EXACT 就说明推理错，当场停）。
+**注意与 §102/§139 的区别**：那条"SLM 暂存判死"说的是 **gemm 累加器经 SLM 回读**（累加器爆、驻留掉）；**这里是 2D 图像窗口带 halo 的标准 tile 载入**，两回事，不许互相引用。
+### 军规 127/128（入 B2）
+**127**：**改引擎源的脚本必须二进制 / `newline=""` 读写并保持原 EOL**（HEAD = LF-only）：本案一次文本模式读写把整文件改成 CRLF，导致 `build_shipped.ps1` 里 `patch_testdefs.py` 的 LF 锚点 `PATCH FAILED exit=2`。
+**128**：**hop/流量账必须把 pool scratch 计入**：`[hop]` 只算 plan 命名面时漏掉 **1.50 GB/帧** 的 scratch 搬运（stem 单发 scr = 116,981,760 B，实际搬 ≈300 MB 而旧账只报 83.6 MB）；任何"离地板几倍"的判定都要用补了 scr 的口径。

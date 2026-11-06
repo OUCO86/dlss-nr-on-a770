@@ -92,10 +92,13 @@ struct PreArgs {
     unsigned m, k, batch, sa, sb, sc, flags;
 };
 
-static inline auto pre_kernel(PreArgs A) {
-    return [A](sycl::item<1> it) {
-        unsigned pixel = (unsigned)it.get_id(0);
-        if (pixel >= A.m) return;
+// pre_at: the per-pixel body, index-first. pre_kernel is the shipped wrapper (basic
+// parallel_for over the network extent); the split exists so the SAME body can be entered from
+// an explicit nd_range launch -- layer 1's fill is only judgeable if the work-group count is
+// knowable, and a basic parallel_for leaves the local size to the runtime (military rule: measured,
+// not inferred). Guard stays in the wrapper AND in the nd arm: identical semantics.
+static inline void pre_at(const PreArgs& A, unsigned pixel) {
+    {
         unsigned width = A.batch, height = A.k;
         unsigned x = pixel % width, y = pixel / width;
         const unsigned noiseAt = 0u;
@@ -174,6 +177,13 @@ static inline auto pre_kernel(PreArgs A) {
         for (int ch = 0; ch < 5; ch++) values[10u + ch] = A.plan[controlAt + ch];
         values[15] = 0.0f;
         for (int j = 0; j < 16; j++) A.features[pixel * 16u + j] = (sycl::half)values[j];
+    }
+}
+static inline auto pre_kernel(PreArgs A) {
+    return [A](sycl::item<1> it) {
+        unsigned pixel = (unsigned)it.get_id(0);
+        if (pixel >= A.m) return;
+        pre_at(A, pixel);
     };
 }
 
