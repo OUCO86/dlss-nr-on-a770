@@ -1,0 +1,9 @@
+family,biggest_kernel,ops,fixup,fixup_pct,closures,launches_pf,RT_sum_ms,RT_per_closure_ms,price_per_launch_ms,hop_per_closure_MB,byte_floor_ms_at_190_to_305_GBs,multiple_above_floor,judgement
+global_attention,smax::vit_softmax_tiled,14760,4408,29.9,8,48,10.973,1.372,0.229,47.27,0.155-0.249,5.5-8.9,instruction-mass bound: this ONE kernel is ~70 percent of the family's total GEN ops (softmax leg of the 6-launch chain)
+global_attention,f16v1::gemm_b (scores leg),2538,1171,46.1,8,48,,,,,,,fixup share 46 percent on the scores gemm
+global_attention,packdev::pack_a16_b / pack_b16_t_b / pack_b16_b,562,158,28.1,8,48,,,,,,,pack launches are instruction-cheap (556-562 ops) so the four-pack folding knife buys launch count and latency, NOT bandwidth
+window_block,wbv4ph::launch_v4ph (fused route; wbv3/v4 variants also present),2977,1617,54.3,10,10,18.041,1.804,1.804,79.41,0.260-0.418,4.3-6.9,fixup share 54 percent (worst of the three) plus ONE launch per closure = a single long dependency chain
+window_block,wbv3::launch_v3,1798,932,51.8,,,,,,,,-,escape-hatch route, same fixup problem
+ffn_merge,ffn2::fused<Shape<32,64,256,0,4,2>>,1177,529,44.9,1,1,2.708,2.708,2.708,108.64,0.356-0.572,4.7-7.6,one launch = pure dependency-chain exposure; ops mass is small so the bound is latency/serialization not arithmetic
+ALL_THREE,slm_size / barrier_count / residency,,,,not measured this round: the .ze_info parse in s6/l1_slm.py matched nothing (regex shape wrong); carry as a debt for the next shovel,,,,,,,
+NOTES,bytes moved per closure = [hop] touched footprint (upper bound on DRAM traffic); floors are ranges because the same access form measured 305.5 then 223.9 GB/s across processes (plus or minus 30 percent); launches are helper-entry charges added by the (jia) instrument (rtcsv now carries pf=), which changed ZERO kernels (0 of 270, ops 800047 identical),,,

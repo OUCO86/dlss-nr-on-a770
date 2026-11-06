@@ -2381,13 +2381,22 @@ int xmx_graph_run(int id) {
         static bool rtiming = getenv("NR_RUN_TIMING") != nullptr;
         if (rtiming) {
             std::vector<double> ms;
+            std::vector<long> pfs;                       // (甲) #153: launches charged per closure (helper entries)
             ms.reserve(g_graphs[id].size());
             int lci = 0;
             for (auto& fn : g_graphs[id]) {
-                lc_begin(-1);   // not the record pass: not counted (see #141)
+                // (甲) #153: this diagnostic pass now CHARGES the closure, so the same line that
+                // carries the closure's GPU ms also carries its launch count (helper entries).
+                // #141's "not counted" applied to the record pass; here counting is what makes
+                // "price per launch = ms / pf" a reading instead of a guess. Cost: one closure
+                // bracket per pass (691/frame), NOT a statement at any launch site (军规 132).
+                lc_begin(lci);
                 auto t0 = std::chrono::steady_clock::now();
                 fn();
+                long pfnow = g_lc_ticks - g_lc_tick0;
                 lc_end();
+                pfs.push_back(pfnow);
+                lci++;
                 GQ->wait();   // section 92: without this the closures submit async and the
                               // per-closure wall time is meaningless (GPU overlaps between
                               // closures -- the sum exceeded the whole run). Waiting makes
@@ -2416,7 +2425,7 @@ int xmx_graph_run(int id) {
                 for (size_t i = 0; i < ms.size(); i++) {
                     const char* nm2 = (id < (int)g_graph_names.size() && i < (int)g_graph_names[id].size())
                                       ? g_graph_names[id][i] : "?";
-                    std::fprintf(f, "rtcsv %zu %s %.4f\n", i, nm2, ms[i]);
+                    std::fprintf(f, "rtcsv %zu %s %.4f pf=%ld\n", i, nm2, ms[i], i < pfs.size() ? pfs[i] : -1L);
                 }
             }
             // per-op-name totals: which family owns the time
