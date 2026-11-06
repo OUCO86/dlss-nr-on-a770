@@ -2833,3 +2833,25 @@ WINDOW_BLOCK RED (9 fails)
 ### 军规 141/142（入 B2）
 **141**：**JIT 缓存态是认证环境的一部分：每份读数必须标注 `cold`（专用空 `SYCL_CACHE_DIR`）或 `hot`（受管 `E:\DSH\sycl-cache`）**；**cold 是编译确定性的真值，hot 只用于历史可比**；**受管缓存要打包备份并记 md5**。
 **142**：**golden 的可复现性是门链权威性的前提**：一条门若只在某种缓存态下绿、且其 golden 无法从冷编译复现 ⇒ **该门在其它态下的 RED 不能当证据**；**重生成 golden 必须走反证链（所有历史件在该态下都匹配新 golden），并带 provenance**。
+
+## 130. ★★★★★ **更正我自己：20:09 那轮门红不是"并发读写"，而是 11-01 01:47 → 11-02 10:07 之间的一段既有回归；并且实机每次冷编译 ⇒ 冷态读数就是用户体验**
+### 三条新事实（全部 cold 态、scratch CWD、未碰加载位）
+1. **帧不依赖旧 Gen**：同一只现槽件 `A05A47AB`，**hot（受管 `E:\DSH\sycl-cache`）均 55.02 ms vs cold（今天新编译）均 54.96 ms，Δ +0.05 ms（带内）**；
+2. **冷 JIT 是确定的**：两条**独立**新缓存跑同两门 ⇒ **日志字节相同、首个反例相同**（`QKVW-16x24-float Q: 67 bad; first 131 got 0xb300 want 0xb380`）
+ ⇒ **军规 140 里"并发读写是最可能来源"的归因作废**；并且 `notes/DS-takeover-2026-11-01.md:2803` 记的"专用空缓存复跑 = GREEN"**在今夜同配置下复现为 RED** ⇒ **以复现为准重判**；
+3. **回归窗口夹到 36 小时**：`ctrl_nomacros`（11-02 10:07）与 `rt2`（11-02 17:16）**已 RED**；缓存里 **11-01 01:47** 起的旧 Gen（`xmx_rec_gemm_qkv_window` 体内核 **13,309 ops / 4,448 fixup**）才与 numpy golden 相符，今天冷编译是 **28,066 / 8,389**
+ ⇒ **改动落在 11-01 01:47 → 11-02 10:07**（候选 = §99/§100 的 P3a/P4 融合、attnV fold、`vit_softmax_tiled` 直写 `pack_a16`）。**两门 cold 复跑每次 ≈ 2 分钟 ⇒ 可直接提交二分。**
+### 两条门的性质不同（这是关键区分）
+- **`gate_gemm_f16_qkv_window`**：期望值来自**门内 numpy 参考模型**（`gate_gemm_f16_qkv_window.py:111`）⇒ 冷态**设备 ≠ 参考模型**，**只有 Q 面差、K/V 逐位相同 ⇒ 差异集中在 Q 归一化链**；**"重生成 golden" = 把设备行为判为正确 ⇒ 语义裁决：不许重生成，按 bug 追**；
+- **`gate_window_block`**：**内部自洽对照**（composition vs 3-leg chain，`WB-16x24-epi1-narrow / f32out: target differs from the 3-leg chain`）⇒ **没有 golden 可改，冷态两条路互不一致 = 确定是 bug** ⇒ **先二分这个**。
+### 认证口径改成（作废我上一条的"39/1 按设计"）
+**修好之前：`38 门全绿 + 2 门已知红（挂 bug）+ 身份守卫（staged 时按设计红）`**，并把两门的**首个反例、二分结论**写进 `tools/gates_known_red.md`；**以后每铲的 40 门读数按这个口径判**。
+### 一条要补的实机读数
+**游戏进程不设 `SYCL_CACHE_*`**（`libxmx_sycl.cpp` 里 `SYCL_CACHE|_putenv|setenv` 0 命中；设变量的是 `tools/dsh_run_gates.sh:12-13`、`dsh_bench.sh:15-16`、`run_C1.ps1:8`、`run_C2.ps1:14`、`run_M.ps1:9`、`run_s6b.ps1:15`、`k2b_ab.ps1:26-27` = hot；`build_shipped.ps1:75-76` = 专用）
+⇒ **实机每次冷编译 ⇒ 冷态读数就是用户看到的**；**要量冷态首帧代价（第一次 walk 的帧时 vs 稳态）**，若首帧明显更贵 ⇒ 单列挂账。
+### 普查工具修正与 com4 的正确范围
+`s6/l1_span_count2.py`（只数代码不数注释）：`gemm_int8_qkv` **20**、`gemm_qkv_window` **5**、`unary` 6、`gemm_int8_batched` 4、`gemm_window_residual_pool` 4、**`window_block` 4（com2 里其实没切它）**、`merge_heads_scale` 3、其余各 1-2；按区间的头文件：`softmax` 20（已切）、`wbres` 6、`requant` 4、`post` 16、`pre` 35 = **INSIDE 可切**；**`quantize_row` 0（`cr_div` 4）、`publish` 10、`cosine_tree` 8 = OUTSIDE ⇒ 不能切**；**`gemm_f16_v1` 真实调用点 = 0**（com4 那处是空刀）。
+⇒ **com4 的正确重测 = `post(16) + wbres(6) + requant(4)`，cold 态跑"帧面四闸 + 38 门"，那两门的既有红单独记账。**
+### 军规 143/144（入 B2；并更正 140）
+**143**：**冷 JIT 编译是确定的（两条独立空缓存给出字节相同的日志与相同反例）⇒ 能在 cold 态复现的门红必须当真缺陷处理；hot 态绿不构成正确性证据。** 更正军规 140 的归因：20:09 的 3 RED **不是并发读写**，而是 11-01 01:47 → 11-02 10:07 之间的一段既有回归（`ctrl_nomacros`、`rt2` 已红；只有缓存里 11-01 01:47 的旧 Gen 与 numpy golden 相符）。**引用旧账里的"复跑 GREEN"之前必须先确认它能否复现。**
+**144**：**门链的期望值来源要分清两类：`设备 vs 参考模型`（numpy）的门是语义权威，不许用"重生成 golden"把设备行为判为正确；`内部自洽对照`（composition vs 3-leg chain）的门在冷态互不一致时直接判 bug。** 附一条环境事实：**游戏进程不设 `SYCL_CACHE_*` ⇒ 实机每次冷编译 ⇒ 冷态读数即用户体验**（帧面 hot vs cold 只差 0.05 ms，带内）。
