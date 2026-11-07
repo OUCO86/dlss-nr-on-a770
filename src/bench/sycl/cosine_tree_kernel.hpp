@@ -24,9 +24,6 @@ static const float COSINE_NORM_FLOOR = 0.00006198883056640625f;
 static const float VIT_ROOT = 5.65625f;   // half(sqrt(32)), cosine_tree.glsl:58
 
 // the half-fma spelling: half_round(l*r + acc) with the multiply-add NOT contracted
-#pragma clang fp contract(off)   // imfnat3: tight region for the helper below only (jun129)
-static inline float cr_plain_div(float a, float b) { return a / b; }   // ONE correctly-rounded div.rn (pre_kernel.hpp:40-41 recipe)
-#pragma clang fp contract(fast)
 static inline float cr_hfma(float l, float r, float acc) {
     return qr_half_round(cr_add(cr_mul(l, r), acc));   // imfnat2 knife 2: cr_mul/cr_add are already the native op under contract(off) (publish_kernel.hpp:28-31); was fadd_rn(fmul_rn(...))
 }
@@ -50,7 +47,7 @@ static inline float cosine_reciprocal(const float* h) {
     for (int lane = 0; lane < 4; ++lane)
         for (int p = 0; p < 2; p++) one[lane][p] = cr_hadd(two[lane][p], two[lane ^ 1][p]);
     float norm = sycl::max(cr_hadd(one[0][0], one[0][1]), qr_half_round(COSINE_NORM_FLOOR));
-    return qr_half_round(cr_plain_div(1.0f, sycl::sqrt(norm)));   // imfnat3: div.rn under contract(off), was ext::intel::math::fdiv_rn
+    return qr_half_round(sycl::ext::intel::math::fdiv_rn(1.0f, sycl::sqrt(norm)));   // imfnat3a: division back on the wrapper (jun165)
 }
 
 // cosine_reciprocal_32 -- GENERATED (kdis/gen_cr32.py) from the exact tree of
@@ -60,7 +57,7 @@ static inline float cosine_reciprocal_32(float h0, float h1, float h2, float h3,
     float one00 = cr_hadd(cr_hadd(cr_hadd(cr_hfma(h8,h8,cr_hmul(h0,h0)), cr_hfma(h24,h24,cr_hmul(h16,h16))), cr_hadd(cr_hfma(h12,h12,cr_hmul(h4,h4)), cr_hfma(h28,h28,cr_hmul(h20,h20)))), cr_hadd(cr_hadd(cr_hfma(h10,h10,cr_hmul(h2,h2)), cr_hfma(h26,h26,cr_hmul(h18,h18))), cr_hadd(cr_hfma(h14,h14,cr_hmul(h6,h6)), cr_hfma(h30,h30,cr_hmul(h22,h22)))));
     float one01 = cr_hadd(cr_hadd(cr_hadd(cr_hfma(h9,h9,cr_hmul(h1,h1)), cr_hfma(h25,h25,cr_hmul(h17,h17))), cr_hadd(cr_hfma(h13,h13,cr_hmul(h5,h5)), cr_hfma(h29,h29,cr_hmul(h21,h21)))), cr_hadd(cr_hadd(cr_hfma(h11,h11,cr_hmul(h3,h3)), cr_hfma(h27,h27,cr_hmul(h19,h19))), cr_hadd(cr_hfma(h15,h15,cr_hmul(h7,h7)), cr_hfma(h31,h31,cr_hmul(h23,h23)))));
     float norm = sycl::max(cr_hadd(one00, one01), qr_half_round(COSINE_NORM_FLOOR));
-    return qr_half_round(cr_plain_div(1.0f, sycl::sqrt(norm)));   // imfnat3
+    return qr_half_round(sycl::ext::intel::math::fdiv_rn(1.0f, sycl::sqrt(norm)));   // imfnat3a: division back on the wrapper (jun165)
 }
 
 // cosine_tree.glsl:47-54, the ViT variant (opendlss_reference), verbatim.
@@ -70,7 +67,7 @@ static inline float vit_reciprocal(const float* h) {
     for (int c = 0; c < 8; ++c) r[c] = cr_hadd(r[c], r[c + 8]);
     for (int c = 0; c < 4; ++c) r[c] = cr_hadd(r[c], r[c + 4]);
     float norm = sycl::max(cr_hadd(cr_hadd(r[0], r[2]), cr_hadd(r[1], r[3])), qr_half_round(COSINE_NORM_FLOOR));
-    return qr_half_round(cr_plain_div(1.0f, sycl::sqrt(norm)));   // imfnat3
+    return qr_half_round(sycl::ext::intel::math::fdiv_rn(1.0f, sycl::sqrt(norm)));   // imfnat3a: division back on the wrapper (jun165)
 }
 
 // kernel: rows x 32 f32 in, normalized f32 out (each output element itself half-rounded,
