@@ -2944,3 +2944,28 @@ WINDOW_BLOCK RED (9 fails)
 2. **每站点成本重标定（同一批 `hr_bisect` dump，新口径）**：**`fmul_rn` 410.8 条/站点、`fadd_rn` 1,233.2、`fdiv_rn` 776.8；原生 `mul/add`（含 half 往返）1.0-1.2 条/站点**。
 3. ★ **新机制事实（改变排刀算术）**：**IMF 序列在帧里不全是逐站点内联，而是被编译器外提成共享子程序**：全帧 **221 只被 `call` 的外提体、645 个 call 站点 ⇒ 动态 116,392 条 = 静态体的 31.3%**（`att5::fused` 里一只 225 条的 e4m3 体外提后被 call 32 次）
  ⇒ **"软件模拟热点"的排序算术必须是 `动态条数 = call 站点数 × 外提体条数`，不是静态指纹行数**；**下一铲的 `tools/frame_hotspots.csv` 按这个口径重排**。
+
+## 138. ★★★★★ **全帧"软件模拟热点"普查交回（零 GPU，`tools/frame_hotspots.csv` + `notes/bigknife-sweep-2026-11-07.md`）：全帧动态 468,002 条里 31.3% 是外提的软件序列，其中 `esimd::div_ieee` 下形一家就占 23.8%**
+### 口径先修对
+- **全帧静态 ops**：B（上线谱系）**371,492**、对照 `hb0` **1,048,060** ⇒ **第一把 IMF 刀实砍 −64.6%**（旧口径 336,505/882,001 漏了 9.4% 的谓词保护行：正则 `^\([A-Za-z0-9+|,_* ]*\)` 不含 `.` ⇒ `(f0.0) cmp …` 整行没数）；
+- **每站点价格重标定**：**`fmul_rn` 410.8、`fadd_rn` 1,233.2、`fdiv_rn` 776.8、原生 `mul/add` 1.0、原生+half 往返 1.2 条/站点**。
+### ★ 最大发现（改变排刀算术，军规 160）
+**软件序列不是逐站点内联，而是被编译器外提成共享子程序按站点 call**：全帧 **221 只外提体 / 645 个 call 站点 / 动态 116,392 条 = 全帧动态 468,002 的 31.3%**；
+**其中 `esimd::div_ieee` 的下形 = 69 只体 / 472 站点 / 动态 111,616 条 = 23.8%**（每体 195-454 条）；
+**⇒ 排行算术 = `动态条数 = call 站点数 × 外提体条数`，不是静态指纹行数**。
+### 两条否证（都入档，防止再走回头路）
+1. **`sycl::half` 的算术/比较运算符不是热点**：全帧 `:hf` 只有 `mul 1,022 / add 294 / mad 8 / cmp 26 / sel 18 / math.inv 38`，**全是原生带类型指令**；便携形指纹 `0x1FFF / >>13 / <<10 / 0x7c00 / 0x3ff` **命中 0** ⇒ **我上一条怀疑的"下一个大热点是 half 运算符"被否证**；
+2. **§61 说的"IMF 指纹还剩 4,392 行"不是 IMF 的账**：那套宽松立即数同时命中 **e4m3 指数提取**（`shr 23` 2,600 行、`and 255` 1,530 行、`448.0f` 2,077 站点）；**内联 IMF 真残量 = 106 块 / 54,574 条（静态 14.7%）～ 165 站点 / 127,690 条（marker 上界）**。
+### ★ 每族兑换率（军规 161：先乘这个再决定砍不砍指令）
+`GA 41.9-51.8K 条/ms`、`ffn_merge 7.6K 条/ms`、`post/unary2 30.4K 条/ms` ⇒ **砍指令有帧钱**；**贴地的 int8 gemm 族 1.16M 条/ms、`window_block` ~1.3M 条/ms** ⇒ **砍指令买不到钱，钱只能在延迟链/依赖上找**。
+### 三把最大刀（子代理提的，按动态条数 × 关键路径）
+- **刀 1 ★★ `esimd::div_ieee` → `inv + emul`（或每行一次倒数 + 每元素只乘）**：站点在 `pack_device.hpp:111/173/212/567/616/689`、`quantize_row_kernel.hpp:241/249/280/329`、`att5_fused_kernel.hpp:111/113/451/452`、`b6_res_kernel.hpp:392/393`、`gemm_s8_v8_kernel.hpp:1245/1253`、`s8_v9b/v9c`；**−100K+ 动态条**；落族 **GA 60,470 + ffn_merge 9,722（单这族 ≈ −1.3 ms）+ post/unary2**；**`quantize_row` 的 28,153 落在贴地的 `quant` ⇒ 不计帧钱**；预计 **腿级 −2 ~ −3 ms**；**风险：会改数值（1 ULP 商 ⇒ X.5 tie 翻）**；
+- **刀 2 ★ 收掉最后一坨内联 IMF**：`cr_hfma`（`cosine_tree_kernel.hpp:28`）与 `cr_sub`（`post_kernel.hpp:28`）改用已经原生的 `cr_mul/cr_add` ⇒ **−54.6K（实测）~ −127.7K（上界）条**；落 `ctree 22,643`（GA ⇒ ≈ −0.44 ms）+ `postpass 12,301`（unary2 ⇒ ≈ −0.4 ms）；**`rec:gemm_int8_qkv` 的 39,298 条在贴地族 ⇒ 不算钱**；预计 **腿级 −0.8 ~ −1.5 ms**；风险：逐站点仅 ±0/NaN 类，**但刀 1 已证换原生会被重结合** ⇒ 必须走量化流程；
+- **刀 3（零画质风险）`qr_e4m3` 两形合一 + `e4m3_decode` 换 256 项 LUT**：`qr_e4m3`（`publish_kernel.hpp:33-41`）**2,077 站点 × 29-51 条 = 60,233 条（12.9% 动态）**，而**同一函数的 ESIMD 形实测只 14 条/站点**（`gemm_s8_v8_kernel.hpp:397-411`、`att5/b6`）⇒ 把 plain-SYCL 站点换成 ESIMD/magic-add 形；`quantize_row_kernel.hpp:71-75` 的 `e4m3_decode` **每字节调 2 次 `sycl::exp2`** ⇒ 换 1 KB 的 256 项 f32 表；预计 **省 ~31K 条 + decode 链**；**风险：数值不变**——**lmxx 的 magic-add 形与出货形 host 逐位对照 6,048,389 样本 DIFFERENT = 0**（`s6/c9_e4m3_magic.py`，样本含全部 65,536 个 f16 精确值、全部 256 个 e4m3 码 ±、4M 随机位形、2M 管线幅度域、角值）⇒ **这把不用叫用户裁画质，走门链即可**。
+### 社区锚点（带行号，可照搬性已判定）
+- **lmxx**：`cosine_tree.glsl:16-18` 的 `hmul/hadd/hfma` = **`precise float t = l*r(+acc)` + `half_round(t)`，一个正确舍入库调用都不用**（⇒ 刀 2 的现成拼法）；`attention.comp:236-238/354-358/127-135` **每行一次倒数、元素只乘**（⇒ 刀 1 的保守形状）；`publish.glsl:41-46` **就是 magic-add e4m3 形**（⇒ 刀 3 直接照搬，已 host 证等价）；`publish.glsl:12-21` 明写"手工做指数/尾数要 10 条 + 2 分支，硬件转换只 2 条"；
+- **oneDNN-GPU**：`…/jit/dsl/ir/codegen/kernel.hpp:645-652` **"fdiv_ieee() is not supported in XeHPG so we use a less precise, inv-based sequence"** → `inv + emul` 两条（`:680-682` 只有 XeHPC+ 才发真 `fdiv_ieee`；`:593` 另记"立即数 src0 不支持 fdiv_ieee"）⇒ **A770 = XeHPG，这是刀 1 的正当性来源**；`math_utils.h:671-677` + `conversion.h:63` 用 **`convert_char_sat_rte`**（一条饱和 RNE 转换）做 int8 取整+夹取 ⇒ 可替掉我们的 `rint + 双 clamp`；**整个 `src/gpu` 里没有一处 per-element 的 `ext::intel::math::f*_rn` 包装**；
+- **ggml-sycl**：**LUT 反量化**现成机制 `vecdotq.hpp:114-131`、`dequantize.hpp:431-432/444-448/1775-1798/1825` ⇒ 刀 3 的 decode 表化；`dmmv.cpp:1593-1604/1751-1752` ESIMD 向量数学适用；**反面例子** `common.hpp:1159-1174` 的 `pow(2.0f, exp-7)` 逐元素 ⇒ 不要照搬；
+- **`refs/fsr-sdk` 本轮无可读 shader 源**（只有文档与 `.bat`）、`refs/nvidia-dlss` 也没有可比对的设备算术源码 ⇒ 要做 FSR 系数表对照得重新取源。
+### 顺带一条排刀结论
+**`window_block` 的 4.3-6.9× 与软件模拟无关**（b6 只有 4,251 动态条、内联 IMF 块 0 只、兑换率 ~1.3M 条/ms）⇒ **它的钱仍只能在每 WG 延迟链 / SLM 往返 / 每闭包 1 发的依赖上找**（§136 推论 ② 成立）。
