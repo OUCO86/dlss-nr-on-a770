@@ -21,6 +21,8 @@
 // correctness one (this is a bit-exact numeric gate).
 #pragma once
 #include <sycl/sycl.hpp>
+#include <cstdlib>                 // NR_SMAX_FORM / NR_SMAX_TRACE (getenv/atoi)
+#include <cstdio>                  // the [smaxform] routing trace
 #include "publish_kernel.hpp"
 #include "cosine_tree_kernel.hpp"   // cr_hadd, cr_hmul (the half-domain add/mul)   // qr_half_round, cr_mul, cr_add, qr_e4m3, qr_e4m3_scalar
 
@@ -31,6 +33,32 @@ namespace smax {
 static inline float cr_mul(float a, float b) { return a * b; }
 static inline float cr_add(float a, float b) { return a + b; }
 static inline float cr_div(float a, float b) { return a / b; }
+
+// NR_SMAX_FORM (layer1 SS53, certified 2026-11-07): the multi-row form of vit_softmax_tiled -- a ROW
+// SLICE OF 32 LANES (two sub-groups at the instance's measured simd=16) instead of one work-item per
+// row, 8 rows per work-group, the four pair-partials staged in local memory and folded by the row's
+// lane 0 in the shipped LEFT-ASSOCIATIVE order. Bench: DIFFARM Ap 0/1,179,648 and recip 0/6,144 (byte
+// identical), ratio 2.948 (48/48 paired samples >= 2.0), work-groups 6,144 -> 768, grf 128 / simd 16 /
+// barrier 1 / scratch 0 / SLM 1,024 B (measured by the launch-time probe, layer1 SS53d).
+// Default ON; NR_SMAX_FORM=0 escapes to the shipped one-item-per-row form.
+static inline bool smax_form_on() {
+    static bool v = !getenv("NR_SMAX_FORM") || atoi(getenv("NR_SMAX_FORM")) != 0;
+    return v;
+}
+// The form's shape contract: blocks tile tokens by 64 (so every lane owns exactly one shipped
+// pair-slot), work-groups tile rows by 8 (so no group is half-inactive), and the A-tile map needs
+// stride % 16 == 0 (the shipped recorder already requires it). Anything else stays on the old form.
+static inline bool smax_form_ok(unsigned nrows, unsigned tokens, unsigned stride) {
+    return (tokens % 64u) == 0u && (nrows % 8u) == 0u && (stride % 16u) == 0u && stride >= tokens;
+}
+// routing table for the gates: NR_SMAX_TRACE=1 prints which shape took which form (bounded).
+static inline void smax_form_trace(unsigned nrows, unsigned tokens, unsigned stride, bool taken) {
+    static int n = 0;
+    if (!getenv("NR_SMAX_TRACE") || n >= 64) return;
+    ++n;
+    printf("[smaxform] nrows=%u tokens=%u stride=%u -> %s\n",
+           nrows, tokens, stride, taken ? "NEW multirow" : "OLD one-item");
+}
 
 static const float SOFT_SCALE     = 0.044921875f;
 static const float SOFT_BIAS      = 1.30078125f;
@@ -262,6 +290,71 @@ inline auto vit_softmax_tiled() {
     };
 }
 
+// vit_softmax_tiled_multirow -- the certified multi-row form (s6/smax2_bench.cpp MR<false>, byte
+// -identical to vit_softmax_tiled there). Same pure arithmetic, same tile addresses, same reciprocal
+// spelling (cr_div inside the contract(off) region); only the WORK DECOMPOSITION differs: lane L of a
+// 32-lane row slice owns pair-slot (c = L&7, j = L>>3) of the current 64-column block, stages
+// ps[rl*32 + c*4 + j], and the row's lane 0 folds the four partials of each of the 8 columns
+// left-associatively (softmax_kernel.hpp:239), then the even/odd column fold (:241-242) and the
+// ascending block accumulation (:243). The store pass splits the columns over the lanes, which makes
+// each sub-group's store a contiguous 16 x f16 = 32 B write.
+static const unsigned SMR_RPB = 8u;      // rows per work-group
+static const unsigned SMR_RLW = 32u;     // lanes per row
+struct tiled_multirow {
+    const float* src; sycl::half* Ap; float* recip; unsigned nrows, tokens, stride;
+    sycl::local_accessor<float, 1> la;
+    void operator()(sycl::nd_item<1> nd) const {
+        unsigned lid = (unsigned)nd.get_local_id(0);
+        unsigned rl = lid / SMR_RLW, L = lid % SMR_RLW;
+        unsigned r = (unsigned)nd.get_group(0) * SMR_RPB + rl;
+        bool act = r < nrows;                       // padded groups: skip the work, keep the barriers uniform
+        float* ps = la.get_pointer();
+        const float* row = act ? (src + (size_t)r * stride) : src;
+        unsigned blocks = (tokens + 63u) / 64u;
+        float zero = vit_weight(0.0f), total = 0.0f;
+        nd.barrier(sycl::access::fence_space::local_space);
+        for (unsigned b = 0; b < blocks; ++b) {
+            if (act) {
+                unsigned c = L & 7u, j = L >> 3u;
+                unsigned k0 = b * 64u + c + 16u * j, k1 = k0 + 8u;
+                float w0 = k0 < tokens ? vit_weight(row[k0]) : zero;
+                float w1 = k1 < tokens ? vit_weight(row[k1]) : zero;
+                ps[rl * SMR_RLW + c * 4u + j] = ctree::cr_hadd(w0, w1);                    // :237
+            }
+            nd.barrier(sycl::access::fence_space::local_space);
+            if (act && L == 0u) {
+                float column[8];
+                const float* pp = ps + rl * SMR_RLW;
+                for (unsigned cc = 0; cc < 8u; ++cc)
+                    column[cc] = ctree::cr_hadd(ctree::cr_hadd(ctree::cr_hadd(
+                          pp[cc * 4u], pp[cc * 4u + 1u]), pp[cc * 4u + 2u]), pp[cc * 4u + 3u]);   // :239
+                float even = ctree::cr_hadd(ctree::cr_hadd(ctree::cr_hadd(column[0], column[2]), column[4]), column[6]);
+                float odd  = ctree::cr_hadd(ctree::cr_hadd(ctree::cr_hadd(column[1], column[3]), column[5]), column[7]);
+                total = ctree::cr_hadd(total, ctree::cr_hadd(even, odd));                  // :241-243
+            }
+            nd.barrier(sycl::access::fence_space::local_space);
+        }
+        if (act && L == 0u) {
+            unsigned padding = blocks * 64u - tokens;
+            if (padding > 0u) total = ctree::cr_hadd(total, -ctree::cr_hmul(zero, (float)padding));
+            recip[r] = qr_half_round(cr_div(1.0f, total));                                 // :246-247
+        }
+        if (act) {
+            unsigned rows_ = stride;
+            unsigned h = r / rows_, srow = r % rows_;
+            unsigned tr = srow / 16u, strip = (srow % 16u) / 8u, il = srow % 8u;
+            unsigned kb_n = stride / 16u;
+            size_t per = (size_t)(stride / 16u) * kb_n * 2u * 128u;
+            sycl::half* Apb = Ap + (size_t)h * per;
+            for (unsigned k = L; k < stride; k += SMR_RLW) {                               // :256-259
+                sycl::half v = sycl::half(k < tokens ? qr_e4m3(vit_weight(row[k])) : 0.0f);
+                unsigned kc = k / 16u, k16 = k % 16u;
+                Apb[((size_t)(tr * kb_n + kc) * 2u + strip) * 128u + il * 16u + k16] = v;
+            }
+        }
+    }
+};
+
 // #145 (军规 132): launch wrappers with the census tick at entry. The kernel type is
 // unchanged, so the GEN instruction census stays comparable; the recorder no longer writes a
 // parallel_for at the call site, and nothing is wrapped around a launch.
@@ -269,6 +362,19 @@ static inline void launch_vit_softmax_tiled(sycl::queue& q, sycl::range<1> r, co
                                             sycl::half* Ap, float* recip,
                                             unsigned nrows, unsigned tokens, unsigned stride) {
     LC_TICK();
+    bool take = smax_form_on() && smax_form_ok(nrows, tokens, stride);
+    smax_form_trace(nrows, tokens, stride, take);
+    if (take) {
+        // global = nrows * 32 lanes, local = 8 rows x 32 lanes = 256 -> nrows/8 work-groups (6,144 -> 768
+        // at the shipped GA shape). SLM = 8 rows x 32 pair-slots x 4 B = 1,024 B per work-group.
+        q.submit([&](sycl::handler& h) {
+            sycl::local_accessor<float, 1> la(sycl::range<1>(SMR_RPB * SMR_RLW), h);
+            h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)nrows * SMR_RLW),
+                                             sycl::range<1>(SMR_RPB * SMR_RLW)),
+                           tiled_multirow{src, Ap, recip, nrows, tokens, stride, la});
+        });
+        return;
+    }
     q.parallel_for(r, vit_softmax_tiled()(src, Ap, recip, nrows, tokens, stride));
 }
 static inline void launch_vit_softmax_kernel(sycl::queue& q, sycl::range<1> r, const float* src,
