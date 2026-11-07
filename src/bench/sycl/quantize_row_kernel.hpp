@@ -19,11 +19,15 @@
 
 static const unsigned QR_GRID = 65535u;   // x-extent cap, same as the GLSL
 
-// imfnat3 tried replacing those ext::intel::math::fdiv_rn sites with a plain / inside a contract(off)
-// region, on the strength of pre_kernel.hpp:40-41. MEASURED FALSE for division (jun165): on Xe-HPG the
-// plain / lowers to SFU math.inv + mul (1 ULP) -- gate_quant_window then read scales bits-equal=False,
-// i.e. even peak/127 moved. imfnat3a therefore keeps the wrapper here; only the mul/add/sub legs of the
-// knife survived (cosine_tree cr_hfma, post cr_sub).
+// imfnat3 (2026-11-08): the plain-SYCL quantise chain used ext::intel::math::fdiv_rn, which inlines a
+// ~777-instruction correctly-rounded software sequence per site. The engine already proved the cheaper
+// route in pre_kernel.hpp:40-48: inside a contract(off) region a plain / IS a single div.rn (the same
+// value, no fixups). Opened and closed tightly around this one helper (jun129).
+#pragma clang fp contract(off)
+static inline float qr_div(float a, float b) { return a / b; }
+#pragma clang fp contract(fast)
+
+
 // prods/recips are diagnostics-only (nullptr in production paths).
 inline auto qr_kernel() {
     return [](sycl::half* a_src, sycl::uint2* packed, float* scales,
@@ -112,11 +116,11 @@ inline auto qr_kernel() {
             // scale 1 ULP low -> 63.499996 vs 63.5 -> dev 64 vs gold 63). The header's
             // own rule ("ONE correctly-rounded division") applies to BOTH divisions;
             // the earlier gates' data simply never hit a bad peak.
-            float scale = (peak == 0.0f) ? 1.0f : sycl::ext::intel::math::fdiv_rn(peak, 127.0f);   // imfnat3a: back on the wrapper (jun165)
+            float scale = (peak == 0.0f) ? 1.0f : qr_div(peak, 127.0f);   // imfnat3: div.rn under contract(off)
             if (row >= m) return;
-            if (within == 0u) { scales[row] = scale; if (recips) recips[row] = sycl::ext::intel::math::fdiv_rn(1.0f, scale); }   // imfnat3a
+            if (within == 0u) { scales[row] = scale; if (recips) recips[row] = qr_div(1.0f, scale); }   // imfnat3
             auto grid = [&](float v) {
-                int r = (int)sycl::rint(sycl::ext::intel::math::fdiv_rn(v, scale));   // imfnat3a
+                int r = (int)sycl::rint(qr_div(v, scale));   // imfnat3: div.rn under contract(off)
                 return (r < -127 ? -127 : (r > 127 ? 127 : r));
             };
             auto pack4 = [](int x0, int x1, int x2, int x3) {
@@ -144,7 +148,7 @@ inline auto qr_kernel() {
                         float f[8]; halves(sw, f);
                         int g[8]; for (int i = 0; i < 8; ++i) g[i] = grid(f[i]);
                         out = sycl::uint2(pack4(g[0],g[1],g[2],g[3]), pack4(g[4],g[5],g[6],g[7]));
-                        if (prods) for (int i = 0; i < 8; ++i) prods[(size_t)row * k + w * 8u + i] = sycl::ext::intel::math::fdiv_rn(f[i], scale);   // imfnat3a
+                        if (prods) for (int i = 0; i < 8; ++i) prods[(size_t)row * k + w * 8u + i] = qr_div(f[i], scale);   // imfnat3
                     }
                 }
                 dst[at] = out;

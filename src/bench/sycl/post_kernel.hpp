@@ -25,7 +25,7 @@ namespace postpass {
 // cr_sub(a,b) = fadd_rn(a,-b): IEEE subtraction and adding the negation are both
 // correctly rounded and give the same result.
 #pragma clang fp contract(off)   // imfnat3: opened/closed tightly around these two definitions only (jun129)
-static inline float cr_div(float a, float b) { return sycl::ext::intel::math::fdiv_rn(a, b); }   // imfnat3a: division back on the wrapper -- plain / lowers to SFU recip + mul (1 ULP), jun165
+static inline float cr_div(float a, float b) { return a / b; }   // imfnat3: ONE correctly-rounded div.rn (the pre_kernel.hpp:40-41 recipe); was ext::intel::math::fdiv_rn
 static inline float cr_sub(float a, float b) { return a - b; }   // imfnat3: native sub.rn (was ext::intel::math::fadd_rn(a,-b))
 #pragma clang fp contract(fast)  // imfnat3: close the region (nothing below changes)
 
@@ -108,7 +108,7 @@ static inline auto post_kernel(PostArgs A) {
         rgb[1] = decode11((word >> 11u) & 0x7FFu);
         rgb[2] = decode10((word >> 22u) & 0x3FFu);
         if (exposure > 0.0f)
-            for (int ch = 0; ch < 3; ch++) rgb[ch] = sycl::ext::intel::math::fdiv_rn(rgb[ch], exposure);   // imfnat3a
+            for (int ch = 0; ch < 3; ch++) rgb[ch] = cr_div(rgb[ch], exposure);   // imfnat3: back to a plain division (no double rounding); CSE hoists it once per pixel
         float shown[3];
         for (int ch = 0; ch < 3; ch++) shown[ch] = rgb[ch];
         float proxyScale = to_proxy_scale(luminance(rgb[0], rgb[1], rgb[2]));
