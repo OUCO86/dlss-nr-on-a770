@@ -17,9 +17,18 @@
 static inline float qr_half_round(float x) {
     return (float)sycl::half(x);   // f32 -> f16 (RNE) -> f32
 }
-// correctly-rounded scalar ops (no contraction) — the `precise` equivalent
-static inline float cr_mul(float a, float b) { return sycl::ext::intel::math::fmul_rn(a, b); }
-static inline float cr_add(float a, float b) { return sycl::ext::intel::math::fadd_rn(a, b); }
+// correctly-rounded scalar ops (no contraction) -- the `precise` equivalent.
+// 2026-11-07 (s6/layer1.md sec 61): the DEVICE spelling of fmul_rn/fadd_rn is the IMF software
+// sequence __imf_fmul_rn/__imf_fadd_rn (sycl/ext/intel/math/imf_rounding_math.hpp:78/87), INLINED at
+// every call site: 309 GEN ops per mul site, 1,048 per add site. Device bit matrix over 33,168,896
+// pairs: in every pair whose two results are both NORMAL the HW op == the IMF result exactly (0
+// exceptions); differences only in signed-zero (HW keeps -0) and NaN payload (HW keeps sign+payload).
+// Both paths flush subnormals identically => denormal behaviour unchanged. contract(off) is opened
+// here so the plain operators cannot be fused into an FMA (that would skip the rounding point).
+#pragma clang fp contract(off)
+static inline float cr_mul(float a, float b) { return a * b; }
+static inline float cr_add(float a, float b) { return a + b; }
+#pragma clang fp contract(fast)
 
 static inline float qr_e4m3(float x) {
     float magnitude = sycl::fmin(sycl::fabs(x), 448.0f);
