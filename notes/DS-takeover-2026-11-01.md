@@ -2885,3 +2885,20 @@ WINDOW_BLOCK RED (9 fails)
 
 #### 补一行（§131 内，上一条命令把它当命令解析掉了）
 **两条路在不同阶段各自偏离**：**输出面上 composition 更贴参考模型（5.355% vs 7.924%）**，**归一化面上 chain 更贴模型**（Q 0.510%、K 0.225%、attended 3.109%）——**所以这不是"一条路对、一条路错"的简单情形：两条路各自在不同阶段偏离，但只有 chain 与参考的归一化算法同构，而实机走的是 composition。**
+
+## 132. ★★★★★ **softmax 新形转正：帧 55.1 -> 51.5 ms（-3.68 ms、8/8；子代理 16 对 -3.627、16/16、sd 0.546、同批对照 +0.200）；两槽 = `F2364615…`；门链 `40 GREEN / 0 RED`（两种口径各一次，带 `[gate-selfcheck]`）**
+### 这把刀是什么
+**`smax::tiled_multirow`**：一行由 **32 lane（simd=16 时 2 个 sub-group）** 服务、**WG = 8 行 × 32 lane = 256**、四 pair 全进 local（`ps[rl*32 + c*4 + j]`）、行内 lane0 按 `hadd(hadd(hadd(p0,p1),p2),p3)` **左结合同序**、列折叠按 even/odd 收尾、块升序、**32 B 合并存**；`NR_SMAX_FORM` 默认 ON、`=0` 逃生；**guard** `tokens%64==0 && nrows%8==0 && stride%16==0 && stride>=tokens`。**只改 `softmax_kernel.hpp`（+106）**，`vit_softmax_tiled()`/`vit_softmax_kernel()` 一字未动。
+### 读数（三级口径分开报，军规 112/131）
+- **bench**（12 进程 × 4 对、冷缓存、件 `FA6287B3` 批后复验）：OLD `1.04734 ms` → NEW `0.35520 ms` ⇒ **ratio 2.948**（min 2.928、sd 0.010、**48/48 ≥ 2.0**）；**`Ap` 0/1,179,648、`recip` 0/6,144 逐位全等**；**组数实测 6,144 → 768（8.0×）**；**`w[k]` 复用判负**（慢 1.2% = 6×sd、多 6,144 B SLM、数值 0/0）⇒ **引擎不带 w 缓存**（推翻我给的"最大质量项"预期）；**ops 只降 6.5%（15,541 → 14,525）却快 2.9× ⇒ 军规 137 第二例**；
+- **腿级（串行 `NR_RUN_TIMING`）**：`xmx_rec_global_attention` **11.116 → 5.988 ms/帧**（中位 −5.06、sd 0.201、**10/10**），每闭包 **1.389 → 0.749 ms**；**其余 20 族全在噪声带内** ⇒ **刀只咬 GA、无外溢**；
+- **出货帧（cgraph）**：**16 对 −3.627 ms、16/16、sd 0.546**（父级另测 8 对 **−3.678、8/8**）⇒ **55.1 → ≈51.5 ms/帧**；**腿级 −5.06 > 帧 −3.63 = 重叠吸收的正常结果，两者不互相预测也不互相否定**。
+### 码代（三方对照）
+**槽实体 → HEAD 未打补丁：`0 changed of 270`**（仅仪表提交零码代漂移）；**HEAD 未打补丁 → 本刀：新增 `smax::tiled_multirow` 12,783 ops + 两只 `xmx_rec_unary` 各 ±1 op（182→181、202→203，净 0）** ⇒ **±1 由本补丁的 `static inline` 与 `<cstdlib>/<cstdio>` 改变 TU 内联/布局决策所致，不是仪表**；**语义未变**（四闸 + 逃生腿逐字节 EXACT；腿级 unary 2.939→2.858、sd 0.257 不显著）。**验收 ③ 按实测更正为"新增 1 核 + 2 只 unary 各 ±1（净 0）"。**
+### ★★ 门链口径大修（军规 146/147）+ 一条旧结论作废
+- **修好的仪器**：`tools/dsh_run_gates.sh` 现在先打 **`[gate-selfcheck]`：本次实际加载的 dll 路径 + md5、`SYCL_CACHE_DIR`**；**`RUNDIR` 可覆盖 ⇒ 能测变体**；**默认专用空缓存**；`oneapi` 留在 PATH 解析依赖。**旧版 `s6/run_gates_scratch.sh:22` 硬编码 `DSH_ONEAPI=E:/DSH/oneapi` ⇒ 所谓"scratch 门链"一直在测加载槽件**（证据：带 `NR_SMAX_TRACE` 插桩的变体在 40 门日志里 `[smaxform]` = 0 行，而同一件在 `nr_replay_now.exe <显式路径>` 打出 16 行 `-> NEW multirow`）。
+- **`gate_graph` / `gate_skip_graph` 是 CWD 敏感门**：同一只槽件 `CWD=oneapi` 两门 GREEN，任何 scratch（连 16 只依赖 dll 都复制）两门 RED，日志先出 **`[skip-chains] chain=NN OUT OF RANGE (valid 0..18446744073709551615)` ⇒ 链登记表为空**，`gate_graph` 随后崩在 `xmx_buf_download` 访问违例 ⇒ **这两门必须 staged 口径**。
+- ★ **复跑结果（修好的仪器 + 专用空缓存）**：**旧件 `A05A47AB` 在 staged 与 scratch 两种口径下 `gate_window_block`、`gate_gemm_f16_qkv_window` 都 GREEN**；**新件 `F2364615` 全链 `40 GREEN / 0 RED`（staged 一次、scratch 一次）** ⇒ **`tools/gates_known_red.md §3` 那张"冷编译下每一件都红、反例一字不差"的表不可复现，作废为 `caliber suspect`**；**20:09 那次 `6AEE1ADE` 的 5+9 fails 仍待复现（候选：共享缓存旧 Gen、那次 shell 的 `NR_*` 泄漏），复现之前不许当证据。**
+- **语义事实仍成立（来自探针，与门链无关）**：composition 与 3-leg 在出货几何差 **4.287% 字节 / 6.45% 像素**；归一化倒数与残差融合形都被洗清；**用户已裁决不要求对齐厂商**。
+### 帧阶梯（更新）
+**63.5 → 58.5 → 57.3（A5）→ 56.3（smax cr_* 刀 + LW16）→ 56.1（qkv 族）→ 55.1（com2 复合刀）→ 51.5（softmax 新形）**；**本次一夜累计 −5.8 ms/帧**。
