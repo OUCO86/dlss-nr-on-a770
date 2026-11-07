@@ -2910,3 +2910,7 @@ WINDOW_BLOCK RED (9 fails)
 **方法坑两条（军规 150）**：自旋窗太短会低估并发（1 ms ⇒ 40；16 ms ⇒ 64）；多档同二进制会被越界档毒死（连 `N=4096` 都起不来）。
 **顺带纠正**：ocloc 1.73 对探针实例确实吐 `slm_size`（45,056 精确、64→1,024、57,346→58,368）与 `grf_count/simd_size/barrier_count`、无 `type: scratch` ⇒ "读不出保留量"只是出货大核的现象；`leg_decomp.csv` 其余 SLM 行（`ffn_merge` 31,744 ⇒ "2 WG"、`wbv3` 65,536 ⇒ "1 WG"）同样不是实测，该列已改名 `per_wg_slm_ratio_NOT_occupancy`。
 **未测（别当结论）**：SLM 带宽/延迟是否随字节数变；出货核真实并发（要插桩 ⇒ 要改引擎，未做）；`grf` 压力对台阶的影响（探针本身 `grf=128` 与出货同值）。
+
+### 11:55 **用户令（停止派新任务）**：**做完 float2Half 原生腿这把最大刀就要实机验证**；**验证前不得下发任何其他任务**；**他验证完回报、并明确说"继续"之前，一切铲都停**。
+**当前唯一在跑的子代理**：`f2872c0d-5c83-45bc-8acb-0d76a9c1f090`，范围已收窄成四步（A 三拼法探针 → B 只改 `publish_kernel.hpp` 的 f32→f16 腿 → C 变化量量化 + 块崩塌/dB/corr + 腿级 ≥10 → D 出货 16 对 + 同批 4 对对照），**做完立刻停手交回**。**旧会话 `1b335290`（WB SLM 探针）已 interrupt，状态 inactive。**
+**我（父级）在这期间只做**：核对写域（`git status` + 引擎文件对 HEAD 哈希）、**拿到 D 的读数后做转正**（从 HEAD 建正式件 → staged → 门链带 `[gate-selfcheck]` → 写两槽 → 更新 `out/SHIPPED_MD5.txt` 与 `notes/DEPLOYED_ARTIFACT.md` → 复跑门链 → 留回退件），**然后把件交给用户进游戏判**；**不再开任何新铲**。
