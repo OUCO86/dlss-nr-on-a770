@@ -2,7 +2,8 @@
 
 **铲手**：子代理（唯一在跑）。**纪律**：本轮零 GPU、零 git 写、引擎文件只读；只用已存在的冷编译 dump 与源码。
 **写过的东西**：`E:\DSH\tools\frame_hotspots.csv`（新建）、`E:\DSH\s6\c2_*.py / c3_*.py / c4_*.py / c6_*.py / c7_*.py / c9_*.py / c10_*.py / c12_*.py / c13_*.py / c15_*.py` 与日志 `E:\DSH\s6\S2_*.log / S3_*.log / S4_*.log / S6_*.log / S7_*.log / S9_*.log / S10_*.log / S12_*.log / S13_*.log`、`E:\DSH\s6\layer1.md §63`。
-`git status --porcelain` = **空**（仓内零改动；csv 写在受管 `E:\DSH\tools\`，不在仓内）。
+`git status --porcelain` 原文（复核 01:5x）= **`?? notes/bigknife-sweep-2026-11-07.md` + `?? tools/frame_hotspots.csv`**（只有这两条未跟踪新文件；**零处 modified**，引擎与门脚本逐文件对 HEAD 的 blob 哈希全 SAME）。
+注意：清单 csv 在受管 `E:\DSH\tools\` 与仓内 `E:\DSH\dlss-nr-on-a770\tools\` 各有一份同内容副本（md5 `CE5DB27DE5CA5624A9812578C51619C2`，非硬链）⇒ 入库与否由父级定。
 
 ---
 
