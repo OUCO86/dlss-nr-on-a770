@@ -22,6 +22,10 @@ $VCTOOLS = 'E:\ProgramData\Microsoft\Microsoft Visual Studio\18\Community\VC\Too
 $SDK     = 'E:\Windows Kits\10'
 $PY      = 'C:\Users\wangz\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe'
 $HERE    = Join-Path $Repo 'src\bench\sycl'
+# Rule 171: make the Tag unique per invocation. Two concurrent builds sharing one $LOG (and $SCR)
+# caused icx to never run at all -- Out-File hit a locked log, exit code stayed 0, and the script
+# printed "BUILD FAILED: no dll" over and over (seen 2026-11-08 07:3x, parent-side mistake).
+$Tag     = "${Tag}-" + (Get-Date -Format 'yyyyMMdd-HHmmss')
 $SCR     = "E:\DSH\tmp\shipbuild_$Tag"
 $LOG     = "E:\DSH\logs\build_$Tag.log"
 
