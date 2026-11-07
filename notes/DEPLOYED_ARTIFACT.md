@@ -2,8 +2,15 @@
 
 | 项 | 值 |
 |---|---|
-| **两槽 md5** | **`AF5A19B30E40B7594C142691F54B5B97`**（`out\libxmx.dll` = `oneapi\libxmx_sycl.dll`，3,382,272 B）= **`shfimf1`（IMF→原生算术根替换）** |
-| **源码提交** | **`92259ae`**；构建 `tools/build_shipped.ps1 -Tag shfimf1`，走 `tools/shipped_build.defs` 基座；日志 `E:\DSH\logs\build_shfimf1.log` |
+| **两槽 md5** | **`5EC0F5095C20CD7FD40519B41B758DDC`**（`out\libxmx.dll` = `oneapi\libxmx_sycl.dll`，3,348,480 B）= **`shf3a`（`imfnat3a`：只把 `*`/`+`/`-` 换原生，除法退回 `fdiv_rn`）** |
+| **源码提交** | **`e2c447c`**；构建 `tools/build_shipped.ps1 -Tag shf3a`（父级从干净 HEAD 重建），走 `shipped_build.defs` 基座；日志 `E:\DSH\logs\build_shf3a.log` |
+| **逐位性** | **四闸 4/4 逐字节 EXACT**：非 fused 1301 `DD49827D…`、fused 1301 `254C02B7…`、features `CACD2029…`、**result 回到 `DAC32974…`**（= 除法确实退回去了）；**门链 staged 口径 `40 GREEN / 0 RED`**（`[gate-selfcheck]` 两行齐、`syclcache_3a_staged` 新建）；**守卫：271 只共同核 `grf_count`/`simd_size`/`type: scratch`/SLM 参数差异全 0、`send.slm` 3,545 → 3,545** |
+| **机制读数** | **全帧静态 371,492 → 279,463（−92,029 = −24.8%）；动态 468,002 → 375,970（−92,032 = −19.7%）**；内联 IMF 块 106 → 28；`goto` −21,951、`join` −13,662（**这一半收益里 39% 是软件块内部控制流塌掉**）；ESIMD `div_ieee` 那半一根没动（69 体 / 472 站点 / 动态 111,612） |
+| **帧读数（诚实）** | **8 对 mean `+0.174 ms`、sd 0.314、2σ 0.629、B 赢 3/8 ⇒ 统计上中性**（**没赚到，也没证明亏**）；**A/B 本批都在 ≈46.2-46.4 ms**（**同一只 `AF5A19B3` 这批读 46.2、上一批读 49.8 ⇒ 热漂，绝对值不可跨批比**）；**⚠ 待复核：若后续批次再出现一致正 delta，就把它退回 `AF5A19B3`** |
+| **上一件（回退位）** | **`builds\libxmx_shfimf1.dll` = `AF5A19B3…`**（源码 `92259ae`，**认证值 49.83 ms/帧**、16 对 −5.763、用户已实机验收）|
+| **回退链** | `builds\libxmx_shfimf1.dll`（`AF5A19B3`）→ `builds\libxmx_shsm1.dll`（`F2364615`）→ `keep_pre_smax_A05A47AB.dll` → `keep_pre_com2_E0B03E90.dll` → `out\libxmx.before-ATT5.keep`（`ABB969FE`）|
+| **金标** | `bk.1301.bin` / `bk.1301.skip.bin` = `DD49827DD33A7EF07C2C17892F18970D`；`bk.1301.pre-skip-1a.bin` = `249A46F374E9` |
+| **fused 三面基线** | `254C02B7… / CACD2029… / DAC32974…`（**未变**）⇒ 历史与复现命令见 **`tools/fused_face_baseline.md`** |
 | **帧读数（认证）** | 出货 **16 对 −5.763 ms、16/16、sd 1.295（2σ=2.591，\|均值\|/2σ=2.2）**；A 侧 = `F2364615`（均值 55.59）⇒ **B 均值 49.83 ms/帧**（48.82-50.56）；**用户实机验收：画面没问题、帧数提高不少** |
 | **门链** | **`40 GREEN / 0 RED`**（staged 口径、当场新建空缓存 `tmp\syclcache_cert_imf_2350`、带 `[gate-selfcheck]`）|
 | **fused 三面基线** | `254C02B7… / CACD2029… / DAC32974…`；非 fused 1301 = 金标 `DD49827D…` ⇒ 全部历史与复现命令见 **`tools/fused_face_baseline.md`** |
