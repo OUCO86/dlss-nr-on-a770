@@ -11,11 +11,6 @@
 | **回退链** | `builds\libxmx_shfimf1.dll`（`AF5A19B3`）→ `builds\libxmx_shsm1.dll`（`F2364615`）→ `keep_pre_smax_A05A47AB.dll` → `keep_pre_com2_E0B03E90.dll` → `out\libxmx.before-ATT5.keep`（`ABB969FE`）|
 | **金标** | `bk.1301.bin` / `bk.1301.skip.bin` = `DD49827DD33A7EF07C2C17892F18970D`；`bk.1301.pre-skip-1a.bin` = `249A46F374E9` |
 | **fused 三面基线** | `254C02B7… / CACD2029… / DAC32974…`（**未变**）⇒ 历史与复现命令见 **`tools/fused_face_baseline.md`** |
-| **帧读数（认证）** | 出货 **16 对 −5.763 ms、16/16、sd 1.295（2σ=2.591，\|均值\|/2σ=2.2）**；A 侧 = `F2364615`（均值 55.59）⇒ **B 均值 49.83 ms/帧**（48.82-50.56）；**用户实机验收：画面没问题、帧数提高不少** |
-| **门链** | **`40 GREEN / 0 RED`**（staged 口径、当场新建空缓存 `tmp\syclcache_cert_imf_2350`、带 `[gate-selfcheck]`）|
-| **fused 三面基线** | `254C02B7… / CACD2029… / DAC32974…`；非 fused 1301 = 金标 `DD49827D…` ⇒ 全部历史与复现命令见 **`tools/fused_face_baseline.md`** |
-| **回退链** | `builds\libxmx_shsm1.dll`（`F2364615…`，51.5）→ `builds\keep_pre_smax_A05A47AB.dll`（55.1）→ `builds\keep_pre_com2_E0B03E90.dll`（56.1）→ `out\libxmx.before-ATT5.keep`（`ABB969FE`）|
-| **金标** | `bk.1301.bin` / `bk.1301.skip.bin` = `DD49827DD33A7EF07C2C17892F18970D`；`bk.1301.pre-skip-1a.bin` = `249A46F374E9` |
 
 ## ★ 一次失败的转正（2026-11-08 04:0x-04:5x）：`imfnat3` 试上线后被自己数据否证并回退
 - **件**：`builds\libxmx_imfnat3.dll` = `66FEC9313177446C192712118A02BA3B`（3,349,504 B，**−32,768 B**）；源码 `2744e7f`（`cosine_tree_kernel.hpp` 7/4、`post_kernel.hpp` 5/3、`quantize_row_kernel.hpp` 13/4）；
