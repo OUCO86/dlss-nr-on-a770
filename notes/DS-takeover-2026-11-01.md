@@ -3403,3 +3403,4 @@ WINDOW_BLOCK RED (9 fails)
 **⇒ 处置：`merge_mega` 不排进引擎；690 这只从第二层出账。**
 ### ④ 现场
 两槽 `A2C3009F…` / 3,335,168 B 复验未动；三金标时间戳未动；仓库 `2167a9c` CLEAN、**零 git 写由子代理执行**；产物 `s6/c19_ffnmerge.cpp`、`s6/pe_c19.ps1`、`s6/pe_c19_plan_census.py`、`s6/pe_c19_zeinfo.py`、日志 `s6/C19_p{1,2,3}.log`、asm `E:\DSH\tmp\k3ze\d_c19`；状态 `s6/layer1.md §105`。
+﻿placeholder
