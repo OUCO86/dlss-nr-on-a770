@@ -42,3 +42,5 @@
 | **回退链** | **`builds\libxmx_imfnat3.dll`（`66FEC931…`，用户 06:39 实机验收）** → `builds\libxmx_shfimf1.dll`（`AF5A19B3`，认证 49.83 ms/帧、16 对 −5.763）→ `libxmx_shsm1.dll`（`F2364615`）→ `keep_pre_smax_A05A47AB.dll` → `keep_pre_com2_E0B03E90.dll` → `out\libxmx.before-ATT5.keep`（`ABB969FE`）|
 | **金标 / 基线** | 三金标 `DD49827D…/DD49827D…/249A46F3…` 未动（mtime 11-02 / 10-25）；**fused 三面基线不变**（`254C02B7 / CACD2029 / AE050ED1`，见 `tools/fused_face_baseline.md`）|
 | **门链** | **C5 未重跑 40 门**（**逐位不变 ⇒ 预期与 `imfnat3` 相同：28 GREEN / 12 RED**，那 12 道是 `imfnat3` 改数值造成的面比较类红，**待重定 golden**）|
+
+### 覆盖上表（2026-11-08 10:2x）：**两槽 = `8658C78653ACE979A7FFEE8AD81CD627`（3,342,336 B）= C7（`window_block` P1/P5/P6 去复制）**；源码 **`a2e7c3e`**（件 = 父级从 HEAD 重建 `builds\libxmx_shfc5→shfc7`；子代理件 `745834F6` 四面一致）；**四闸 4/4 EXACT（`DD49827D / 254C02B7 / CACD2029 / AE050ED1`）⇒ 不需要用户实机裁画质**；**出货 16 对 −0.766 ms、16/16、sd 0.235、2σ 0.470、同批 A/A 对照 mean −0.125 / max|d| 0.420 ⇒ 净 ≈ −0.64 ms**；**A 均值 44.32 → B 43.55 ms/帧**；**回退点 `builds\libxmx_shfc5.dll`（`2F3ACF6C`，C5：−1.793、16/16）→ `libxmx_imfnat3.dll`（`66FEC931`，用户 06:39 实机验收）→ `libxmx_shfimf1.dll`（`AF5A19B3`，49.83 认证值）**；三金标与四面基线未动。
