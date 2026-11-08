@@ -75,33 +75,35 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
             uint scrA = S_SCR + sgid*SCR_SG;
             uint scrB = S_SCR + sgid*SCR_SG + 2048u;
             uint scrC = S_PPO + sgid*2048u;
+// C18 (2026-11-09, port of the C7 blade from window_block_v4.hpp:97-116).
+// v4ph kept the SUBGROUP-UNIFORM QKV loop (no lane term in Ab/Wb) to 2026-11-09: every one
+// of the 16 lanes recomputed the same 16x32 part block => 24 dpas + 24 SLM loads + 24 weight
+// loads + 48 stores PER LANE. NEW: 24 jobs = 3 parts x 8 tiles of 8x8, lane takes job
+// `lane` and lanes 0..7 take `lane+16`; every output element computed EXACTLY ONCE
+// (24 x 64 = 1536 = 3 x 16 rows x 32 cols); per-subgroup dpas 384 -> 48.
+// K chain per element unchanged (kc=0 then kc=1 into the SAME fragment) and the operand
+// slices are byte-identical to tile8s's: a = S_AQO + sgid*1024 + kc*512 + rb*256,
+// b = WqkvPacked + (part*2 + (cb>>1))*256 + (cb&1)*128 + kc*1536. SCR byte map UNCHANGED
+// (row*128B + col*4B) => the P2 reload loop, the stop_stage 10/11/12 dumps and P4's
+// row-sum order all read the same bytes.
             #pragma unroll
-            for (uint part = 0; part < 3u; ++part) {
-                uint scr = (part==0u)? scrA : (part==1u)? scrB : scrC;
-                esimd::simd<float,64> c00(0.f),c01(0.f),c10(0.f),c11(0.f);
-                wbv3::tile8s(c00,c01,c10,c11, S_AQO + sgid*1024u,
-                             WqkvPacked + (size_t)(part*2u+0u)*256u, 2, 6);
-                esimd::simd<float,64> d00(0.f),d01(0.f),d10(0.f),d11(0.f);
-                wbv3::tile8s(d00,d01,d10,d11, S_AQO + sgid*1024u,
-                             WqkvPacked + (size_t)(part*2u+1u)*256u, 2, 6);
-                #pragma unroll
-                for (int r = 0; r < 8; ++r) {
-                    esimd::simd<float,16> m01;
-                    m01.template select<8,1>(0)  = c00.template select<8,1>(r*8);
-                    m01.template select<8,1>(8)  = c01.template select<8,1>(r*8);
-                    esimd::simd<float,16> m11;
-                    m11.template select<8,1>(0)  = c10.template select<8,1>(r*8);
-                    m11.template select<8,1>(8)  = c11.template select<8,1>(r*8);
-                    esimd::simd<float,16> n01;
-                    n01.template select<8,1>(0)  = d00.template select<8,1>(r*8);
-                    n01.template select<8,1>(8)  = d01.template select<8,1>(r*8);
-                    esimd::simd<float,16> n11;
-                    n11.template select<8,1>(0)  = d10.template select<8,1>(r*8);
-                    n11.template select<8,1>(8)  = d11.template select<8,1>(r*8);
-                    esimd::slm_block_store(scr + (uint)r*32u*4u,           m01);
-                    esimd::slm_block_store(scr + (uint)(8+r)*32u*4u,       m11);
-                    esimd::slm_block_store(scr + (uint)r*32u*4u + 64u,     n01);
-                    esimd::slm_block_store(scr + (uint)(8+r)*32u*4u + 64u, n11);
+            for (uint pass = 0; pass < 2u; ++pass) {
+                uint job = lane + pass*16u;
+                if (job < 24u) {
+                    uint part = job >> 3, tile = job & 7u;
+                    uint rb = tile & 1u, cb = tile >> 1u;
+                    uint scr = (part==0u)? scrA : (part==1u)? scrB : scrC;
+                    const half* Wb = WqkvPacked + (size_t)(part*2u + (cb>>1u))*256u + (size_t)(cb&1u)*128u;
+                    esimd::simd<float,64> c(0.f);
+                    #pragma unroll
+                    for (uint kc = 0; kc < 2u; ++kc)
+                        c = esimd::xmx::dpas<8, 8, float>(c,
+                            esimd::simd<half,128>(Wb + (size_t)kc*1536u, esimd::overaligned_tag<16>{}),
+                            esimd::slm_block_load<half,128>(S_AQO + sgid*1024u + kc*512u + rb*256u, esimd::overaligned_tag<16>{}));
+                    #pragma unroll
+                    for (int r = 0; r < 8; ++r)
+                        esimd::slm_block_store(scr + (rb*8u + (uint)r)*128u + cb*32u,
+                                               c.template select<8,1>(r*8));   // 8-float block: no OWORD tag
                 }
             }
             esimd::barrier();
@@ -205,40 +207,31 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
             // ===== P3 scores: rows owned, cols 0..63 =====
             // P8-f (section 100): the A tile is the SAME across all four tc blocks
             // -- hoisted to registers once (the v4 twin; bench_v4full JUDGEs EXACT).
+// C18 (port of the C5 blade, window_block_v4.hpp:243-259): the scores phase was
+// SUBGROUP-UNIFORM here too (qb = S_QPO + sgid*1024, bb = S_KTO + tc*512 carry no lane term)
+// => 16 lanes recomputed the same 16x64 block 16 times (32 dpas + 8 SLM loads + 16 stores per
+// lane). NEW: each lane owns ONE 8x8 tile (rowblk = lane&1, colblk = lane>>1) => 16 tiles x
+// 64 outputs = the 16x64 block exactly once; per-subgroup dpas 512 -> 32. Per-element K chain
+// unchanged (b0@K0-15 with aq0, then b1@K16-31 with aq1 into the SAME fragment); operand
+// slices byte-identical (aq0/aq1 = qb + rowblk*256, aq2/aq3 = qb + 512 + rowblk*256;
+// b = S_KTO + (colblk>>1)*512 + (colblk&1)*256 and +2048). SCR byte map UNCHANGED
+// (row*256B + col*4B) => the stop_stage==5 dump and P4 read the same bytes.
             {
               uint qb = S_QPO + sgid*1024u;
-              esimd::simd<half,128> aq0 = esimd::slm_block_load<half,128>(qb, esimd::overaligned_tag<16>{});
-              esimd::simd<half,128> aq1 = esimd::slm_block_load<half,128>(qb + 256, esimd::overaligned_tag<16>{});
-              esimd::simd<half,128> aq2 = esimd::slm_block_load<half,128>(qb + 512, esimd::overaligned_tag<16>{});
-              esimd::simd<half,128> aq3 = esimd::slm_block_load<half,128>(qb + 768, esimd::overaligned_tag<16>{});
-              for (uint tc = 0; tc < 4u; ++tc) {
-                esimd::simd<float,64> c00(0.f),c01(0.f),c10(0.f),c11(0.f);
-                uint bb = S_KTO + tc*512u;
-                esimd::simd<half,128> b0 = esimd::slm_block_load<half,128>(bb, esimd::overaligned_tag<16>{});
-                esimd::simd<half,128> b1 = esimd::slm_block_load<half,128>(bb + 256, esimd::overaligned_tag<16>{});
-                c00 = esimd::xmx::dpas<8, 8, float>(c00, b0, aq0);
-                c01 = esimd::xmx::dpas<8, 8, float>(c01, b1, aq0);
-                c10 = esimd::xmx::dpas<8, 8, float>(c10, b0, aq1);
-                c11 = esimd::xmx::dpas<8, 8, float>(c11, b1, aq1);
-                esimd::simd<half,128> c0 = esimd::slm_block_load<half,128>(bb + 2048, esimd::overaligned_tag<16>{});
-                esimd::simd<half,128> c1 = esimd::slm_block_load<half,128>(bb + 2304, esimd::overaligned_tag<16>{});
-                c00 = esimd::xmx::dpas<8, 8, float>(c00, c0, aq2);
-                c01 = esimd::xmx::dpas<8, 8, float>(c01, c1, aq2);
-                c10 = esimd::xmx::dpas<8, 8, float>(c10, c0, aq3);
-                c11 = esimd::xmx::dpas<8, 8, float>(c11, c1, aq3);
-                uint scr = S_SCR + sgid*SCR_SG;
-                #pragma unroll
-                for (int r = 0; r < 8; ++r) {
-                    esimd::simd<float,16> m01;
-                    m01.template select<8,1>(0)  = c00.template select<8,1>(r*8);
-                    m01.template select<8,1>(8)  = c01.template select<8,1>(r*8);
-                    esimd::simd<float,16> m11;
-                    m11.template select<8,1>(0)  = c10.template select<8,1>(r*8);
-                    m11.template select<8,1>(8)  = c11.template select<8,1>(r*8);
-                    esimd::slm_block_store(scr + (uint)r*64u*4u + tc*16u*4u,       m01);
-                    esimd::slm_block_store(scr + (uint)(8+r)*64u*4u + tc*16u*4u,   m11);
-                }
-            }
+              uint rowblk = lane & 1u, colblk = lane >> 1u;
+              esimd::simd<half,128> aq0 = esimd::slm_block_load<half,128>(qb + rowblk*256u, esimd::overaligned_tag<16>{});
+              esimd::simd<half,128> aq1 = esimd::slm_block_load<half,128>(qb + 512u + rowblk*256u, esimd::overaligned_tag<16>{});
+              uint bb = S_KTO + (colblk >> 1u)*512u + (colblk & 1u)*256u;
+              esimd::simd<half,128> b0 = esimd::slm_block_load<half,128>(bb, esimd::overaligned_tag<16>{});
+              esimd::simd<half,128> b1 = esimd::slm_block_load<half,128>(bb + 2048u, esimd::overaligned_tag<16>{});
+              esimd::simd<float,64> c(0.f);
+              c = esimd::xmx::dpas<8, 8, float>(c, b0, aq0);   // K = 0..15  (engine step 1)
+              c = esimd::xmx::dpas<8, 8, float>(c, b1, aq1);   // K = 16..31 (engine step 2)
+              uint scr = S_SCR + sgid*SCR_SG;
+              #pragma unroll
+              for (int r = 0; r < 8; ++r)
+                  esimd::slm_block_store(scr + (rowblk*8u + (uint)r)*256u + colblk*32u,
+                                         c.template select<8,1>(r*8));   // 8-float block: no OWORD tag (no such overload)
             }
             esimd::barrier();
             if (stop_stage == 5u) {   // scores rows (map-agnostic row dump, v3 stop=5 form)
@@ -308,10 +301,26 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
             }
 
             // ===== P5 attnV rows-owned: 2 tiles per subgroup =====
-            for (uint tc = 0; tc < 2u; ++tc) {
-                esimd::simd<float,64> c00(0.f),c01(0.f),c10(0.f),c11(0.f);
-                wbv3::tile8ss(c00,c01,c10,c11, S_PPO + sgid*2048u, S_VPO + tc*512u, 4, 2);
-                wbv3::store16s(S_SCR + sgid*SCR_SG + tc*16u*4u, 32, c00,c01,c10,c11);
+// C18 (port of the C7 blade, window_block_v4.hpp:339-352): 2 uniform tc tiles ->
+// 8 lane-owned 8x8 tiles (rb = lane&1, cb = lane>>1), lanes 8..15 idle. Conservation:
+// 8 tiles x 4 dpas = 32 = the old 2 x tile8ss(kb_n=4) per lane x 16 lanes; outputs
+// 8 x 64 = 512 = 16 rows x 32 cols exactly once. K chain per element unchanged (kc 0..3 of
+// 16 into the SAME fragment); operand slices byte-identical to tile8ss:
+// a = S_PPO + sgid*2048 + kc*512 + rb*256; b = S_VPO + (cb>>1)*512 + (cb&1)*256 + kc*1024.
+// SCR byte map unchanged (row*128B + col*4B) => stop_stage==8 dump and P6 read the same bytes.
+            if (lane < 8u) {
+                uint rb = lane & 1u, cb = lane >> 1u;
+                esimd::simd<float,64> c(0.f);
+                #pragma unroll
+                for (uint kc = 0; kc < 4u; ++kc)
+                    c = esimd::xmx::dpas<8, 8, float>(c,
+                        esimd::slm_block_load<half,128>(S_VPO + (cb>>1u)*512u + (cb&1u)*256u + kc*1024u, esimd::overaligned_tag<16>{}),
+                        esimd::slm_block_load<half,128>(S_PPO + sgid*2048u + kc*512u + rb*256u, esimd::overaligned_tag<16>{}));
+                uint scr = S_SCR + sgid*SCR_SG;
+                #pragma unroll
+                for (int r = 0; r < 8; ++r)
+                    esimd::slm_block_store(scr + (rb*8u + (uint)r)*128u + cb*32u,
+                                           c.template select<8,1>(r*8));   // 8-float block: no OWORD tag
             }
             esimd::barrier();
             if (stop_stage == 8u) {   // attended rows (v3 stop=8 form: f32->half)
@@ -334,10 +343,28 @@ inline event launch_v4ph(queue& q, const void* Img, bool image_half,
                 wbv3::sh16(S_ATO + (((tr*2u+1u)*2u+strip)*128u + il*16u)*2u, oh.template select<16,1>(16).read());
             }
             esimd::barrier();
-            for (uint tc = 0; tc < 2u; ++tc) {
-                esimd::simd<float,64> c00(0.f),c01(0.f),c10(0.f),c11(0.f);
-                wbv3::tile8s(c00,c01,c10,c11, S_ATO + sgid*1024u, WprojPacked + (size_t)tc*256u, 2, 2);
-                wbv3::store16s(S_SCR + sgid*SCR_SG + tc*16u*4u, 32, c00,c01,c10,c11);
+// C18 (port of the C7 blade, window_block_v4.hpp:383-397): 2 uniform tc tiles ->
+// 8 lane-owned tiles (rb = lane&1, cb = lane>>1), lanes 8..15 idle. 8 x 2 dpas = 16 = the
+// old 2 x tile8s(kb_n=2) per lane; outputs 512 = 16 x 32 once. Per-element K chain unchanged
+// (kc 0 then 1 of 16 into the SAME fragment). a = S_ATO + sgid*1024 + kc*512 + rb*256;
+// b = WprojPacked + (cb>>1)*256 + (cb&1)*128 + kc*512. SCR byte map unchanged => the
+// stop_stage==9 dump and P7 (the head/pool outlets included) read the same bytes.
+// NOT touched by C18: P0/P2/P4/P7, every barrier, the head tile8s GEMM + compact store,
+// the pool fold, all dump paths, and slm_init<45056>.
+            if (lane < 8u) {
+                uint rb = lane & 1u, cb = lane >> 1u;
+                const half* Wb = WprojPacked + (size_t)(cb >> 1u)*256u + (size_t)(cb & 1u)*128u;
+                esimd::simd<float,64> c(0.f);
+                #pragma unroll
+                for (uint kc = 0; kc < 2u; ++kc)
+                    c = esimd::xmx::dpas<8, 8, float>(c,
+                        esimd::simd<half,128>(Wb + (size_t)kc*512u, esimd::overaligned_tag<16>{}),
+                        esimd::slm_block_load<half,128>(S_ATO + sgid*1024u + kc*512u + rb*256u, esimd::overaligned_tag<16>{}));
+                uint scr = S_SCR + sgid*SCR_SG;
+                #pragma unroll
+                for (int r = 0; r < 8; ++r)
+                    esimd::slm_block_store(scr + (rb*8u + (uint)r)*128u + cb*32u,
+                                           c.template select<8,1>(r*8));   // 8-float block: no OWORD tag
             }
             esimd::barrier();
             if (stop_stage == 9u) {   // projected rows, FULL f32 (the section-100
