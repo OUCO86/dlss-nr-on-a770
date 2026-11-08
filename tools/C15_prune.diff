@@ -1,0 +1,153 @@
+diff --git a/src/bench/sycl/libxmx_sycl.cpp b/src/bench/sycl/libxmx_sycl.cpp
+index ac28b43..023c098 100644
+--- a/src/bench/sycl/libxmx_sycl.cpp
++++ b/src/bench/sycl/libxmx_sycl.cpp
+@@ -434,6 +434,21 @@ struct B6Stash {
+ };
+ static B6Stash g_b6;
+ static bool b6_on() { static bool v = getenv("NR_B6") != nullptr && atoi(getenv("NR_B6")) != 0; return v; }   // B6-1 VERDICT +1.08 (16-pair, 0/16 wins): DEFAULT OFF; NR_B6=1 = retest switch (the axis is frozen-for-retest, not dead -- see 6.25)   // B6-1 PROMOTED: bench_b6 12/12 EXACT (PKT/AS/ATT/planes/1270 both shapes)
++// ==================== C15 (2026-11-09): dissolved-closure witness + optional prune =========
++// A fusion site replaces an ALREADY-PUSHED closure body with [](){}. The closure stays in the
++// stream (passes counts it, [lcount] prints it) but it emits ZERO device submissions, so it is
++// NOT a node of the captured cgraph either -- the engine says so itself at :677 ("passes
++// therefore stays at 691 ... while the captured cgraph's NODE count drops (a no-op closure emits
++// zero device ops)") and at :1603. g_cmds_dissolved stamps exactly which indices were dissolved,
++// AT DISSOLVE TIME, so "how many closures are empty" is a measured count and not an inference
++// from labels or from pf=0 (instrument correction #157b: pf=0 alone is NOT proof of idleness).
++// Host-side, record/capture time only: no statement is added inside any kernel or any
++// parallel_for (military rule 132), and no device op is added, removed or reordered.
++// NR_PRUNE_DISSOLVED=1 additionally drops those closures from the captured stream at capture
++// time. Default OFF => the shipped path is verbatim.
++static std::set<size_t> g_cmds_dissolved;
++static void pg_dissolve(size_t idx) { g_cmds_dissolved.insert(idx); }
++static bool prune_dissolved_on() { static bool v = getenv("NR_PRUNE_DISSOLVED") != nullptr && atoi(getenv("NR_PRUNE_DISSOLVED")) != 0; return v; }
+ // called by a gemm recorder: if `a` is a fused-quant pk whose scale buf == this gemm's
+ // a_scale and whose M,K match, no-op the quant closure and return its info.
+ static bool qfuse_take(int a, int a_scale, unsigned M, unsigned K, QuantFused& out){
+@@ -448,6 +463,7 @@ static bool qfuse_take(int a, int a_scale, unsigned M, unsigned K, QuantFused& o
+     out = it->second;
+     g_cmds[out.qcmd] = [](){};                 // the quant launch dissolves
+     g_cmd_names[out.qcmd] = "quant(FUSED-pack)";
++    pg_dissolve(out.qcmd);
+     g_quant_pk.erase(it);
+     return true;
+ }
+@@ -466,6 +482,7 @@ static bool qfuse_take_gather(int a, int a_scale, unsigned M, unsigned C,
+     out = it->second;
+     g_cmds[out.qcmd] = [](){};
+     g_cmd_names[out.qcmd] = "quant_window(FUSED-pack)";
++    pg_dissolve(out.qcmd);
+     g_quant_pk.erase(it);
+     return true;
+ }
+@@ -501,6 +518,7 @@ static bool qfuse_take_b(int a, int a_scale, unsigned M, unsigned K, unsigned ld
+     out = it->second;                                  // ops may sit in between
+     g_cmds[out.qcmd] = [](){};
+     g_cmd_names[out.qcmd] = "quant(FUSED-pack-b)";
++    pg_dissolve(out.qcmd);
+     g_quant_pk.erase(it);
+     return true;
+ }
+@@ -833,6 +851,8 @@ static bool s6_take_residual(size_t cmd, int a, int b, int c, int a_scale, int b
+     // THE RULE: all six or none. Five no-ops + one fused launch.
+     g_cmds[g.cq1] = [](){}; g_cmds[g.cb1] = [](){}; g_cmds[g.cq2] = [](){};
+     g_cmds[g.cb2] = [](){}; g_cmds[g.cq3] = [](){};
++    pg_dissolve(g.cq1); pg_dissolve(g.cb1); pg_dissolve(g.cq2);
++    pg_dissolve(g.cb2); pg_dissolve(g.cq3);   // C15: same six, no rename (labels lie here)
+     ++g_s6_fires; ++g_s6_fires_gen;
+     // RECORD-TIME host witness (env-gated, like the NR_*_TRACE family): prints nothing
+     // on the device, adds no op to the stream, and lives at closure level -- the kernel
+@@ -1061,7 +1081,8 @@ static bool a5_take_wres(size_t cmd, int a, int b, int c, int a_scale, int b_sca
+     g_cmds[g.c_qw]  = [](){}; g_cmd_names[g.c_qw]  = "quant_window(A5-fused)";
+     g_cmds[g.c_qkv] = [](){}; g_cmd_names[g.c_qkv] = "gemm_int8_qkv(A5-fused)";
+     g_cmds[g.c_wa]  = [](){}; g_cmd_names[g.c_wa]  = "window_attention(A5-fused)";
+-    if (g.stage == 4 && g.c_q2) { g_cmds[g.c_q2] = [](){}; g_cmd_names[g.c_q2] = "quant(A5-fused)"; }
++    pg_dissolve(g.c_qw); pg_dissolve(g.c_qkv); pg_dissolve(g.c_wa);   // C15 witness
++    if (g.stage == 4 && g.c_q2) { g_cmds[g.c_q2] = [](){}; g_cmd_names[g.c_q2] = "quant(A5-fused)"; pg_dissolve(g.c_q2); }
+     if (g.stage == 3) { g.pk2 = a; g.sc2 = a_scale; }   // recorded for the witness only
+     // A5-TOUCH: the fused closure also reads/writes the Q/K/V planes (they are its internal
+     // faces now that 642/643 are no-ops), but 645's own pgraph_ids() never listed them. touch
+@@ -2325,6 +2346,51 @@ static void pgraph_final_dump() {
+     }
+     std::fflush(stdout);
+ }
++// ---- C15: capture-time PRUNE of dissolved closures (NR_PRUNE_DISSOLVED=1) ----------------
++// The dissolved closures carry ZERO device submissions, so dropping them from the stream changes
++// the HOST-side closure list only. What must stay identical is (i) the device op stream, (ii) the
++// scratch-pool block sequence, (iii) the per-closure touch/ids registries of the SURVIVING
++// closures. So the prune compacts every per-capture parallel vector in the same order (rule 57),
++// compacts the g_cmd_names TAIL that belongs to this capture (name_offset = names - closures),
++// and renumbers the skip witness g_skipped_cmds. It runs AFTER skip_chains_apply / bmerge_apply /
++// the report dumps, so those all still see the pre-prune indices.
++// Refused (and said so) if NR_BMERGE_ORDER permuted the stream: g_cmds_dissolved holds PRE-reorder
++// indices and a stale index would drop the wrong closure.
++static void prune_dissolved_apply(int gid) {
++    size_t n = g_cmds.size(), nd = 0;
++    for (size_t i = 0; i < n; ++i) if (g_cmds_dissolved.count(i)) ++nd;
++    bool report = getenv("NR_C15_REPORT") != nullptr || prune_dissolved_on();
++    if (report)
++        std::printf("[c15] graph=%d closures=%zu dissolved=%zu skip_noop=%zu switch=%d\n",
++                    gid, n, nd, g_skipped_cmds.size(), (int)prune_dissolved_on());
++    if (!prune_dissolved_on() || nd == 0) { std::fflush(stdout); return; }
++    if (!g_order_moves.empty()) {
++        std::printf("[c15] graph=%d REFUSED: %zu order moves make the dissolve indices stale\n",
++                    gid, g_order_moves.size()); std::fflush(stdout); return; }
++    std::vector<char> drop(n, 0);
++    for (size_t i = 0; i < n; ++i) if (g_cmds_dissolved.count(i)) drop[i] = 1;
++    std::vector<size_t> map(n, SIZE_MAX);
++    size_t kept = 0;
++    for (size_t i = 0; i < n; ++i) if (!drop[i]) map[i] = kept++;
++    auto comp = [&](auto& v) {
++        size_t w = 0, m = v.size() < n ? v.size() : n;
++        for (size_t i = 0; i < m; ++i) if (!drop[i]) { if (w != i) v[w] = std::move(v[i]); ++w; }
++        if (v.size() != m) { std::printf("[c15] VECTOR-SHORT size=%zu closures=%zu -- prune skipped\n", v.size(), n); return; }
++        v.resize(w);
++    };
++    comp(g_cmds); comp(g_cmds_touch); comp(g_cmds_group); comp(g_pg_ids_snap);
++    comp(g_cmds_launch); comp(g_cmds_name); comp(g_cmds_poolblk);
++    size_t noff = g_cmd_names.size() >= n ? g_cmd_names.size() - n : 0;
++    std::vector<const char*> tail; tail.reserve(kept);
++    for (size_t i = 0; i < n; ++i) if (!drop[i]) tail.push_back(g_cmd_names[noff + i]);
++    g_cmd_names.resize(noff);
++    for (size_t i = 0; i < tail.size(); ++i) g_cmd_names.push_back(tail[i]);
++    std::set<size_t> sk;
++    for (size_t i : g_skipped_cmds) if (i < n && map[i] != SIZE_MAX) sk.insert(map[i]);
++    g_skipped_cmds = std::move(sk);
++    std::printf("[c15] graph=%d pruned=%zu passes %zu -> %zu\n", gid, nd, n, kept);
++    std::fflush(stdout);
++}
+ int xmx_graph_capture(void) {
+     if (!g_recording) FAILMSG("not recording");
+     // NR_SKIP_CHAINS: whole-chain no-ops, applied to the frozen closure list BEFORE the
+@@ -2338,6 +2404,7 @@ int xmx_graph_capture(void) {
+     group_census_report((int)g_graphs.size());   // B step 1: report-only (NR_GROUP_TRACE)
+     if (sp_on()) { std::printf("[scrpriv] versioned_ids=%zu extra_bytes=%zu (%.1f MiB)\n",
+                     g_sp_live.size(), g_sp_extra_bytes, (double)g_sp_extra_bytes / 1048576.0); std::fflush(stdout); }
++    prune_dissolved_apply((int)g_graphs.size());   // C15: last step before the stream is frozen
+     g_graphs.push_back(std::move(g_cmds)); g_graph_names.push_back(std::move(g_cmd_names));
+     g_graph_touch.push_back(std::move(g_cmds_touch)); g_cmds_touch.clear();
+     g_graph_launch.push_back(std::move(g_cmds_launch)); g_cmds_launch.clear();   // #140
+@@ -2350,6 +2417,7 @@ int xmx_graph_capture(void) {
+     // prints closures=691 names=1382 name_offset=691). Forgetting to reset the new vectors is
+     // exactly how section 85 got us: a bookkeeping desync looks like a numerics bug.
+     g_cmds_group.clear(); g_cmds_poolblk.clear(); g_pg_ids_snap.clear(); g_cmds_launch.clear(); g_cmds_name.clear();
++    g_cmds_dissolved.clear();   // C15: per-capture witness, exactly like the vectors above
+     g_quant_pk.clear(); g_fused_quant.clear();          // record-scoped registries die
+     g_pending_fold_slot = SIZE_MAX; g_fold_slot.clear(); // with the stream (10-27 audit)
+     s6_reset();                                          // S6 chain candidate: ditto
+@@ -4919,6 +4987,7 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
+         g_cmd_names[B.wacmd] = "window_attention(B6-1 fused)";
+         g_cmds[B.quantcmd] = [](){};
+         g_cmd_names[B.quantcmd] = "quant(B6-fused)";
++        pg_dissolve(B.quantcmd);   // C15 witness (B6 is default OFF)
+         flop_note("win_int8_res",M,N,K,1);   // the wres gemm still counts in the flop ledger
+         return 0;   // the wres closure is NEVER pushed
+     }
+@@ -5643,6 +5712,7 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
+         g_lfw.confirmed = true;
+         g_cmds[g_lfw.qcmd] = [](){};
+         g_cmd_names[g_lfw.qcmd] = "int8_qkv(LFW-fused)";
++        pg_dissolve(g_lfw.qcmd);   // C15 witness (LFW is default OFF)
+         LfwStash S = g_lfw;
+         const size_t na = (size_t)S.Mp * S.C;
+         sycl::half* OutH = (sycl::half*)Out;
