@@ -110,3 +110,24 @@
 **40 门链在现役件上重跑**：`[gate-selfcheck] loaded dll = E:/DSH/oneapi/libxmx_sycl.dll md5 = 8658c78653ace979a7ffee8ad81cd627`、`SYCL_CACHE_DIR = E:/DSH/tmp/syclcache_gates_0209`（新建空缓存）、`RUNDIR = E:/DSH/oneapi` ⇒ **40 GREEN / 0 RED**。
 **⇒ 待办里"12 条因 `imfnat3` 变红的数值门需要带 provenance 重定基线"这一项作废：现役路上没有需要重定基线的门**；**三条 `bk.1301*` 金标与四面基线一字未动**。
 **日志：`E:\DSH\logs\gates_live_0209.txt`**
+
+## 十、★★★★★ **C18 已转正（2026-11-09 06:2x）：帧 −2.556 ms（非 fused 16/16）、−2.618 ms（fused 4/4）；WB 家族 fused 腿 15.437 → 13.142**
+| 项 | 读数 |
+|---|---|
+| **机制** | 把 **C5+C7 的 lane-disjoint 形状**（P1 QKV / P3 scores / P5 attnV / P6 outproj）移植进 **`wbv4ph::launch_v4ph`**；**依据 = §162 的分支身份取证**（帧里两只最大 WB 闭包 **8349w HEAD / 8160w POOL** 走的是 v4ph，**从没吃过 C5/C7**；`tools/wb_plan_census.py` 读 plan flags：`pooling=0x800000`、`head=0x1000000`） |
+| **改动面** | **只 `src/bench/sycl/window_block_v4ph.hpp`（+93/−66）**；未动 P0/P2/P4/P7、所有栅栏、head 的 `tile8s` GEMM + compact store、pool fold、`slm_init<45056>` |
+| **定档** | **head −27.3%、pool −31.2%**（475.5 / 495.2 → 345.7 / 342.4 ns/窗；每臂 3 进程、每进程新建空缓存、min-of-9、散布 ≤0.6%）；**判官 4/4 逐字节 EXACT**（七区 0/116,981,760 B、head compact 0/8,355,840 B、pool Tgt 0/33,423,360 B） |
+| **守卫** | **`grf 128→128`（没涨）、`slm 45,056→45,056`、`type: scratch` 0、`signal.barrier 18→18`、`fence.slm 18→18`、`simd 1`**；**码代 `.text 3,485→2,742`（−21.3%）、`dpas.8x8 109→23`、`store.slm 189→85`、`load.slm 128→84`；记分板 `.dst≤5` 53.8%→21.2%、p50 5→10、MLP 3.16→3.28** |
+| **腿级（fused，3/侧）** | **`window_block` 15.437 → 13.142 = −2.295 ms/进程**；**`2` 巨头 4.254→3.060（−28.1%）、`691` 巨头 4.376→3.078（−29.7%）**；八只 v4full 兄弟未变；**TOTAL 串行 125.523→122.046 = −3.477** |
+| **帧（权威）** | **非 fused 16 对：mean −2.556、sd 0.415、2σ 0.830、\|mean\|/2σ = 3.08、B 赢 16/16；A 43.6 → B 41.1 ms/帧；同批 A/A 4 对 mean −0.005、max\|d\| 0.21**；**fused 4 对：−2.23 / −2.50 / −2.94 / −2.80 ⇒ mean −2.618、4/4**（A/A 里有一腿 +6 ms 量级离群 ⇒ fused 认证必须 ≥4 对并显式报离群） |
+| **逐位性** | **四闸 4/4 EXACT（两条路各测两遍）**；**40 门链在新件上 40 GREEN / 0 RED**；**⇒ 不需要用户实机裁画质** |
+| **已上线** | 两槽 = **`A2C3009F5EC9C7F48B304346CE5A36D9`（3,335,168 B）**；`out/SHIPPED_MD5.txt` 已更新；HEAD `aac15ce` = 出货件源状态；旧两槽存 `out\libxmx.before-c18.keep`；回退链 `shfc7(8658C786) → shfc5(2F3ACF6C) → imfnat3(66FEC931) → shfimf1(AF5A19B3)` |
+### 第 2 层倍数表（C18 之后）
+| 族 | 每闭包（fused 腿级） | 状态 |
+|---|---|---|
+| **`window_block`** | **1.314 ms 均值**（巨头 **3.06-3.08**、兄弟 **0.81-1.03**）| ❌ 仍未达标，但**去复制这条线已把三只核（v4full 的 P1/P3/P5/P6 + v4ph 的同四相）全收割完**；**剩余价格在"少发 submission / 换形状"，不在指令量**（军规 186/188/189） |
+| `gemm_int8_residual` | 0.340（68 只 23.15）| ✅ 贴地（旧申报口径）；**新价签：`690 ffn_merge` 与尾部单只按 1:1 兑换**（§161） |
+| **`ffn_merge`** | **1.519 ms（单只，尾部）** | ❌ **下一个最实靶（尾部比值 1.08 ⇒ 帧价 ≈ 1.6 ms）** |
+| `global_attention` | 0.473（8 只）| ❌ 2.1-3.3×；**C512 att 段融合价签 1.61 ms** |
+### 这条线累计
+**C5 −1.793 + C7 −0.766 + C18 −2.556 = −5.115 ms/帧**（**全部逐位不变、全部 16/16、全部四闸 EXACT**）；**WB 家族 fused 腿 15.437 → 13.142，两只巨头各降 ~30%**。
