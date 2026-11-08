@@ -209,45 +209,47 @@ inline event launch_v4full(queue& q, const void* Img, bool image_half,
             group_barrier(it.get_group());          // KTO/VPO shared for P3/P5
 
             // ===== P3 scores: rows owned, cols 0..63 =====
-            // P8-f (section 100): the A tile (S_QPO + sgid*1024, kc 0..1) is the
-            // SAME across all four tc blocks -- hoist to registers ONCE (4 x
-            // simd<half,128> = the whole 2KB A row-block; tile8ss's A-side SLM
-            // re-reads 4x vanish). Bench judges = the seven stage-dump regions,
-            // all EXACT (bench_v4full); scores stage 0.333->0.289 ms/call.
+            // C5 BLADE (2026-11-08, lane-disjoint P3; audit s6/layer1.md 76, A/B定档 s6/c5_ab.cpp):
+            // The old shape was SUBGROUP-UNIFORM: qb = S_QPO + sgid*1024 and bb = S_KTO + tc*512
+            // carry NO lane term, so all 16 lanes of a subgroup loaded identical operands and
+            // recomputed the whole 16x64 block 16 times (32 dpas + 20 SLM loads + 64 SLM stores
+            // per lane). window_block was the ONLY dpas family in the engine written that way --
+            // s8v8/ffn2/ffnc/att5/b6/wares all use per-thread disjoint tiles (see
+            // gemm_s8_v8_kernel.hpp:772 "THREAD-LOCAL -- 32 disjoint 16x16 blocks").
+            // A/B skeleton probe on the identical shape (same useful work, 2040 WGs, 3 procs/arm,
+            // cold caches): uniform 0.2619 ms/launch vs lane-disjoint 0.0918 ms/launch
+            // = -65.1 percent wall (static slots 36->2 dpas, 87->17 send.slm, 432->78 instr).
+            // NEW SHAPE: each lane owns ONE 8x8 output tile --
+            //   rowblk = lane&1 (rows 0-7 / 8-15 of the subgroup slab),
+            //   colblk = lane>>1 (8 tiles of 8 cols) -- 2 x 8 = 16 tiles = the 16x64 block
+            //   exactly once (no overlap, no gap: 16 lanes x 64 outputs = 1,024).
+            // BIT-EXACTNESS: per output ELEMENT the K chain is untouched -- the engine's c00
+            // accumulated dpas(b0 = cols 0..7,K 0..15 ; aq0 = rows 0..7,K 0..15) THEN
+            // dpas(b2 = same cols,K 16..31 ; aq2 = same rows,K 16..31) into the SAME register
+            // fragment. Here the same lane runs exactly those two steps for its own (rowblk,
+            // colblk) pair with byte-identical operand slices (aq0/aq1 = K 0..15 of rows 0-7 /
+            // 8-15 at qb+0/qb+256; aq2/aq3 = K 16..31 at qb+512/qb+768; b0/b1 = K 0..15 / 16..31
+            // of col tile colblk at KA + (colblk>>1)*512 + (colblk&1)*256 and +2048).
+            // Accumulator fragment layout = row*8+col (same as the old c00/c01/c10/c11), and the
+            // SCR byte map is UNCHANGED: row*256B + col*4B (colblk*32B = tc*64B + (colblk&1)*32B)
+            // => the stop_stage==5 scores dump (:253-266) and P4 (:268-311) read the same bytes
+            // as before, and P4's row-sum order (c=0..63) is not touched at all.
             {
               uint qb = S_QPO + sgid*1024u;
-              esimd::simd<half,128> aq0 = esimd::slm_block_load<half,128>(qb, esimd::overaligned_tag<16>{});
-              esimd::simd<half,128> aq1 = esimd::slm_block_load<half,128>(qb + 256, esimd::overaligned_tag<16>{});
-              esimd::simd<half,128> aq2 = esimd::slm_block_load<half,128>(qb + 512, esimd::overaligned_tag<16>{});
-              esimd::simd<half,128> aq3 = esimd::slm_block_load<half,128>(qb + 768, esimd::overaligned_tag<16>{});
-              for (uint tc = 0; tc < 4u; ++tc) {
-                esimd::simd<float,64> c00(0.f),c01(0.f),c10(0.f),c11(0.f);
-                uint bb = S_KTO + tc*512u;
-                esimd::simd<half,128> b0 = esimd::slm_block_load<half,128>(bb, esimd::overaligned_tag<16>{});
-                esimd::simd<half,128> b1 = esimd::slm_block_load<half,128>(bb + 256, esimd::overaligned_tag<16>{});
-                c00 = esimd::xmx::dpas<8, 8, float>(c00, b0, aq0);
-                c01 = esimd::xmx::dpas<8, 8, float>(c01, b1, aq0);
-                c10 = esimd::xmx::dpas<8, 8, float>(c10, b0, aq1);
-                c11 = esimd::xmx::dpas<8, 8, float>(c11, b1, aq1);
-                esimd::simd<half,128> c0 = esimd::slm_block_load<half,128>(bb + 2048, esimd::overaligned_tag<16>{});
-                esimd::simd<half,128> c1 = esimd::slm_block_load<half,128>(bb + 2304, esimd::overaligned_tag<16>{});
-                c00 = esimd::xmx::dpas<8, 8, float>(c00, c0, aq2);
-                c01 = esimd::xmx::dpas<8, 8, float>(c01, c1, aq2);
-                c10 = esimd::xmx::dpas<8, 8, float>(c10, c0, aq3);
-                c11 = esimd::xmx::dpas<8, 8, float>(c11, c1, aq3);
-                uint scr = S_SCR + sgid*SCR_SG;
-                #pragma unroll
-                for (int r = 0; r < 8; ++r) {
-                    esimd::simd<float,16> m01;
-                    m01.template select<8,1>(0)  = c00.template select<8,1>(r*8);
-                    m01.template select<8,1>(8)  = c01.template select<8,1>(r*8);
-                    esimd::simd<float,16> m11;
-                    m11.template select<8,1>(0)  = c10.template select<8,1>(r*8);
-                    m11.template select<8,1>(8)  = c11.template select<8,1>(r*8);
-                    esimd::slm_block_store(scr + (uint)r*64u*4u + tc*16u*4u,       m01);
-                    esimd::slm_block_store(scr + (uint)(8+r)*64u*4u + tc*16u*4u,   m11);
-                }
-            }
+              uint rowblk = lane & 1u, colblk = lane >> 1u;
+              esimd::simd<half,128> aq0 = esimd::slm_block_load<half,128>(qb + rowblk*256u, esimd::overaligned_tag<16>{});
+              esimd::simd<half,128> aq1 = esimd::slm_block_load<half,128>(qb + 512u + rowblk*256u, esimd::overaligned_tag<16>{});
+              uint bb = S_KTO + (colblk >> 1u)*512u + (colblk & 1u)*256u;
+              esimd::simd<half,128> b0 = esimd::slm_block_load<half,128>(bb, esimd::overaligned_tag<16>{});
+              esimd::simd<half,128> b1 = esimd::slm_block_load<half,128>(bb + 2048u, esimd::overaligned_tag<16>{});
+              esimd::simd<float,64> c(0.f);
+              c = esimd::xmx::dpas<8, 8, float>(c, b0, aq0);   // K = 0..15  (engine step 1)
+              c = esimd::xmx::dpas<8, 8, float>(c, b1, aq1);   // K = 16..31 (engine step 2)
+              uint scr = S_SCR + sgid*SCR_SG;
+              #pragma unroll
+              for (int r = 0; r < 8; ++r)
+                  esimd::slm_block_store(scr + (rowblk*8u + (uint)r)*256u + colblk*32u,
+                                         c.template select<8,1>(r*8));   // 8-float block: no OWORD tag (no such overload)
             }
             esimd::barrier();
             if (stop_stage == 5u) {   // scores rows (map-agnostic row dump, v3 stop=5 form)
