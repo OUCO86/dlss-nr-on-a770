@@ -1,0 +1,21 @@
+item,value,source,note
+kernel,wbv4::launch_v4full (live piece 66FEC931),window_block_v4.hpp:23-392,"leg_decomp: ops 2359, grf 128, simd 1, slm 45056, 1 launch/closure"
+P3 phase lines,217-252,window_block_v4.hpp,A-side hoist 219-222; tc loop 223-250; barrier 252
+dpas per WG,128,8 dpas/tc x 4 tc x 4 subgroups,matches the parent prior: 2040 windows x 128 = 261k dpas/leg
+dpas time (ladder),6.68 ms per FRAME-leg set = 0.668 ms per closure = 327 ns per window = 2.56 ns per dpas,d13: 16.663 - 9.981 over 10 closures,"CORRECTION to the prior: 25.6 ns/dpas came from treating 6.68 ms as ONE closure. Per closure it is 0.668 ms. With 2,040 WG / 64 concurrent = 31.9 waves, each WG spends ~45 ns per (dpas+SLM) op -> that is SLM-latency/dependency bound, not issue bound"
+A-side slm loads per WG,16,"4 x simd<half,128> per subgroup (219-222) x 4 subgroups",each A load feeds 8 dpas -> reuse 8x; A slab is subgroup-private (qb = S_QPO + sgid*1024)
+K-side slm loads per WG,64,"4 per tc (226-227, 232-233) x 4 tc x 4 subgroups",each K load feeds only 2 dpas -> reuse 2x
+K-side redundancy,4x,bb = S_KTO + tc*512 has NO sgid term (225),all four subgroups read the SAME 4 KB of KTO -> 16 KB of SLM traffic for 4 KB of unique data
+total slm loads per WG,80,16 A + 64 K,dpas per slm load = 128/80 = 1.60
+slm stores per WG (P3),256,"store 247-248: 8 rows x 2 stores x 4 tc x 4 subgroups, 64 B each",16 KB written into the per-subgroup SCR slab (S_SCR + sgid*4096)
+P4 reads those stores back,128 loads + 256 stores per WG,"window_block_v4.hpp:268-311 (2 x simd<float,32> loads per thread, 4 x sh16 stores)","P3->P4 SCR round trip is SUBGROUP-LOCAL (same sgid slab) -> pure overhead, no cross-thread sharing needed"
+barrier sites around P3,1 (line 252) + the group_barrier at 209 upstream,"window_block_v4.hpp:209,252",ze_info barrier_count=1 is metadata only (jun167)
+goto/join share of the instance,342 of 4273 lines in wbmega::launch_full; 76 of 2033 in wbv3::launch_v3,wmap census (live piece),control flow is a large fraction of these bodies
+
+candidate,change,slm ops saved per WG,dpas changed?,per-element order,four-gate verdict,risk
+C1 K-tile column split,give each subgroup a different output-column range so the KTO tiles are read ONCE per WG instead of 4x: bb = S_KTO + tc*512 becomes sgid-dependent ownership of the N side (225-233),"-48 K loads (64 -> 16), i.e. -60% of P3 slm loads; dpas per slm load 1.60 -> 3.20",count stays 128/WG,unchanged if each output element keeps the same K=32 chain in the same order (it does: only WHICH subgroup computes WHICH columns changes),should stay byte-EXACT,SCR/P4 row ownership and the 247-248 store addresses must follow the new ownership; the P4 softmax rows are per-subgroup today
+C2 hoist K tiles into registers across tc,"like the A-side hoist at 219-222 but for the 4 tc blocks (16 x simd<half,128> live)",-48 loads (same as C1),no,unchanged,should stay byte-EXACT,register pressure: grf is already 128 (the max) -> almost certainly spills to scratch; the c60 guard (scratch args must stay 0) will catch it
+C3 wider dpas tile (M or N 16),"dpas<8,16>/<16,8> instead of <8,8>","fewer loads per useful MAC, but the tile map layout (128-half operands) changes",YES: the accumulation decomposition changes,NOT guaranteed: a different M/N split moves which partials add into which accumulator,must be treated as value-changing until proven,"breaks the ""pure restructure"" premise; needs the ladder + faces re-baseline"
+C4 fuse P3 -> P4 in registers (skip the SCR round trip),P4 consumes the accumulators of the tc loop directly instead of re-reading SCR (268-311 reads what 247-248 wrote),-256 stores -128 loads per WG (P3->P4 traffic vanishes),no,unchanged: the row sum at 298-300 still walks the same 64 elements in the same order,should stay byte-EXACT,"needs 4 x simd<float,64> live at once (256 f32/thread) -> spill risk again; the P4 dump path (312-317) and stop_stage ladder must be re-plumbed"
+
+measurement gap,the ladder cannot price P3 alone below the dump cost (correction A): stop=5 pays the 16.7 MB DumpKV write,,,,,"to separate C1/C4 savings, use the cold-dump op census (ops/send.slm/dpas), not the leg ms"
