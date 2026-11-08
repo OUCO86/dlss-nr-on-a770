@@ -1,0 +1,142 @@
+closure,family,label,chain,tier,read_ids,write_ids,leg_ms,n_RAW_preds,n_fake_preds,last_RAW_pred,last_any_pred,move_back_slots_no_reallocation,move_back_slots_if_slabs_versioned,preds_in_400_550_band (closure:CLASS:planes),succs (closure:CLASS)
+550,xmx_rec_quant_window,quant_window(FUSED-pack),40,C256,1303,1305 1306,0.0022,1,2,549,549,0,0,"549:RAW:1303; 548:WAW:1305,1306; 549:WAR:1305,1306",559:WAR; 551:RAW; 553:WAW
+551,xmx_rec_gemm_int8_qkv,xmx_rec_gemm_int8_qkv,40,C256,1000 1010 1011 1305 1306,1307 1308 1309,0.2151,1,7,550,550,0,0,546:WAW:1307; 547:WAR:1307; 547:WAW:1308; 548:WAR:1308; 549:WAR:1308; 541:WAW:1309,553:WAR; 552:RAW; 556:WAW; 557:WAW; 561:WAW
+552,xmx_rec_window_attention,xmx_rec_window_attention,40,C256,999 1307 1308 1309,1310,0.2656,1,2,551,551,0,0,542:WAW:1310; 543:WAR:1310,556:WAR; 557:WAR; 561:WAR; 553:RAW; 562:WAW
+553,xmx_rec_quant,quant(FUSED-pack),40,C256,1310,1305 1306,0.0022,1,2,552,552,0,0,,554:RAW; 555:WAW; 562:WAR
+554,xmx_rec_gemm_window_int8_residual,xmx_rec_gemm_window_int8_residual,40,C256,1001 1008 1009 1303 1305 1306,1292,0.2241,2,3,553,553,0,0,544:WAW:1292; 545:WAR:1292; 549:WAR:1292; 549:RAW:1303,555:RAW; 559:RAW; 564:WAW; 559:WAR; 555:WAR
+555,xmx_rec_quant,xmx_rec_quant,40,C256,1292,1305 1306,0.0797,1,2,554,554,0,0,,564:WAR; 556:RAW; 558:WAW
+556,xmx_rec_gemm_int8_batched,xmx_rec_gemm_int8_batched,40,C256,1031 1032 1305 1306,1307,0.2622,1,2,555,555,0,0,,558:WAR; 557:RAW; 561:WAW
+557,xmx_rec_gemm,xmx_rec_gemm,40,C256,1023 1307,1308,0.2183,1,2,556,556,0,0,,561:WAR; 558:RAW; 559:RAW; 561:WAW
+558,xmx_rec_quant,quant(FUSED-pack),40,C256,1308,1305 1306,0.0024,1,2,557,557,0,0,,559:RAW; 560:WAW; 561:WAR
+559,xmx_rec_gemm_int8_residual,xmx_rec_gemm_int8_residual,40,C256,1021 1025 1026 1292 1305 1306 1308,1303,0.1997,3,3,558,558,0,0,549:WAW:1303,564:WAR; 560:RAW; 564:RAW; 572:WAW; 560:WAR; 561:WAR
+560,xmx_rec_quant_window,quant_window(FUSED-pack),41,C256,1303,1305 1306,0.0023,1,2,559,559,0,0,,572:WAR; 561:RAW; 563:WAW
+561,xmx_rec_gemm_int8_qkv,xmx_rec_gemm_int8_qkv,41,C256,1019 1029 1030 1305 1306,1307 1308 1309,0.2149,1,7,560,560,0,0,,563:WAR; 562:RAW; 565:WAW; 570:WAW; 574:WAW
+562,xmx_rec_window_attention,xmx_rec_window_attention,41,C256,1018 1307 1308 1309,1310,0.2587,1,2,561,561,0,0,,565:WAR; 570:WAR; 574:WAR; 563:RAW; 575:WAW
+563,xmx_rec_quant,quant(FUSED-pack),41,C256,1310,1305 1306,0.0022,1,2,562,562,0,0,,564:RAW; 567:WAW; 575:WAR
+564,xmx_rec_gemm_window_int8_residual,xmx_rec_gemm_window_int8_residual,41,C256,1020 1027 1028 1303 1305 1306,1292,0.2567,2,3,563,563,0,0,,565:RAW; 572:WAR; 567:WAR
+565,xmx_rec_gemm,xmx_rec_gemm,41,C256,1292 1293,1307,0.215,1,2,564,564,0,0,,566:RAW; 568:WAW
+566,xmx_rec_unary,xmx_rec_unary,41,C256,1280 1294 1307,1295,0.3243,2,0,565,565,0,0,,567:RAW; 572:RAW; 577:WAW; 568:WAR
+567,xmx_rec_quant,xmx_rec_quant,41,C256,1295,1305 1306,0.0021,1,2,566,566,0,0,,577:WAR; 568:RAW; 569:WAW
+568,xmx_rec_gemm_int8_batched,xmx_rec_gemm_int8_batched,41,C256,1050 1051 1305 1306,1307,0.0022,1,2,567,567,0,0,,569:WAR; 569:RAW; 574:WAW
+569,xmx_rec_quant,xmx_rec_quant,41,C256,1307,1305 1306,0.0021,1,2,568,568,0,0,,570:RAW; 571:WAW; 574:WAR
+570,xmx_rec_gemm_int8_batched,xmx_rec_gemm_int8_batched,41,C256,1052 1053 1305 1306,1308,0.0021,1,2,569,569,0,0,,571:WAR; 571:RAW; 572:RAW; 574:WAW
+571,xmx_rec_quant,quant(FUSED-pack),41,C256,1308,1305 1306,0.002,1,2,570,570,0,0,,572:RAW; 573:WAW; 574:WAR
+572,xmx_rec_gemm_int8_residual,xmx_rec_gemm_int8_residual,41,C256,1040 1044 1045 1050 1051 1052 1053 1295 1305 1306 1308,1303,0.4181,3,3,571,571,0,0,,577:WAR; 573:RAW; 577:RAW; 583:WAW; 573:WAR; 574:WAR
+573,xmx_rec_quant_window,quant_window(FUSED-pack),42,C128,1303,1305 1306,0.0022,1,2,572,572,0,0,,583:WAR; 574:RAW; 576:WAW
+574,xmx_rec_gemm_int8_qkv,xmx_rec_gemm_int8_qkv,42,C128,1038 1048 1049 1305 1306,1307 1308 1309,0.252,1,7,573,573,0,0,,576:WAR; 575:RAW; 579:WAW; 581:WAW; 585:WAW
+575,xmx_rec_window_attention,xmx_rec_window_attention,42,C128,1037 1307 1308 1309,1310,0.3271,1,2,574,574,0,0,,579:WAR; 581:WAR; 585:WAR; 576:RAW; 586:WAW
+576,xmx_rec_quant,quant(FUSED-pack),42,C128,1310,1305 1306,0.0021,1,2,575,575,0,0,,577:RAW; 578:WAW; 586:WAR
+577,xmx_rec_gemm_window_int8_residual,xmx_rec_gemm_window_int8_residual,42,C128,1039 1046 1047 1303 1305 1306,1295,0.2686,2,3,576,576,0,0,,578:RAW; 583:RAW; 588:WAW; 583:WAR; 578:WAR
+578,xmx_rec_quant,xmx_rec_quant,42,C128,1295,1305 1306,0.0022,1,2,577,577,0,0,,588:WAR; 579:RAW; 580:WAW
+579,xmx_rec_gemm_int8_batched,xmx_rec_gemm_int8_batched,42,C128,1069 1070 1305 1306,1307,0.0021,1,2,578,578,0,0,,580:WAR; 580:RAW; 585:WAW
+580,xmx_rec_quant,xmx_rec_quant,42,C128,1307,1305 1306,0.0021,1,2,579,579,0,0,,581:RAW; 582:WAW; 585:WAR
+581,xmx_rec_gemm_int8_batched,xmx_rec_gemm_int8_batched,42,C128,1071 1072 1305 1306,1308,0.002,1,2,580,580,0,0,,582:WAR; 582:RAW; 583:RAW; 585:WAW
+582,xmx_rec_quant,quant(FUSED-pack),42,C128,1308,1305 1306,0.0021,1,2,581,581,0,0,,583:RAW; 584:WAW; 585:WAR
+583,xmx_rec_gemm_int8_residual,xmx_rec_gemm_int8_residual,42,C128,1059 1063 1064 1069 1070 1071 1072 1295 1305 1306 1308,1303,0.4758,3,3,582,582,0,0,,588:WAR; 584:RAW; 588:RAW; 594:WAW; 584:WAR; 585:WAR
+584,xmx_rec_quant_window,quant_window(FUSED-pack),43,C128,1303,1305 1306,0.0021,1,2,583,583,0,0,,594:WAR; 585:RAW; 587:WAW
+585,xmx_rec_gemm_int8_qkv,xmx_rec_gemm_int8_qkv,43,C128,1057 1067 1068 1305 1306,1307 1308 1309,0.2474,1,7,584,584,0,0,,587:WAR; 586:RAW; 590:WAW; 592:WAW; 596:WAW
+586,xmx_rec_window_attention,xmx_rec_window_attention,43,C128,1056 1307 1308 1309,1310,0.3163,1,2,585,585,0,0,,590:WAR; 592:WAR; 596:WAR; 587:RAW; 597:WAW
+587,xmx_rec_quant,quant(FUSED-pack),43,C128,1310,1305 1306,0.0022,1,2,586,586,0,0,,588:RAW; 589:WAW; 597:WAR
+588,xmx_rec_gemm_window_int8_residual,xmx_rec_gemm_window_int8_residual,43,C128,1058 1065 1066 1303 1305 1306,1295,0.2436,2,3,587,587,0,0,,589:RAW; 594:RAW; 599:WAW; 594:WAR; 589:WAR
+589,xmx_rec_quant,xmx_rec_quant,43,C128,1295,1305 1306,0.0023,1,2,588,588,0,0,,599:WAR; 590:RAW; 591:WAW
+590,xmx_rec_gemm_int8_batched,xmx_rec_gemm_int8_batched,43,C128,1088 1089 1305 1306,1307,0.0021,1,2,589,589,0,0,,591:WAR; 591:RAW; 596:WAW
+591,xmx_rec_quant,xmx_rec_quant,43,C128,1307,1305 1306,0.0021,1,2,590,590,0,0,,592:RAW; 593:WAW; 596:WAR
+592,xmx_rec_gemm_int8_batched,xmx_rec_gemm_int8_batched,43,C128,1090 1091 1305 1306,1308,0.0021,1,2,591,591,0,0,,593:WAR; 593:RAW; 594:RAW; 596:WAW
+593,xmx_rec_quant,quant(FUSED-pack),43,C128,1308,1305 1306,0.0021,1,2,592,592,0,0,,594:RAW; 595:WAW; 596:WAR
+594,xmx_rec_gemm_int8_residual,xmx_rec_gemm_int8_residual,43,C128,1078 1082 1083 1088 1089 1090 1091 1295 1305 1306 1308,1303,0.5021,3,3,593,593,0,0,,599:WAR; 595:RAW; 599:RAW; 605:WAW; 595:WAR; 596:WAR
+595,xmx_rec_quant_window,quant_window(FUSED-pack),44,C128,1303,1305 1306,0.0021,1,2,594,594,0,0,,605:WAR; 596:RAW; 598:WAW
+596,xmx_rec_gemm_int8_qkv,xmx_rec_gemm_int8_qkv,44,C128,1076 1086 1087 1305 1306,1307 1308 1309,0.2509,1,7,595,595,0,0,,598:WAR; 597:RAW; 601:WAW; 603:WAW; 607:WAW
+597,xmx_rec_window_attention,xmx_rec_window_attention,44,C128,1075 1307 1308 1309,1310,0.3459,1,2,596,596,0,0,,601:WAR; 603:WAR; 607:WAR; 598:RAW; 608:WAW
+598,xmx_rec_quant,quant(FUSED-pack),44,C128,1310,1305 1306,0.0022,1,2,597,597,0,0,,599:RAW; 600:WAW; 608:WAR
+599,xmx_rec_gemm_window_int8_residual,xmx_rec_gemm_window_int8_residual,44,C128,1077 1084 1085 1303 1305 1306,1295,0.2749,2,3,598,598,0,0,,600:RAW; 605:RAW; 610:WAW; 605:WAR; 600:WAR
+600,xmx_rec_quant,xmx_rec_quant,44,C128,1295,1305 1306,0.0021,1,2,599,599,0,0,,610:WAR; 601:RAW; 602:WAW
+601,xmx_rec_gemm_int8_batched,xmx_rec_gemm_int8_batched,44,C128,1107 1108 1305 1306,1307,0.0021,1,2,600,600,0,0,,602:WAR; 602:RAW; 607:WAW
+602,xmx_rec_quant,xmx_rec_quant,44,C128,1307,1305 1306,0.0021,1,2,601,601,0,0,,603:RAW; 604:WAW; 607:WAR
+603,xmx_rec_gemm_int8_batched,xmx_rec_gemm_int8_batched,44,C128,1109 1110 1305 1306,1308,0.002,1,2,602,602,0,0,,604:WAR; 604:RAW; 605:RAW; 607:WAW
+604,xmx_rec_quant,quant(FUSED-pack),44,C128,1308,1305 1306,0.002,1,2,603,603,0,0,,605:RAW; 606:WAW; 607:WAR
+605,xmx_rec_gemm_int8_residual,xmx_rec_gemm_int8_residual,44,C128,1097 1101 1102 1107 1108 1109 1110 1295 1305 1306 1308,1303,0.4788,3,3,604,604,0,0,,610:WAR; 606:RAW; 610:RAW; 616:WAW; 606:WAR; 607:WAR
+606,xmx_rec_quant_window,quant_window(FUSED-pack),45,C128,1303,1305 1306,0.0022,1,2,605,605,0,0,,616:WAR; 607:RAW; 609:WAW
+607,xmx_rec_gemm_int8_qkv,xmx_rec_gemm_int8_qkv,45,C128,1095 1105 1106 1305 1306,1307 1308 1309,0.2722,1,7,606,606,0,0,,609:WAR; 608:RAW; 612:WAW; 614:WAW; 618:WAW
+608,xmx_rec_window_attention,xmx_rec_window_attention,45,C128,1094 1307 1308 1309,1310,0.3209,1,2,607,607,0,0,,612:WAR; 614:WAR; 618:WAR; 609:RAW; 619:WAW
+609,xmx_rec_quant,quant(FUSED-pack),45,C128,1310,1305 1306,0.0025,1,2,608,608,0,0,,610:RAW; 611:WAW; 619:WAR
+610,xmx_rec_gemm_window_int8_residual,xmx_rec_gemm_window_int8_residual,45,C128,1096 1103 1104 1303 1305 1306,1295,0.2415,2,3,609,609,0,0,,611:RAW; 616:RAW; 621:WAW; 616:WAR; 611:WAR
+611,xmx_rec_quant,xmx_rec_quant,45,C128,1295,1305 1306,0.0023,1,2,610,610,0,0,,621:WAR; 612:RAW; 613:WAW
+612,xmx_rec_gemm_int8_batched,xmx_rec_gemm_int8_batched,45,C128,1126 1127 1305 1306,1307,0.0021,1,2,611,611,0,0,,613:WAR; 613:RAW; 618:WAW
+613,xmx_rec_quant,xmx_rec_quant,45,C128,1307,1305 1306,0.0021,1,2,612,612,0,0,,614:RAW; 615:WAW; 618:WAR
+614,xmx_rec_gemm_int8_batched,xmx_rec_gemm_int8_batched,45,C128,1128 1129 1305 1306,1308,0.0021,1,2,613,613,0,0,,615:WAR; 615:RAW; 616:RAW; 618:WAW
+615,xmx_rec_quant,quant(FUSED-pack),45,C128,1308,1305 1306,0.002,1,2,614,614,0,0,,616:RAW; 617:WAW; 618:WAR
+616,xmx_rec_gemm_int8_residual,xmx_rec_gemm_int8_residual,45,C128,1116 1120 1121 1126 1127 1128 1129 1295 1305 1306 1308,1303,0.4689,3,3,615,615,0,0,,621:WAR; 617:RAW; 621:RAW; 627:WAW; 617:WAR; 618:WAR
+617,xmx_rec_quant_window,quant_window(FUSED-pack),46,C128,1303,1305 1306,0.0021,1,2,616,616,0,0,,627:WAR; 618:RAW; 620:WAW
+618,xmx_rec_gemm_int8_qkv,xmx_rec_gemm_int8_qkv,46,C128,1114 1124 1125 1305 1306,1307 1308 1309,0.2816,1,7,617,617,0,0,,620:WAR; 619:RAW; 623:WAW; 625:WAW; 629:WAW
+619,xmx_rec_window_attention,xmx_rec_window_attention,46,C128,1113 1307 1308 1309,1310,0.3176,1,2,618,618,0,0,,623:WAR; 625:WAR; 629:WAR; 620:RAW; 630:WAW
+620,xmx_rec_quant,quant(FUSED-pack),46,C128,1310,1305 1306,0.0023,1,2,619,619,0,0,,621:RAW; 622:WAW; 630:WAR
+621,xmx_rec_gemm_window_int8_residual,xmx_rec_gemm_window_int8_residual,46,C128,1115 1122 1123 1303 1305 1306,1295,0.2463,2,3,620,620,0,0,,622:RAW; 627:RAW; 632:WAW; 627:WAR; 622:WAR
+622,xmx_rec_quant,xmx_rec_quant,46,C128,1295,1305 1306,0.0022,1,2,621,621,0,0,,632:WAR; 623:RAW; 624:WAW
+623,xmx_rec_gemm_int8_batched,xmx_rec_gemm_int8_batched,46,C128,1145 1146 1305 1306,1307,0.002,1,2,622,622,0,0,,624:WAR; 624:RAW; 629:WAW
+624,xmx_rec_quant,xmx_rec_quant,46,C128,1307,1305 1306,0.0022,1,2,623,623,0,0,,625:RAW; 626:WAW; 629:WAR
+625,xmx_rec_gemm_int8_batched,xmx_rec_gemm_int8_batched,46,C128,1147 1148 1305 1306,1308,0.002,1,2,624,624,0,0,,626:WAR; 626:RAW; 627:RAW; 629:WAW
+626,xmx_rec_quant,quant(FUSED-pack),46,C128,1308,1305 1306,0.0021,1,2,625,625,0,0,,627:RAW; 628:WAW; 629:WAR
+627,xmx_rec_gemm_int8_residual,xmx_rec_gemm_int8_residual,46,C128,1135 1139 1140 1145 1146 1147 1148 1295 1305 1306 1308,1303,0.4691,3,3,626,626,0,0,,632:WAR; 628:RAW; 632:RAW; 640:WAW; 628:WAR; 629:WAR
+628,xmx_rec_quant_window,quant_window(FUSED-pack),47,C128,1303,1305 1306,0.0021,1,2,627,627,0,0,,640:WAR; 629:RAW; 631:WAW
+629,xmx_rec_gemm_int8_qkv,xmx_rec_gemm_int8_qkv,47,C128,1133 1143 1144 1305 1306,1307 1308 1309,0.2461,1,7,628,628,0,0,,631:WAR; 630:RAW; 633:WAW; 638:WAW; 642:WAW
+630,xmx_rec_window_attention,xmx_rec_window_attention,47,C128,1132 1307 1308 1309,1310,0.3137,1,2,629,629,0,0,,633:WAR; 638:WAR; 642:WAR; 631:RAW; 643:WAW
+631,xmx_rec_quant,quant(FUSED-pack),47,C128,1310,1305 1306,0.0021,1,2,630,630,0,0,,632:RAW; 635:WAW; 643:WAR
+632,xmx_rec_gemm_window_int8_residual,xmx_rec_gemm_window_int8_residual,47,C128,1134 1141 1142 1303 1305 1306,1295,0.2435,2,3,631,631,0,0,,633:RAW; 640:WAR; 635:WAR
+633,xmx_rec_gemm,xmx_rec_gemm,47,C128,1295 1296,1307,0.2611,1,2,632,632,0,0,,634:RAW; 636:WAW
+634,xmx_rec_unary,xmx_rec_unary,47,C128,1271 1297 1307,1298,0.5348,2,0,633,633,0,0,,635:RAW; 640:RAW; 645:WAW; 636:WAR
+635,xmx_rec_quant,xmx_rec_quant,47,C128,1298,1305 1306,0.0022,1,2,634,634,0,0,,645:WAR; 636:RAW; 637:WAW
+636,xmx_rec_gemm_int8_batched,xmx_rec_gemm_int8_batched,47,C128,1164 1165 1305 1306,1307,0.0021,1,2,635,635,0,0,,637:WAR; 637:RAW; 642:WAW
+637,xmx_rec_quant,xmx_rec_quant,47,C128,1307,1305 1306,0.0022,1,2,636,636,0,0,,638:RAW; 639:WAW; 642:WAR
+638,xmx_rec_gemm_int8_batched,xmx_rec_gemm_int8_batched,47,C128,1166 1167 1305 1306,1308,0.0021,1,2,637,637,0,0,,639:WAR; 639:RAW; 640:RAW; 642:WAW
+639,xmx_rec_quant,quant(FUSED-pack),47,C128,1308,1305 1306,0.0021,1,2,638,638,0,0,,640:RAW; 641:WAW; 642:WAR
+640,xmx_rec_gemm_int8_residual,xmx_rec_gemm_int8_residual,47,C128,1154 1158 1159 1164 1165 1166 1167 1298 1305 1306 1308,1303,0.4842,3,3,639,639,0,0,,645:WAR; 641:RAW; 645:RAW; 651:WAW; 641:WAR; 642:WAR
+641,xmx_rec_quant_window,quant_window(A5-fused),48,C64,1303,1305 1306,0.0021,1,2,640,640,0,0,,651:WAR; 642:RAW; 644:WAW
+642,xmx_rec_gemm_int8_qkv,gemm_int8_qkv(A5-fused),48,C64,1152 1162 1163 1305 1306,1307 1308 1309,0.2922,1,7,641,641,0,0,,644:WAR; 643:RAW; 647:WAW; 649:WAW; 653:WAW
+643,xmx_rec_window_attention,window_attention(A5-fused),48,C64,1151 1307 1308 1309,1310,0.4266,1,2,642,642,0,0,,647:WAR; 649:WAR; 653:WAR; 644:RAW; 654:WAW
+644,xmx_rec_quant,quant(FUSED-pack),48,C64,1310,1305 1306,0.0021,1,2,643,643,0,0,,645:RAW; 646:WAW; 654:WAR
+645,xmx_rec_gemm_window_int8_residual,xmx_rec_gemm_window_int8_residual,48,C64,1153 1160 1161 1303 1305 1306,1298,0.2592,2,3,644,644,0,0,,646:RAW; 651:RAW; 656:WAW; 651:WAR; 646:WAR
+646,xmx_rec_quant,xmx_rec_quant,48,C64,1298,1305 1306,0.0022,1,2,645,645,0,0,,656:WAR; 647:RAW; 648:WAW
+647,xmx_rec_gemm_int8_batched,xmx_rec_gemm_int8_batched,48,C64,1183 1184 1305 1306,1307,0.002,1,2,646,646,0,0,,648:WAR; 648:RAW; 653:WAW
+648,xmx_rec_quant,xmx_rec_quant,48,C64,1307,1305 1306,0.0021,1,2,647,647,0,0,,649:RAW; 650:WAW; 653:WAR
+649,xmx_rec_gemm_int8_batched,xmx_rec_gemm_int8_batched,48,C64,1185 1186 1305 1306,1308,0.002,1,2,648,648,0,0,,650:WAR; 650:RAW; 651:RAW; 653:WAW
+650,xmx_rec_quant,quant(FUSED-pack),48,C64,1308,1305 1306,0.002,1,2,649,649,0,0,,651:RAW; 652:WAW; 653:WAR
+651,xmx_rec_gemm_int8_residual,xmx_rec_gemm_int8_residual,48,C64,1173 1177 1178 1183 1184 1185 1186 1298 1305 1306 1308,1303,0.5326,3,3,650,650,0,0,,656:WAR; 652:RAW; 656:RAW; 662:WAW; 652:WAR; 653:WAR
+652,xmx_rec_quant_window,quant_window(A5-fused),49,C64,1303,1305 1306,0.0022,1,2,651,651,0,0,,662:WAR; 653:RAW; 655:WAW
+653,xmx_rec_gemm_int8_qkv,gemm_int8_qkv(A5-fused),49,C64,1171 1181 1182 1305 1306,1307 1308 1309,0.2965,1,7,652,652,0,0,,655:WAR; 654:RAW; 658:WAW; 660:WAW; 664:WAW
+654,xmx_rec_window_attention,window_attention(A5-fused),49,C64,1170 1307 1308 1309,1310,0.4222,1,2,653,653,0,0,,658:WAR; 660:WAR; 664:WAR; 655:RAW; 665:WAW
+655,xmx_rec_quant,quant(FUSED-pack),49,C64,1310,1305 1306,0.0021,1,2,654,654,0,0,,656:RAW; 657:WAW; 665:WAR
+656,xmx_rec_gemm_window_int8_residual,xmx_rec_gemm_window_int8_residual,49,C64,1172 1179 1180 1303 1305 1306,1298,0.2635,2,3,655,655,0,0,,657:RAW; 662:RAW; 667:WAW; 662:WAR; 657:WAR
+657,xmx_rec_quant,xmx_rec_quant,49,C64,1298,1305 1306,0.0022,1,2,656,656,0,0,,667:WAR; 658:RAW; 659:WAW
+658,xmx_rec_gemm_int8_batched,xmx_rec_gemm_int8_batched,49,C64,1202 1203 1305 1306,1307,0.002,1,2,657,657,0,0,,659:WAR; 659:RAW; 664:WAW
+659,xmx_rec_quant,xmx_rec_quant,49,C64,1307,1305 1306,0.0021,1,2,658,658,0,0,,660:RAW; 661:WAW; 664:WAR
+660,xmx_rec_gemm_int8_batched,xmx_rec_gemm_int8_batched,49,C64,1204 1205 1305 1306,1308,0.002,1,2,659,659,0,0,,661:WAR; 661:RAW; 662:RAW; 664:WAW
+661,xmx_rec_quant,quant(FUSED-pack),49,C64,1308,1305 1306,0.0021,1,2,660,660,0,0,,662:RAW; 663:WAW; 664:WAR
+662,xmx_rec_gemm_int8_residual,xmx_rec_gemm_int8_residual,49,C64,1192 1196 1197 1202 1203 1204 1205 1298 1305 1306 1308,1303,0.5367,3,3,661,661,0,0,,667:WAR; 663:RAW; 667:RAW; 673:WAW; 663:WAR; 664:WAR
+663,xmx_rec_quant_window,quant_window(A5-fused),50,C64,1303,1305 1306,0.0022,1,2,662,662,0,0,,673:WAR; 664:RAW; 666:WAW
+664,xmx_rec_gemm_int8_qkv,gemm_int8_qkv(A5-fused),50,C64,1190 1200 1201 1305 1306,1307 1308 1309,0.2972,1,7,663,663,0,0,,666:WAR; 665:RAW; 669:WAW; 671:WAW; 675:WAW
+665,xmx_rec_window_attention,window_attention(A5-fused),50,C64,1189 1307 1308 1309,1310,0.4174,1,2,664,664,0,0,,669:WAR; 671:WAR; 675:WAR; 666:RAW; 676:WAW
+666,xmx_rec_quant,quant(FUSED-pack),50,C64,1310,1305 1306,0.0021,1,2,665,665,0,0,,667:RAW; 668:WAW; 676:WAR
+667,xmx_rec_gemm_window_int8_residual,xmx_rec_gemm_window_int8_residual,50,C64,1191 1198 1199 1303 1305 1306,1298,0.2673,2,3,666,666,0,0,,668:RAW; 673:RAW; 678:WAW; 673:WAR; 668:WAR
+668,xmx_rec_quant,xmx_rec_quant,50,C64,1298,1305 1306,0.0026,1,2,667,667,0,0,,678:WAR; 669:RAW; 670:WAW
+669,xmx_rec_gemm_int8_batched,xmx_rec_gemm_int8_batched,50,C64,1221 1222 1305 1306,1307,0.0021,1,2,668,668,0,0,,670:WAR; 670:RAW; 675:WAW
+670,xmx_rec_quant,xmx_rec_quant,50,C64,1307,1305 1306,0.0022,1,2,669,669,0,0,,671:RAW; 672:WAW; 675:WAR
+671,xmx_rec_gemm_int8_batched,xmx_rec_gemm_int8_batched,50,C64,1223 1224 1305 1306,1308,0.002,1,2,670,670,0,0,,672:WAR; 672:RAW; 673:RAW; 675:WAW
+672,xmx_rec_quant,quant(FUSED-pack),50,C64,1308,1305 1306,0.002,1,2,671,671,0,0,,673:RAW; 674:WAW; 675:WAR
+673,xmx_rec_gemm_int8_residual,xmx_rec_gemm_int8_residual,50,C64,1211 1215 1216 1221 1222 1223 1224 1298 1305 1306 1308,1303,0.5428,3,3,672,672,0,0,,678:WAR; 674:RAW; 678:RAW; 681:WAW; 674:WAR; 675:WAR
+674,xmx_rec_quant_window,quant_window(A5-fused),51,C64,1303,1305 1306,0.0021,1,2,673,673,0,0,,681:WAR; 675:RAW; 677:WAW
+675,xmx_rec_gemm_int8_qkv,gemm_int8_qkv(A5-fused),51,C64,1209 1219 1220 1305 1306,1307 1308 1309,0.2984,1,7,674,674,0,0,,677:WAR; 676:RAW; 679:WAW
+676,xmx_rec_window_attention,window_attention(A5-fused),51,C64,1208 1307 1308 1309,1310,0.4226,1,2,675,675,0,0,,679:WAR; 677:RAW
+677,xmx_rec_quant,quant(FUSED-pack),51,C64,1310,1305 1306,0.0022,1,2,676,676,0,0,,678:RAW
+678,xmx_rec_gemm_window_int8_residual,xmx_rec_gemm_window_int8_residual,51,C64,1210 1217 1218 1303 1305 1306,1298,0.2756,2,3,677,677,0,0,,679:RAW; 681:WAR
+679,xmx_rec_gemm,xmx_rec_gemm,51,C64,1298 1299,1307,0.2162,1,2,678,678,0,0,,680:RAW
+680,xmx_rec_unary2,xmx_rec_unary2,-1,-,1267 1300 1301 1307,1270,1.323,2,3,679,679,0,0,,681:RAW; 682:WAR
+681,xmx_rec_ffn,xmx_rec_ffn,-1,-,1230 1231 1232 1270 1301,1303,0.4605,1,3,680,680,0,0,,682:WAR; 682:RAW; 683:WAW
+682,xmx_rec_window_block,xmx_rec_window_block,-1,-,1225 1226 1227 1228 1229 1303,1301,1.1671,1,2,681,681,0,0,,683:RAW; 684:WAW; 683:WAR
+683,xmx_rec_ffn,xmx_rec_ffn,-1,-,1240 1241 1242 1301,1303,0.4489,1,2,682,682,0,0,,684:WAR; 684:RAW; 685:WAW
+684,xmx_rec_window_block,xmx_rec_window_block,-1,-,1235 1236 1237 1238 1239 1303,1301,1.2261,1,2,683,683,0,0,,685:RAW; 686:WAW; 685:WAR
+685,xmx_rec_ffn,xmx_rec_ffn,-1,-,1250 1251 1252 1301,1303,0.4884,1,2,684,684,0,0,,686:WAR; 686:RAW; 687:WAW
+686,xmx_rec_window_block,xmx_rec_window_block,-1,-,1245 1246 1247 1248 1249 1303,1301,1.1658,1,2,685,685,0,0,,687:RAW; 688:WAW; 687:WAR
+687,xmx_rec_ffn,xmx_rec_ffn,-1,-,1260 1261 1262 1301,1303,0.7663,1,2,686,686,0,0,,688:WAR; 688:RAW; 689:WAW
+688,xmx_rec_window_block,xmx_rec_window_block,-1,-,1255 1256 1257 1258 1259 1303,1301,1.2117,1,2,687,687,0,0,,689:RAW; 689:WAR
+689,xmx_rec_ffn_merge,xmx_rec_ffn_merge,-1,-,7 24 25 26 1266 1301,1303,3.5491,2,2,688,688,0,0,,690:RAW
+690,xmx_rec_window_block,xmx_rec_window_block,-1,-,8 19 20 21 22 23 1303,1302,4.1594,1,0,689,689,0,0,,

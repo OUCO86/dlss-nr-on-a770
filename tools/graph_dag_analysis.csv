@@ -1,0 +1,28 @@
+metric,value,note
+closures_total,691,"non-fused walk, A_leg_BASE_1.log block0"
+closures_live,523,noop=0 (14 default chains skipped)
+closures_noop,168,
+frames_measured_ms,44.73,"(A) BASE leg median, layer1 sec 93.1"
+plane_ids_in_frame,730,"run-local ids; join key = (bytes,imported,gen)"
+edges_raw,673,
+edges_war,738,
+edges_waw,584,
+longest_path_ms_unit044_alledges,22.792,nodes=518
+longest_path_ms_unit044_RAWonly,22.704,nodes=516
+longest_path_ms_rt_alledges,111.413,nodes=518
+longest_path_ms_rt_RAWonly,105.478,nodes=516
+serial_sum_ms_unit044,23.012,n_live x 0.044
+serial_sum_ms_rt,111.959,"per-closure RT (serialised diagnostic, includes host wait)"
+consecutive_live_pairs,522,
+consecutive_pairs_sharing_plane,522,
+wave_plan_as_recorded_waves,523,
+wave_plan_as_recorded_maxwidth,1,
+wave_plan_raw_only_waves,523,
+wave_plan_raw_only_maxwidth,1,
+listsched_K1_all_edges_ms,23.012,
+listsched_K1_fake_removed_ms,23.012,
+listsched_K2_all_edges_ms,22.792,
+listsched_K2_fake_removed_ms,22.704,
+listsched_K4_all_edges_ms,22.792,
+listsched_K4_fake_removed_ms,22.704,
+versioning_extra_bytes_K4_mib,521.64,"K=min(users,4) over every plane that carries a fake edge"
