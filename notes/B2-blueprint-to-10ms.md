@@ -409,3 +409,12 @@ SM_LW | 分支=b1-wblock-resident（origin 已推）。
 ⇒ **同一只闭包在两条路里的帧价能差 4 倍（例：400-550 段 0.114 vs 0.38-0.47）**；**所以：非 fused 的 16 对只用来判"有没有过统计线"，给用户报"实机快多少"必须换成 fused 口径定价**；
 **修正过的数**：**`691 window_block`（fused leg 4.277 ms）的 fused 帧价 = 4.277 × 0.38-0.47 ≈ 1.6-2.0 ms/帧**（不是按噪声数推的 3.81）；**`window_block` 全族 15.28 ms leg × 0.38-0.47 ≈ 5.8-7.2 ms/帧 = 第二层最大一块**。
 **配套仪器判死**：**`NR_V2_STOP` 在 cgraph 路上不能用**（`stop != 0` 会在 capture 期多一次 `pool_get`（`:6032`），而 `:2504-2506` 要求 capture 期 **ZERO `sycl::malloc_device`**；且 `:6044-6045` 把 68.4 MB witness 下到 host `std::vector` ⇒ **memcpy 节点带失效主机指针进图**，正是 `:2502` 点名的 "host-vector memcpy nodes (dangling at replay)"）⇒ **只能配 `NR_CGRAPH=0` 用、只做相位归因、不得用于帧价**；**它不像 `NR_SKIP_CHAINS` 被 fused 的 `REFUSED` 挡住**（在 WB recorder 内读，`:6026`）。
+189. ★ **给任何一只核定价之前，必须先用 plan 参数证明"帧里跑的到底是哪只核"（分支身份取证），否则整条刀序会建在错的对象上。**
+**正案（C16/C17 全夜的空转）**：我按 `tools/chain_map.csv` + `rtcsv` 的族名认定"尾部两只最大 WB 闭包（fused leg 4.277 / 4.214 ms）= `wbv4::launch_v4full`"，于是把 C16 的靶定成"v4full 的标量 SLM 写换宽存"、又把 C17 的假设定成"帧内比独立慢 1.6× ⇒ 冷读"。**两条都建在错对象上**：
+**`tools/wb_plan_census.py` 直接读 plan（`work/plan_960x544.c`，20 步 = 2 录 × 10；flags：`pooling=0x800000`、`head=0x1000000`、`narrow=0x1000`、`epi=(f>>8)&0xF`、`image_half=0x8000`）**：
+- **`idx 0/10 = 8160w 544x960 a120 pool=1` ⇒ 走 `wbv4ph::launch_v4ph`（POOL）**（= closure 1/2）；
+- **`idx 9/19 = 8349w 544x960 a121 pad262148 head=1` ⇒ 走 `wbv4ph::launch_v4ph`（HEAD）**（= closure 690/691）；
+- 其余 16 步 plain ⇒ `wbv4::launch_v4full`；
+**引擎分支一致**：`libxmx_sycl.cpp:6023` 的 v4full 支要求 **`!pooling && !head`**，**`:6063` 把 `pooling || head` 送到 v4ph**。
+**后果**：所谓"帧内 512 vs 独立 320 = 1.6×"是**拿两个不同核比价**——**v4ph 单发 476/495 ns/窗，帧内腿 4.159-4.277 ms ⇒ 只贵 5-8%**；**v4full 同形 = 315 ns/窗 ⇒ v4full 比帧里真正跑的 v4ph 便宜 1.51×** ⇒ **于是"两只巨头还在跑 C5+C7 之前的形状"这条线索才浮出来（C18，预计 2.0-3.7 ms/帧）**。
+**配套要求**：① **族名（`rtcsv` / `[lcount]` 的 `name=`）不等于核名**——同一个 recorder 按 plan flags 会走不同分支（本次就是 `xmx_rec_window_block` 走 v4ph 还是 v4full）；② **取证脚本要落盘成仓内工具**（`tools/wb_plan_census.py`），**今后每铲开工第一步 = 跑它确认分支身份**；③ 与军规 175（先证分支活着）、178（footprint ≠ 执行流量）、186（只问帧价与是否减 submission）串成一条：**先证身份 → 再定绝对毫秒 → 再排刀**。

@@ -3353,3 +3353,15 @@ WINDOW_BLOCK RED (9 fails)
 ### ④ ★ C18 = 下一铲（已下令）：**把 C5+C7 的 lane-disjoint 形状移植进 `wbv4ph::launch_v4ph`**
 **先核三条**：**v4ph 是另一个文件（462 行、WG=1/SG=16、全核只有 1 条 group barrier；barrier_audit 对它是 PARTIAL / 18 条 signal barrier）**；**head 形带一条 v4full 没有的额外 `tile8s` GEMM（`window_block_v4ph.hpp:402`，32,768 MAC/窗）**；**pool 形带 fold**；**另：`notes/wb-residency.md` 那份 45,056→32,768 的 SLM 手术不在 HEAD（今天 `slm_init<45056>` 未变）**；
 **定价（按 §161 的尾部比值 0.92-1.08）**：**−25% 腿 ⇒ −2.1 ms 串行 ⇒ ≈ 2.0-2.3 ms/帧**；**−40% ⇒ −3.4 ms ⇒ ≈ 3.1-3.7 ms/帧**。
+
+## 163. ★★★★★ **C18 转正：帧 −2.556 ms、16/16、四闸逐字节 EXACT ⇒ 一夜之间把去复制这条线翻倍（累计 −5.115 ms/帧）**
+- **是什么**：把 **C5+C7 的 lane-disjoint 形状**（P1 QKV / P3 scores / P5 attnV / P6 outproj）移植进 **`wbv4ph::launch_v4ph`**——**因为 §162 取证发现帧里两只最大的 WB 闭包（8349w HEAD、8160w POOL，fused leg 4.277/4.214 ms）走的正是这只核，从没吃过 C5/C7 那两刀**；
+- **改动**：**只 `src/bench/sycl/window_block_v4ph.hpp`（+93/−66）**；**未动** P0/P2/P4/P7、所有栅栏、head 的 `tile8s` GEMM + compact store（`:402-403`）、pool fold、`slm_init<45056>`；**守恒等式写进源码注释**（P1 每 WG 输出 24 job × 64 = 1,536 = 3 × 16 行 × 32 列、每元素恰好一次；K 链 `kc=0 → kc=1` 进同一 fragment；操作数切片与 `tile8s` 逐字节相同；**SCR 字节图 `row*128B + col*4B` 不动 ⇒ P2 重读、`stop_stage 10/11/12` dump、P4 按行求和顺序全部读同一批字节**）；
+- **探针**：**head −27.3%、pool −31.2%**（OLD 475.5 / 495.2 ns/窗 → NEW 345.7 / 342.4；进程间散布 ≤0.6%）；**判官 4/4 EXACT**：七区 0/116,981,760 B、head compact 0/8,355,840 B、pool Tgt 0/33,423,360 B、pool Pl 全零；
+- **守卫**：**`grf 128→128`（没涨）、`slm 45,056→45,056`、`type: scratch` 两边 0、`signal.barrier 18→18`、`fence.slm 18→18`、`simd 1`**；**码代 `.text 3,485→2,742`（−21.3%）、`dpas.8x8 109→23`、`store.slm 189→85`、`load.slm 128→84`；记分板 `.dst≤5` 53.8%→21.2%、p50 5→10、data-waits le5 37.2%→14.3%、MLP 3.16→3.28** ⇒ **军规 182 的"要更多 GRF"没触发，这次是真的少发了重复的 submission 内指令**；
+- **认证（非 fused 691-pass，16 对）**：deltas **−2.53 −2.41 −1.99 −2.80 −1.75 −2.69 −2.75 −2.69 −3.52 −2.00 −2.81 −2.61 −2.69 −2.83 −2.32 −2.51** ⇒ **mean −2.556、sd 0.415、2σ 0.830、\|mean\|/2σ = 3.08、B 赢 16/16**；**A（`8658C786`）均值 43.6 → B 41.1 ms/帧**；**同批 A/A 4 对 = −0.10 / +0.21 / 0.00 / −0.13 ⇒ mean −0.005、max\|d\| 0.21 ⇒ 协议偏置 ≈ 0**；**达标线全过**；
+- **staged 之后独立复跑四闸**（4 腿、每腿新建空缓存、非受管）：**fused 1301 `254C02B7…` ✓ ×2、features `CACD2029…` ✓ ×2、result `AE050ED1…` ✓ ×2、非 fused 1301 `DD49827D…` ✓ ×2**；**passes 693/691 不变**；**三金标 md5 与时间戳未动**（`DD49827D…` 11-02 12:37、`249A46F3…` 10-25 22:27）；
+- **fused 口径（游戏那条路）顺带读数**：变体 **58.79 / 59.42 ms**（每进程一个值，run0）vs 控制此前测得 **60.54 / 60.87 / 61.67** ⇒ **≈ −2 至 −2.9 ms**；正式 4 对随后补；
+- **现场**：两槽 = **`A2C3009F…`（3,335,168 B）**、`out/SHIPPED_MD5.txt` 已更新；**旧两槽存 `out\libxmx.before-c18.keep`**；回退链 `shfc7(8658C786) → shfc5(2F3ACF6C) → imfnat3(66FEC931) → shfimf1(AF5A19B3)`；**HEAD `aac15ce` = 出货件源状态**；工作树 CLEAN；
+- **军规 189 已入 B2**：**给任何一只核定价之前，必须先用 plan flags 证明"帧里跑的是哪只核"——族名（`rtcsv` / `[lcount]` 的 `name=`）不等于核名**；**今后每铲开工第一步 = 跑 `tools/wb_plan_census.py` 认身份**；
+- **这条线累计**：**C5 −1.793 + C7 −0.766 + C18 −2.556 = −5.115 ms/帧**（全部逐位不变、全部 16/16、全部四闸 EXACT）；**WB 家族 fused 腿 15.28 ms 里已砍掉 ~8.5 ms 的重复计算**；**下一只同族靶 = 其余 16 步 plain flags 的 v4full（已吃过 C5/C7）与 `ffn_merge 690`（1.519 ms，尾部 1:1 区）**。

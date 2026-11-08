@@ -44,3 +44,17 @@
 | **门链** | **C5 未重跑 40 门**（**逐位不变 ⇒ 预期与 `imfnat3` 相同：28 GREEN / 12 RED**，那 12 道是 `imfnat3` 改数值造成的面比较类红，**待重定 golden**）|
 
 ### 覆盖上表（2026-11-08 10:2x）：**两槽 = `8658C78653ACE979A7FFEE8AD81CD627`（3,342,336 B）= C7（`window_block` P1/P5/P6 去复制）**；源码 **`a2e7c3e`**（件 = 父级从 HEAD 重建 `builds\libxmx_shfc5→shfc7`；子代理件 `745834F6` 四面一致）；**四闸 4/4 EXACT（`DD49827D / 254C02B7 / CACD2029 / AE050ED1`）⇒ 不需要用户实机裁画质**；**出货 16 对 −0.766 ms、16/16、sd 0.235、2σ 0.470、同批 A/A 对照 mean −0.125 / max|d| 0.420 ⇒ 净 ≈ −0.64 ms**；**A 均值 44.32 → B 43.55 ms/帧**；**回退点 `builds\libxmx_shfc5.dll`（`2F3ACF6C`，C5：−1.793、16/16）→ `libxmx_imfnat3.dll`（`66FEC931`，用户 06:39 实机验收）→ `libxmx_shfimf1.dll`（`AF5A19B3`，49.83 认证值）**；三金标与四面基线未动。
+
+## ★ **覆盖上表：现役 = C18（`wbv4ph::launch_v4ph` 去车道复制）— 2026-11-09 06:2x staged**
+| 项 | 值 |
+|---|---|
+| **两槽** | `E:\DSH\out\libxmx.dll` = `E:\DSH\oneapi\libxmx_sycl.dll` = **`A2C3009F5EC9C7F48B304346CE5A36D9`**（**3,335,168 B**）；`out/SHIPPED_MD5.txt` = `a2c3009f5ec9c7f48b304346ce5a36d9` |
+| **源状态** | HEAD = **`aac15ce`**（**HEAD == 出货件源状态，军规 169②**），工作树 CLEAN；改的只有一处：**`src/bench/sycl/window_block_v4ph.hpp`（+93/−66）** |
+| **机制** | 把 **C5+C7 的 lane-disjoint 形状**（P1 QKV / P3 scores / P5 attnV / P6 outproj）移植进 **v4ph**——**帧里两只最大的 WB 闭包（8349w HEAD、8160w POOL）走的是这只核，从没吃过 C5/C7**（分支身份取证见 §162 + `tools/wb_plan_census.py`） |
+| **逐位性** | **四闸 4/4 逐字节 EXACT，两条路都验**（staged 之后又独立复跑 4 腿 cold：`DD49827D…` / `254C02B7…` / `CACD2029…` / `AE050ED1…`，fused 与非 fused 各 2 次一致）⇒ **不需要用户实机裁画质** |
+| **探针** | **head −27.3%、pool −31.2%**（OLD 475.5/495.2 ns/窗 → NEW 345.7/342.4；进程间散布 ≤0.6%；判官七区 0/116,981,760 B、head compact 0/8,355,840 B、pool Tgt 0/33,423,360 B 全 EXACT） |
+| **守卫** | **`grf 128→128`（没涨）、`slm 45,056→45,056`、`type: scratch` 两边 0、`signal.barrier 18→18`、`fence.slm 18→18`、`simd 1`**；**码代 `.text 3,485→2,742`（−21.3%）、`dpas.8x8 109→23`、`store.slm 189→85`、`load.slm 128→84`；记分板 `.dst≤5` 53.8%→21.2%、p50 5→10、data-waits le5 37.2%→14.3%** |
+| **帧（16 对，非 fused 691-pass）** | **mean −2.556 ms、sd 0.415、2σ 0.830、\|mean\|/2σ = 3.08、B 赢 16/16**；**A（`8658C786`）均值 43.6 → B 41.1 ms/帧**；**同批 A/A 4 对 = −0.10 +0.21 0.00 −0.13 ⇒ mean −0.005、max\|d\| 0.21 ⇒ 协议偏置 ≈ 0** |
+| **fused 口径（游戏那条路，每进程一个值）** | 变体 **58.79 / 59.42 ms**；控制（昨日 `8658C786`）此前测得 **60.54 / 60.87 / 61.67** ⇒ **≈ −2 至 −2.9 ms**（正式 4 对在跑） |
+| **回退链** | `builds\libxmx_shfc7.dll`（`8658C786`，C7）→ `libxmx_shfc5.dll`（`2F3ACF6C`，C5）→ `libxmx_imfnat3.dll`（`66FEC931`，用户 11-08 06:39 实机验收）→ `libxmx_shfimf1.dll`（`AF5A19B3`，49.83 认证值）；**staged 前的旧两槽另存 `out\libxmx.before-c18.keep`** |
+| **这条线累计** | **C5 −1.793 + C7 −0.766 + C18 −2.556 = −5.115 ms/帧**（**全部逐位不变、全部 16/16、全部四闸 EXACT**） |
