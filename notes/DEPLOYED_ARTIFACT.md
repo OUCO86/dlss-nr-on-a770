@@ -28,3 +28,17 @@
 - **`gate_graph` / `gate_skip_graph` 是 CWD 敏感门**（军规 147）⇒ **必须 staged 口径**；**注意 `imfnat2` 那轮观察到 `gate_graph` 在 scratch 口径也 GREEN ⇒ 旧断言未复现，只记账、未改门**；
 - **20:09 那次 `6AEE1ADE` 的 5+9 fails 仍待复现**（候选：共享缓存旧 Gen、那次 shell 的 `NR_*` 泄漏）；**同源码不同构建三面一致**（军规 159）⇒ "构建差异"这条解释已排除；
 - **仍然成立的语义事实**（探针，与门链读数无关）：**实机 composition 路与 3-leg 路在出货几何差 4.287% 字节 / 6.45% 像素**；**归一化倒数与残差融合形都被洗清，分叉在 composition 内部**；**用户已裁决：不要求对齐厂商**。
+
+---
+
+# ★ 最新上线状态（本节覆盖上文所有表格行，2026-11-08 09:4x）
+| 项 | 值 |
+|---|---|
+| **两槽 md5** | **`2F3ACF6C7E8BBC5098CF261F550A091D`**（`out\libxmx.dll` = `oneapi\libxmx_sycl.dll`，**3,347,968 B**）= **C5（`window_block` P3 去车道复制）** |
+| **源码提交** | **`5daac9c`**（只改 `src/bench/sycl/window_block_v4.hpp`，39 加 / 37 删）；**件 = 父级从干净 HEAD 用 `tools/build_shipped.ps1 -Tag shfc5` 重建**（`builds\libxmx_shfc5.dll`；原件带时间戳 `libxmx_shfc5-20261108-093403.dll`）|
+| **逐位性** | **四闸 4/4 逐字节 EXACT**：`DD49827D…` / `254C02B7…` / `CACD2029…` / `AE050ED1…` ⇒ **不需要用户实机裁画质、四面基线不重画**；**子代理件 `4EFAD2C4…` 与父级件四面完全一致**（军规 159 再证） |
+| **帧读数（认证）** | **出货 16 对 mean −1.793 ms、sd 0.295、2σ 0.590、\|均值\|/2σ = 3.04、B 赢 16/16**；**A = `libxmx_imfnat3.dll`（`66FEC931`）均值 46.26 ⇒ B 均值 44.47 ms/帧**；**同批 A/A 对照 4 对 mean −0.080、max\|d\| 0.520 ⇒ 收益是噪声底 3.4×**；每对 `passes 691/691` |
+| **腿级** | **`window_block` 17.963 → 16.134 = −1.828 ms/进程、6/6** ⇒ **每闭包 1.796 → 1.613 ms**；**TOTAL 串行 −0.370（外溢，军规 166）** |
+| **回退链** | **`builds\libxmx_imfnat3.dll`（`66FEC931…`，用户 06:39 实机验收）** → `builds\libxmx_shfimf1.dll`（`AF5A19B3`，认证 49.83 ms/帧、16 对 −5.763）→ `libxmx_shsm1.dll`（`F2364615`）→ `keep_pre_smax_A05A47AB.dll` → `keep_pre_com2_E0B03E90.dll` → `out\libxmx.before-ATT5.keep`（`ABB969FE`）|
+| **金标 / 基线** | 三金标 `DD49827D…/DD49827D…/249A46F3…` 未动（mtime 11-02 / 10-25）；**fused 三面基线不变**（`254C02B7 / CACD2029 / AE050ED1`，见 `tools/fused_face_baseline.md`）|
+| **门链** | **C5 未重跑 40 门**（**逐位不变 ⇒ 预期与 `imfnat3` 相同：28 GREEN / 12 RED**，那 12 道是 `imfnat3` 改数值造成的面比较类红，**待重定 golden**）|
