@@ -3105,3 +3105,13 @@ WINDOW_BLOCK RED (9 fails)
 2. **`window_block` 依赖链/相位拆分 ≈ 0.21 ms/帧**（**复制杠杆已收割完**）；
 3. **`window_attention` 字节 ≈ 0.16 ms/帧**；
 4. **`gemm_*`/`ffn` 各族未定档 ⇒ 不许排刀**（要成对跑 `NR_RES_STOP`/`NR_B_STOP`/`NR_G_STOP`/`NR_STEM_STOP`/`NR_FFN_*`，否则又撞 13 ms 态移）。
+
+## 147. ★★★★ **面地图出炉（`tools/plane_map.csv`，57 面 × 24 列，零改动零 GPU）；C8 的原靶已结案；新的字节刀第一名换人**
+- **(A) 那行诊断改动不需要**：**`[lcount] … [hop] … ids=` 就是 `pgraph_ids({...})` 的参数顺序**（19 处调用点全部可枚举：`xmx_rec_unary` 的 `{a,b,c,d}` 在 `:5128`、`window_block` 的 `{image,qkv,projection,target,bias,cosine,scale,pooled}` 在 `:5967`、`gemm_int8_residual` 的 `{a,b,c,a_scale,b_scale,skip,cosine}` 在 `:4849`…），**而"哪一格是写"从 recorder 体内直接可读**（`xmx_rec_unary` 里 A/B/D 是 `const void*`、**C = `void*` 是目的**，`:5131-5135` ⇒ `ids=1276 1276 1310 1276` = a/b/d 读、**c=1310 写**）；**15 个 recorder 的写格已编成表**（`s6\c74_planemap.py` 的 `WRITE_SLOT`，每格带源码行号）⇒ **尺寸 / 谁写 / 谁读 / 每帧碰几次**全部零改动拿到；
+- **C8 结案**：**id 1276（16.71 MB）对应盘上工件 `*.features.bin` 本来就是 f16**（域 −1..1.65、12.5% 精确 0、次正规带 0.005%、**f16 往返改变 0 个值**）⇒ **无刀可切**；
+- **新第一名 = id 1313（33.55 MB f32、522,240 px × 16 通道）**：**87.6% 是精确 0**（零在 f16 里精确）、**溢出 0、次正规 0**、**f16 往返只改 11.74% 的值、误差恰好 1 个 f16 ulp（max abs 0.25、max rel 4.88e-4）、冲零 0** ⇒ **风险画像明显好于 1309**；
+- **第二名 = id 1309（66.85 MB pre-quantise 累加器）**：域 −123.7..163.7 ⇒ f16 范围安全，**但 99.95% 的值会变 + `gate_quant_window` 的 1 ULP 前科 ⇒ 继续押后**；
+- **第三名 1311/1314/1315/1316**：**无工件 ⇒ 域 UNKNOWN ⇒ 按军规 175 不许排刀**；
+- **★ 军规 178（已入 B2）**：**footprint ≠ 执行流量**——日志只有"操作数槽 × 整面字节"，没有每命令的区域（`n/M/N/K/cols`）⇒ 表里 MB/帧是**上限**；**佐证**：1309 若真按 13.4 GB/帧搬运，300 GB/s 就是 44 ms/帧，而全帧串行才 120 ms、其中 gemm 族合计 ≈ 64 ms ⇒ **这些族已经在字节地板上**（与 1.22-1.4× 一致）；**任何字节刀在做完"区域联接"（零 GPU：`launch_map.csv`/`shapes_census.csv` 的每命令元素数 × 面地图）之前不许进 `knife_ranking` 的 ms 列**（第 1 行的 `estimated_frame_ms` 已清空、`rank_score = −1`）。
+### 军规 177（同铲入库）
+**census/日志里的 plane id 是每次运行局部的 ⇒ 任何按 id 引面必须重新联接，联接键 = `(bytes, imported, gen, class, named_in_plan)`**；三处互证的矛盾：§73 说 id 1276 = 16,711,680 B、本轮 `[bufsizes]` 也是 16,711,680（同批 1271 也是 16,711,680）、而 `tools/plane_class.csv`（另一次 census）里 id 1276 = 4,177,920 B、其 16.7 MB 面是 1265/1270、id 1309 = 4,571,136 B（本轮 1309 = 66,846,720 B）。
