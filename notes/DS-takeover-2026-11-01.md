@@ -3382,3 +3382,24 @@ WINDOW_BLOCK RED (9 fails)
 **非 fused 16 对 mean −2.556（16/16）｜fused 4 对 mean −2.618（4/4）｜fused 腿级 WB 家族 −2.295 ms/进程** ⇒ **三个口径互标一致（±0.3 ms）**；
 **这条线累计：C5 −1.793 + C7 −0.766 + C18 −2.556 = −5.115 ms/帧**（**全部逐位不变、全部 16/16、全部四闸 EXACT**）；
 **现役两槽 = `A2C3009F5EC9C7F48B304346CE5A36D9`（3,335,168 B）**；**HEAD `aac15ce` = 出货件源状态**；**回退链完整**（`shfc7 8658C786` → `shfc5 2F3ACF6C` → `imfnat3 66FEC931` → `shfimf1 AF5A19B3`；staged 前旧两槽另存 `out\libxmx.before-c18.keep`）。
+
+## 166. ★★★ **C19 判死：`690 xmx_rec_ffn_merge`（帧尾第二贵的单只）三臂全不过线 ⇒ 从第二层出账；顺带钉死两条旧价签**
+### ① 身份（三重证据，零 GPU；工具 `s6/pe_c19_plan_census.py`、`s6/pe_c19_zeinfo.py`）
+**fused 690 / 非 fused 689 = pass A 逐元素 ew（`libxmx_sycl.cpp:3519-3528`，16,711,680 项，写 `dMerged` f32 + `dM16` half）+ `ffnc::launch_ffn_chip_cs2<16,false>`（`ffn_chip_kernel.hpp:622-811`；grf 128 / simd 1 / slm 16,384 / scratch 0 / dpas 64）**；
+**不是** `f16v1::gemm_b_merge_scale`、**不是** `f16v2::gemm_b2_merge`（那两只属 `merge_heads` 家族 `:5055/:5744`）、**不是** `ffn2::fused`（**`leg_decomp.csv` 里 ffn_merge=ffn2::fused 那两行是 S6 链腿的旧价签，今后引用要标 vintage**）；
+**自证**：touch 集 7 面求和 = **108,642,688 B 逐字节吻合**；`scr=100,270,080 = pool_get(dMerged)+pool_get(dM16)`（只有 recorder 支会分配）。
+### ② 三臂定档（真实 M=522,240；3 进程 × 每进程新建空缓存已验证 1,585,110 B × min-of-9；GPU ≈ 3 秒）
+| 臂 | 读数 | 判定 |
+|---|---|---|
+| **A0 现核** | span **1.333/1.350/1.349 ms**；**切分：pass A = 0.317-0.340、chip = 1.018-1.023** | 对照帧腿 1.519 ⇒ **帧溢价 +13%，与 §161 的尾部比值 1.08 咬合** ✓ |
+| **A1 `WSTAGE=<16,true>`** | **−1.0 / −1.6 / −2.8%** | **死**：那 522 MB 的每 tile 权重重读是免费的（16 KB 权重集 L1 常驻） |
+| **A2 向量化 pass A** | **+97%（1.73-1.77 ms vs 标量 0.32）** | **死且反向**：**标量形态已经在 DRAM 顶线上**（150 MB ÷ 0.32 ms ≈ **470 GB/s**） |
+| A3 `LW=32` | +5.8% | 现役 LW=16 是对的档 |
+**判官**：**四臂 × 三进程 `dMerged + dM16 + Cout` 全平面 FNV 哈希逐位一致 `461147a8…` ⇒ A1/A2/A3 全部逐位不变**（p2/p3 里 `mismatches=50,133,140` 是轮转顺序下参考面未置位的伪影，**哈希才是判据**）。
+### ③ mega（把 pass A 折进 chip、消 200 MB 往返）的上限与判定
+**pass A = 0.33 ms = span 的 24%、帧腿 1.519 的 22%** ⇒ **mega 上限 ≈ 0.4-0.5 ms 串行 ≈ 帧 0.4-0.5 ms**；
+**"这次与 `stem_mega` 不同"这个区别点不成立**：**pass A 已顶线 ⇒ 往返不是浪费带宽**；**`ffn_chip_kernel.hpp:43-45` 早记着 P8-n 反证（"the mega removed 100 MB of it and the marginal stayed flat"）**；**A2 还证明对这个 ew 段做任何重塑都是加钱不是省钱**；
+**chip 的 1.02 ms**：是它自己 167 MB 屋顶的 **2.9×**、8.56 GFLOP XMX 时间的 **12×** ⇒ **钱在每 WG 9 条栅栏的依赖链上**；**而 `grf=128` 顶格 ⇒ 军规 182 把"更多 tile 在飞"这条路直接堵死**；**车道复制因子 = 1（这只核生来就是 pair-split，`tsl/ph` 都在地址里；守恒 524,288 MAC/WG 恰一次）⇒ 没有可砍的重复**。
+**⇒ 处置：`merge_mega` 不排进引擎；690 这只从第二层出账。**
+### ④ 现场
+两槽 `A2C3009F…` / 3,335,168 B 复验未动；三金标时间戳未动；仓库 `2167a9c` CLEAN、**零 git 写由子代理执行**；产物 `s6/c19_ffnmerge.cpp`、`s6/pe_c19.ps1`、`s6/pe_c19_plan_census.py`、`s6/pe_c19_zeinfo.py`、日志 `s6/C19_p{1,2,3}.log`、asm `E:\DSH\tmp\k3ze\d_c19`；状态 `s6/layer1.md §105`。
