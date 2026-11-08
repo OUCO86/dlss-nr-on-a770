@@ -3409,3 +3409,28 @@ WINDOW_BLOCK RED (9 fails)
 **C16（v4full 换宽存）+ C17（冷读）+ C19（ffn_merge 三臂）+ C20（ffn 两臂）全部判死**，且**每一铲都给出"钱不在核形状里"的独立证据**；**这四只 ffn 的钱在帧语境溢价（1.3-2.1×）**
 ⇒ **第二层"核内/形状级"刀已出清；下一步只剩两类杠杆：① graph/放置级（闭包次序、并发度、fused 与 non-fused 的 42% 差）② 已定价但未做的减 submission（C512 att 段融合 = 1.61 ms）**。
 **现场**：两槽 `A2C3009F…` / 3,335,168 B 复验未动；三金标未动；仓库 CLEAN；**子代理零 git 写、引擎只读**；GPU 合计 ≈ 1 秒；状态 `s6/layer1.md §106`。
+
+## 168. ★★★★ **C21 施工图交回（零 GPU）：C512 att 段的旧价签 2.5-3.1 ms 作废——整段融合装不进 SLM；可建的两处折叠诚实价 ≈ 0.65-0.90 ms/帧**
+### ① 身份（军规 189 又纠一处，`s6/pe_c21_plan_census.py`）
+**这 32 只的腿 = `gemm_int8_qkv + global_attention + quant + gemm_int8_residual`**（**不是** `window_attention`/`gemm_window_int8_residual`，那是 C64 链）；**closure 段 `317..319 … 379..382` 在 ViT 瓶颈链（QUANT 锚），且这 8 条链是活的、不在被跳的 14 条里**；
+**每链 plan 实钉**：`qkv(1286, w775 → 1275/1274/1276, M=192 C=1024 heads=32 tokens=192 flags=0x2000 vit)` → `GA(→1277, rows=192 tokens=192 heads=32)` → `quant(1277 → 1286,1287)` → `int8res(1286, w771 → 1285, skip=1267, flags=0x41100)`；
+**`branch_is_live`**：qkv = **`qres::gemm_qkv_res` LIVE**（`qres_ok`：`C%64 && NH=3C && heads=C/32` 全真；`fused_q` 现支 FALSE）；GA = **6 发 LIVE**（`pack_a16_b` / `pack_b16_t_b` / `gemm_b` scores / `vit_softmax_tiled`（P4，已直写 attnV 的 pack）/ `pack_b16_b` / `gemm_b_merge_scale`（B5-4））；quant = **真 `qr_kernel_row*` LIVE**（`NR_V9B_FOLD` 默认 OFF 且此对非 in-place）；int8res = **`pack_a` + `s8v8::gemm_b_res` LIVE**（`qfuse_take` 无槽）；
+**每链 4 闭包 / 11 发 ⇒ 段 = 32 闭包 / 88 发**；`.ze_info`（`d_c18new`）：`gemm_qkv_res` grf128 / simd1 / **slm 32,768** / scratch0；`gemm_b_res` 18,432 / 0；`gemm_b_merge_scale` 0 / 0；`qr_kernel_rowthread` 0 / 0；`pack_a` 0 / 0。
+### ② 为什么旧价签作废：**整段 4→1 融合当场判死（军规 182 的 SLM 变体）**
+**单 head scores tile = 192×192×4 = 147,456 B > 65,536 B JIT 硬顶**；**probs/head 73,728 B 也超**；**"沿 C 内循环"救不了 —— scores 是 per-head `rows×rows`，不沿 C**；**跨 WG 拆就是把 scores/probs 送回全局 = 融合要消的往返本身**（P8-n 已给这种拆除记过 ≈0 前科）；
+**⇒ §154.4 那句"串行 17.36 ms ⇒ 帧 2.5-3.1 ms"假设了一个装不进的融合，作废**。
+### ③ 可建的两处折叠（都有现成先例与机制）
+- **F1**：把 GA 的三只 pack 发（`pack_a16_b` / `pack_b16_t_b` / `pack_b16_b`）**折进 `gemm_qkv_res` 的常驻 epilogue 直写 pack 布局**（P3a/P4 家法；16×32 tile 转置在 SLM 内 1 KB，合法）⇒ **每链 −3 发、−2.36 MB 往返**；
+- **F2**：把 post-GA 的 `quant` 闭包**折进 `int8res` 的 `pack_a_fused`**（`qfuse_take` 机制现成、`:4770` 今天就在跑；P4b 反向配对；**1277/1286/1287 是 plan 面不是池块 ⇒ 不触 pair-21 的雷**）⇒ **每链 −1 发、−1 真闭包、−0.39 MB**；
+**合计：32 → 24 真闭包、88 → 56 发**；**dpas 与累加序全不动**（scores K=32 升、softmax 行不变、attnV K=192 升、`merge_scale` VERBATIM、res K=1024 升；pack 是纯字节置换）⇒ **四闸应当逐字节 EXACT**；**1275/1274/1276 照写 ⇒ touch 集不变**。
+### ④ 诚实定价（两口径部分重叠）
+**(a) `leg × r_seg`**：段内节省 0.10-0.15 ms/链串行 ⇒ 0.8-1.2 ms 串行 × **r_seg 0.38-0.47 = 0.30-0.56 ms/帧**；
+**(b) 减 submission**：**8 只闭包 × 0.044 = 0.35 ms/帧**；
+**⇒ 总账 ≈ 0.65-0.90 ms/帧**（不是 2.5-3.1）。
+### ⑤ 障碍与判死线（若要排引擎，先证这几条）
+1. **几何锁**：`lfw/b6/att5` 守卫只认 **C64 / heads2 / tokens64**（`:4443`）⇒ 对 C512 永不触发（`branch_is_live=NO`）；**F1 必须长在 `gemm_qkv_res` 的 vit 树 epilogue**（B5-1 FINAL，与 v5a 向量链不同树 ⇒ **pack 映射要按树各写一份**）；
+2. **配对机**：fold 注册不得扰动 `a5_take_qkv` / `qfuse_take` / S6 的**"全六或全无"状态机**（禁 partial no-op）；WKey 纪律不变（F1/F2 不碰权重）；
+3. **消融仪器在这段不可用**（fused 路 `[skip-chains] REFUSED`）⇒ 归因只能用现成账机 `NR_QKV_STOP 1/2/3`、`NR_RES_STOP 1/2`、`NR_Q_STOP 8/9`（要 GPU，留给引擎阶段）；
+4. **`stem_mega` / P8-n 前科**：折叠可能因延迟暴露倒亏（−0.22 案）⇒ **骨架探针门槛 ≥20% of（qkv+GA）链内串行 ~1.4 ms**，臂 = A0 现支 / A1 +F2 / A2 +F1+F2，判官 = 七个面 FNV + scores/softmax 抽检；
+5. **判死线**：**任何"整段一核"方案，看到 scores 147 KB 就停**。
+**现场**：两槽 `A2C3009F…` 未动、三金标未动、仓库 CLEAN、零 git 写由子代理执行、引擎一行未改、**全程零 GPU**；状态 `s6/layer1.md §107`。
