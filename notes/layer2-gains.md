@@ -87,3 +87,26 @@
 **`f16v3::gemm_resid_pub` 冗余因子 = 32**：**整个 WG 的 32 条线程算同一份 16×32 block**（操作数只由 group 与循环常量决定、store 用循环变量 `rl`），**且确认在出货路上**（`libxmx_sycl.cpp:6496/6506/6520/6537/6553/6569/6577/6583/6615/6623`）
 ⇒ **C6 = 同一套去复制**；**做法照 C5：先零 GPU 骨架探针定档（uniform vs `lid`-disjoint），≥25% 才建件**；
 **同仓先例现成**：`gemm_s8_v8_kernel.hpp:772` 自陈 **"THREAD-LOCAL — 32 disjoint 16x16 blocks"**、`s8v9*` 的 `tile=t*NT+lid`、`ffnc::launch_ffn_chip` 的 `ea=…+lid*1024`。
+
+## 八、★★★★★ **C7（WB P1/P5/P6 去车道复制）已转正：帧 −0.766 ms、16/16、四闸逐字节 EXACT；第 2 层倍数再降一档**
+| 项 | 读数 |
+|---|---|
+| **件 / 源** | 两槽 = **`8658C78653ACE979A7FFEE8AD81CD627`**（3,342,336 B，父级从 HEAD `a2e7c3e` 重建）；子代理原件 `745834F6…` **四面完全一致**（军规 159 第三次验证）|
+| **改法** | **P1 QKV / P5 attnV / P6 outproj 三处去复制**：`rowblk=lane&1`、`colblk=lane>>1`、单累加器 fragment、K 链升序、8-float `slm_block_store`（不带 `overaligned_tag<16>`）；**SCR 字节图不动**（P3 `row*256B+col*4B`、P1/P5/P6 `row*128B+col*4B`）⇒ **P4 与 `stop_stage==5` 的 dump 未触碰** |
+| **定档（零 GPU 骨架探针）** | **P1 −51.3% / P5 −51.9% / P6 −45.8%**（`s6\c7_p1.cpp`、`s6\c7_p56.cpp`）|
+| **守恒账（军规 173①）** | **P1 = 24 job × 64 = 1,536 = 3×16×32、dpas 48 不变**；**P5/P6 各 8 tile × 64 = 512、dpas 32/16 不变** |
+| **腿级** | **`window_block` 16.179 → 15.367 = −0.813 ms/进程、6/6；每闭包 1.618 → 1.537**；**TOTAL 串行 −0.778**（这次外溢小，与 C5 那次方向相反 ⇒ 外溢不恒定）|
+| **帧（权威）** | **16 对 mean −0.766 ms、sd 0.235、2σ 0.470、\|mean\|/2σ = 1.63、B 赢 16/16**；**A 均值 44.32 → B 43.55 ms/帧**；**同批 A/A 4 对 mean −0.125、max\|d\| 0.420 ⇒ 净 ≈ −0.64 ms**；每对 `passes 691/691` |
+| **逐位性** | **四闸 4/4 EXACT**（`DD49827D / 254C02B7 / CACD2029 / AE050ED1`）⇒ **不需要用户实机裁画质** |
+### 第 2 层倍数表（C7 之后，形态修正后地板）
+| 族 | 每闭包 | 离地板 | 判定 |
+|---|---|---|---|
+| **`window_block`** | **1.537 ms**（C5 后 1.613、原 1.799-1.806）| **3.9-6.2×，再降一档** | ❌ 仍未达标，但**去复制这条线已收割完（C5 −1.793 + C7 −0.766 = −2.56 ms/帧）** |
+| `global_attention` | 0.443-0.516 | 2.1-3.3× | ❌ |
+| `ffn_merge` | 1.618 | 2.8-4.5× | ❌ |
+| `gemm_int8_residual` / `qkv` / `winres` | — | 1.36× / 1.4× / 1.22× | ✅ 贴地 |
+
+## 九、★ 2026-11-09 02:1x **门链复核（关掉一条半工程）**
+**40 门链在现役件上重跑**：`[gate-selfcheck] loaded dll = E:/DSH/oneapi/libxmx_sycl.dll md5 = 8658c78653ace979a7ffee8ad81cd627`、`SYCL_CACHE_DIR = E:/DSH/tmp/syclcache_gates_0209`（新建空缓存）、`RUNDIR = E:/DSH/oneapi` ⇒ **40 GREEN / 0 RED**。
+**⇒ 待办里"12 条因 `imfnat3` 变红的数值门需要带 provenance 重定基线"这一项作废：现役路上没有需要重定基线的门**；**三条 `bk.1301*` 金标与四面基线一字未动**。
+**日志：`E:\DSH\logs\gates_live_0209.txt`**
