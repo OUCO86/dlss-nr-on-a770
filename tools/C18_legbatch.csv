@@ -1,0 +1,12 @@
+seq,side,rep,dll,run0,passes,cache_pre,cache_post,md5
+1,A,1,libxmx_shfc7.dll,139.08,693,0,12,8658C786
+2,B,2,libxmx_wbph_c18-20261109-052655.dll,119.72,693,0,12,A2C3009F
+3,B,1,libxmx_wbph_c18-20261109-052655.dll,120.52,693,0,12,A2C3009F
+4,A,3,libxmx_shfc7.dll,122.79,693,0,12,8658C786
+5,A,2,libxmx_shfc7.dll,122.88,693,0,12,8658C786
+6,B,3,libxmx_wbph_c18-20261109-052655.dll,132.35,693,0,12,A2C3009F
+7,,,,NA,NA,0,0,
+8,,,,NA,NA,0,0,
+9,,,,NA,NA,0,0,
+10,,,,NA,NA,0,0,
+11,,,,NA,NA,0,0,

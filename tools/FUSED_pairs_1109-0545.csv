@@ -1,0 +1,14 @@
+pair,side,dll,runs,med,passes,cache_pre,cache_post,md5
+1,A,libxmx_shfc7.dll,60.78,60.78,693,0,12,8658C786
+1,B,libxmx_wbph_c18-20261109-052655.dll,58.55,58.55,693,0,12,A2C3009F
+2,B,libxmx_wbph_c18-20261109-052655.dll,57.93,57.93,693,0,12,A2C3009F
+2,A,libxmx_shfc7.dll,60.43,60.43,693,0,12,8658C786
+3,A,libxmx_shfc7.dll,60.87,60.87,693,0,12,8658C786
+3,B,libxmx_wbph_c18-20261109-052655.dll,57.93,57.93,693,0,12,A2C3009F
+4,B,libxmx_wbph_c18-20261109-052655.dll,58.46,58.46,693,0,12,A2C3009F
+4,A,libxmx_shfc7.dll,61.26,61.26,693,0,12,8658C786
+101,A1,libxmx_shfc7.dll,60.38,60.38,693,0,12,8658C786
+101,A2,libxmx_shfc7.dll,60.94,60.94,693,0,12,8658C786
+102,A1,libxmx_shfc7.dll,67.17,67.17,693,0,12,8658C786
+102,A2,libxmx_shfc7.dll,60.54,60.54,693,0,12,8658C786
+done
