@@ -3115,3 +3115,13 @@ WINDOW_BLOCK RED (9 fails)
 - **★ 军规 178（已入 B2）**：**footprint ≠ 执行流量**——日志只有"操作数槽 × 整面字节"，没有每命令的区域（`n/M/N/K/cols`）⇒ 表里 MB/帧是**上限**；**佐证**：1309 若真按 13.4 GB/帧搬运，300 GB/s 就是 44 ms/帧，而全帧串行才 120 ms、其中 gemm 族合计 ≈ 64 ms ⇒ **这些族已经在字节地板上**（与 1.22-1.4× 一致）；**任何字节刀在做完"区域联接"（零 GPU：`launch_map.csv`/`shapes_census.csv` 的每命令元素数 × 面地图）之前不许进 `knife_ranking` 的 ms 列**（第 1 行的 `estimated_frame_ms` 已清空、`rank_score = −1`）。
 ### 军规 177（同铲入库）
 **census/日志里的 plane id 是每次运行局部的 ⇒ 任何按 id 引面必须重新联接，联接键 = `(bytes, imported, gen, class, named_in_plan)`**；三处互证的矛盾：§73 说 id 1276 = 16,711,680 B、本轮 `[bufsizes]` 也是 16,711,680（同批 1271 也是 16,711,680）、而 `tools/plane_class.csv`（另一次 census）里 id 1276 = 4,177,920 B、其 16.7 MB 面是 1265/1270、id 1309 = 4,571,136 B（本轮 1309 = 66,846,720 B）。
+
+## 148. ★★★★ **区域联接出炉：footprint 高估 9.7-22.9 倍被量化确认；1313 是池回收 slab（混合 dtype）⇒ 字节刀必须按"边"定义，不能按面**
+- **新表**：`tools/plane_traffic.csv`（385 面 × 18 列）、`tools/knife_ranking.csv`（21 × 18）；**引擎一行未改、GPU = 0**；
+- **1313（33.55 MB）每帧执行流量 = 904.9 MB/帧（R 718.7 / W 186.2）vs footprint 8,791 ⇒ 高估 9.7×**；**1309：执行 584.6 vs footprint 13,369 = 22.9×**（**军规 178 的量化确认**）；
+- **但 1313 不是逻辑缓冲，是池回收 slab**：它同时被 `gemm_int8_qkv` 的 k 输出（**int8**）、`window_attention` 的 out（f16）、`gemm` 的 c（**f32**）、`quant` 的 packed（int8）、`unary` 碰 ⇒ **"把这张面换 f16"在 slab 上没有定义**；**1311/1314/1315/1316 全是 int8 活动面 ⇒ 换 f16 反而更贵（无刀）**；
+- **E1（最大字节 prize）**：`gemm_int8_residual` 写 f32 C（68 × 8.36 = **568 MB/帧**）→ `quant_window` 读它（52 × 8.36 = **435 MB/帧**）：这条边的累加器 f32→f16 = **省 ~501 MB/帧 = 1.64 / 2.28 / 2.64 ms/帧**；**风险 HIGH**（pre-quantise 累加器、实测 f16 往返 **99.95% 会变**、max abs 0.062 / rel 2.75%、`gate_quant_window` 的 1 ULP 前科）⇒ **§73 的"押后"在本铲之后仍然成立**；
+- **E2**：1313 slab 的 f32-gemm 那一片（**132 MB/帧**）⇒ **省 66 MB/帧 = 0.22 / 0.30 / 0.35 ms/帧**，风险 LOW-MEDIUM（87.6% 精确 0、只 11.7% 会变、误差恰好 1 ulp）⇒ **正好骑在 0.25 ms/帧 的门槛上**；
+- **校验当场抓出三件事**：**(a) census 的 `closure` 编号 ≠ 日志的 `cmd` 编号**（census closure 10 = unary，日志 cmd 10 = window_block）⇒ 第一版按索引 zip 是错的，改成**按族按序 zip**（每族 census 行数与每帧命令数逐一核对，合计 691 ✓）；**(b)** 自己 `MB/ms` 多乘 1000 的单位滑（已修）；**(c) 一条不可能的读数 = 真发现**：`xmx_rec_quant_window` 245.6 MB/帧 ÷ 0.10 ms = **2,456 GB/s ⇒ 不可能** ⇒ 它的 0.10 ms 是 **fused 路里的 pack 桩**（与 C7 腿级表 `quant(FUSED-pack) 0.333` / `quant_window(FUSED-pack) 0.103` 同源）⇒ **该族流量属 fused recorder，不许按这个 leg ms 定价**，已剔除并写进 note；
+- **过校验才填 ms 的族**：`xmx_rec_quant` **1,270.2 MB/帧 ÷ 3.74 ms = 339.6 GB/s ✓ 落在 305-560 带内**、`unary` 70.9、`gemm_int8_batched` 29.6、`qkv` 14.5、`gemm_int8` 12.8、`gemm` 5.6 GB/s；
+- **欠定档（UNKNOWN 格数已标、不填 ms）**：`gemm_int8_residual` 16.6 GB/s（**216 格未定价**）、`window_block` 0.4 GB/s（**52 格**；`mk_wb` 用了 census 的 `M=8160=tr_n`，而 WB 真正读的是 `windows × 64 × 32` ⇒ **欠约 16×**）、`window_attention` 33.5 GB/s（52 格）。
