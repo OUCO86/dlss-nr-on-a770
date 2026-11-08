@@ -3165,3 +3165,14 @@ WINDOW_BLOCK RED (9 fails)
 ⇒ **帧里"等数据"最纯的地方是 qkv gemm 那几只（MLP 1.0-1.6 ⇒ 几乎零重叠），不在 WB**；这与执行流量口径对上了：**`qkv` 每帧 182.3 MB ÷ 12.7 ms = 14.5 GB/s = 可达带宽的 5%** ⇒ **它既不是带宽受限也不是指令受限，是 MLP 受限**。
 - **按宽度归到源码（`launch_v4full` 267 条记录 = RAW 109 / RECYCLE 50 / WAW 16 / store-payload 133）**：`load.slm.d64x32t.a32`（`slm_block_load<half,128>`）→ **`:246-250`（P3 dpas 操作数）RAW 39 / RECY 10**；`load.ugm.d64x32t.a64`（全局 `block_load<half,128>`）→ **P0/P1，RAW 24 / RECY 20**；`load.slm.d64x2t.a32` → **`:153/:155`（P2 跨道组装）RAW 13 / RECY 7**；`load.slm.d64x4t.a32` → **`:191`（P2 K 侧）RAW 12 / RECY 10**。
 **（靶号更正：我之前给的 `:226-233` 现在落在注释块里——C5 重写 P3 之后，P3 的 A/K 载入在 `:246-250`。）**
+
+## 152. ★★★★ **C12 在第 1 步判死：qkv 那三只"高停顿"核根本没有 `dpas`；真正的墙是 `grf_count = 128` 顶格导致的分配器串行化**
+- **父级点名的靶不成立**：`xmx_rec_gemm_int8_qkv#x`（14,674 行）、`#1`（25,176 行）、`xmx_rec_gemm_qkv_window#x`（12,477 行）**一条 XMX 都没有**，而且是 **SIMD8/16/32 核**（`.ze_info` 的 `simd_size`），不是 ESIMD `simd=1` ⇒ **"每线程 tile 对半 / dpas 守恒 / 累加器减半"没有作用对象**（守恒等式两边都是 0）；
+- **真 qkv GEMM 只有 `s8v5::gemm_qkv_v`（765 行，dpas=4）与 `qres::gemm_qkv_res`（726 行，dpas=4）**，**它们 MLP 已经 5.00 / 5.86、`.dst` p50 = 7 / 23、≤5 只占 38.9% / 22.7%** ⇒ **本来就不等数据，没有刀**；
+- **那三只 MLP 1.14-1.90 的核撞的是军规 182 的同一堵墙**：它们是 **int8/int32 反量化 + 标量乘加链**（194 条 `load.ugm.d32.a32.ca.ca.bss`、64 条 `store.ugm.d32.a64.wb.wb`、24 条 `store.ugm.d16u32.a32.wb.wb`）；
+ **冒烟枪**：`gemm_int8_qkv#x` 的 214 条 load 里 **161 条（75%）的目标 GRF 就是它的地址 GRF**（`send.ugm (16|M0) r78 r78 … {ExBSO,A@5,$10}` → 下一条 `mov r86 ← r78 {$10.dst}` 距离 1 → 再 `shl r78 ← r84` 把 r78 当地址重写 → 又一条 `r78 r78`）⇒ **分配器把地址与返回值塞进同一段寄存器 ⇒ 下一条载入的地址计算必须等上一条记分板 ⇒ MLP 钉死 1.19**；
+ **消它要么"地址/目标各留一段 GRF"要么"拆 `accN` 串行链成多累加器"——两个都要更多寄存器，而这三只 `grf_count` 全是 128 顶格 ⇒ 判死**；
+- **仪器再补一刀（子代理做的，该他上一铲就做）**：新增 **`tools/stall_census5.py` = 基本块感知**（只在同一 BB 内算 send→wait；块 = label 起、`goto|br|join|end-of-thread` 止；跨块等待丢弃并单独计数）——**理由：`gemm_int8_qkv#x` 是 14,674 行 / 3,497 label / 1,937 goto / 1,245 join 的完全展开派发体，线性文本距离不该直接当延迟用**；**复核结论不翻**（跨块丢弃仅 2/14/5 条，对 217/282/137 条等待；**p50 1-2、≤5 占 91-96%、MLP 1.14-1.90 全部存活**）；
+- **排名变了**（`tools/stall_hotspots_bb_aware.csv`；**帧级 same-BB short≤5 = 57.9%**，丢弃 847 条）：**新 #1 = `ffnc::launch_ffn_chip`（8,834 行 / 580 块 / 656 loads / dpas=32 / p50 5 / ≤5 占 53.1% / MLP 2.50）—— 帧里最重且真有 dpas 的一只**；#2-#5 = `gemm_int8_qkv#1`、`gemm_int8_qkv#x`、`gemm_qkv_window#x`、`window_block#3`（132 loads、p50 2、97.1%、MLP 1.62、dpas=0）；
+- **另一处自我更正**：旧 `tools/stall_sites.csv` **把复用同一记分板号的多次 send 折叠成一条记录**（`launch_v4full` 只有 16 条）⇒ **已修成 reuse-aware：267 条**；帧级 12,634 条 = **RAW 5,850 / ADDR-RECYCLE 1,462 / WAW 826 / other 2,055**；`launch_v4full` = **RAW 109 / RECYCLE 50（其中 45 条 first-wait ≤2 = 90%）/ WAW 16 / store-payload 133**；**旧版分栏数（RAW 805 / RECYCLE 749）作废**。
+**本轮 GPU = 0**（按 C11 立的规矩：刀没有对象，跑墙钟只会得到另一个 no-op）；引擎一行未改；HEAD `7819451`、dirty=0；两槽 `8658C786…` 与三金标未动。
