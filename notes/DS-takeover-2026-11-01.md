@@ -3404,3 +3404,24 @@ WINDOW_BLOCK RED (9 fails)
 ### ④ 现场
 两槽 `A2C3009F…` / 3,335,168 B 复验未动；三金标时间戳未动；仓库 `2167a9c` CLEAN、**零 git 写由子代理执行**；产物 `s6/c19_ffnmerge.cpp`、`s6/pe_c19.ps1`、`s6/pe_c19_plan_census.py`、`s6/pe_c19_zeinfo.py`、日志 `s6/C19_p{1,2,3}.log`、asm `E:\DSH\tmp\k3ze\d_c19`；状态 `s6/layer1.md §105`。
 ﻿placeholder
+
+## 167. ★★★ **C20 判死：帧尾四只 `ffn` 也不进引擎；同时纠正我又一次用错普查表（stall 画像那行是逃生口核，游戏路不跑）**
+### ① 身份（零 GPU，`s6/pe_c20_plan_census.py`）
+**16 步 `OP_XMX_REC_FFN`（2 录 × 8），全 `M=130,560 cin=32 hidden=128 groups=1`，flags `0x40000`×14 + `0`×2（idx 4/12 是 f32-skip）⇒ epi=0 narrow=0 half_skip=1 ⇒ 引擎 `:3353` 守卫真 ⇒ 现役支 = `packdev::pack_a16`（`:3337-3338`）+ `ffnc::launch_ffn_chip_cs2<16,false>`（`:3369`，`NR_CHIP_CS`/`NR_CHIP_LW16` 默认 ON）**；`.ze_info`：**grf 128 / simd 1 / slm 16,384 / scratch 0**（与 690 同一只核）。
+**★ 我引用的那条"全帧 stall 第一（656 loads / dpas 32 / p50 5 / ≤5 53.1% / MLP 2.50）"是 `launch_ffn_chip` = `NR_CHIP_CS=0` 的逃生口核，游戏路不跑它**；**现役 `cs2` 的 bb_aware 行是 67 loads / 20 dpas**，实测记分板 **FIRST p50 9 / le5 34.4% / MLP 2.98**
+⇒ **军规 189 的延伸：普查表（`stall_hotspots*`、`lane_replication_audit`、`leg_decomp`）每一行都必须标 `branch_is_live` + `data_vintage`，否则定价会连着两次建在不跑的核上（§162 是 v4full/v4ph，这次是 ffnc 的 cs2/cs）**。
+### ② 复制因子 = 1 ⇒ 去复制这一类刀没有
+**pair-split 生来去重（`tsl`/`ph` 都在地址里）；守恒 524,288 MAC/WG 恰一次**。
+### ③ 探针（真实 M=130,560、`half_skip=true`；3 进程 × 每进程新建空缓存已验证 1,645,148 B × min-of-9；**判官 = `Cout` 全平面 FNV，三臂 × 三进程逐位一致 `2c82c723…`**）
+| 臂 | 读数 | 判定 |
+|---|---|---|
+| **A0 现核 span** | **0.3333 / 0.3492 / 0.3339 ms**（`pack_a16` + 间隙 **0.014**；chip **0.316-0.335**）| 对帧腿 0.44-0.70 ⇒ **帧溢价 1.3-2.1×** |
+| **A1 删死 `pack_a16`** | **−4.1%（散布内）；逐位不变** | `dAp` 在现役支无读者（**`ffn_merge` 在 `:3537` 有 `skip_pack` 守卫，ffn 没补上**）；**proc-3 反而 +11%**：死包把 `Araw` 预热进 L2，删了 chip 变慢 |
+| **A2 `WSTAGE <16,true>`** | **−2.8%（噪声）；逐位不变** | 与 C19 一致：**16 KB 权重集 L1 常驻，staging 免费** |
+**门槛 20% 不过 ⇒ 判死、不进引擎。**
+### ④ 唯一结构发现 = **死提交**（记账不排刀）
+**`:3337-3338` 无条件 `pack_a16` + 8.4 MB 死池分配，每帧 8 只 ffn 闭包都付**；**可证逐位不变、可当卫生补丁**；**但价 = 0.014 × 8 = 0.11 ms 串行，低于仪器分辨下限（军规 161：单只 <1 ms 不可定价），且 proc-3 显示删它可能倒亏（L2 预热）**。
+### ⑤ 第二层的当前结论（三铲合流）
+**C16（v4full 换宽存）+ C17（冷读）+ C19（ffn_merge 三臂）+ C20（ffn 两臂）全部判死**，且**每一铲都给出"钱不在核形状里"的独立证据**；**这四只 ffn 的钱在帧语境溢价（1.3-2.1×）**
+⇒ **第二层"核内/形状级"刀已出清；下一步只剩两类杠杆：① graph/放置级（闭包次序、并发度、fused 与 non-fused 的 42% 差）② 已定价但未做的减 submission（C512 att 段融合 = 1.61 ms）**。
+**现场**：两槽 `A2C3009F…` / 3,335,168 B 复验未动；三金标未动；仓库 CLEAN；**子代理零 git 写、引擎只读**；GPU 合计 ≈ 1 秒；状态 `s6/layer1.md §106`。
