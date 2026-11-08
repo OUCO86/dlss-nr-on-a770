@@ -3092,3 +3092,16 @@ WINDOW_BLOCK RED (9 fails)
 ### 车道复制这条线结案
 **活核里已收割完：C5 −1.793 + C7 −0.766 = −2.56 ms/帧，全部逐位不变、全部 16/16。**
 **下一铲 = 零 GPU 的"靶排序表"**（每族 `leg ms × 离地板倍数 × 字节地板 × 可挖 ms 上限 × 已知机制是否饱和 × 候选杠杆`），由父级挑刀；**当前最大的非贴地族仍是 `window_block`（15.3 ms/进程、3.9-6.2× 地板）**。
+
+## 146. ★★★★ **靶排序表出炉 + 一台仪器被判废（相位级定档以后只能用骨架探针）**
+- **两张表**：`tools/knife_ranking.csv`（19 行 × 18 列）、`tools/lane_replication_audit.csv`（23 行 × 14 列，**新增 `branch_is_live`**）；
+- **★ 线上停点阶梯现在量不动了**（57 腿，`s6\pe_k3e_ladders.ps1`，GPU 68 秒）：**`NR_V2_STOP` 出现物理不可能的序**（全跑 16.341 → stop=5 18.291 → stop=6 20.015 → stop=9 20.402，而 stop=10/11/12 = 12.567/12.400/11.525）⇒ **早退腿的 dump 代价（16.7 MB 写 + 下载）已经是主导项**；**`NR_WB_STOP` 同批废**（**TOTAL serial 双态 121-122 vs 128-136 ms = 13 ms 的时钟/热台阶** ⇒ 导出量为负）；**上一铲 §79.2 的 leg3 = +0.120 ms/进程仍然有效**（那批无 dump、TOTAL 稳在 120.4-120.9）；
+- **军规 176（已入 B2）**：**相位级定档一律用骨架探针（静态槽 + 墙钟，sd 0.003 级）；线上 STOP 阶梯只适合 ≥5 ms 的段，且停点腿必须与对照腿成对相邻；停点差 < 同批 TOTAL 态移 ⇒ 直接判废**；**另：`NR_WB_STOP` 量的是 leg3，`NR_V2_STOP` 才是相位**（父级原话混用过，已更正）；
+- **现役 per-family 数取自 C7 的配对腿级**（`rt_c7leg_B_*`，A/B 同分钟交替）：**`window_block` 15.887 ms/进程、1.589 ms/闭包**；
+- **`branch_is_live` 全表补完**：**LIVE-DEFAULT**：`wbv4::launch_v4full`、`ffn2::fused`、`ffnc::launch_ffn_chip/_cs2`（`NR_FFN_CHIPRES/JOIN/FF3/CHIP_CS/FF9` 全默认 ON、`NR_CHIP_LW16` 默认 ON）、`s8v8::gemm_b_pub_slm`、`gemm_b_res_window`、`s8v5::gemm_qkv_v`、`qres::gemm_qkv_res`、`wares::launch_wa_res`、`att5::fused`（编译期 `T_ATT5_FUSE_DEF=1`）、`b6`、`lfw2`、`f16v2::gemm_b2<32/64>`、`f16v1::gemm_dual_pub/gemm_pub_pa16/gemm_b_merge_scale/gemm_b_pub_f16`；**DEAD-BY-DEFAULT**：`wbv4ph`、`wbv3`、`wbmega::launch_full`、`s8v8::gemm32_b_pub`、`gemm_b_res_batch`、`ffnc::stem_mega`、**`f16v1::gemm_b`**、`f16v3` 的 `nd_range` 分支与 staging 路；**DEAD-NO-SITE**：`ffnt::launch_ffn_fused`、`lfw::launch_lfw`、`qkv_resident`；**ROUTE-DEPENDENT/未复核**：`s8v8::gemm_b_pub`、`s8v9::gemm_b_rq`、`s8v9b::gemm_b_rq9b`；
+- ★ **连带发现（引用要标 vintage）**：`leg_decomp.csv` 里 GA 那行写的是 **"f16v1::gemm_b (scores leg)"，但它现在默认不走**（默认是 `f16v2::gemm_b2<64>`）；
+### 排刀结论（预估帧钱降序，**无绝对毫秒定档的候选一律 `est = -1` 不许排刀**）
+1. **跨族字节面 `f32 → f16`**：**0.48-0.78 ms/帧**（**改数值 ⇒ 走用户实机，不走四闸**）；**最干净的一条 = id 1276（`unary` 每帧把一张 f32 面读 48 次）**；**id 1309 `dC`（被 `gemm_int8_residual ×136 / quant_window ×104 / window_int8_residual ×104 / window_block ×2` 碰、且是量化前累加器）押后**（`gate_quant_window` 的 1 ULP 前科）；
+2. **`window_block` 依赖链/相位拆分 ≈ 0.21 ms/帧**（**复制杠杆已收割完**）；
+3. **`window_attention` 字节 ≈ 0.16 ms/帧**；
+4. **`gemm_*`/`ffn` 各族未定档 ⇒ 不许排刀**（要成对跑 `NR_RES_STOP`/`NR_B_STOP`/`NR_G_STOP`/`NR_STEM_STOP`/`NR_FFN_*`，否则又撞 13 ms 态移）。
