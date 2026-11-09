@@ -3744,3 +3744,32 @@ WINDOW_BLOCK RED (9 fails)
 **新 md5 只上报、未写 `shipped_build.defs`**：`att5_fused_kernel.hpp` `96222E87…` → **`CC14B1486C097539445C2F563D25ABE6`**；`gemm_s8_v8_kernel.hpp` `E2991804…` → **`C9AA3CBD94BF5D6BE6DC552EBECE45A4`**；`libxmx_sycl.cpp`（apply 后）= **`C3A7A43BA19932B280C115498FFFE7CC`**；`s6_ffn_block_kernel.hpp` 未改（仍 `490647A9…` ✓）；`window_block_mega.hpp` 未改（仍 `872DA837…`）；
 **刀** = `E:\DSH\tools\C31_engine_u8.diff`：**74,206 B、26 hunk、+901/−5、LF、UTF-8 无 BOM、`git apply --check` exit 0**（含三文件；清单与新 md5 由 `tools/wb_c30_export.py` 打印）；
 **现场**：porcelain 0、`.cpp` 回 `CC48937E…` = HEAD、两 header 回 HEAD；未 commit/staged/promote；两槽两次对账均 `A2C3009F…` / 3,335,168 B = `out/SHIPPED_MD5.txt` ✓、`fsutil hardlink list` 只剩一条 ✓；三金标、四面基线、`shipped_build.defs`、门脚本/golden、受管缓存未写（只新增 `out\nr_vit_trace*.log` + `tmp\gatemirror`、`tmp\syclcache_c31gates`）；每腿新建空缓存、腿间 62 s、每腿 `RECORD_FAILED=0`；**GPU ≈ 17 分钟**（预算 45）；状态 `s6/layer1.md §118`。
+
+## 180. ★★★★★ **C33+C34（ViT 复用的最后判定）：机制惰性已证、早退确实在跑（`earlyout=32/73`），但收益按比例缩水且覆盖不全 ⇒ 画面仍变 ⇒ 这条线停在"未达标"，不 staged；今晚负结果的正确记账是"覆盖 32/73 时 −1.06 ms/帧且画面变"，不是"(A) 路线没有收益"**
+### ① C33（守到 40 处 launcher、装上二次解锁的 s6 副本）
+**机制惰性证明 ✓✓**：关掉 C32 那条往 plan face `1287` 写 stamp 的自证之后，同一件同一静止序列 8 帧逐帧 7 面 FNV：**`s0f`(REUSE=0) vs `s6ns`(level 6、flag 恒 0、40 处守卫全在) = ALL 8×7 EQUAL** ⇒ **C32 的 40 项 DIFF 确证就是那次 stamp 写**（`1287` 在 span 内先被读后被写、判据核在 span 之前 ⇒ 污染下游）；**C28 那句"读者/作者都关在跨度内所以可以盖"只对整段溶解的 twin 成立**；**管道净代价 = +0.2 ms/帧**。
+**但三条交付判据不成立**：静止 `s6ns` vs `s6t` = **DIFF 40/56**；变化两档 `1301`/`features` EXACT 而 **`result` 仍变**（m1 580,710 B、m2 84,284 B）；帧 ms：fused `s0f` 46.13 vs `s6t` 46.51/47.48 ⇒ **不省反而慢**；plain −0.8。
+**覆盖**：已守 **40 处** = `s8v8` 11 + `wbmega` 8（上轮编译失败真因：7 处 `return q.submit` + **1 处 direct `return q.parallel_for`**）+ `att5::fused` 1 + `quantize_row` 3 只 factory（第一次失败 = 实参顺序，gate 在第 4 位 `(dsrc, dpack, dscale, vit_g_, m, k)`）+ `.cpp` inline 16 + **`s6_ffn_block_kernel.hpp` 1**（装的是登记态 `20A44A6E…`，编译打印 `header ok … gate=ON` ✓）；**未守：`b6_res_kernel.hpp`**。
+**自证缺陷（它自己认的）**：`SELFATT frames=… earlyout=k/73` 打印块插在 `vit_frame_note` 里，而**该函数在 level-6 路径上根本没被调用** ⇒ 本轮没有"哪几帧真早退"的读数 ⇒ 军规 196② 未闭合。
+**布局被迫回退（新教训 → 军规 199）**：原想把 flag 挪到固定负偏移 `gate[-100]`，但**已登记的 s6 副本按 `gate[-1]` 写死、且它的字节必须等于 defs 里的第二合法态** ⇒ 任何改动都要三次解锁 ⇒ 退回 `gate = vg+1+cmd` + `gate[4199]` 命中格（`vg` 扩到 8400 ints）。
+### ② C34（一行接线 + 两条腿，GPU 3 分钟）：**拿到决定读数**
+接线 = `xmx_graph_run` 的 level-6 分支调 `vit_frame_note(id)`，读数走已建的 `malloc_host` 镜像（**不碰任何业务面**）：
+```
+s6t  (REUSE=6, THMAX=0/THSUM=0, NOSTAMP=1):  f1:k=0/73   f2..f9:k=32/73   ← 稳定 32
+s6ns (同配置 THMAX=-1 ⇒ flag 恒 0):          f1..f9:k=0/73                ← 对照干净
+```
+**`f1 k=0` 是正确的**（首帧影子 0xFF ⇒ max=65535 ⇒ flag=0 ⇒ 必算）⇒ **跨帧滞后那条已被同帧设计消掉**；
+**⇒ 机制确实在跑，但 73 只标记里只有 32 只走早退分支**（真跑 49 只里约 17 只没守到：`b6_res` 整只未改、同一 launcher 被多只闭包共用时命中格只算一处、部分 inline 站点捕获形态不同）
+**⇒ C33 静止 DIFF 40 的正因 = 这 17 只造成的半复用**，不是判据错、不是 flag 没写；
+**计时腿**：`s0f` 46.13（REUSE=0 基准）｜`s6ns`（c34a，k=0）**46.50 ⇒ 管道净代价 +0.37**｜`s6t`（k=32/73）**45.44 ⇒ vs 同件对照 −1.06 ms/帧**、vs `s0f` −0.69；
+**⇒ 32 只早退 = 1.06 ms ⇒ 线性外推到 73 只 ≈ −2.4 ms/帧，够不到 twin 的 −4.08**（**溶解把节点/提交开销一起拿掉，核内早退只省执行时间**）。
+**件**：`c33i` = `ABEDA545B1BD8E21D4AF79D5DD0113AC`（3,458,560 B，icx exit=0，`gate=ON`）→ **`c34a-20261109-202614` = `37773A85535B94B24FD3CBB4C1EC4CC0`，3,458,560 B，icx exit=0**（相对 c33i 只差那一行接线）；**刀 `E:\DSH\tools\C34_engine_u8.diff` = 106,638 B、60 hunk、+1012/−16、LF、UTF-8 无 BOM、`--check` exit 0**，六文件 apply 后 md5：`libxmx_sycl.cpp` `9B3FA1AA…`、`att5_fused_kernel.hpp` `48F3FF65…`、`gemm_s8_v8_kernel.hpp` `D2517A4F…`、`window_block_mega.hpp` `3D5D8401…`、`quantize_row_kernel.hpp` `87E37A6A…`、`s6_ffn_block_kernel.hpp` `20A44A6E…`（与登记态逐字节相同 ✓）。
+### ③ 三种设计的最终对照（今晚整条线的账）
+| 设计 | 判决时机 | 省什么 | 实测帧 ms | 画面 |
+|---|---|---|---|---|
+| **twin（整段溶解，单 submit）** | **跨帧**（晚一帧）| 节点 + 执行 | **−4.08 fused / −3.92 plain**（静止） | **静止 EXACT；变化会错复用**（result 4.41-27.43%、新 NaN 2,000-11,656）⇒ **不安全** |
+| **level 4 拆帧（两 submit，整段溶解）** | 同帧 | 节点 + 执行，但**多一次 submit 代价 +2.19** | **−2.75 / −2.38**（触发帧）；**不触发帧反而 +2.19** | **静止与变化两档都 EXACT** ⇒ 语义正确但**运动场景是净亏** ⇒ 已按军规 198① 记为弃用（写域自缚） |
+| **level 6 核内早退（单 submit）** | 同帧 | **只省执行**（节点照付） | 覆盖 32/73 ⇒ **−1.06**；外推 73/73 ⇒ **≈ −2.4**；管道代价 **+0.37** | **覆盖不全 ⇒ 半复用 ⇒ 画面变**；覆盖全了才可能 EXACT |
+### ④ 判定与现场
+**判定（我下）**：**不 staged、不认证**；这条线记为 **"未达标，停在覆盖 32/73"**；**要继续就还差 17 只闭包的守法（`b6_res` + 共用 launcher 的命中格 + 捕获形态差异），预期把收益推到 ≈ −2.4 ms/帧（静止），仍低于 twin 的 −4.08，且运动场景只亏 +0.37 ⇒ 风险轮廓最好**；**明早由用户裁决是否补完**。
+**现场**：主树 **CLEAN**（porcelain 0；六文件回 HEAD：`.cpp` `CC48937E…`、`s6` `490647A9…`）；未 commit/staged/promote；两槽开工与收工两次对账均 `A2C3009F…` / 3,335,168 B = `out/SHIPPED_MD5.txt` ✓；三金标、四面基线、`shipped_build.defs`、`build_shipped.ps1`（父级改）、门脚本/golden、受管缓存未写；每腿新建空缓存、腿间 62 s、`RECORD_FAILED=0` ✓；日志 `C27_{s6t,s6ns}.log`、`build_vitreuse_c34a-…log`；状态 `s6/layer1.md §120、§121`。

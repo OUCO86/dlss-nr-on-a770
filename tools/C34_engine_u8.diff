@@ -1,0 +1,1550 @@
+diff --git a/src/bench/sycl/att5_fused_kernel.hpp b/src/bench/sycl/att5_fused_kernel.hpp
+index f1c310f..802bf6b 100644
+--- a/src/bench/sycl/att5_fused_kernel.hpp
++++ b/src/bench/sycl/att5_fused_kernel.hpp
+@@ -54,7 +54,8 @@ static inline event fused(queue& q,
+                            unsigned windows,
+                            unsigned across, unsigned top, unsigned left,
+                            unsigned image_h, unsigned image_w,
+-                           const Outlets& o) {
++                           const Outlets& o,
++                           const int* vflag = nullptr) {   // C30 (A): same-frame reuse flag (device)
+     LC_TICK();   // #145 军规 132: launch counted at helper entry
+     constexpr int TOK = 64, NH = 3 * C, KBN = C / 32, PPH = C / 64;   // parts per kind
+     // ---- SLM map (bytes) ----
+@@ -79,6 +80,12 @@ static inline event fused(queue& q,
+     return q.submit([&](handler& h) {
+         h.parallel_for(nd_range(range((size_t)windows * 16u), range(16u)),
+             [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
++            // C30 (A): the same-frame reuse decision, read on the DEVICE. When the criterion
++            // (which runs earlier in this very frame) found the segment input unchanged, every
++            // span kernel returns here without touching a byte -- so its face keeps the
++            // previous frame's value, which is exactly the reuse the plan's lifecycle allows
++            // (section 113.1). Flag clear => the shipped path, instruction-for-instruction.
++            if (vflag && vflag[-1] && *vflag) { ((int*)vflag)[4199] = 2; return; }   // C33: per-closure mark, not the bare flag
+             esimd::slm_init<SLMB>();
+             auto gr = it.get_group();
+             uint w = (uint)it.get_group(0);
+diff --git a/src/bench/sycl/gemm_s8_v8_kernel.hpp b/src/bench/sycl/gemm_s8_v8_kernel.hpp
+index 28cb392..38ba5b2 100644
+--- a/src/bench/sycl/gemm_s8_v8_kernel.hpp
++++ b/src/bench/sycl/gemm_s8_v8_kernel.hpp
+@@ -23,6 +23,12 @@
+ #include "publish_kernel.hpp"   // qr_e4m3_scalar (ESIMD-safe) for the fused store
+ #include <cstring>
+ 
++// C31: same-frame reuse gate (defined in libxmx_sycl.cpp). A launcher here asks for the
++// gate of the closure it is being called from; the kernel then returns WITHOUT writing when
++// the frame decided to reuse (so its face keeps the previous frame's value -- section 113.1).
++extern int g_vit_run_cmd;
++const int* vit_gate(int cmd);
++
+ namespace s8v8 {
+ using namespace sycl;
+ namespace esimd = sycl::ext::intel::esimd;
+@@ -61,8 +67,10 @@ static inline sycl::event gemm(sycl::queue& q, const int8_t* Ap, const int8_t* B
+                                int32_t* C32, int Mp, int N, int K) {
+     LC_TICK();   // #145 军规 132: launch counted at helper entry
+     int wg = (Mp / BM) * (N / BN);
++    const int* vit_g_ = vit_gate(g_vit_run_cmd);   // C31 gate for THIS closure
+     return q.submit([&](handler& h) {
+         h.parallel_for(nd_range(range(wg * NT), range(NT)), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
++            if (vit_g_ && vit_g_[-1] && *vit_g_) { ((int*)vit_g_)[4199] = 2; return; }   // C31: reuse => touch nothing
+             esimd::slm_init<3 * SLM_A + 3 * SLM_B>();   // s8d2 three-buffer (10-31: the proven depth-2 form, this file's remaining double-buffer cores)
+             int gid = (int)it.get_group(0);
+             int lid = (int)it.get_local_id(0);
+@@ -142,8 +150,10 @@ static inline sycl::event gemm_b(sycl::queue& q, const int8_t* Ap, const int8_t*
+     LC_TICK();   // #145 军规 132: launch counted at helper entry
+     int wg = (Mp / BM) * (N / BN);
+     size_t apb = (size_t)Mp * K, bpb = (size_t)N * K, cb = (size_t)Mp * N;
++    const int* vit_g_ = vit_gate(g_vit_run_cmd);   // C31 gate for THIS closure
+     return q.submit([&](handler& h) {
+         h.parallel_for(nd_range(range((size_t)wg * batch * NT), range(NT)), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
++            if (vit_g_ && vit_g_[-1] && *vit_g_) { ((int*)vit_g_)[4199] = 2; return; }   // C31: reuse => touch nothing
+             esimd::slm_init<3 * SLM_A + 3 * SLM_B>();   // s8d2 three-buffer
+             int gid = (int)it.get_group(0);
+             int lid = (int)it.get_local_id(0);
+@@ -217,8 +227,10 @@ static inline sycl::event gemm32_b(sycl::queue& q, const int8_t* Ap, const int8_
+     const int SLM_TOTAL32 = 2 * SLM_A32 + 2 * SLM_B32;
+     int wg = (Mp / BM) * (N / BN32);
+     size_t apb = (size_t)Mp * K, bpb = (size_t)N * K, cb = (size_t)Mp * N;
++    const int* vit_g_ = vit_gate(g_vit_run_cmd);   // C31 gate for THIS closure
+     return q.submit([&](handler& h) {
+         h.parallel_for(nd_range(range((size_t)wg * batch * NT32), range(NT32)), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
++            if (vit_g_ && vit_g_[-1] && *vit_g_) { ((int*)vit_g_)[4199] = 2; return; }   // C31: reuse => touch nothing
+             esimd::slm_init<3 * SLM_A32 + 3 * SLM_B32>();   // s8d2 three-buffer
+             int gid = (int)it.get_group(0);
+             int lid = (int)it.get_local_id(0);
+@@ -288,8 +300,10 @@ static inline sycl::event gemm32(sycl::queue& q, const int8_t* Ap, const int8_t*
+     const int SLM_B32_BASE = 2 * SLM_A32;
+     const int SLM_TOTAL32 = 2 * SLM_A32 + 2 * SLM_B32;
+     int wg = (Mp / BM) * (N / BN32);
++    const int* vit_g_ = vit_gate(g_vit_run_cmd);   // C31 gate for THIS closure
+     return q.submit([&](handler& h) {
+         h.parallel_for(nd_range(range(wg * NT32), range(NT32)), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
++            if (vit_g_ && vit_g_[-1] && *vit_g_) { ((int*)vit_g_)[4199] = 2; return; }   // C31: reuse => touch nothing
+             esimd::slm_init<3 * SLM_A32 + 3 * SLM_B32>();   // s8d2 three-buffer
+             int gid = (int)it.get_group(0);
+             int lid = (int)it.get_local_id(0);
+@@ -456,8 +470,10 @@ static inline sycl::event gemm_b_pub(sycl::queue& q, const int8_t* Ap, const int
+     LC_TICK();   // #145 军规 132: launch counted at helper entry
+     int wg = (Mp / BM) * (N / BN);
+     size_t apb = (size_t)Mp * K, bpb = (size_t)N * K;
++    const int* vit_g_ = vit_gate(g_vit_run_cmd);   // C31 gate for THIS closure
+     return q.submit([&](handler& h) {
+         h.parallel_for(nd_range(range((size_t)wg * batch * NT), range(NT)), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
++            if (vit_g_ && vit_g_[-1] && *vit_g_) { ((int*)vit_g_)[4199] = 2; return; }   // C31: reuse => touch nothing
+             esimd::slm_init<3 * SLM_A + 3 * SLM_B>();   // s8d2 three-buffer
+             int gid = (int)it.get_group(0);
+             int lid = (int)it.get_local_id(0);
+@@ -598,8 +614,10 @@ static inline sycl::event gemm32_b_pub(sycl::queue& q, const int8_t* Ap, const i
+     const int SLM_B32_BASE = 2 * SLM_A32;                 // the two B buffers follow the A
+     int wg = (Mp / BM) * (N / BN32);
+     size_t apb = (size_t)Mp * K, bpb = (size_t)N * K;
++    const int* vit_g_ = vit_gate(g_vit_run_cmd);   // C31 gate for THIS closure
+     return q.submit([&](handler& h) {
+         h.parallel_for(nd_range(range((size_t)wg * batch * NT32P), range(NT32P)), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
++            if (vit_g_ && vit_g_[-1] && *vit_g_) { ((int*)vit_g_)[4199] = 2; return; }   // C31: reuse => touch nothing
+             esimd::slm_init<2 * SLM_A32 + 2 * SLM_B32>();   // depth-1 double buffer, 10KB
+             int gid = (int)it.get_group(0);
+             int lid = (int)it.get_local_id(0);
+@@ -698,8 +716,10 @@ static inline sycl::event gemm_b_pub_slm(sycl::queue& q, const int8_t* Ap, const
+     // int32 = 16KB total (the row-index space of the full map would still reach
+     // 30.5KB; the compact map is what makes the occupancy probe real). Both overlap the 12KB
+     // operand region -- legal, operands are dead after the loop's final barrier.
++    const int* vit_g_ = vit_gate(g_vit_run_cmd);   // C31 gate for THIS closure
+     return q.submit([&](handler& h) {
+         h.parallel_for(nd_range(range((size_t)wg * batch * NT), range(NT)), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
++            if (vit_g_ && vit_g_[-1] && *vit_g_) { ((int*)vit_g_)[4199] = 2; return; }   // C31: reuse => touch nothing
+             esimd::slm_init<HALF ? 18432 : 32768>();   // s8d2: operands 18KB; the HALF compact stage (16KB) aliases the dead operand region after the loop's final barrier
+             int gid = (int)it.get_group(0);
+             int lid = (int)it.get_local_id(0);
+@@ -874,8 +894,10 @@ static inline sycl::event gemm_b_res(sycl::queue& q, const int8_t* Ap, const int
+     LC_TICK();   // #145 军规 132: launch counted at helper entry
+     int wg = (Mp / BM) * (N / BN);
+     size_t apb = (size_t)Mp * K, bpb = (size_t)N * K;
++    const int* vit_g_ = vit_gate(g_vit_run_cmd);   // C31 gate for THIS closure
+     return q.submit([&](handler& h) {
+         h.parallel_for(nd_range(range((size_t)wg * NT), range(NT)), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
++            if (vit_g_ && vit_g_[-1] && *vit_g_) { ((int*)vit_g_)[4199] = 2; return; }   // C31: reuse => touch nothing
+             esimd::slm_init<3 * SLM_A + 3 * SLM_B>();   // s8d2 three-buffer
+             int loc = (int)it.get_group(0);
+             int lid = (int)it.get_local_id(0);
+@@ -1002,8 +1024,10 @@ static inline sycl::event gemm_b_res_batch(sycl::queue& q, const S8ResDesc* desc
+                                            bool narrow, bool half_skip, unsigned epi) {
+     LC_TICK();   // #145 军规 132: launch counted at helper entry
+     int wg = (Mp / BM) * (N / BN);
++    const int* vit_g_ = vit_gate(g_vit_run_cmd);   // C31 gate for THIS closure
+     return q.submit([&](handler& h) {
+         h.parallel_for(nd_range(range((size_t)wg * batch * NT), range(NT)), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
++            if (vit_g_ && vit_g_[-1] && *vit_g_) { ((int*)vit_g_)[4199] = 2; return; }   // C31: reuse => touch nothing
+             esimd::slm_init<3 * SLM_A + 3 * SLM_B>();   // s8d2 three-buffer
+             int gid = (int)it.get_group(0);
+             int g = gid / wg; int loc = gid % wg;
+@@ -1145,8 +1169,10 @@ static inline sycl::event gemm_b_res8(sycl::queue& q, const int8_t* Ap, const in
+     LC_TICK();   // #145 军规 132: launch counted at helper entry
+     int wg = (Mp / BM) * (N / BN);
+     size_t apb = (size_t)Mp * K, bpb = (size_t)N * K;
++    const int* vit_g_ = vit_gate(g_vit_run_cmd);   // C31 gate for THIS closure
+     return q.submit([&](handler& h) {
+         h.parallel_for(nd_range(range((size_t)wg * NT), range(NT)), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
++            if (vit_g_ && vit_g_[-1] && *vit_g_) { ((int*)vit_g_)[4199] = 2; return; }   // C31: reuse => touch nothing
+             esimd::slm_init<32768>();   // the 128x64 f32 tile (32KB) aliases the 18KB operand region post-barrier (the pub_slm pattern)
+             int loc = (int)it.get_group(0);
+             int lid = (int)it.get_local_id(0);
+@@ -1277,8 +1303,10 @@ static inline sycl::event gemm_b_res_window(sycl::queue& q, const int8_t* Ap, co
+     LC_TICK();   // #145 军规 132: launch counted at helper entry
+     int wg = (Mp / BM) * (N / BN);
+     size_t apb = (size_t)Mp * K, bpb = (size_t)N * K;
++    const int* vit_g_ = vit_gate(g_vit_run_cmd);   // C31 gate for THIS closure
+     return q.submit([&](handler& h) {
+         h.parallel_for(nd_range(range((size_t)wg * NT), range(NT)), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
++            if (vit_g_ && vit_g_[-1] && *vit_g_) { ((int*)vit_g_)[4199] = 2; return; }   // C31: reuse => touch nothing
+             esimd::slm_init<3 * SLM_A + 3 * SLM_B>();   // s8d2 three-buffer
+             int loc = (int)it.get_group(0);
+             int lid = (int)it.get_local_id(0);
+diff --git a/src/bench/sycl/libxmx_sycl.cpp b/src/bench/sycl/libxmx_sycl.cpp
+index ac28b43..c54e77e 100644
+--- a/src/bench/sycl/libxmx_sycl.cpp
++++ b/src/bench/sycl/libxmx_sycl.cpp
+@@ -172,7 +172,9 @@ static long g_lc_skipped = 0;                  // launch sites the narrow policy
+ static std::vector<LCount>* g_lc_vec = nullptr;   // the counters of the graph currently replaying
+ #define LC_ADD(field, v) do { if (g_lcount_on && g_lc_vec && g_lc_cur >= 0 && (size_t)g_lc_cur < g_lc_vec->size()) \
+                             (*g_lc_vec)[(size_t)g_lc_cur].field += (v); } while (0)
+-static void lc_begin(int i) { if (g_lcount_on) { g_lc_cur = i; g_lc_tick0 = g_lc_ticks; } }
++static int g_vit_run_cmd = -1;   // C31: the closure ordinal currently being enqueued (set by
++                             // lc_begin, which BOTH the plain-loop and the record paths call)
++static void lc_begin(int i) { g_vit_run_cmd = i; if (g_lcount_on) { g_lc_cur = i; g_lc_tick0 = g_lc_ticks; } }
+ static void lc_end() {
+     if (g_lcount_on && g_lc_cur >= 0 && g_lc_vec && (size_t)g_lc_cur < g_lc_vec->size())
+         (*g_lc_vec)[(size_t)g_lc_cur].pf = (int)(g_lc_ticks - g_lc_tick0);
+@@ -988,6 +990,46 @@ static void a5_note_qw(size_t cmd, int source, int packed, int scale, unsigned M
+     g_a5.M = M; g_a5.C = K; g_a5.height = height; g_a5.width = width;
+     g_a5.across = across; g_a5.pad = pad;
+ }
++static int vit_reuse_level(void);   // fwd (used by the C30 guard helpers below)
++
++// ---- C30 (A) level 6: ONE submit, the reuse decision lives ON THE DEVICE. The criterion
++// closure (already before the span) reduces max|delta| / sum|delta| across its items and
++// writes a 4-byte flag into device memory; each guarded span kernel tests that flag at its
++// entry and returns without writing (so its face keeps the previous frame's value -- the
++// section 113.1 lifecycle). vg[0] = the per-frame flag, vg[1+closure] = 1 for closures inside
++// the span (filled once at capture), so the same launch site used by window closures is
++// untouched. The host never decides anything at this level.
++static int* g_vit_vg = nullptr;       // device: [0]=flag, [1+i]=guardable(closure i)
++static long long* g_vit_acc = nullptr;  // C31 device: [0]=max, [1]=sum, [2]=arrived (64-bit cells)
++static int* g_vit_hf = nullptr;       // malloc_host mirror for the TRACE only (never decides)
++// C31: the per-closure gate cell, with NO call-site churn: a header launcher asks for
++// vit_gate(g_vit_run_cmd) at enqueue time and the kernel then tests gate[-1] (the frame
++// flag) and *gate (this closure is inside the marked span). nullptr => shipped path.
++const int* vit_gate(int cmd);
++static int* vit_gbuf(void) {
++    if (vit_reuse_level() < 6) return nullptr;
++    if (!g_vit_vg) g_vit_vg = (int*)sycl::malloc_host(8400u * 4u, *GQ);   // C33: flag + marks + hit cells
++    return g_vit_vg;
++}
++static long long* vit_accbuf(void) {   // C31: 64-bit cells -- the int32 sum overflowed and
++                                       // produced NEGATIVE sums in the trace (unacceptable)
++    if (!g_vit_acc) g_vit_acc = (long long*)sycl::malloc_device(4u * sizeof(long long), *GQ);
++    return g_vit_acc;
++}
++static int* vit_hfbuf(void) {
++    if (!g_vit_hf) g_vit_hf = (int*)sycl::malloc_host(4u * 4u, *GQ);
++    return g_vit_hf;
++}
++const int* vit_gate(int cmd) {
++    const int* vg = vit_gbuf();
++    if (!vg || cmd < 0 || cmd > 4090) return nullptr;
++    return vg + 1 + cmd;     // C33: gate[-1]=the frame flag, gate[4199]=this closure hit cell
++}
++// the guard, as the FIRST statement of a device kernel: skip this kernel entirely
++#define VIT_GUARD(vg, cidx) do { if ((vg) && (vg)[0] && (vg)[1 + (cidx)]) return; } while (0)
++
++
++
+ static void a5_take_qkv(size_t cmd, int a, int b, int q, int k, int v, int a_scale, int b_scale,
+                         int qkv_scale, unsigned M, unsigned channels, unsigned heads,
+                         unsigned tokens, unsigned flags) {
+@@ -1147,7 +1189,8 @@ static void a5_att_run(const A5Fuse& f) {
+     att5::Outlets o;                 // DUMP=false: every outlet stays null and folds away
+      att5::fused<64, 2, 5, false, false>(*GQ, dImg, dBp, bs, qs, bias, dOp, bs2, cp, Out2,
+                                         Q, Kk, V, f.windows, f.across, f.top, f.left,
+-                                        f.ih, f.iw, o);
++                                        f.ih, f.iw, o,
++                                        vit_gate(g_vit_run_cmd));   // C33: per-closure gate cell (was the bare flag base)
+ }
+ static sycl::half* cached_pack_b_f16(int bufid, const sycl::half* B, int K, int N) {
+     WKey wk{bufid, K, N, 0};
+@@ -1543,6 +1586,7 @@ int xmx_buf_destroy(int id) {
+     g_bufs.erase(it); return 0;
+ }
+ 
++static void vit_reset(void);   // fwd: the C25 NR_VIT_REUSE record-scoped notes (block below)
+ int xmx_begin(void) { g_lcount_on = getenv("NR_LCOUNT") != nullptr; g_lc_cur = -1; g_lc_skipped = 0;
+     ++g_gen; g_recording = true; g_cmds.clear();
+     g_sp_live.clear();   // B step 3: the versioned ids are per recording
+@@ -1560,12 +1604,14 @@ int xmx_begin(void) { g_lcount_on = getenv("NR_LCOUNT") != nullptr; g_lc_cur = -
+     g_quant_pk.clear(); g_fused_quant.clear();
+     g_pending_fold_slot = SIZE_MAX; g_fold_slot.clear();
+     s6_reset();   // S6: the chain candidate's cmd indices are RECORD-scoped
++    vit_reset();  // C25: the ViT-chain notes are RECORD-scoped too (the plan records twice)
+     return 0; }
+ int xmx_abort(void) { g_recording = false; g_cmds.clear(); g_cmds_touch.clear();
+     g_cmds_group.clear(); g_cmds_poolblk.clear(); g_pg_ids_snap.clear(); g_cmds_launch.clear(); g_cmds_name.clear();
+     g_quant_pk.clear(); g_fused_quant.clear();
+     g_pending_fold_slot = SIZE_MAX; g_fold_slot.clear();
+     s6_reset();
++    vit_reset();   // C25 (rule: clear the record-scoped registries at BOTH ends)
+     return 0; }
+ 
+ // ==================== NR_SKIP_CHAINS: whole-block-chain skip (2026-11-02, B2 跳块铲) ====
+@@ -1713,6 +1759,734 @@ static void skip_chains_apply(std::vector<std::function<void()>>& cmds,
+     std::fflush(stdout);
+ }
+ 
++// ==================== NR_VIT_REUSE (C25, 2026-11-09): adaptive ViT-chain reuse =========
++// Quality-for-speed blade (rule 156: it CHANGES THE PICTURE; the user judges it on real
++// hardware). When the ViT segment's input has not moved since the frame that last ran it,
++// the 8 ViT attention chains do not have to run: the faces they write are PLAN faces
++// (1275/1274/1276/1277/1285 -- created by OP_BUF in the kept recording, plan idx 4516-4534,
++// never destroyed, never re-zeroed per frame: the only zero is OP_XMX_BUF_ZERO 1285 at 4517,
++// at plan build), so NOT re-running the chain = re-reading last frame's values.
++// Census (rule 189, tools/wb_c25_census.py + wb_c25_faces.py on plan_960x544.c):
++//   chain = QUANT(1267->1286,1287) -> GEMM_INT8_QKV(1286,w -> 1275,1274,1276, flags 0x2000
++//   vit) -> GLOBAL_ATTENTION(1275,1274,1276 -> 1277) -> QUANT(1277->1286,1287) [dissolved:
++//   "quant(FUSED-pack)"] -> GEMM_INT8_RESIDUAL(1286,w -> 1285, skip=1267, flags 0x41100).
++//   fused route: closures 318..385 (GA at 320,329,...,383) = 40 closures / 88 launches /
++//   leg 8.000 ms of the 120.206 ms serial frame (tools/FRT_fused_leg2.txt, 11-09 04:03).
++//   plain route: the same pattern at 317..384 (GA at 319,...,382), 691 closures.
++// Why the residual stream stays legal (rule 183): the FFN closures (QUANT(1285->...) +
++// GEMM_INT8 + RES writing 1267) are NOT in the skip set, so 1267 keeps being written every
++// frame and the downstream window chains never read a face nobody wrote. The only face read
++// stale is 1285 -- which IS the reuse. 1286/1287 are overwritten by the next surviving QUANT.
++// Mechanism: the shipped dissolution machinery only, no branch inside any kernel:
++//   * record time: vit_note_qkv / vit_note_quant remember the chain closure indices;
++//   * capture time (xmx_graph_capture, after the skip and bmerge passes): a TWIN graph with
++//     the SAME closure count is stored, the chain bodies replaced by g_cmds[i] = [](){}
++//     (the :449/:467/:502/:1061-1064 mechanism; "closure count unchanged, only the body
++//     changes" -- :676/:908);
++//   * the criterion runs INSIDE the first chain's opening QUANT body (that closure survives
++//     in the twin, so the verdict keeps being produced on skipped frames): one extra
++//     parallel_for compares the face with a shadow and writes per-item mismatch counts into
++//     SHARED memory. No readback node and no host sync: the shipped cgraph replay ends with
++//     ext_oneapi_graph(...).wait() (:2542), so the host reads the counters after the frame
++//     and picks master/twin for the NEXT frame (1-frame lag -- a static scene is static).
++//   * NR_VIT_REUSE=0/unset OFF (shipped path verbatim); =1 criterion; =2 always skip
++//     (the quality instrument); =3 criterion runs, never skips (prices the criterion).
++// Guards: the twin is REFUSED if NR_BMERGE is live (a merged group could carry a skipped
++// member's write) or if the name pattern does not match exactly (printed, not guessed).
++static int vit_reuse_level() {
++    static int v = getenv("NR_VIT_REUSE") ? atoi(getenv("NR_VIT_REUSE")) : 0;
++    return v;
++}
++static const int VIT_U4PER = 16;                    // uint4 words per criterion item
++struct VitQNote { size_t cmd; int src; int packed, scale; unsigned M, K; };
++struct VitQkvNote { size_t cmd; unsigned ch, heads, tokens; int src; unsigned M, K; };
++struct VitChain { size_t qkv, from, to, qcmd; int srcid, scaleid; unsigned M, K; };
++struct VitGemmNote { size_t cmd; int a, c; unsigned M, N, K; };      // S2: the ViT entry GEMM
++struct VitUnaryNote { size_t cmd; int a, b, c, d; unsigned n; };     // S2: the patch-merge UNARY
++static std::vector<VitQNote> g_vit_qnotes;          // record-scoped (cleared with the stream)
++static std::vector<size_t>   g_vit_qkvs;            // record-scoped vit QKV closure indices
++static std::vector<VitGemmNote>  g_vit_gemm;        // record-scoped GEMM notes
++static std::vector<VitUnaryNote> g_vit_unary;       // record-scoped UNARY notes
++static std::vector<VitChain> g_vit_chains;          // resolved at capture time
++static std::vector<char> g_vit_kill;                // C27: per-closure "dissolve in the twin"
++static size_t g_vit_span_from = 0, g_vit_span_to = 0;   // the dissolved span (S2)
++static std::vector<std::function<void()>> g_vit_twincmds;
++// ---- C29 (NR_VIT_REUSE=4): the SAME-FRAME split. The twin of C25-C28 had the right saving
++// but the wrong semantics: its verdict is computed inside frame N-1 from 1271(N-1) vs
++// 1271(N-2), so it can never certify the frame it gates. Level 4 splits the frame at the
++// criterion closure: A = [0..criterion], Bm = the rest computed, Bt = the rest with the ViT
++// segment dissolved. The host reads THIS frame's counters (malloc_host: a plain deref, no
++// driver call) between the two submits, so produce and consume happen in the same frame.
++static std::vector<std::function<void()>> g_vit_A, g_vit_Bm, g_vit_Bt;
++static std::vector<const char*> g_vit_Anm, g_vit_Bmnm, g_vit_Btnm;
++static std::vector<std::vector<void*>> g_vit_Atch, g_vit_Bmtch, g_vit_Bttch;
++static bool    g_vit_splitready = false;
++static int     g_vit_gA = -1, g_vit_gBm = -1, g_vit_gBt = -1;
++static size_t  g_vit_hostcmd_stored = SIZE_MAX;
++static int*    g_vit_mcnt = nullptr;                // per-item max |delta| in the 16-bit code field
++static int*    g_vit_scnt = nullptr;                // per-item sum |delta| in the same units
++static bool  g_vit_twinready = false;
++static int   g_vit_master = -1, g_vit_twin = -1;
++static void* g_vit_face = nullptr;                  // the compared plan face (frozen ptr)
++static void* g_vit_flag = nullptr;                  // C28: attribution face the twin stamps
++static int*    g_vit_tcnt = nullptr;                // C28: device counter of twin executions
++static sycl::uint4* g_vit_shadow = nullptr;         // device: last frame's face
++static void* g_vit_face2 = nullptr;                 // S2: the segment's OTHER input stream
++static sycl::uint4* g_vit_shadow2 = nullptr;        //   (the residual plane the chains skip
++static size_t  g_vit_items2 = 0;                    //    with) -- rule 192: judge ALL inputs
++static int*    g_vit_dcnt = nullptr;                // shared: per-item mismatch words
++static size_t  g_vit_items = 0;
++static int     g_vit_skip_next = 0;                 // verdict for the next frame
++static int     g_vit_ran_once = 0;                  // has a criterion verdict been produced?
++static long    g_vit_lastdiff = -1;                 // the verdict's raw number
++static long    g_vit_lastmax = 0, g_vit_lastsum = 0;  // C29: max / sum |delta| in code units
++static int     g_vit_frames = 0, g_vit_skips = 0;   // bookkeeping for the print
++static void vit_reset(void) {
++    g_vit_qnotes.clear(); g_vit_qkvs.clear(); g_vit_gemm.clear(); g_vit_unary.clear();
++}
++// NR_VIT_REUSE_SET=chain|segment (default segment):
++//   chain   = S1, dissolve the 8 attention chains only (the C25 blade, NOT certified);
++//   segment = S2, dissolve the WHOLE ViT segment: the entry GEMM (the only writer of 1285
++//             before the chains) through the last attention residual. Face-lifecycle
++//             proof (tools/wb_c26_timeline.py, kept recording, plain indices):
++//               1285: writers 312 + 321,330,...,384 ; readers 313..379 (all in-segment)
++//                     + 385 (the exit GEMM, OUTSIDE the span) => skipping 312..384 leaves
++//                     1285 = last frame's segment output and 385 reads exactly that.
++//               1267: last in-segment writer = 379, next writer = 393, first reader after
++//                     the span = 394 => the ViT's 1267 writes are DEAD by plan structure
++//                     => NO shadow/restore needed (that was the open question of C25 112.1(2)).
++//               1286/1287: every writer and reader is inside 313..383.
++//               1271: written by UNARY 311 (n=98,304 halfs) and read by GEMM 312 => the
++//                     criterion host is 311, OUTSIDE the span, so it keeps running on
++//                     skipped frames and compares the segment's real input.
++static const char* vit_reuse_set(void) {
++    static const char* v = getenv("NR_VIT_REUSE_SET") ? getenv("NR_VIT_REUSE_SET") : "segment";
++    return v;
++}
++static void vit_note_quant(size_t cmd, int source, int packed, int scale, unsigned M, unsigned K) {
++    VitQNote n{ cmd, source, packed, scale, M, K };
++    g_vit_qnotes.push_back(n);
++}
++static void vit_note_qkv(size_t cmd, unsigned channels, unsigned heads, unsigned tokens) {
++    // only the GLOBAL-attention (ViT) chains: heads=32, tokens=192, C=1024 with the vit
++    // flag -- the caller checks the flag. The window chains belong to NR_SKIP_CHAINS.
++    g_vit_qkvs.push_back(cmd);
++    (void)channels; (void)heads; (void)tokens;
++}
++static void vit_note_gemm(size_t cmd, int a, int c, unsigned M, unsigned N, unsigned K) {
++    VitGemmNote n{ cmd, a, c, M, N, K };
++    g_vit_gemm.push_back(n);
++}
++static void vit_note_unary(size_t cmd, int a, int b, int c, int d, unsigned n) {
++    VitUnaryNote u{ cmd, a, b, c, d, n };
++    g_vit_unary.push_back(u);
++}
++static const char* vit_nm(const std::vector<const char*>& names, size_t off, size_t i) {
++    return i + off < names.size() ? names[i + off] : "?";
++}
++// capture time: resolve the chains, inject the criterion into the first chain's opening
++// QUANT, and build the twin closure list with the chain bodies dissolved.
++static void vit_reuse_apply(std::vector<std::function<void()>>& cmds,
++                            const std::vector<const char*>& names, int graphid) {
++    g_vit_twinready = false; g_vit_twincmds.clear(); g_vit_chains.clear();
++    g_vit_master = -1; g_vit_twin = -1;
++    g_vit_ran_once = 0; g_vit_skip_next = 0;
++    const int lvl = vit_reuse_level();
++    if (!lvl) return;
++    if (getenv("NR_BMERGE") && atoi(getenv("NR_BMERGE")) >= 1) {
++        std::printf("[vit-reuse] graph=%d REFUSED: NR_BMERGE is live (a merged group could "
++                    "carry a skipped member's write)\n", graphid);
++        std::fflush(stdout); return;
++    }
++    if (names.size() < cmds.size()) {
++        std::printf("[vit-reuse] graph=%d REFUSED: cmds=%zu names=%zu\n", graphid,
++                    cmds.size(), names.size());
++        std::fflush(stdout); return;
++    }
++    const size_t off = names.size() - cmds.size();
++    // NOTE (unlike the skip-chains pass, which demands a WHOLE recording): the fused route's
++    // name list is one entry short in the first recording (the fused pre refuses its second
++    // recording, :168-169), so off is not a multiple of cmds.size() there. The mapping that
++    // matters -- names[i+off] for the kept recording -- is exact, and every chain is
++    // re-verified by its name pattern below: a wrong offset cannot survive that check.
++    for (size_t q : g_vit_qkvs) {
++        if (q < 1 || q + 5 > cmds.size()) {
++            std::printf("[vit-reuse] graph=%d REFUSED: qkv cmd=%zu out of span (closures=%zu)\n",
++                        graphid, q, cmds.size());
++            g_vit_chains.clear(); return;
++        }
++        if (strcmp(vit_nm(names, off, q), "xmx_rec_gemm_int8_qkv") ||
++            strcmp(vit_nm(names, off, q - 1), "xmx_rec_quant") ||
++            strcmp(vit_nm(names, off, q + 1), "xmx_rec_global_attention")) {
++            std::printf("[vit-reuse] graph=%d REFUSED: pattern at cmd=%zu is [%s,%s,%s,%s]\n",
++                        graphid, q, vit_nm(names, off, q - 1), vit_nm(names, off, q),
++                        vit_nm(names, off, q + 1), vit_nm(names, off, q + 2));
++            g_vit_chains.clear(); return;
++        }
++        {
++            size_t e = q + 2;
++            while (e < cmds.size() && e <= q + 5 &&
++                   strcmp(vit_nm(names, off, e), "xmx_rec_gemm_int8_residual")) ++e;
++            if (e > q + 5) {
++                std::printf("[vit-reuse] graph=%d REFUSED: no terminating residual at cmd=%zu\n",
++                            graphid, q);
++                g_vit_chains.clear(); return;
++            }
++            // the opening QUANT of this chain: its source face is the chain's input
++            VitChain c{ q, 0, e, q - 1, -1, -1, 0, 0 };
++            bool found = false;
++            for (const VitQNote& n : g_vit_qnotes)
++                if (n.cmd == q - 1) { c.srcid = n.src; c.scaleid = n.scale; c.M = n.M; c.K = n.K; found = true; break; }
++            if (!found) {
++                std::printf("[vit-reuse] graph=%d REFUSED: opening QUANT of cmd=%zu not noted\n",
++                            graphid, q);
++                g_vit_chains.clear(); return;
++            }
++            g_vit_chains.push_back(c);
++        }
++    }
++    if (g_vit_chains.empty()) {
++        std::printf("[vit-reuse] graph=%d REFUSED: no vit chains found (qkv notes=%zu)\n",
++                    graphid, g_vit_qkvs.size());
++        std::fflush(stdout); return;
++    }
++    // order the chains by cmd.
++    std::sort(g_vit_chains.begin(), g_vit_chains.end(),
++              [](const VitChain& a, const VitChain& b) { return a.qkv < b.qkv; });
++    const bool segmode = (strcmp(vit_reuse_set(), "chain") != 0);
++    const VitChain C0 = g_vit_chains[0];
++    size_t host_cmd = C0.qcmd;                  // the closure that hosts the criterion
++    int    faceid   = C0.srcid;                 // the plan face to compare
++    size_t halfs    = (size_t)C0.M * (size_t)C0.K;
++    g_vit_span_from = g_vit_chains.front().qkv;
++    g_vit_span_to   = g_vit_chains.back().to;
++    if (!segmode) {
++        // S1: per-chain spans; the FIRST chain keeps its opening QUANT (the criterion host).
++        for (size_t i = 0; i < g_vit_chains.size(); ++i) {
++            VitChain& c = g_vit_chains[i];
++            c.from = i ? c.qcmd : c.qkv;
++        }
++    } else {
++        // S2: the span = the ViT ENTRY GEMM .. the last chain's residual (plain 312..384 /
++        // fused 313..385, 73 closures, serial leg 13.940 ms). The criterion moves to the
++        // surviving producer of the entry GEMM's source face (the patch-merge UNARY that
++        // writes 1271 with n=98,304 halfs), because the entry GEMM itself is dissolved.
++        const size_t q1 = g_vit_chains.front().qkv;
++        size_t gcmd = SIZE_MAX; int gsrc = -1;
++        for (const VitGemmNote& n : g_vit_gemm) {
++            if (n.cmd >= q1) continue;
++            bool read_by_segment_quant = false;
++            for (const VitQNote& q : g_vit_qnotes)
++                if (q.cmd < q1 && q.cmd + 16 >= q1 && q.src == n.c) { read_by_segment_quant = true; break; }
++            if (!read_by_segment_quant) continue;
++            if (gcmd == SIZE_MAX || n.cmd > gcmd) { gcmd = n.cmd; gsrc = n.a; }
++        }
++        if (gcmd == SIZE_MAX) {
++            std::printf("[vit-reuse] graph=%d REFUSED: no ViT entry GEMM found (no noted GEMM "
++                        "before cmd=%zu whose output a segment QUANT reads). gemm_notes=%zu "
++                        "quant_notes=%zu chains=%zu", graphid, q1, g_vit_gemm.size(),
++                        g_vit_qnotes.size(), g_vit_chains.size());
++            for (size_t z = 0; z < g_vit_gemm.size(); ++z)
++                if (g_vit_gemm[z].cmd + 24 >= q1 && g_vit_gemm[z].cmd <= q1)
++                    std::printf(" | g%zu cmd=%zu a=%d c=%d M=%u N=%u K=%u", z, g_vit_gemm[z].cmd,
++                                g_vit_gemm[z].a, g_vit_gemm[z].c, g_vit_gemm[z].M, g_vit_gemm[z].N,
++                                g_vit_gemm[z].K);
++            for (size_t z = 0; z < g_vit_qnotes.size(); ++z)
++                if (g_vit_qnotes[z].cmd + 24 >= q1 && g_vit_qnotes[z].cmd <= q1 + 4)
++                    std::printf(" | q%zu cmd=%zu src=%d M=%u K=%u", z, g_vit_qnotes[z].cmd,
++                                g_vit_qnotes[z].src, g_vit_qnotes[z].M, g_vit_qnotes[z].K);
++            for (size_t z = 0; z < g_vit_unary.size(); ++z)
++                if (g_vit_unary[z].cmd + 8 >= q1 && g_vit_unary[z].cmd <= q1)
++                    std::printf(" | u%zu cmd=%zu a=%d b=%d c=%d d=%d n=%u", z, g_vit_unary[z].cmd,
++                                g_vit_unary[z].a, g_vit_unary[z].b, g_vit_unary[z].c,
++                                g_vit_unary[z].d, g_vit_unary[z].n);
++            std::printf(" | unary_notes=%zu\n", g_vit_unary.size());
++            std::fflush(stdout); g_vit_chains.clear(); return;
++        }
++        size_t ucmd = SIZE_MAX; unsigned un = 0;
++        for (const VitUnaryNote& u : g_vit_unary) {
++            if (u.cmd >= gcmd) continue;
++            if (u.a != gsrc && u.b != gsrc && u.c != gsrc && u.d != gsrc) continue;
++            if (ucmd == SIZE_MAX || u.cmd > ucmd) { ucmd = u.cmd; un = u.n; }
++        }
++        if (ucmd == SIZE_MAX || !un) {
++            std::printf("[vit-reuse] graph=%d REFUSED: no surviving producer of the entry GEMM's "
++                        "source face id=%d => the criterion would have nowhere to live\n",
++                        graphid, gsrc);
++            std::fflush(stdout); g_vit_chains.clear(); return;
++        }
++        g_vit_span_from = gcmd; g_vit_span_to = g_vit_chains.back().to;
++        host_cmd = ucmd; faceid = gsrc; halfs = (size_t)un;
++        if (host_cmd >= g_vit_span_from) {
++            std::printf("[vit-reuse] graph=%d REFUSED: criterion host cmd=%zu sits inside the "
++                        "dissolved span %zu..%zu\n", graphid, host_cmd, g_vit_span_from,
++                        g_vit_span_to);
++            std::fflush(stdout); g_vit_chains.clear(); return;
++        }
++    }
++    // ---- the criterion: compare the segment's INPUT face with the shadow ----
++    auto bit = g_bufs.find(faceid);
++    if (bit == g_bufs.end() || !bit->second.p || !halfs) {
++        std::printf("[vit-reuse] graph=%d REFUSED: criterion face id=%d unresolved (p=%p halfs=%zu)\n",
++                    graphid, faceid, bit == g_bufs.end() ? nullptr : bit->second.p, halfs);
++        std::fflush(stdout); g_vit_chains.clear(); return;
++    }
++    if ((halfs * 2u) % (16u * (size_t)VIT_U4PER)) {
++        std::printf("[vit-reuse] graph=%d REFUSED: face %zu halfs is not a whole number of "
++                    "criterion chunks\n", graphid, halfs);
++        std::fflush(stdout); g_vit_chains.clear(); return;
++    }
++    g_vit_items = halfs * 2u / (16u * (size_t)VIT_U4PER);
++    g_vit_face = bit->second.p;
++    // S2 second input stream: the segment's chains also read the residual plane (their
++    // opening QUANT's source, and the residual `skip` operand) -- a frame in which the
++    // patch-merge face is bit-identical but the residual plane moved MUST NOT be reused
++    // (rule 192: the judge/criterion covers EVERY input face). In chain mode the opening
++    // QUANT's own face IS the criterion face, so there is no second stream.
++    g_vit_face2 = nullptr; g_vit_items2 = 0; g_vit_flag = nullptr;
++    size_t halfs2 = 0;
++    if (segmode) {
++        // C28 attribution face: the chain's scale plane (768 B in this plan) -- every writer
++        // and reader of it sits INSIDE the dissolved span, so in a reused frame the twin's
++        // stamp is the only thing there, and a master frame overwrites it with real quant
++        // data. The face dump then proves the frame attribution by itself (no host print).
++        auto bf = g_bufs.find(C0.scaleid);
++        if (bf != g_bufs.end() && bf->second.p && bf->second.bytes >= 16 && bf->second.bytes <= 65536u)
++            g_vit_flag = bf->second.p;
++        auto b2 = g_bufs.find(C0.srcid);
++        if (b2 != g_bufs.end() && b2->second.p && C0.M && C0.K) {
++            halfs2 = (size_t)C0.M * (size_t)C0.K;
++            if ((halfs2 * 2u) % (16u * (size_t)VIT_U4PER) == 0) {
++                g_vit_items2 = halfs2 * 2u / (16u * (size_t)VIT_U4PER);
++                g_vit_face2 = b2->second.p;
++            }
++        }
++        if (!g_vit_face2) {
++            std::printf("[vit-reuse] graph=%d REFUSED: the segment's second input face "
++                        "id=%d (%ux%u) is unresolved -- reusing on one face alone would be "
++                        "unsafe (rule 192)\n", graphid, C0.srcid, C0.M, C0.K);
++            std::fflush(stdout); g_vit_chains.clear(); return;
++        }
++    }
++    if (!g_vit_shadow) g_vit_shadow = (sycl::uint4*)sycl::malloc_device(halfs * 2u, *GQ);
++    if (g_vit_items2 && !g_vit_shadow2)
++        g_vit_shadow2 = (sycl::uint4*)sycl::malloc_device(halfs2 * 2u, *GQ);
++    auto vkind_host = [&](void) { return lvl == 4 || lvl == 5 || (getenv("NR_VIT_VREAD") && strcmp(getenv("NR_VIT_VREAD"), "host") == 0); };
++    auto vkind_shr  = [&](void) { return lvl != 4 && getenv("NR_VIT_VREAD") && strcmp(getenv("NR_VIT_VREAD"), "shr") == 0; };
++    if (!g_vit_dcnt)   g_vit_dcnt   = vkind_shr()
++        ? (int*)sycl::malloc_shared((g_vit_items + g_vit_items2) * 4u, *GQ)
++        : vkind_host()
++        ? (int*)sycl::malloc_host((g_vit_items + g_vit_items2) * 4u, *GQ)
++        : (int*)sycl::malloc_device((g_vit_items + g_vit_items2) * 4u, *GQ);
++    // C29: the magnitude arrays live in the SAME memory kind as the word counters.
++    if (!g_vit_mcnt) g_vit_mcnt = vkind_shr() ? (int*)sycl::malloc_shared((g_vit_items + g_vit_items2) * 4u, *GQ)
++                             : vkind_host() ? (int*)sycl::malloc_host((g_vit_items + g_vit_items2) * 4u, *GQ)
++                             : (int*)sycl::malloc_device((g_vit_items + g_vit_items2) * 4u, *GQ);
++    if (!g_vit_scnt) g_vit_scnt = vkind_shr() ? (int*)sycl::malloc_shared((g_vit_items + g_vit_items2) * 4u, *GQ)
++                             : vkind_host() ? (int*)sycl::malloc_host((g_vit_items + g_vit_items2) * 4u, *GQ)
++                             : (int*)sycl::malloc_device((g_vit_items + g_vit_items2) * 4u, *GQ);
++    if (!g_vit_shadow || !g_vit_dcnt || (g_vit_items2 && !g_vit_shadow2)) {
++        std::printf("[vit-reuse] graph=%d REFUSED: criterion buffers did not allocate\n", graphid);
++        std::fflush(stdout); g_vit_chains.clear(); return;
++    }
++    GQ->memset(g_vit_shadow, 0xFF, halfs * 2u).wait();
++    if (g_vit_items2) GQ->memset(g_vit_shadow2, 0xFF, halfs2 * 2u).wait();
++    GQ->memset(g_vit_dcnt, 0, (g_vit_items + g_vit_items2) * 4u).wait();
++    GQ->memset(g_vit_mcnt, 0, (g_vit_items + g_vit_items2) * 4u).wait();
++    GQ->memset(g_vit_scnt, 0, (g_vit_items + g_vit_items2) * 4u).wait();
++    std::function<void()> twin_host_body;           // C28: the twin's stamped criterion body
++    size_t twin_host_cmd = SIZE_MAX;
++    {
++        void* f = g_vit_face; sycl::uint4* sh = g_vit_shadow; int* dc = g_vit_dcnt;
++        int* mc = g_vit_mcnt; int* sc = g_vit_scnt;
++        void* f2 = g_vit_face2; sycl::uint4* sh2 = g_vit_shadow2; int* dc2 = dc + g_vit_items;
++        void* fl = g_vit_flag;
++        if (fl && !g_vit_tcnt) g_vit_tcnt = (int*)sycl::malloc_device(4u, *GQ);
++        if (fl && g_vit_tcnt) GQ->memset(g_vit_tcnt, 0, 4u).wait();
++        int* tc = g_vit_tcnt;
++        // C30 (A) level 6: the device-side verdict plumbing
++        long long* acc = (lvl >= 6) ? vit_accbuf() : nullptr;
++        int* vgl = (lvl >= 6) ? vit_gbuf() : nullptr;
++        int* hf  = (lvl >= 6) ? vit_hfbuf() : nullptr;
++        const long thmax = getenv("NR_VIT_REUSE_THMAX") ? atol(getenv("NR_VIT_REUSE_THMAX")) : 0;
++        const size_t sp_lo = g_vit_span_from, sp_hi = g_vit_span_to;   // C33: cells to re-arm
++        const int nostamp = getenv("NR_VIT_NOSTAMP") ? 1 : 0;   // C33: host-side, captured
++        const long thsum = getenv("NR_VIT_REUSE_THSUM") ? atol(getenv("NR_VIT_REUSE_THSUM")) : 0;
++        const size_t items = g_vit_items, items2 = g_vit_items2;
++        auto old = std::move(cmds[host_cmd]);
++        // C28: the criterion body comes from a factory so the MASTER copy and the TWIN copy
++        // carry a different stamp. The twin stamps its identity (16 magic bytes) into
++        // g_vit_flag -- a plan face whose EVERY writer and reader lies inside the dissolved
++        // span (the chain's 768 B scale face): in a master frame the span overwrites it with
++        // real quant data, in a twin frame the magic survives into the face dump. The dump
++        // then PROVES which graph ran, so host prints are no longer used for frame
++        // attribution (the C27 "off by one frame" wrinkle).
++        auto make_crit = [&](int stamp) {
++            return [old, f, sh, dc, items, f2, sh2, dc2, items2, fl, tc, mc, sc, acc, vgl, hf, thmax, thsum, sp_lo, sp_hi, nostamp, stamp]() {
++                old();
++                GQ->parallel_for(sycl::range(items), [f, sh, dc, mc, sc, fl, tc, acc, vgl, sp_lo, sp_hi, nostamp, stamp](sycl::item<1> it) {
++                    constexpr int PER = 16;
++                    const sycl::uint4* a = (const sycl::uint4*)f;
++                    size_t b = it.get_id(0) * PER;
++                    int d = 0, mx = 0; long sm = 0;
++                    for (int i = 0; i < PER; ++i) {
++                        sycl::uint4 x = a[b + i], y = sh[b + i];
++                        // C29 magnitude form of the criterion: the per-half |delta| in the
++                        // 16-bit code field (max and sum), computed BEFORE the shadow is
++                        // written -- the first build folded the copy into the updated
++                        // memory and measured |x-x| = 0 (caught by face evidence, 2026-11-09).
++                        // The word-count alone was proven to be a cliff (0 or 85-95% of the
++                        // words), so it cannot carry a perceptual threshold (see 115.4).
++                        {
++                            const unsigned int* w = (const unsigned int*)&y;
++                            for (int q = 0; q < 4; ++q) {
++                                for (int hh = 0; hh < 2; ++hh) {
++                                    unsigned int o = (unsigned int)x[q], p = w[q];
++                                    unsigned int u = (hh ? (o >> 16) : (o & 0xFFFFu));
++                                    unsigned int v = (hh ? (p >> 16) : (p & 0xFFFFu));
++                                    unsigned int dd = (u > v) ? (u - v) : (v - u);
++                                    if ((int)dd > mx) mx = (int)dd;
++                                    sm += (long)dd;
++                                }
++                            }
++                        }
++                        if (x[0] != y[0] || x[1] != y[1] || x[2] != y[2] || x[3] != y[3]) {
++                            ++d; sh[b + i] = x;
++                        }
++                    }
++                    dc[it.get_id(0)] = d;
++                    if (mc) mc[it.get_id(0)] = mx;
++                    if (sc) sc[it.get_id(0)] = (int)(sm > 0x7FFFFFF0 ? 0x7FFFFFF0 : sm);
++                    if (acc && vgl) {   // fold face 1 into the same-frame accumulators
++                        sycl::atomic_ref<long long, sycl::memory_order::relaxed,
++                                         sycl::memory_scope::device,
++                                         sycl::access::address_space::global_space> amax(acc[0]);
++                        sycl::atomic_ref<long long, sycl::memory_order::relaxed,
++                                         sycl::memory_scope::device,
++                                         sycl::access::address_space::global_space> asum(acc[1]);
++                        amax.fetch_max(mx);
++                        asum.fetch_add((long long)sm);
++                    }
++                    if (stamp == 1 && it.get_id(0) == 0 && fl) {
++                        unsigned e = tc ? (unsigned)(*tc) + 1u : 0u;
++                        if (tc) *tc = (int)e;
++                        *(sycl::uint4*)fl = sycl::uint4(sycl::uint(0xC28A571Du), sycl::uint(0x51E771C8u),
++                                                        e, sycl::uint(0x00000001u));
++                    }
++                });
++                if (items2)
++                    GQ->parallel_for(sycl::range(items2), [f2, sh2, dc2, mc, sc, items, items2, acc, vgl, hf, fl, thmax, thsum, sp_lo, sp_hi, nostamp, stamp](sycl::item<1> it) {
++                        constexpr int PER = 16;
++                        const sycl::uint4* a = (const sycl::uint4*)f2;
++                        size_t b = it.get_id(0) * PER;
++                        int d = 0, mx = 0; long sm = 0;
++                        for (int i = 0; i < PER; ++i) {
++                            sycl::uint4 x = a[b + i], y = sh2[b + i];
++                            {
++                                const unsigned int* w = (const unsigned int*)&y;
++                                for (int q = 0; q < 4; ++q) {
++                                    for (int hh = 0; hh < 2; ++hh) {
++                                        unsigned int o = (unsigned int)x[q], p = w[q];
++                                        unsigned int u = (hh ? (o >> 16) : (o & 0xFFFFu));
++                                        unsigned int v = (hh ? (p >> 16) : (p & 0xFFFFu));
++                                        unsigned int dd = (u > v) ? (u - v) : (v - u);
++                                        if ((int)dd > mx) mx = (int)dd;
++                                        sm += (long)dd;
++                                    }
++                                }
++                            }
++                            if (x[0] != y[0] || x[1] != y[1] || x[2] != y[2] || x[3] != y[3]) {
++                                ++d; sh2[b + i] = x;
++                            }
++                        }
++                        size_t k = it.get_id(0) + items;
++                        dc2[it.get_id(0)] = d;
++                        if (mc) mc[k] = mx;
++                        if (sc) sc[k] = (int)(sm > 0x7FFFFFF0 ? 0x7FFFFFF0 : sm);
++                        // C30 (A): the DEVICE-SIDE same-frame verdict. Every item folds its own
++                        // max/sum in; the last one to arrive turns the accumulators into the
++                        // flag the span kernels test at their entry. No host involvement.
++                        if (acc && vgl) {
++                            sycl::atomic_ref<long long, sycl::memory_order::relaxed,
++                                             sycl::memory_scope::device,
++                                             sycl::access::address_space::global_space> amax(acc[0]);
++                            sycl::atomic_ref<long long, sycl::memory_order::relaxed,
++                                             sycl::memory_scope::device,
++                                             sycl::access::address_space::global_space> asum(acc[1]);
++                            sycl::atomic_ref<long long, sycl::memory_order::relaxed,
++                                             sycl::memory_scope::device,
++                                             sycl::access::address_space::global_space> adone(acc[2]);
++                            amax.fetch_max(mx);
++                            asum.fetch_add((int)(sm > 0x3E800 ? 0x3E800 : sm));
++                            long long seen_ll = adone.fetch_add(1); int seen = (int)seen_ll;
++                            if (seen == (int)items2 - 1) {          // last item of the frame
++                                long long gmax = acc[0], gsum = acc[1];
++                                int dec = ((long)gmax <= thmax && (long)gsum <= thsum) ? 1 : 0;
++                                vgl[0] = dec;
++                                // C33: per-closure self-attestation WITHOUT touching any business
++                                // face: the criterion re-arms the span cells to 1, a guarded kernel that
++                                // early-outs writes 2 into its own cell, and the host counts them after
++                                // the frame (a plain read of malloc_host cells, no driver call).
++                                for (int i = (int)sp_lo; i <= (int)sp_hi; ++i) { vgl[1 + i] = dec; vgl[4200 + i] = 0; }
++                                vgl[8399] = (vgl[8399] + 1) & 0x7FFFFFFF;   // frame sequence
++                                // C32 (step 2): level-6 FACE SELF-ATTESTATION -- the DEVICE writes
++                                // {magic, magic, THIS frame decision, 3} into plan face 1287.
++                                if (stamp == 3 && fl && !nostamp) {   // C33: NR_VIT_NOSTAMP kills the face write
++                                    unsigned* sp = (unsigned*)fl;
++                                    sp[0] = 0xC29B6A5Eu; sp[1] = 0x7A51E771u;
++                                    sp[2] = (unsigned)dec; sp[3] = 3u;
++                                }
++                                if (hf) { hf[0] = dec; hf[1] = (int)(gmax > 0x7FFFFFFF ? 0x7FFFFFFF : gmax); hf[2] = (int)(gsum > 0x7FFFFFFF ? 0x7FFFFFFF : gsum); hf[3] = seen + 1; }
++                                acc[0] = 0; acc[1] = 0; acc[2] = 0;  // ready for the next frame
++                            }
++                        }
++                    });
++            };
++        };
++        cmds[host_cmd] = make_crit(lvl >= 6 ? 3 : 0);   // C32: level 6 stamps the face every frame
++        twin_host_body = make_crit(1);
++        twin_host_cmd = host_cmd;
++    }
++    // ---- the twin closure list: SAME count, the selected SPAN dissolved. C27 adds the
++    // bisect sets (entry / attn / ffn) so the "which half moves `result`" question can be
++    // answered without touching anything else in the mechanism. ----
++    const char* setname = vit_reuse_set();
++    auto in_chain = [&](size_t i) -> bool {
++        for (const VitChain& c : g_vit_chains)
++            if (i >= c.qcmd && i <= c.to) return true;
++        return false;
++    };
++    g_vit_kill.assign(cmds.size(), 0);
++    size_t noops = 0;
++    if (!segmode) {                                   // chain: the C25 S1 set
++        for (const VitChain& c : g_vit_chains)
++            for (size_t i = c.from; i <= c.to; ++i)
++                if (!g_vit_kill[i]) { g_vit_kill[i] = 1; ++noops; }
++    } else if (strcmp(setname, "entry") == 0) {       // S-a: only the ViT entry GEMM
++        g_vit_kill[g_vit_span_from] = 1; noops = 1;
++    } else if (strcmp(setname, "attn") == 0) {        // S-b: only the 8 attention chains
++        for (const VitChain& c : g_vit_chains)
++            for (size_t i = c.qcmd; i <= c.to; ++i)
++                if (!g_vit_kill[i]) { g_vit_kill[i] = 1; ++noops; }
++    } else if (strcmp(setname, "ffn") == 0) {         // S-c: only the 8 FFN sub-blocks
++        for (size_t i = g_vit_span_from + 1; i <= g_vit_span_to; ++i)
++            if (!in_chain(i)) { g_vit_kill[i] = 1; ++noops; }
++    } else {                                          // S-d: the whole segment (C26)
++        for (size_t i = g_vit_span_from; i <= g_vit_span_to; ++i)
++            if (!g_vit_kill[i]) { g_vit_kill[i] = 1; ++noops; }
++    }
++    if (g_vit_kill[host_cmd]) {
++        std::printf("[vit-reuse] graph=%d REFUSED: set=%s would dissolve the criterion host "
++                    "cmd=%zu -- the verdict would stop being produced\n", graphid, setname,
++                    host_cmd);
++        std::fflush(stdout); g_vit_chains.clear(); return;
++    }
++    // ---- C29 level 4: the same-frame SPLIT (A = [0..criterion], Bm = the rest computed,
++    // Bt = the rest with the segment dissolved). The decision is taken by the host BETWEEN
++    // the two submits from THIS frame's own counters, so it certifies the frame it gates.
++    if (lvl == 4) {
++        if (host_cmd + 1 != g_vit_span_from) {
++            std::printf("[vit-reuse] graph=%d REFUSED (level 4 split): the segment must start "
++                        "right after the criterion host (host=%zu span=%zu..%zu)\n", graphid,
++                        host_cmd, g_vit_span_from, g_vit_span_to);
++            std::fflush(stdout); g_vit_chains.clear(); return;
++        }
++        g_vit_A.assign(cmds.begin(), cmds.begin() + (host_cmd + 1));
++        g_vit_Bm.assign(cmds.begin() + (host_cmd + 1), cmds.end());
++        g_vit_Bt = g_vit_Bm;
++        for (size_t i = g_vit_span_from; i <= g_vit_span_to; ++i)
++            g_vit_Bt[i - (host_cmd + 1)] = [](){};
++        // face self-attestation (rule 196): Bt's first closure stamps the attribution face
++        // (plan 1287 -- every writer and reader of it is inside the dissolved span). In the
++        // computed path the span overwrites that face with real quant data; in the dissolved
++        // path the stamp survives into the face dump, so the dump says which B ran -- with a
++        // device-side execution counter that numbers the reuses.
++        void* fl2 = g_vit_flag; int* tc2 = g_vit_tcnt;
++        if (fl2)
++            g_vit_Bt[0] = [fl2, tc2]() {
++                GQ->parallel_for(sycl::range((size_t)1), [fl2, tc2](sycl::item<1> it) {
++                    if (it.get_id(0) != 0 || !fl2) return;
++                    unsigned e = tc2 ? (unsigned)(*tc2) + 1u : 0u;
++                    if (tc2) *tc2 = (int)e;
++                    *(sycl::uint4*)fl2 = sycl::uint4(sycl::uint(0xC28A571Du), sycl::uint(0x51E771C8u),
++                                                     e, sycl::uint(0x00000002u));
++                });
++            };
++        g_vit_hostcmd_stored = host_cmd;
++        g_vit_splitready = true;
++        std::printf("[vit-reuse] graph=%d SPLIT ready: A=0..%zu  B=%zu..%zu (Bt dissolves %zu..%zu)\n",
++                    graphid, host_cmd, host_cmd + 1, cmds.size() - 1, g_vit_span_from, g_vit_span_to);
++    }
++    // C30 (A) level 6: allocate + clear the device flag and accumulators HERE (never inside
++    // the cgraph record pass -- section 92 forbids sycl::malloc_device while recording), then
++    // mark the span closures as guardable with ONE memcpy at capture time.
++    if (lvl >= 6) {
++        int* vg = vit_gbuf(); long long* acc0 = vit_accbuf(); int* hf0 = vit_hfbuf();
++        if (!vg || !acc0 || !hf0) {
++            std::printf("[vit-reuse] graph=%d REFUSED: level 6 buffers did not allocate\n", graphid);
++            std::fflush(stdout); g_vit_chains.clear(); return;
++        }
++        GQ->memset(vg, 0, 8400u * 4u).wait();
++        GQ->memset(acc0, 0, 4u * sizeof(long long)).wait();
++        static int marks[8400];
++        for (int i = 0; i < 8400; ++i) marks[i] = 0;
++        size_t lo6 = g_vit_span_from, hi6 = g_vit_span_to;
++        if (hi6 < 4090u) for (size_t i = lo6; i <= hi6; ++i) marks[1 + i] = 1;
++        GQ->memcpy(vg + 1, marks + 1, 4199u * 4u).wait();
++        g_vit_twinready = false;      // level 6 never dissolves anything: ONE submit, and the
++                                      // kernels that read the flag simply return (no empty node,
++                                      // no second graph, no host decision)
++        std::printf("[vit-reuse] graph=%d LEVEL6 armed: single submit + device flag; marked span %zu..%zu (%zu closures)\n",
++                    graphid, lo6, hi6, hi6 >= lo6 ? hi6 - lo6 + 1 : 0);
++        std::fflush(stdout);
++    }
++    g_vit_twincmds = cmds;
++    for (size_t i = 0; i < g_vit_kill.size(); ++i)
++        if (g_vit_kill[i]) g_vit_twincmds[i] = [](){};
++    // C28: the twin's criterion copy carries stamp=1 (it marks the attribution face), the
++    // master's carries stamp=0. Same work, same nodes, one captured constant apart -- so a
++    // face dump can tell the two graphs apart without trusting any host print.
++    if (twin_host_cmd != SIZE_MAX && twin_host_cmd < g_vit_twincmds.size() && !g_vit_kill[twin_host_cmd])
++        g_vit_twincmds[twin_host_cmd] = twin_host_body;
++    if (lvl != 5) g_vit_twinready = true;   // C30 level 5 = TELEMETRY ONLY: nothing dissolved,
++                                            // nothing skipped -- the picture is REUSE=0 by law
++    std::printf("[vit-reuse] graph=%d level=%d set=%s chains=%zu span=%zu..%zu noop=%zu "
++                "criterion cmd=%zu face=%p halfs=%zu items=%zu face2=%p items2=%zu flag=%p vread=%s\n",
++                graphid, lvl, setname, g_vit_chains.size(),
++                g_vit_span_from, g_vit_span_to, noops, host_cmd, g_vit_face, halfs, g_vit_items,
++                g_vit_face2, g_vit_items2, g_vit_flag,
++                getenv("NR_VIT_VREAD") ? getenv("NR_VIT_VREAD") : "dev");
++    std::fflush(stdout);
++}
++// the per-frame verdict: shared-memory counters, read AFTER the frame's graph wait (the
++// shipped replay already waits: ext_oneapi_graph(...).wait()), so no extra submit and no
++// extra sync point is added to the frame.
++static void vit_verdict_update(void) {
++    const int lvl = vit_reuse_level();
++    // C27 DIAGNOSTIC ONLY (attribution of the run-1 divergence): NR_VIT_DELAY=<microseconds>
++    // inserts a pure host pause at this point in the inter-frame gap -- no queue op, no
++    // memory read -- and NR_VIT_NOREAD=1 suppresses the counter read entirely. If a bare
++    // pause reproduces the same divergence, the frame is TIMING-sensitive (an intra-frame
++    // order hazard in the shipped graph), and no property of the reuse or of the read is
++    // implicated.
++    {
++        static int delay_us = getenv("NR_VIT_DELAY") ? atoi(getenv("NR_VIT_DELAY")) : 0;
++        if (delay_us > 0) {
++            auto t0 = std::chrono::steady_clock::now();
++            while ((int)std::chrono::duration_cast<std::chrono::microseconds>(
++                       std::chrono::steady_clock::now() - t0).count() < delay_us) {}
++        }
++    }
++    static int noread = getenv("NR_VIT_NOREAD") ? 1 : 0;
++    if (noread) { g_vit_lastdiff = -3; return; }   // keeps skip_next as-is (0 at start)
++    if (!lvl || g_vit_twin < 0) { g_vit_skip_next = 0; return; }
++    if (lvl == 2) { g_vit_skip_next = 1; return; }   // force skip (the quality instrument)
++    if (lvl == 3) { g_vit_skip_next = 0; return; }   // never skip (prices the criterion)
++    // the FIRST frame must run the segment: the shadow was seeded at capture time and no
++    // criterion verdict exists yet.
++    if (!g_vit_ran_once) { g_vit_skip_next = 0; g_vit_lastdiff = -2; return; }
++    long tot = 0;
++    // C27 attribution: the counters are now DEVICE memory and come over by an explicit
++    // memcpy, instead of the host dereferencing malloc_shared pages (the shipped replay
++    // already host-syncs at this point -- ext_oneapi_graph(...).wait() -- so this adds no
++    // new sync KIND, only a 9 KB copy). Reason: with the shared-USM dereference the frame
++    // trajectory diverged from the never-read control (REUSE=3) at run 1, i.e. BEFORE any
++    // skip and identically for every skip set (entry/attn/ffn/segment) -- so the read
++    // itself, not the reuse, was the perturbation. NR_VIT_VREAD=shr restores the old path.
++    static int vread_dev = (getenv("NR_VIT_VREAD") && strcmp(getenv("NR_VIT_VREAD"), "shr") == 0) ? 0
++                         : (getenv("NR_VIT_VREAD") && strcmp(getenv("NR_VIT_VREAD"), "host") == 0) ? 0 : 1;
++    const size_t n = g_vit_items + g_vit_items2;
++    static int* hs = nullptr;
++    if (vread_dev) {
++        if (!hs) hs = (int*)malloc(n * 4u);
++        if (hs) {
++            GQ->memcpy(hs, g_vit_dcnt, n * 4u).wait();
++            for (size_t i = 0; i < n; ++i) tot += hs[i];
++        }
++    } else {
++        for (size_t i = 0; i < n; ++i) tot += g_vit_dcnt[i];
++    }
++    g_vit_lastdiff = tot;
++    static int th = getenv("NR_VIT_REUSE_TH") ? atoi(getenv("NR_VIT_REUSE_TH")) : 0;
++    g_vit_skip_next = (tot <= (long)th) ? 1 : 0;
++}
++// C30 事二(2): TELEMETRY (NR_VIT_TRACE=<path>, default OFF). One appended line per frame:
++//   frame, words_diff, max|delta|, sum|delta|, verdict
++// verdict = 1 means a SAME-FRAME reuse would have fired at NR_VIT_REUSE_THMAX/THSUM. Nothing
++// else changes: no dissolution, no skip, no extra queue op, and when the variable is unset no
++// file is even opened. This is how the trigger rate gets collected from real play, not from a
++// synthetic sweep (the input side was proven cliff-like in 116.3).
++static void vit_trace(void) {
++    static const char* path = getenv("NR_VIT_TRACE");
++    if (!path || !*path) return;
++    static FILE* fp = nullptr;
++    static long thmax = getenv("NR_VIT_REUSE_THMAX") ? atol(getenv("NR_VIT_REUSE_THMAX")) : 0;
++    static long thsum = getenv("NR_VIT_REUSE_THSUM") ? atol(getenv("NR_VIT_REUSE_THSUM")) : 0;
++    static unsigned long frame = 0;
++    if (!fp) {
++        fp = fopen(path, "a");
++        if (!fp) { std::printf("[vit-trace] CANNOT OPEN %s\n", path); std::fflush(stdout); return; }
++        std::printf("[vit-trace] appending to %s (thmax=%ld thsum=%ld)\n", path, thmax, thsum);
++        std::fflush(stdout);
++    }
++    ++frame;
++    int verdict = (g_vit_lastmax <= thmax && g_vit_lastsum <= thsum) ? 1 : 0;
++    std::fprintf(fp, "%lu,%ld,%ld,%ld,%d\n", frame, g_vit_lastdiff, g_vit_lastmax, g_vit_lastsum, verdict);
++    std::fflush(fp);
++}
++// C29 level 4 verdict: reduce THIS frame's counters on the host (malloc_host arrays: a plain
++// dereference, no driver call, no queue op -- C28 proved the read itself is neutral) and
++// gate on the MAGNITUDE pair (max |delta| and sum |delta| in the 16-bit code field), with
++// the old word-count threshold kept as a third, optional gate.
++static void vit_verdict_update4(void) {
++    const size_t n = g_vit_items + g_vit_items2;
++    long words = 0, mx = 0, sm = 0;
++    if (g_vit_dcnt && g_vit_mcnt && g_vit_scnt) {
++        for (size_t i = 0; i < n; ++i) {
++            words += g_vit_dcnt[i];
++            if ((long)g_vit_mcnt[i] > mx) mx = g_vit_mcnt[i];
++            sm += (long)g_vit_scnt[i];
++        }
++    }
++    static long thmax = getenv("NR_VIT_REUSE_THMAX") ? atol(getenv("NR_VIT_REUSE_THMAX")) : 0;
++    static long thsum = getenv("NR_VIT_REUSE_THSUM") ? atol(getenv("NR_VIT_REUSE_THSUM")) : 0;
++    static long thw   = getenv("NR_VIT_REUSE_TH") ? atol(getenv("NR_VIT_REUSE_TH")) : -1;  // -1 = not used
++    g_vit_lastdiff = words; g_vit_lastmax = mx; g_vit_lastsum = sm;
++    g_vit_skip_next = (mx <= thmax && sm <= thsum && (thw < 0 || words <= thw)) ? 1 : 0;
++    vit_trace();          // C30: the telemetry line (no-op unless NR_VIT_TRACE is set)
++}
++// C33: how many marked span closures actually took the early-out THIS frame, and the frame
++// sequence the criterion advanced -- both read out of malloc_host cells the kernels themselves
++// wrote (self-attestation without touching a business face).
++static void vit_earlyout_count(int *nearly, int *seq) {
++    if (!g_vit_vg) { *nearly = -1; *seq = -1; return; }
++    int hits = 0;
++    for (size_t i = g_vit_span_from; i <= g_vit_span_to; ++i)
++        if (g_vit_vg[4200 + i] == 2) ++hits;
++    *nearly = hits; *seq = g_vit_vg[8399];
++}
++static void vit_frame_note(int id) {
++    { int n_early = -1, n_seq = -1; vit_earlyout_count(&n_early, &n_seq);
++      std::printf("[vit-reuse] SELFATT frames=%d flag=%d earlyout=%d/%d seq=%d\n",
++                  g_vit_frames + 1, g_vit_skip_next, n_early,
++                  (int)(g_vit_span_to >= g_vit_span_from ? g_vit_span_to - g_vit_span_from + 1 : 0),
++                  n_seq); std::fflush(stdout); }   // presence-gated print of the reuse ledger
++    g_vit_frames++;
++    if (g_vit_skip_next) g_vit_skips++;   // level 4 reuses via g_vit_gBt, not the twin id
++    static int every = getenv("NR_VITDBG") ? 1 : 60;
++    // (the modulo test must not be used with every=1: frames % 1 is always 0)
++    if (every <= 1 || (g_vit_frames - 1) % every == 0) {
++        std::printf("[vit-reuse] frames=%d skipped=%d lastdiff=%ld lastmax=%ld lastsum=%ld items=%zu "
++                    "th=%s/%s/%s -> %s\n",
++                    g_vit_frames, g_vit_skips, g_vit_lastdiff, g_vit_lastmax, g_vit_lastsum,
++                    g_vit_items,
++                    getenv("NR_VIT_REUSE_TH") ? getenv("NR_VIT_REUSE_TH") : "0",
++                    getenv("NR_VIT_REUSE_THMAX") ? getenv("NR_VIT_REUSE_THMAX") : "0",
++                    getenv("NR_VIT_REUSE_THSUM") ? getenv("NR_VIT_REUSE_THSUM") : "0",
++                    g_vit_skip_next ? "TWIN" : "MASTER");
++        std::fflush(stdout);
++    }
++}
+ // ==================== KNIFE 1: NR_BMERGE -- same-shape residual legs merged into ONE launch ====
+ // notes/shape-merge-plan.md 7.1 knife 1, A3 slice (xmx_rec_gemm_int8_residual: 16 sites of
+ // 2040x256x256 + 12 sites of 8160x128x128, all ALIVE on the load slot per tools/shapes_alive.csv).
+@@ -2331,6 +3105,7 @@ int xmx_graph_capture(void) {
+     // graph is stored (default empty => this function is never entered; see the block above).
+     skip_chains_apply(g_cmds, g_cmd_names, (int)g_graphs.size());
+     bmerge_apply(g_cmds);      // KNIFE 1: runs AFTER the skip pass, so skipped legs cannot merge
++    vit_reuse_apply(g_cmds, g_cmd_names, (int)g_graphs.size());   // C25: twin list (OFF = no-op)
+     bmerge_order_apply();      // B step 2 (i): presence-gated REORDER (NR_BMERGE_ORDER), default off
+     bmerge_order_report();     // what it moved, so the declared-set check has something to read
+     pgraph_final_dump();       // the FROZEN touch sets, i.e. after any reorder -- [pgt] cannot show it
+@@ -2354,12 +3129,123 @@ int xmx_graph_capture(void) {
+     g_pending_fold_slot = SIZE_MAX; g_fold_slot.clear(); // with the stream (10-27 audit)
+     s6_reset();                                          // S6 chain candidate: ditto
+     g_recording = false;
+-    return (int)g_graphs.size() - 1;
+-}
++    // C25 NR_VIT_REUSE: the twin (the same closure COUNT, the 8 ViT attention chains
++    // dissolved) is stored as an EXTRA graph id so xmx_graph_run needs nothing but the
++    // id swap. Default OFF => g_vit_twinready is false and this block never runs.
++    g_vit_master = (int)g_graphs.size() - 1;
++    g_vit_twin = -1;
++    if (g_vit_twinready && g_vit_twincmds.size() == g_graphs[g_vit_master].size()) {
++        std::vector<std::function<void()>> twin = std::move(g_vit_twincmds);
++        g_graphs.push_back(std::move(twin));
++        g_graph_names.push_back(g_graph_names.back());     // same names, same length
++        g_graph_touch.push_back(g_graph_touch.back());     // the A touch sets (conservative)
++        std::vector<LCount> lc = g_graph_launch.back();
++        for (LCount& e : lc) e = LCount();                 // the twin counts separately
++        g_graph_launch.push_back(std::move(lc));
++        g_graph_ids.push_back(g_graph_ids.back());
++        g_graph_name.push_back(g_graph_name.back());
++        g_vit_twin = (int)g_graphs.size() - 1;
++        std::printf("[vit-reuse] graph=%d TWIN stored as graph=%d (closures=%zu, master=%d)\n",
++                    g_vit_master, g_vit_twin, g_graphs[g_vit_twin].size(), g_vit_master);
++        std::fflush(stdout);
++    } else if (vit_reuse_level()) {
++        std::printf("[vit-reuse] graph=%d NO TWIN (twinready=%d)\n", g_vit_master,
++                    (int)g_vit_twinready);
++        std::fflush(stdout);
++    }
++    // C29 level 4: store the three split graphs (A / Bm / Bt) as extra ids. The plan only
++    // ever names the MASTER; xmx_graph_run does the split itself.
++    if (g_vit_splitready && vit_reuse_level() == 4 && g_vit_master >= 0 &&
++        g_vit_A.size() + g_vit_Bm.size() == g_graphs[g_vit_master].size()) {
++        const size_t hc = g_vit_hostcmd_stored;
++        auto push_slice = [&](std::vector<std::function<void()>>& lst, size_t from, size_t to) {
++            g_graphs.push_back(std::move(lst));
++            const std::vector<const char*>& nm = g_graph_names[g_vit_master];
++            g_graph_names.push_back(std::vector<const char*>(nm.begin() + from, nm.begin() + to));
++            const std::vector<std::vector<void*>>& tt = g_graph_touch[g_vit_master];
++            g_graph_touch.push_back(std::vector<std::vector<void*>>(tt.begin() + from, tt.begin() + to));
++            g_graph_launch.push_back(std::vector<LCount>(to - from));
++            if (g_graph_ids.size() == (size_t)g_vit_master + 1) {
++                const std::vector<std::vector<int>>& idv = g_graph_ids[g_vit_master];
++                if (idv.size() == g_graphs[g_vit_master].size())
++                    g_graph_ids.push_back(std::vector<std::vector<int>>(idv.begin() + from, idv.begin() + to));
++                else g_graph_ids.push_back(std::vector<std::vector<int>>());
++            } else g_graph_ids.push_back(std::vector<std::vector<int>>());
++            if (g_graph_name.size() == (size_t)g_vit_master + 1) {
++                const std::vector<const char*>& an = g_graph_name[g_vit_master];
++                if (an.size() == g_graphs[g_vit_master].size())
++                    g_graph_name.push_back(std::vector<const char*>(an.begin() + from, an.begin() + to));
++                else g_graph_name.push_back(std::vector<const char*>());
++            } else g_graph_name.push_back(std::vector<const char*>());
++            return (int)g_graphs.size() - 1;
++        };
++        g_vit_gA  = push_slice(g_vit_A,  0,           hc + 1);
++        g_vit_gBm = push_slice(g_vit_Bm, hc + 1,      g_graphs[g_vit_master].size());
++        g_vit_gBt = push_slice(g_vit_Bt, hc + 1,      g_graphs[g_vit_master].size());
++        std::printf("[vit-reuse] SPLIT stored: A=%d (0..%zu) Bm=%d Bt=%d (closures=%zu, master=%d)\n",
++                    g_vit_gA, hc, g_vit_gBm, g_vit_gBt, g_graphs[g_vit_master].size(), g_vit_master);
++        std::fflush(stdout);
++    }
++    g_vit_twincmds.clear(); g_vit_twinready = false;
++    return g_vit_master;   // the plan's graph id stays the MASTER; the twin and the split
++                           // graphs are reached only by xmx_graph_run's own selection
++}
++static int xmx_graph_run_one(int id);   // fwd: the shipped single-graph replay path
++// C29: the public entry. Level 4 (NR_VIT_REUSE=4) runs the frame as TWO submits -- A up to
++// and including the criterion closure, then Bm (segment computed) or Bt (segment dissolved)
++// chosen from THIS frame's counters -- so the reuse decision certifies the frame it applies
++// to. Every other level (and the shipped default 0) is the single existing path.
+ int xmx_graph_run(int id) {
++    if (vit_reuse_level() == 4 && g_vit_splitready && g_vit_gA >= 0 && id == g_vit_master) {
++        int pa = xmx_graph_run_one(g_vit_gA);
++        if (pa < 0) return pa;
++        vit_verdict_update4();
++        int pb = xmx_graph_run_one(g_vit_skip_next ? g_vit_gBt : g_vit_gBm);
++        vit_frame_note(g_vit_skip_next ? g_vit_gBt : g_vit_gBm);
++        g_vit_ran_once = 1;
++        if (pb < 0) return pb;
++        return pa + pb;
++    }
++    int rv = xmx_graph_run_one(id);
++    // C30 (A) level 6: the decision was taken ON THE DEVICE inside this very frame (the
++    // criterion node runs before the span, the span kernels read the flag at their entry).
++    // The host only mirrors it, after the frame, for NR_VIT_TRACE -- a plain read of
++    // malloc_host memory, no driver call, and it never selects a graph.
++    if (vit_reuse_level() == 6 && rv >= 0 && id == g_vit_master && g_vit_hf) {
++        g_vit_lastmax = g_vit_hf[1]; g_vit_lastsum = g_vit_hf[2];
++        g_vit_skip_next = g_vit_hf[0];
++        g_vit_frames++;
++        vit_frame_note(id);   // C34: the ONE-LINE wiring -- level 6 never reached the note, so
++                              // SELFATT (flag / earlyout=k/73 / seq from the malloc_host mirror)
++                              // never printed. No business face is touched by this readout.
++        vit_trace();
++        g_vit_skip_next = 0;
++    }
++    return rv;
++}
++static int xmx_graph_run_one(int id) {
+     if (g_recording) FAILMSG("cannot replay during recording");
+     if (id < 0 || id >= (int)g_graphs.size() || g_graphs[id].empty())
+         FAILMSG("graph is not live");
++    // C25 NR_VIT_REUSE: the per-frame master/twin pick. The verdict comes from the
++    // criterion that ran INSIDE the previous frame's graph (shared counters, already
++    // valid because the replay waits). OFF => this block is never entered.
++    const int vit_lvl_now = vit_reuse_level();
++    if (vit_lvl_now >= 1 && vit_lvl_now <= 3 && g_vit_twin >= 0 && (id == g_vit_master || id == g_vit_twin)) {
++        vit_verdict_update();
++        id = g_vit_skip_next ? g_vit_twin : g_vit_master;
++        vit_frame_note(id);
++        g_vit_ran_once = 1;   // this frame's graph carries the criterion (chain 1's QUANT
++                              // survives in the twin too), so a verdict will exist
++    } else if (vit_reuse_level() == 5 && id == g_vit_master) {
++        // C30 事二(2): TELEMETRY build -- the criterion node runs (it lives in the surviving
++        // closure before the span), the magnitude verdict is computed from THIS frame's
++        // counters, NR_VIT_TRACE gets its line, and NOTHING is dissolved or skipped.
++        vit_verdict_update4();
++        g_vit_skip_next = 0;
++        vit_frame_note(id);
++        g_vit_ran_once = 1;
++    }
+     int passes = (int)g_graphs[id].size();
+     g_lc_vec = ((size_t)id < g_graph_launch.size() && g_graph_launch[id].size() == g_graphs[id].size())
+                ? &g_graph_launch[id] : nullptr;
+@@ -3015,7 +3901,9 @@ int xmx_rec_gemm_qkv_window(int image, int weight, int q, int k, int v, int scal
+         // qkv_epilogue: in-place Q/K head norm on the f32 acc (QKV_READ = float(stage)),
+         // then publish e4m3 -> half scatter. One device pass per (row, head) for the norm,
+         // then the publish/scatter pass.
++         const int* vit_g_3878 = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+          GQ->parallel_for(sycl::range((size_t)M * heads), [=](sycl::item<1> it) {
++                 if (vit_g_3878 && vit_g_3878[-1] && *vit_g_3878) { ((int*)vit_g_3878)[4199] = 2; return; }   // C32: reuse => touch nothing
+             size_t i = it.get_id(0);
+             unsigned r = (unsigned)(i / heads), head = (unsigned)(i % heads);
+             float row32[32];
+@@ -3821,6 +4709,8 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
+     if (!g_recording) FAILMSG("not recording");
+     if (!M || !N || !K || (N % 16u) || (K % 16u))
+         FAILMSG("gemm f16 needs N%%16==0, K%%16==0 (our tile)");
++    if (vit_reuse_level())            // C26: note the GEMM (the ViT entry probe looks here)
++        vit_note_gemm(g_cmds.size(), a, c, M, N, K);
+     const bool transposed = (bt & 1u) != 0u;   // scores leg: B stored (N,K), ldb->K
+     if (bt & 0x800000u) FAILMSG("pooled window residual belongs to the window_block family");
+     auto ia = g_bufs.find(a), ib = g_bufs.find(b), ic = g_bufs.find(c);
+@@ -3908,8 +4798,10 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
+         else if (v2_ok)                    f16v2::gemm_b2<32>(*GQ, dAp, dBp, dC, Mp2, (int)N, (int)K, (int)nb);
+         else                               f16v1::gemm_b(*GQ, dAp, dBp, dC, Mp2, (int)N, (int)K, (int)nb);
+         static int gst3 = getenv("NR_G_STOP") ? atoi(getenv("NR_G_STOP")) : 0;   // 3 = skip the publish pass (gemm only): the fold-value probe
++        const int* vit_g_4773 = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+         if (gst3 < 3)GQ->parallel_for(sycl::range(nb * (size_t)M * N),
+                          [=](sycl::item<1> it) {
++                if (vit_g_4773 && vit_g_4773[-1] && *vit_g_4773) { ((int*)vit_g_4773)[4199] = 2; return; }   // C32: reuse => touch nothing
+             size_t i = it.get_id(0);
+             size_t mn = (size_t)M * N;
+             unsigned g = (unsigned)(i / mn); size_t rem = i % mn;
+@@ -4135,7 +5027,9 @@ int xmx_rec_gemm_int8_batched(int a, int b, int c, int a_scale, int b_scale,
+             // frame, 1301 MUST move; if it stays EXACT the fold is a dud, not a win.
+             if (qfmode != 2 && getenv("NR_BG_FOLD_LIVE")) {
+                 float* sc_p = (float*)ias->second.p;
++                 const int* vit_g_5000 = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+                  GQ->parallel_for(sycl::range((size_t)M), [=](sycl::item<1> i) {
++                         if (vit_g_5000 && vit_g_5000[-1] && *vit_g_5000) { ((int*)vit_g_5000)[4199] = 2; return; }   // C32: reuse => touch nothing
+                     sc_p[i.get_id(0)] = sc_p[i.get_id(0)] * 0.5f; });
+             } }
+         else { bgp++; if (getenv("NR_BPACK_TRACE") && bgp <= 8) printf("[bpack] gather M=%u N=%u K=%u b=%u sa=%u lda=%u\n", M, N, K, batch, (unsigned)sa, lda_e);
+@@ -4430,6 +5324,8 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
+     const size_t na = (size_t)Mp * C, nb = (size_t)NH * C;
+     g_cmd_names.push_back(__func__);
+     pgraph_ids({a,b,q,k,v,a_scale,b_scale,qkv_scale});   // PGRAPH touch-set (conservative: every operand id)
++    if (vit_reuse_level() && (flags & 0x2000u))          // C25: note the ViT (global-attention) chains
++        vit_note_qkv(g_cmds.size(), channels, heads, tokens);
+         flop_note("int8_qkv",M,3u*channels,channels,1);
+         if (getenv("NR_SHAPE_DUMP")) { static long qv=0,qnv=0; if(flags&0x2000u) qv++; else qnv++;
+             std::printf("[qkv-vit] vit=%ld nonvit=%ld (running)\n", qv, qnv); }
+@@ -4505,7 +5401,9 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
+             // kernel -- no dC float-bits round-trip, one fewer launch. Non-vit only.
+             if (qkvstop < 1) {
+                 static int qres_v2 = getenv("NR_QKV_RESV2") ? atoi(getenv("NR_QKV_RESV2")) : 0;   // P6 v2 FALSIFIED (ESIMD arrays spill: 186-187 vs 178-180); 3 = v3 scalar-contiguous probe
++                const int* vit_g_5372 = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+                 if (qres_v2 == 3)GQ->parallel_for(sycl::range((size_t)M * heads), [=](sycl::item<1> it) {
++                        if (vit_g_5372 && vit_g_5372[-1] && *vit_g_5372) { ((int*)vit_g_5372)[4199] = 2; return; }   // C32: reuse => touch nothing
+                         unsigned rh = (unsigned)it.get_id(0);
+                         unsigned r = rh / heads, head = rh % heads;
+                         const float rs = as[r];
+@@ -4581,8 +5479,10 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
+         // VIT_ROOT/scale + e4m3 + scatter, all in registers -- dC write-back
+         // AND the stage-3 pass vanish. Arithmetic VERBATIM from the two passes
+         // below (qr_half_round/cr_mul/ctree::vit_reciprocal/VIT_ROOT order kept).
++         const int* vit_g_5448 = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+          GQ->parallel_for(sycl::range((size_t)M * heads),
+                          [=](sycl::item<1> it) {
++                 if (vit_g_5448 && vit_g_5448[-1] && *vit_g_5448) { ((int*)vit_g_5448)[4199] = 2; return; }   // C32: reuse => touch nothing
+             size_t i = it.get_id(0);
+             unsigned r = (unsigned)(i / heads), head = (unsigned)(i % heads);
+             float row32[32];
+@@ -4617,8 +5517,10 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
+         });
+         } else {
+         float* vdbg = getenv("NR_VITDBG") ? (float*)sycl::malloc_device((size_t)M * heads * 16u, *GQ) : nullptr;
++         const int* vit_g_5484 = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+          GQ->parallel_for(sycl::range((size_t)M * heads),
+                          [=](sycl::item<1> it) {
++                 if (vit_g_5484 && vit_g_5484[-1] && *vit_g_5484) { ((int*)vit_g_5484)[4199] = 2; return; }   // C32: reuse => touch nothing
+             size_t i = it.get_id(0);
+             unsigned r = (unsigned)(i / heads), head = (unsigned)(i % heads);
+             float row32[32];
+@@ -5056,7 +5958,9 @@ int xmx_rec_global_attention(int q, int k, int v, int merged, unsigned rows,
+         dCtx = (float*)pool_get(cx * 4);   // split path only
+          f16v1::gemm_b(*GQ, dAp, dBv, dCtx, Mp, 32, (int)rows, (int)heads);
+         // merge_heads_scale: (1,rows,heads*32) with scale=reciprocal (heads*rows), e4m3, half
++         const int* vit_g_5923 = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+          GQ->parallel_for(sycl::range((size_t)rows * CH), [=](sycl::item<1> it) {
++                 if (vit_g_5923 && vit_g_5923[-1] && *vit_g_5923) { ((int*)vit_g_5923)[4199] = 2; return; }   // C32: reuse => touch nothing
+             unsigned index = (unsigned)it.get_id(0);
+             unsigned c = index % CH, token = index / CH;
+             size_t at = (size_t)(c / 32u) * rows + token;   // window=0: at=(0*heads + c/32)*rows + token
+@@ -5126,6 +6030,8 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
+     static int ustop = getenv("NR_U_STOP") ? atoi(getenv("NR_U_STOP")) : 0;
+     if (ustop == 9) { g_cmd_names.push_back(__func__);pg_push([](){}); return 0; }
+     pgraph_ids({a,b,c,d});   // PGRAPH touch-set (conservative: every operand id)
++    if (vit_reuse_level())   // C26: note the UNARY (the S2 criterion host looks here: it is
++        vit_note_unary(g_cmds.size(), a, b, c, d, n);   // the producer of the entry GEMM's face
+     const unsigned flags = kind;                 // the plan's arg0 IS the flags word
+     const unsigned sub = flags & 0xFFu;
+     auto ia = g_bufs.find(a), ic = g_bufs.find(c);
+@@ -5155,7 +6061,9 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
+         static bool uvec = !getenv("NR_UNARY_VEC") || atoi(getenv("NR_UNARY_VEC")) != 0;
+         if (uvec && (N % 16u) == 0u && !a_half) {
+             pg_push([=]() {
++                 const int* vit_g_6024 = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+                  GQ->parallel_for(sycl::range((size_t)N / 16u), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
++                         if (vit_g_6024 && vit_g_6024[-1] && *vit_g_6024) { ((int*)vit_g_6024)[4199] = 2; return; }   // C32: reuse => touch nothing
+                     namespace esimd = sycl::ext::intel::esimd;
+                     size_t i = (size_t)it.get_id(0) * 16u;
+                     esimd::simd<float,16> v = esimd::block_load<float,16>(
+@@ -5167,7 +6075,9 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
+             return 0;
+         }
+         pg_push([=]() {
++             const int* vit_g_6036 = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+              GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
++                     if (vit_g_6036 && vit_g_6036[-1] && *vit_g_6036) { ((int*)vit_g_6036)[4199] = 2; return; }   // C32: reuse => touch nothing
+                 size_t i = it.get_id(0);
+                 ((sycl::half*)C)[i] = sycl::half(qr_e4m3(((const float*)A)[i]));
+             });
+@@ -5185,7 +6095,9 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
+         static bool uvec3 = !getenv("NR_UNARY_VEC") || atoi(getenv("NR_UNARY_VEC")) != 0;
+         if (uvec3 && !a_half && narrow && epi == 1u && (CH % 16u) == 0u && (N % 16u) == 0u) {
+             pg_push([=]() {
++                 const int* vit_g_6054 = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+                  GQ->parallel_for(sycl::range((size_t)N / 16u), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
++                         if (vit_g_6054 && vit_g_6054[-1] && *vit_g_6054) { ((int*)vit_g_6054)[4199] = 2; return; }   // C32: reuse => touch nothing
+                     namespace esimd = sycl::ext::intel::esimd;
+                     size_t index = (size_t)it.get_id(0) * 16u;
+                     unsigned ch = CH, width = SB;
+@@ -5204,7 +6116,9 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
+             return 0;
+         }
+         pg_push([=]() {
++             const int* vit_g_6073 = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+              GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
++                     if (vit_g_6073 && vit_g_6073[-1] && *vit_g_6073) { ((int*)vit_g_6073)[4199] = 2; return; }   // C32: reuse => touch nothing
+                 size_t index = it.get_id(0);
+                 unsigned ch = CH, width = SB;
+                 unsigned cc = (unsigned)(index % ch), rest = (unsigned)(index / ch);
+@@ -5232,7 +6146,9 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
+         static bool uvec2 = !getenv("NR_UNARY_VEC") || atoi(getenv("NR_UNARY_VEC")) != 0;
+         if (uvec2 && !a_half && b_half && narrow && epi == 1u && (CH % 16u) == 0u && (N % 16u) == 0u) {
+             pg_push([=]() {
++                 const int* vit_g_6101 = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+                  GQ->parallel_for(sycl::range((size_t)N / 16u), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
++                         if (vit_g_6101 && vit_g_6101[-1] && *vit_g_6101) { ((int*)vit_g_6101)[4199] = 2; return; }   // C32: reuse => touch nothing
+                     namespace esimd = sycl::ext::intel::esimd;
+                     size_t index = (size_t)it.get_id(0) * 16u;
+                     unsigned ch = CH, target = SA, source = SB;
+@@ -5252,7 +6168,9 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
+             return 0;
+         }
+         pg_push([=]() {
++             const int* vit_g_6121 = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+              GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
++                     if (vit_g_6121 && vit_g_6121[-1] && *vit_g_6121) { ((int*)vit_g_6121)[4199] = 2; return; }   // C32: reuse => touch nothing
+                 size_t index = it.get_id(0);
+                 unsigned ch = CH, target = SA, source = SB;
+                 unsigned cc = (unsigned)(index % ch), rest = (unsigned)(index / ch);
+@@ -5274,7 +6192,9 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
+         static bool uvec4 = getenv("NR_UNARY_VEC2") != nullptr && atoi(getenv("NR_UNARY_VEC2")) != 0;   // U-4 VERDICT 16-pair: 6w/10l mean +0.42 = NEGATIVE -> default OFF (asset kept)
+         if (uvec4 && !a_half && !narrow && epi == 0u && (CH % 16u) == 0u && (N % 16u) == 0u) {
+             pg_push([=]() {
++                 const int* vit_g_6143 = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+                  GQ->parallel_for(sycl::range((size_t)N / 16u), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
++                         if (vit_g_6143 && vit_g_6143[-1] && *vit_g_6143) { ((int*)vit_g_6143)[4199] = 2; return; }   // C32: reuse => touch nothing
+                     namespace esimd = sycl::ext::intel::esimd;
+                     size_t index = (size_t)it.get_id(0) * 16u;
+                     unsigned ch = CH, height = SA, width = SB, padded = SC;
+@@ -5290,7 +6210,9 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
+             return 0;
+         }
+         pg_push([=]() {
++             const int* vit_g_6159 = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+              GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
++                     if (vit_g_6159 && vit_g_6159[-1] && *vit_g_6159) { ((int*)vit_g_6159)[4199] = 2; return; }   // C32: reuse => touch nothing
+                 size_t index = it.get_id(0);
+                 unsigned ch = CH, height = SA, width = SB, padded = SC;
+                 unsigned cc = (unsigned)(index % ch), rest = (unsigned)(index / ch);
+@@ -5444,7 +6366,9 @@ int xmx_rec_unary2(unsigned kind, int a, int b, int c, int d, int second, unsign
+     const unsigned N = n, CH = channels, SA = sa, SB = sb;
+     g_cmd_names.push_back(__func__);
+     pg_push([=]() {
++         const int* vit_g_6313 = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+          GQ->parallel_for(sycl::range((size_t)N), [=](sycl::item<1> it) {
++                 if (vit_g_6313 && vit_g_6313[-1] && *vit_g_6313) { ((int*)vit_g_6313)[4199] = 2; return; }   // C32: reuse => touch nothing
+             unsigned index = (unsigned)it.get_id(0);
+             unsigned cc = index % CH, rest = index / CH;
+             unsigned x = rest % SA, y = rest / SA;
+@@ -6757,6 +7681,8 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
+     static int qstop = getenv("NR_Q_STOP") ? atoi(getenv("NR_Q_STOP")) : 0;
+     if (qstop == 9) { g_cmd_names.push_back(__func__);pg_push([](){}); return 0; }
+     pgraph_ids({source,packed,scale});   // PGRAPH touch-set (conservative: every operand id)
++    if (vit_reuse_level())               // C25: remember the opening QUANT of a ViT chain
++        vit_note_quant(g_cmds.size(), source, packed, scale, M, K);
+     if (!M || !K || K % 16u) FAILMSG("quant needs K a multiple of 16");
+     auto s = g_bufs.find(source), p = g_bufs.find(packed), c = g_bufs.find(scale);
+     if (s == g_bufs.end() || p == g_bufs.end() || c == g_bufs.end()) FAILMSG("bad quant operand");
+diff --git a/src/bench/sycl/quantize_row_kernel.hpp b/src/bench/sycl/quantize_row_kernel.hpp
+index aefe988..d09424f 100644
+--- a/src/bench/sycl/quantize_row_kernel.hpp
++++ b/src/bench/sycl/quantize_row_kernel.hpp
+@@ -11,6 +11,10 @@
+ // Division is ext::intel::math::fdiv_rn(v, scale): the shipped numpy contract
+ // (int8_quant.py:50 `wide / scale`) is ONE correctly-rounded division; icx lowers
+ // `v * (1.0f/scale)` to an approximate reciprocal (1 ULP off) which flips X.5 ties.
++// C32: same-frame reuse gate (defined in libxmx_sycl.cpp; see gemm_s8_v8_kernel.hpp)
++extern int g_vit_run_cmd;
++const int* vit_gate(int cmd);
++
+ #pragma once
+ #include <sycl/sycl.hpp>
+ #include <sycl/ext/intel/math.hpp>
+@@ -167,6 +171,7 @@ inline void qr_launch(sycl::queue& q, sycl::device& dev, K kern,
+                       unsigned image_h, unsigned image_w, unsigned window_cols, unsigned window_pad,
+                       float* dprod, float* drecip) {
+     LC_TICK();   // #145 军规 132: launch counted at helper entry
++    const int* vit_g_ = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+     unsigned words = k / 8u;
+     auto sgs = dev.get_info<sycl::info::device::sub_group_sizes>();
+     unsigned SUB_max = 1u; for (unsigned s : sgs) if (s > SUB_max) SUB_max = s;
+@@ -201,9 +206,10 @@ inline void qr_launch(sycl::queue& q, sycl::device& dev, K kern,
+ // gather/e4m3 variants (quant_window) keep the proven plain kernel for now.
+ // ============================================================================
+ inline auto qr_kernel_esimd() {
+-    return [](sycl::half* a_src, sycl::uint2* packed, float* scales,
++    return [](sycl::half* a_src, sycl::uint2* packed, float* scales, const int* vit_gate_,
+               unsigned m, unsigned k) {
+         return [=](sycl::nd_item<2> it) SYCL_ESIMD_KERNEL {
++            if (vit_gate_ && vit_gate_[-1] && *vit_gate_) { ((int*)vit_gate_)[4199] = 2; return; }   // C32: reuse => touch nothing
+             namespace esimd = sycl::ext::intel::esimd;
+             esimd::slm_init<64 * 4>();    // per-lane row-max slots (LW=64: §96 GRF rule)
+             const unsigned words = k / 8u;          // 8-half words (16B)
+@@ -275,8 +281,9 @@ inline auto qr_kernel_esimd() {
+ // (numpy golden) is the judge. k must EQUAL KMAX exactly. ----
+ template <int KMAX>
+ inline auto qr_kernel_rowthread() {
+-    return [](sycl::half* a_src, sycl::uint2* packed, float* scales, unsigned m, unsigned k) {
++    return [](sycl::half* a_src, sycl::uint2* packed, float* scales, const int* vit_gate_, unsigned m, unsigned k) {
+         return [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
++            if (vit_gate_ && vit_gate_[-1] && *vit_gate_) { ((int*)vit_gate_)[4199] = 2; return; }   // C32: reuse => touch nothing
+             namespace esimd = sycl::ext::intel::esimd;
+             unsigned row = (unsigned)it.get_id(0);
+             const size_t base = (size_t)row * k;
+@@ -308,8 +315,9 @@ inline auto qr_kernel_rowthread() {
+ // costs resident workgroups). The frame's K>512 quants are always K%1024==0.
+ template <int CH16>
+ inline auto qr_kernel_rowgroup() {
+-    return [](sycl::half* a_src, sycl::uint2* packed, float* scales, unsigned m, unsigned k) {
++    return [](sycl::half* a_src, sycl::uint2* packed, float* scales, const int* vit_gate_, unsigned m, unsigned k) {
+         return [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
++            if (vit_gate_ && vit_gate_[-1] && *vit_gate_) { ((int*)vit_gate_)[4199] = 2; return; }   // C32: reuse => touch nothing
+             namespace esimd = sycl::ext::intel::esimd;
+             esimd::slm_init<256>();
+             constexpr int K = CH16 * 16 * 64;
+@@ -349,20 +357,21 @@ inline void qr_launch_esimd(sycl::queue& q, sycl::device& dev,
+                             sycl::half* dsrc, sycl::uint2* dpack, float* dscale,
+                             unsigned m, unsigned k, sycl::event *out_ev = nullptr) {
+     LC_TICK();   // #145 军规 132: launch counted at helper entry
++    const int* vit_g_ = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+     // ROW-THREAD dispatch (section 99): exact small-K shapes get the senior geometry.
+     // out_ev (bench-only, defaulted): the last enqueued event, for GPU-side timing.
+-    if (k == 64u)  { if(out_ev) *out_ev = q.parallel_for(sycl::range(m), qr_kernel_rowthread<64>()(dsrc, dpack, dscale, m, k)); else q.parallel_for(sycl::range(m), qr_kernel_rowthread<64>()(dsrc, dpack, dscale, m, k)); return; }
+-    if (k == 128u) { if(out_ev) *out_ev = q.parallel_for(sycl::range(m), qr_kernel_rowthread<128>()(dsrc, dpack, dscale, m, k)); else q.parallel_for(sycl::range(m), qr_kernel_rowthread<128>()(dsrc, dpack, dscale, m, k)); return; }
+-    if (k == 256u) { if(out_ev) *out_ev = q.parallel_for(sycl::range(m), qr_kernel_rowthread<256>()(dsrc, dpack, dscale, m, k)); else q.parallel_for(sycl::range(m), qr_kernel_rowthread<256>()(dsrc, dpack, dscale, m, k)); return; }
+-    if (k == 512u) { if(out_ev) *out_ev = q.parallel_for(sycl::range(m), qr_kernel_rowthread<512>()(dsrc, dpack, dscale, m, k)); else q.parallel_for(sycl::range(m), qr_kernel_rowthread<512>()(dsrc, dpack, dscale, m, k)); return; }
++    if (k == 64u)  { if(out_ev) *out_ev = q.parallel_for(sycl::range(m), qr_kernel_rowthread<64>()(dsrc, dpack, dscale, vit_g_, m, k)); else q.parallel_for(sycl::range(m), qr_kernel_rowthread<64>()(dsrc, dpack, dscale, vit_g_, m, k)); return; }
++    if (k == 128u) { if(out_ev) *out_ev = q.parallel_for(sycl::range(m), qr_kernel_rowthread<128>()(dsrc, dpack, dscale, vit_g_, m, k)); else q.parallel_for(sycl::range(m), qr_kernel_rowthread<128>()(dsrc, dpack, dscale, vit_g_, m, k)); return; }
++    if (k == 256u) { if(out_ev) *out_ev = q.parallel_for(sycl::range(m), qr_kernel_rowthread<256>()(dsrc, dpack, dscale, vit_g_, m, k)); else q.parallel_for(sycl::range(m), qr_kernel_rowthread<256>()(dsrc, dpack, dscale, vit_g_, m, k)); return; }
++    if (k == 512u) { if(out_ev) *out_ev = q.parallel_for(sycl::range(m), qr_kernel_rowthread<512>()(dsrc, dpack, dscale, vit_g_, m, k)); else q.parallel_for(sycl::range(m), qr_kernel_rowthread<512>()(dsrc, dpack, dscale, vit_g_, m, k)); return; }
+     // P8-j: K>512 -> the single-read rowgroup form (the double-read ESIMD path
+     // below stays as the NR_QR_RG=0 escape hatch). K%1024==0 required (the frame
+     // census: 1024/2048/4096 only); other K fall through to the old path.
+     static bool rg = !getenv("NR_QR_RG") || atoi(getenv("NR_QR_RG")) != 0;
+     if (rg && k % 1024u == 0u && k <= 4096u) {
+-        if (k == 1024u) { auto e = q.submit([&](sycl::handler& h){ h.parallel_for(sycl::nd_range<1>(sycl::range(m*64u), sycl::range(64u)), qr_kernel_rowgroup<1>()(dsrc, dpack, dscale, m, k)); }); if(out_ev) *out_ev=e; return; }
+-        if (k == 2048u) { auto e = q.submit([&](sycl::handler& h){ h.parallel_for(sycl::nd_range<1>(sycl::range(m*64u), sycl::range(64u)), qr_kernel_rowgroup<2>()(dsrc, dpack, dscale, m, k)); }); if(out_ev) *out_ev=e; return; }
+-        if (k == 4096u) { auto e = q.submit([&](sycl::handler& h){ h.parallel_for(sycl::nd_range<1>(sycl::range(m*64u), sycl::range(64u)), qr_kernel_rowgroup<4>()(dsrc, dpack, dscale, m, k)); }); if(out_ev) *out_ev=e; return; }
++        if (k == 1024u) { auto e = q.submit([&](sycl::handler& h){ h.parallel_for(sycl::nd_range<1>(sycl::range(m*64u), sycl::range(64u)), qr_kernel_rowgroup<1>()(dsrc, dpack, dscale, vit_g_, m, k)); }); if(out_ev) *out_ev=e; return; }
++        if (k == 2048u) { auto e = q.submit([&](sycl::handler& h){ h.parallel_for(sycl::nd_range<1>(sycl::range(m*64u), sycl::range(64u)), qr_kernel_rowgroup<2>()(dsrc, dpack, dscale, vit_g_, m, k)); }); if(out_ev) *out_ev=e; return; }
++        if (k == 4096u) { auto e = q.submit([&](sycl::handler& h){ h.parallel_for(sycl::nd_range<1>(sycl::range(m*64u), sycl::range(64u)), qr_kernel_rowgroup<4>()(dsrc, dpack, dscale, vit_g_, m, k)); }); if(out_ev) *out_ev=e; return; }
+     }
+     // LW: §96/bench_v2crash proved the BIG-state v2 ESIMD+barrier kernels HANG at
+     // LW>=128 (GRF rule). The quant kernel's state is small (one 32-wide vector), so
+@@ -380,6 +389,6 @@ inline void qr_launch_esimd(sycl::queue& q, sycl::device& dev,
+     unsigned gyy = (ngroups + gxx - 1u) / gxx;
+     q.submit([&](sycl::handler& h) {
+         h.parallel_for(sycl::nd_range<2>(sycl::range(LW * gxx, gyy), sycl::range(LW, 1u)),
+-            qr_kernel_esimd()(dsrc, dpack, dscale, m, k));
++            qr_kernel_esimd()(dsrc, dpack, dscale, vit_g_, m, k));
+     });
+ }
+diff --git a/src/bench/sycl/s6_ffn_block_kernel.hpp b/src/bench/sycl/s6_ffn_block_kernel.hpp
+index 7f9f72a..ec80115 100644
+--- a/src/bench/sycl/s6_ffn_block_kernel.hpp
++++ b/src/bench/sycl/s6_ffn_block_kernel.hpp
+@@ -50,6 +50,10 @@
+ #include <cstdint>
+ #include "gemm_s8_v8_kernel.hpp"   // s8v8::pub_vec_v8 (the shipped publish math)
+ 
++// C32: same-frame reuse gate (defined in libxmx_sycl.cpp; see gemm_s8_v8_kernel.hpp)
++extern int g_vit_run_cmd;
++const int* vit_gate(int cmd);
++
+ namespace ffn2 {
+ using namespace sycl;              // the bench file had this at scope; keeps the body verbatim
+ 
+@@ -107,8 +111,10 @@ static sycl::event fused(sycl::queue& q, const Args& a) {
+     constexpr int BANDS = S::BANDS;
+     const int nblk = a.M / T;
+     return q.submit([&](handler& h) {
++        const int* vit_g_ = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+         h.parallel_for(nd_range(range((size_t)nblk * 64), range(64)),
+                        [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
++            if (vit_g_ && vit_g_[-1] && *vit_g_) return;   // C32: reuse => touch nothing (before slm_init)
+             esimd::slm_init<S::SLM>();
+             const int blk = (int)it.get_group(0), t = (int)it.get_local_id(0);
+             const int r0 = blk * T;
+diff --git a/src/bench/sycl/window_block_mega.hpp b/src/bench/sycl/window_block_mega.hpp
+index b4bde37..16c6091 100644
+--- a/src/bench/sycl/window_block_mega.hpp
++++ b/src/bench/sycl/window_block_mega.hpp
+@@ -22,6 +22,10 @@
+ #include <cmath>
+ #include "cosine_tree_kernel.hpp"
+ 
++// C32: same-frame reuse gate (see gemm_s8_v8_kernel.hpp / libxmx_sycl.cpp)
++extern int g_vit_run_cmd;
++const int* vit_gate(int cmd);
++
+ namespace wbmega {
+ using namespace sycl;
+ namespace esimd = sycl::ext::intel::esimd;
+@@ -102,8 +106,10 @@ inline sycl::event launch_leg1(
+     LC_TICK();   // #145 军规 132: launch counted at helper entry
+     // one workgroup per window row: windows*8 rows, 32 threads each
+     return q.submit([&](handler& h) {
++    const int* vit_g_ = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+         h.parallel_for(nd_range<1>(range(windows * 8u * 32u), range(32u)),
+             [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
++                if (vit_g_ && vit_g_[-1] && *vit_g_) { ((int*)vit_g_)[4199] = 2; return; }   // C32: reuse => touch nothing
+             esimd::slm_init<SLM_TOTAL_B>();
+             uint wgr = (uint)it.get_group(0);          // window*8 + sub
+             uint lid = (uint)it.get_local_id(0);
+@@ -376,8 +382,10 @@ inline sycl::event normalize_esimd(sycl::queue& q, const float* dCq,
+                                    const float* qs, unsigned rows, unsigned NH, unsigned C) {
+     LC_TICK();   // #145 军规 132: launch counted at helper entry
+     return q.submit([&](handler& h) {
++    const int* vit_g_ = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+         h.parallel_for(nd_range<1>(range((size_t)rows / 8u * 32u), range(32u)),
+             [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
++                if (vit_g_ && vit_g_[-1] && *vit_g_) { ((int*)vit_g_)[4199] = 2; return; }   // C32: reuse => touch nothing
+             esimd::slm_init<8u * 16u * 4u>();   // 8 rows x (Q,K) x 4 lanes x 2 parity floats
+             uint r  = (uint)it.get_group(0) * 8u + (uint)it.get_local_id(0) / 4u;
+             uint l  = (uint)it.get_local_id(0) % 4u;
+@@ -452,8 +460,10 @@ inline sycl::event qkv_norm_esimd(sycl::queue& q, int32_t* dC,
+     LC_TICK();   // #145 军规 132: launch counted at helper entry
+     unsigned rows = M * heads;
+     return q.submit([&](handler& h) {
++    const int* vit_g_ = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+         h.parallel_for(nd_range<1>(range((size_t)rows / 8u * 32u), range(32u)),
+             [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
++                if (vit_g_ && vit_g_[-1] && *vit_g_) { ((int*)vit_g_)[4199] = 2; return; }   // C32: reuse => touch nothing
+             esimd::slm_init<8u * 16u * 4u>();
+             unsigned rh = (unsigned)it.get_group(0) * 8u + (unsigned)it.get_local_id(0) / 4u;
+             unsigned l  = (unsigned)it.get_local_id(0) % 4u;
+@@ -531,8 +541,10 @@ inline sycl::event launch_mega256(
+ {
+     LC_TICK();   // #145 军规 132: launch counted at helper entry
+     return q.submit([&](handler& h) {
++    const int* vit_g_ = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+         h.parallel_for(nd_range<1>(range(windows * 256u), range(256u)),
+             [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
++                if (vit_g_ && vit_g_[-1] && *vit_g_) { ((int*)vit_g_)[4199] = 2; return; }   // C32: reuse => touch nothing
+             esimd::slm_init<8u * 2560u>();          // 8 subgroups x leg1's 2560B region
+             uint wg  = (uint)it.get_group(0);
+             uint lid = (uint)it.get_local_id(0);
+@@ -635,8 +647,10 @@ inline sycl::event launch_full(
+ {
+     LC_TICK();   // #145 军规 132: launch counted at helper entry
+     return q.submit([&](handler& h) {
++    const int* vit_g_ = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+         h.parallel_for(nd_range<1>(range((size_t)windows * 32u), range(32u)),
+             [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
++                if (vit_g_ && vit_g_[-1] && *vit_g_) { ((int*)vit_g_)[4199] = 2; return; }   // C32: reuse => touch nothing
+             esimd::slm_init<31744u>();
+             const uint Q=0u, K=4096u, V=8192u, SCR=12288u, CTX=20480u,
+                        AFRG=28672u, VAL=29184u, ROW=31232u;
+@@ -1026,8 +1040,10 @@ inline sycl::event qkv_norm_scatter_esimd(sycl::queue& q, const int32_t* dC,
+     LC_TICK();   // #145 军规 132: launch counted at helper entry
+     unsigned rows = M * heads;
+     return q.submit([&](handler& h) {
++    const int* vit_g_ = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+         h.parallel_for(nd_range<1>(range((size_t)rows / 8u * 32u), range(32u)),
+             [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
++                if (vit_g_ && vit_g_[-1] && *vit_g_) { ((int*)vit_g_)[4199] = 2; return; }   // C32: reuse => touch nothing
+             esimd::slm_init<8u * 16u * 4u>();
+             unsigned rh = (unsigned)it.get_group(0) * 8u + (unsigned)it.get_local_id(0) / 4u;
+             unsigned l  = (unsigned)it.get_local_id(0) % 4u;
+@@ -1105,7 +1121,9 @@ inline sycl::event qkv_norm_scatter_v2(sycl::queue& q, const int32_t* dC,
+                                        unsigned tokens) {
+     LC_TICK();   // #145 军规 132: launch counted at helper entry
+     unsigned tasks = M * heads * 3u;      // (row, head, part): part 0=Q 1=K 2=V
++    const int* vit_g_ = vit_gate(g_vit_run_cmd);   // C32 gate (direct parallel_for site)
+     return q.parallel_for(sycl::range((size_t)tasks), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
++        if (vit_g_ && vit_g_[-1] && *vit_g_) { ((int*)vit_g_)[4199] = 2; return; }   // C32: reuse => touch nothing
+         unsigned rh = (unsigned)it.get_id(0);
+         unsigned part = rh % 3u, head = (rh / 3u) % heads, r = rh / (3u * heads);
+         const float rs = as[r];
+@@ -1180,8 +1198,10 @@ inline sycl::event qkv_norm_scatter_vit_esimd(sycl::queue& q, const int32_t* dC,
+     LC_TICK();   // #145 军规 132: launch counted at helper entry
+     unsigned rows = M * heads;
+     return q.submit([&](handler& h) {
++    const int* vit_g_ = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+         h.parallel_for(nd_range<1>(range((size_t)rows / 8u * 32u), range(32u)),
+             [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
++                if (vit_g_ && vit_g_[-1] && *vit_g_) { ((int*)vit_g_)[4199] = 2; return; }   // C32: reuse => touch nothing
+             esimd::slm_init<8u * 16u * 4u>();
+             unsigned rh = (unsigned)it.get_group(0) * 8u + (unsigned)it.get_local_id(0) / 4u;
+             unsigned l  = (unsigned)it.get_local_id(0) % 4u;
