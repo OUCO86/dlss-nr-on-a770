@@ -9,8 +9,9 @@
 #   3. compiles with the /D list in tools/shipped_build.defs (same icx recipe as build_dll.sh)
 #   4. product -> E:\DSH\builds\libxmx_<Tag>.dll   (md5 printed; nothing staged)
 # Guard: s6_ffn_block_kernel.hpp must be the pre-S6_BAR state (md5 490647A9444955B5DE0B9A634A0A317E).
-#   2026-11-09 19:58 C32 re-baseline (parent): 490647A9... -> C38025BB... = SAME pre-S6_BAR state PLUS the
-#   2-line ViT-reuse gate (extern decls + vit_gate() decl after q.submit + early-return before slm_init).
+#   2026-11-09 19:58 C32 re-baseline (parent): add a second accepted state = ViT-reuse gate on top of the
+#   SAME pre-S6_BAR state (extern decls + vit_gate() decl after q.submit + early-return before slm_init).
+#   19:52 second unlock: gated md5 C38025BB (broken copy, externs landed inside a comment) -> 20A44A6E.
 #   Old state is one `git checkout` away; if the ViT-reuse line is dropped, revert this guard too.
 # ASCII only (host shell is Windows PowerShell 5.1; see knife2b.md P8/P11).
 param(
@@ -37,12 +38,13 @@ function Get-Md5Of([string]$p) { (Get-FileHash -LiteralPath $p -Algorithm MD5).H
 # ---- guard: header state must match the shipped basis -------------------------------------
 $hpp = Join-Path $HERE 's6_ffn_block_kernel.hpp'
 $hppMd5 = Get-Md5Of $hpp
-# Two accepted states: pre-gate (490647A9...) = shipped basis; gated (C38025BB...) = same + ViT-reuse gate.
+# Two accepted states: pre-gate (490647A9...) = shipped basis; gated (20A44A6E...) = same + ViT-reuse gate.
+#   (C38025BB... was a BROKEN gate copy: externs landed inside a comment -> syntax error; superseded 19:52.)
 # Anything else (e.g. the reverted S6_BAR experiment) still fails the build.
-if (($hppMd5 -ne 'C38025BBB193D70E350970D048907B7C') -and ($hppMd5 -ne '490647A9444955B5DE0B9A634A0A317E')) {
-  Write-Host "GUARD FAIL: s6_ffn_block_kernel.hpp = $hppMd5 (expected C38025BB... = pre-S6_BAR + ViT gate, or 490647A9... = pre-gate)"; exit 1 }
-Write-Host ("header ok: s6_ffn_block_kernel.hpp = $hppMd5  gate=" + $(if ($hppMd5 -eq 'C38025BBB193D70E350970D048907B7C') {'ON'} else {'OFF'}))
-Write-Host "header ok: s6_ffn_block_kernel.hpp = $hppMd5"
+if (($hppMd5 -ne '20A44A6E090B585FE3731C7FB18BE770') -and ($hppMd5 -ne '490647A9444955B5DE0B9A634A0A317E')) {
+  Write-Host "GUARD FAIL: s6_ffn_block_kernel.hpp = $hppMd5 (expected 20A44A6E... = pre-S6_BAR + ViT gate, or 490647A9... = pre-gate)"; exit 1 }
+Write-Host ("header ok: s6_ffn_block_kernel.hpp = $hppMd5  gate=" + $(if ($hppMd5 -eq '20A44A6E090B585FE3731C7FB18BE770') {'ON'} else {'OFF'}))
+
 foreach ($f in (Join-Path $HERE 'libxmx_sycl.cpp'), $Defs, (Join-Path $Repo 'tools\patch_testdefs.py'), $PY) {
   if (-not (Test-Path -LiteralPath $f)) { Write-Host "MISSING $f"; exit 1 } }
 
