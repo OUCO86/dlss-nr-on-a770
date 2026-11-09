@@ -3480,3 +3480,31 @@ WINDOW_BLOCK RED (9 fails)
 ### ⑤ 现场
 **引擎一行未改、零 git 写由子代理执行、工作树 CLEAN**；两槽 `A2C3009F…` / 3,335,168 B 与三金标时间戳复验未动；状态 `s6/layer1.md §108`（三臂读数 + 判死）与 **§109**（归因铲 + 军规 190 提案）；文件 `s6/c22_vitseg.cpp`、`s6/qkv_resident_f1.hpp`、`s6/pe_c22.ps1`、`s6/c22_build.log`、`s6/C22_io1.log`(OOO 对照)、`C22_io2.log`(in-order)、`C22_p{1,2,3}.log`；
 **⚠ 仪器小坑（已记）**：`pe_c22.ps1` 里 `"...C22_io$InOrder_p$i.log"` 被 PowerShell 解析成变量 `$InOrder_p` ⇒ 日志名实际是 `C22_io1/2.log`，且 **OOO 对照覆盖了 in-order p1 的日志**（读数已落账）；**今后来 `"$name"` 一律写成 `${name}`**。
+
+## 171. ★★★★ **C23-A 判死（F2 在这个几何上没有任何单读形能到 20%），但白送一条更值钱的负发现：现役 `qfuse_take` 在 K=1024 上比它替换掉的拆分对更贵**
+### ① 取证与设计（零 GPU）
+**`pack_a_fused_sr_k<KMAX>` = `src/bench/sycl/pack_device.hpp:85-117`；派发 `pack_a_fused_sr_impl:118-124`（只实例化 64/128/256/512）；入口 `pack_a_fused:126-218`**；
+**K=1024 进不了单读支的四条守卫**：(a) **`:135-136` 名单 `K==64||128||256||512` 不含 1024** ⇒ 落 **`:186-217` 双读通用支**（`:148-179` 的 `K>=2048 && Mp<=512` 两级支也不够格）；(b) **`:102` 载体是 `simd<float,KMAX>` 整行 f32 常驻**，注释 `:137-139` 明说 512-wide GRF 预算只在 K=512 合法；(c) 先例 `quantize_row_kernel.hpp:276-295` 的 rowthread 只到 K=512，**P8-j `:297-345` 把 K>512 全改走 `qr_kernel_rowgroup`（每线程 4-16 GRF 安全区）**；(d) `pack_device.hpp:619-622` 的 b1 教训：**select 偏移必须编译期，runtime 偏移 = spill（+25 ms）**；
+**GRF 账（grf=128 顶格 = 8,192 B/线程）**：**f32@1024 = 行 64 + 量化副本 64 + out 16 = 144 GRF > 128 ⇒ 军规 182 判死**（**K=512 的 72 GRF 与出货 `sr_k<512>` 实测 grf128/scratch=0 对得上**）；
+**两条替代形都建了并过守卫**：**A2 = rowgroup 单读**（64 线程/行、16 half 常驻 + 256 B SLM，逐字照出货 `qr_kernel_rowgroup<1>` 只换 store map）：**`grf128 / simd1 / bar1 / slm1024 / scratch=0`**；**A2b = f16 常驻单线程/行**（`simd<half,1024>` = 32 GRF + 编译期 select）：**`grf128 / simd1 / slm ABSENT / scratch=0`** ⇒ **都不溢出、不新增 SLM 档**。
+### ② 四臂读数与两条门槛（**in-order**；M=192 / Mp=256 / K=N=1024 / flags `0x41100`；3 进程 × reps=3、每进程新建空缓存 986,534 B、串行、腿间 62 s、批前查游戏；min-of-9 ms）
+| 腿/链 | 读数 |
+|---|---|
+| **A0 `pack_a`** | **0.0115 ms** |
+| **A1 `pack_a_fused` 现支（双读）** | **0.0343 ms** |
+| **A2 rowgroup 单读** | **0.0149 ms（比现支快 2.3×）** |
+| A2b f16 常驻单读 | 0.0261 ms |
+| quant 腿 / gemm 腿 | 0.0114 / 0.1609 ms |
+| **C0 = quant + pack_a + gemm** | **0.1760 ms** |
+| C1 = 双读 F2 | 0.1858 ms |
+| **C2 = rowgroup F2（A3）** | **0.1662 ms** |
+| C2b | 0.1760 ms |
+**门槛 (i) A2 vs A0 = +29.6%（A2b +127%）≫ 3% ⇒ 不过**；**门槛 (ii) C2 vs C0 = −5.6%（逐进程 −7.6 / −5.6 / −1.1%，散布与刀同量级）≪ 20% ⇒ 不过**；
+**根因是物理不是形状**：**单读融合 pack 每行搬 3,072 B，而 `pack_a` 只搬 2,048 B（多 50% 字节）**，**而被删的 quant 闭包只值 0.0114 ms、整链 0.176 ms** ⇒ **这个几何上没有任何单读形能碰到 20%**；**⇒ 不进引擎、不建件、四闸未测（按令无需）**；
+**逐位不变已正面证明**：`convert<float>` 精确 + max/abs 结合交换 ⇒ **分段 hmax == 整行 hmax**；`div_ieee(peak,127)`、`div_ieee(v,scale)`、`rnde`、钳位、两级 convert 全与现支同一内在函数；**实测四臂 × 两 pass × 三进程 `dAp2=9fc017fb7b758e88 / 1287=4a280a201d827a1b / 1285=9eb8a400ab167d4c` 一字不差，输入侧七面恒定**。
+### ③ ★ 白送的负发现（值得另排一刀，但价格挂账）
+**(a) 现支的 K=1024 融合比它替换掉的拆分对更贵**：**0.0343（`pack_a_fused` 双读）vs 0.0229（quant + `pack_a`）= +0.011 ms/腿**；**换成 A2 则 0.0149 vs 0.0229 = −0.008 ms/腿 + 少一发**；
+**(b) 改动面极小**：**把 `pack_device.hpp:136` 的 K 名单扩成"1024 → rowgroup 单读"是纯形状改动**（**不新建折叠注册、不碰 `a5_take_qkv` / `qfuse_take` / S6 的"全六或全无"状态机、不新建 WKey**）；
+**(c) 缺的只是普查**：**哪些 `qfuse_take` 位点（`:1859 / :3971 / :4770 / :4956` 里 K==1024 的位点）真在帧里、按军规 187 的 r_seg 各值多少，本轮没做** ⇒ **价格挂账（C24）**，要用 `[qf] take` / `NR_QFUSE_DBG` 定档。
+### ④ 现场
+仓库 `ds-quality-relax-2026-11-02` **工作树全程 CLEAN、零 git 写**；开工 HEAD `ae5de33`、收工 `d98df71`（父级推进）；**引擎与 `pack_device.hpp`/`quantize_row_kernel.hpp` 一行未改**；两槽 `A2C3009F…` / 3,335,168 B 复验未动；三金标未动；**GPU 累计 ≈ 7 个冷进程 ≈ 12 秒**；文件 `s6/c23_packfused.cpp`、`s6/pe_c23.ps1`、`s6/c23_zeinfo.py`、`s6/c23_build.log`、`s6/C23_io1_p{1,2,3}.log`、`s6/C23_batch{,2}.log`、`E:\DSH\tmp\k3ze\c23sep\`、`E:\DSH\tmp\syclcache_c23_{1,2,3}`；状态 **`s6/layer1.md §110`**。
