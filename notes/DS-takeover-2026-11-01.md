@@ -3681,3 +3681,35 @@ WINDOW_BLOCK RED (9 fails)
 **40 门链在 `tmp\c26rt`（候选件）= 27 GREEN / 13 RED**，**RED 全是工装前提不成立**（该目录自报 `ur_adapter_level_zero NOT loaded → backend=1 (OpenCL)`；`gate_skip_graph` 按设计只认槽件身份）⇒ **候选件的门要在正确镜像里跑或 staged 后跑**（已写进军规 197③）。
 ### ⑥ 现场
 主树 **CLEAN**（porcelain 0、引擎 md5 `CC48937E…` = HEAD = 出货同源）；**刀已重导 `E:\DSH\tools\C26_engine_u8.diff` = 51,134 B、9 hunk、+710/−1、LF、UTF-8 无 BOM、`git apply --check` exit 0**；git 只用 apply/checkout，**未 commit/staged/promote**；三金标、四面基线、`shipped_build.defs`、门脚本/golden、受管缓存未动；每腿新建空缓存、腿间 62 s、每腿 `RECORD_FAILED=0`；**GPU ≈ 27 分钟**（预算 60）；日志 `C29_{stamp1,buckets1,zeinfo1}.log`、`C27_{s4fc,s4f,s4pc,s4p,m1c4,m1t8,m1t64,m1t512,m2c4,m2t512,g_off_f}.log`、`gate_*_c29.log`；状态 `s6/layer1.md §116`。
+
+## 178. ★★★★ **C30：单 submit + 设备侧同帧 flag 已落地，但"只守一部分核 = 半复用"是决定性负结果；早退必须全有或全无（C31 正在守全五处）**
+### ① 机制（level 6 = 单 submit + 设备侧同帧 flag，判决链里主机零参与）
+**判据核**（fused 312 / plain 311，保留 `host_cmd+1 != span_from` 的 REFUSED 检查）两次 `parallel_for` 内每 item 用 **`sycl::atomic_ref<…, memory_order::relaxed, memory_scope::device, access::space::global_space>`** 折 `max|Δcode|` / `Σ|Δcode|` 进设备累加器，**最后到达的 item** 把累加器变成 **4 B flag（`vg[0]`）** 并清零备下一帧；**主机只在帧末读 `malloc_host` 镜像写日志，绝不选图**；**`vg[1+闭包]` 的 guardable 标记在 capture 期一次 memcpy 填好**（日志 `LEVEL6 armed: … marked span 313..385 (73 closures)`）⇒ 同一 launch 站点被窗口闭包复用时不误伤；**分配全在 capture 期完成 ⇒ 不在 cgraph record pass 里 `malloc_device`**。
+### ② 闭包 → 核 → 早退插入点全表（49 只真跑 + 24 只已是 no-op）
+| 段内（fused 序号） | 只数 | 实际跑的核 | 插入点 | 本轮 |
+|---|---|---|---|---|
+| 入口 GEMM 313 | 1 | `xmx_rec_gemm` inline dpas | `libxmx_sycl.cpp:4443` | 未改 |
+| `xmx_rec_quant` 318/327… | 8 | `quantize_row_kernel.hpp` / `packdev` | header 核首句 | 未改 |
+| `xmx_rec_gemm_int8` 315/324… | 8 | `gemm_s8_v8_kernel.hpp` 的 `s8v8::gemm_b/gemm32_b` + `.cpp:5144` publish | 两处 | 未改 |
+| `xmx_rec_gemm_int8_residual` 317/322… | 16 | 一半 A5（已守）、另一半 `s6_ffn_block_kernel.hpp`(`s6_ffn_run`) + `b6_res_kernel.hpp` | **s6 受 md5 守卫** | 部分 |
+| qkv/GA 319/320… | 16 | A5 `att5::fused`（已守）与 `window_block_mega.hpp::qkv_norm_scatter_vit_esimd` + `.cpp:5593/5694` | 两处 | 部分 |
+| `quant(FUSED-pack)` | 24 | 已是 no-op（0.103 ms） | 不需要 | n/a |
+**A5 的写法（其余四处照此）**：`att5_fused_kernel.hpp` 的 `fused(...)` 尾加默认参 `const int* vflag = nullptr`，**核体第一句 `if (vflag && *vflag) return;`，位置在 `esimd::slm_init` 之前**（不写 SLM、不写面）；调用点 `a5_att_run` 传 `vit_gbuf()`。
+### ③ ★ 决定性负结果（face/FNV 证据）
+**静止序列、单 submit、只守 A5**：`s6fc`（flag 永不触发）vs `s6f`（flag 在逐位恒等帧触发）⇒ **8×7 面里 34 项 DIFF**（run 0 起 `result/history/head/1267` 就分叉）；
+**机理**：A5 早退而其余段内核照跑 ⇒ **未守的核读到"半新半旧"的面 = 半复用**；**对照 twin 的"整段溶解（闭集）⇒ 逐字节 EXACT"**
+**⇒ 早退只能全有或全无；level 6 在只守一处时不作为可用档。**
+### ④ 读数
+**`REUSE=0` 四闸 4/4 逐字节 EXACT**（早退代码已在件里、`flag=nullptr` 路径）：`254C02B7` / `CACD2029` / `AE050ED1` / `DD49827D` + 槽件控制腿 `exctl` ✓ ⇒ **加守卫不改出货数值**；
+**flag=0 路径净代价**：`s6fc` 稳态 **46.36** vs 基准 `statc` **46.47** ⇒ **≈ 0（−0.11 在噪声内）** ✓；
+**只守 A5 且触发**：`s6f` **45.65 ⇒ −0.71 ms/帧**（= A5 那批 launch 的占比）；plain `s6p` 40.19 vs 基准 40.5-40.9 ⇒ −0.4；
+**对照 twin（全段溶解）= 42.39 ⇒ −4.08** ⇒ **要拿回这个数必须把其余四处核入口守全**（其中 s6 需父级重基线 md5）；
+**遥测内建（不再单独出件）**：`NR_VIT_TRACE=<路径>`（默认 OFF ⇒ 不开文件、不写、不加队列 op）；**level 5 = 只测不跳**（判据核照跑、永不溶解、永不早退 ⇒ 画面按定义与 `REUSE=0` 逐字节相同）；格式 `frame, words_diff, max|Δcode|, sum|Δcode|, verdict`；**开销**：wall `t5off` 50.02 vs `t5tel` 50.52 ⇒ **+0.50 ms/帧**（另一进程 48.36 ⇒ 进程漂移 ±2 ⇒ 诚实说法：代价在噪声内、≤ +0.5）；串行（`NR_RUN_TIMING`）判据 host 闭包 312：0.2072 → 0.2085 ms ⇒ **判据核自身 ≈ 0.13-0.21 ms/帧**，日志那行可忽略；
+**已知缺陷**：**`sum` 用 int32 累加会翻号**（表里出现 `−45,974,272`）⇒ C31 换 64-bit 或每 item 钳到 `1<<16`（`max` 列与 `THMAX` 门不受影响）。
+### ⑤ 现场与交付物
+**主树 CLEAN**（porcelain 0；`.cpp` 回 `CC48937E…` = HEAD；`att5_fused_kernel.hpp` 回 `96222E87…`）；**未 commit / 未 staged / 未 promote**；两槽开工与收工各对账一次 = `A2C3009F…` / 3,335,168 B = `out/SHIPPED_MD5.txt` ✓；三金标、四面基线、`shipped_build.defs`、门脚本、受管缓存未写（只新增 `out\nr_vit_trace*.log` = 允许的日志）；
+**新 md5（只上报）**：`att5_fused_kernel.hpp` `96222E8793E58687C7ABED90D3FDFA10` → **`F063A29371ED86A1EF7238B2306AF520`**；`libxmx_sycl.cpp`（apply 后）= `CF926C9A0424C979D86CCD950547ACE8`；`s6_ffn_block_kernel.hpp` **未改**（build 仍报 `header ok: 490647A9…` ✓）；
+**刀**：`E:\DSH\tools\C30_engine_u8.diff` = **62,911 B、13 hunk、+860/−4、LF、UTF-8 无 BOM、`git apply --check` exit 0**，含两个文件（`att5_fused_kernel.hpp` + `libxmx_sycl.cpp`）；导出器 `tools/wb_c30_export.py` 会列全部改动文件并打印新 md5；**C29 那份 `C26_engine_u8.diff` 是它的子集，续刀只用 C30 这份**；
+**本轮未做（C31 补）**：**ocloc 逐 ELF 对照**、**40 门链**（镜像已按军规 197 设计：`tmp\gatemirror` = 运行时硬链接但排除 `libxmx_sycl.dll` + 候选件副本 + `gatemirror\out\SHIPPED_MD5.txt`）；
+**两次失误已记 §117.5**：整文件 replace 搅坏源码（靠 checkout + 重放刀恢复）；**level 6 首轮被 twin 劫持**（选择块没按档关门 ⇒ 第一批 s6* 读数作废，修成 `lvl ∈ [1,3]` 后才对）；
+**level 4（拆帧）按裁决在 §117.7 记为弃用，原因 = 写域自缚**，不再为它做桶或报收益；**GPU = 12 冷腿 ≈ 13 分钟**，每腿 `RECORD_FAILED=0` ✓。
