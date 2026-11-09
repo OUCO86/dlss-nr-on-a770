@@ -3508,3 +3508,25 @@ WINDOW_BLOCK RED (9 fails)
 **(c) 缺的只是普查**：**哪些 `qfuse_take` 位点（`:1859 / :3971 / :4770 / :4956` 里 K==1024 的位点）真在帧里、按军规 187 的 r_seg 各值多少，本轮没做** ⇒ **价格挂账（C24）**，要用 `[qf] take` / `NR_QFUSE_DBG` 定档。
 ### ④ 现场
 仓库 `ds-quality-relax-2026-11-02` **工作树全程 CLEAN、零 git 写**；开工 HEAD `ae5de33`、收工 `d98df71`（父级推进）；**引擎与 `pack_device.hpp`/`quantize_row_kernel.hpp` 一行未改**；两槽 `A2C3009F…` / 3,335,168 B 复验未动；三金标未动；**GPU 累计 ≈ 7 个冷进程 ≈ 12 秒**；文件 `s6/c23_packfused.cpp`、`s6/pe_c23.ps1`、`s6/c23_zeinfo.py`、`s6/c23_build.log`、`s6/C23_io1_p{1,2,3}.log`、`s6/C23_batch{,2}.log`、`E:\DSH\tmp\k3ze\c23sep\`、`E:\DSH\tmp\syclcache_c23_{1,2,3}`；状态 **`s6/layer1.md §110`**。
+
+## 172. ★★★★ **C24-W1（B 案第一铲：发射顺序 / L2 复用）判死——而且机理上结构性不可达；顺带更正我的一条错误事实**
+### ① 方向审计：**0 只核是坏方向**（表 `tools/C24_walkorder_audit.csv`，13 行 × 13 列；复核脚本 `tools/c24_verify.py`）
+**按 `path_membership.csv` 帧价取前 8 只闭包 → 身份解析后 = 6 只真核**（closure 1 = v4ph(pool)、690 = v4ph(head)、5/684/688 = v4full、689 = `launch_ffn_chip_cs2<16,false>`、0 = `launch_ffn_chip<32>`、680 = unary2 lambda），**再补两族聚合帧价最高的**（`s8v8::gemm_b_res` 6.796、`wares::launch_wa_res` 5.277）：
+- **有列维的 gemm 实例（11 处 s8v8 + s8v9 + qres + 8 处 f16v1 + 2 处 f16v2）全部 `col = loc % NB` 在内层** ⇒ **相邻组共享同一个 BM=128 的 A 行块**（32 KB @K=256 … 512 KB @K=4096）= **好方向**；**翻成 row-inner 会让 B 面被重读 MB 次（最多 255）⇒ 严格更坏**；
+- **6 只连跨组列维都没有**：WB 两形（`window = get_group(0)`，一组 = 一个 8×8 窗口）、WA 两形（`b/w = get_group(0)`）、ffn 两形（`tr = wg*LW + lid`，32 列在 WG 内部劈）⇒ **没有可翻的东西**；它们共享的只有权重+bias 面 **16-25 KB/组**，而该面总量 = **L2 的 0.10-0.15%** ⇒ 同一份常驻；
+- `unary2`（closure 680）通道在最内层（`cc = index % 32`）⇒ 32 个相邻 item 读同一源像素 = 好；`qr_launch_esimd` 逐行读一次写一次；
+- **位不变证明成立**（`t → (tr,tc)` 是 tile 集上的双射，tile 体内 `kb` 循环与 4 条 dpas 次序、store 的 `gr/gc` 表达式都不含 tr/tc 的奇偶或边界分支；`Mp` 已按 BM 补齐、`N % BN == 0` 由 recorder 硬门保证）**但无收益可取**；
+- **死分支已排除（军规 175）**：`s8v9::gemm_b_rq` 在 `:4187` 是 `if (false && …)`；`v9b` 在 `:4216-4224` 默认 OFF（`NR_V9B=1` 才走）。
+### ② 发号探针实测（`s6/c24_walkorder3.cpp`；读数 `tools/C24_walkorder_probe.csv` 21 行；3 进程、每进程新建空缓存、`in_order`、串行、腿间 62 s、零业务面）
+- **SYCL 1-D 的组不是单调升序起**：`asc ≈ desc ≈ 50%`；`mean|gid − rank| = 443/447/453`（G=8349、LW=64）、517-636（G=2135）、239-244（G=1020 LW=32）、264-266（LW=16）、129-132（G=512）、89-92（G=320）；**同波内部顺序逐次不可复现**（背靠背 ×5 的 rank→gid 差异 8336/8349，但 `perm_bad=0` ⇒ 每程都是合法排列）；
+- **内部结构 = 宽 32 组的带状派发**：一波（W = 4096/LW，军规 149）的起始里 `gid mod 32` 覆盖全部 32 个剩余类、`gid/32` 只覆盖 W/32 个商 ⇒ **IGC/L0 把 1-D 组区间铺到一张 32 组宽的 2-D 组网格上按带派发** ⇒ 对 `col = gid % NB`（帧内 NB ∈ {1,2,4,8,16,64}）**除 NB=64 外同一 A 行块的 NB 只 tile 落在同一条 32 带内 ⇒ 同波共存 ⇒ 我们现有的好方向确实生效**；
+- **`nd_range<2>` 是否 Y 最快**：**引擎活路里只有两只 2-D（`quantize_row_kernel.hpp:181/:382`）——⚠ 我先前说"我们引擎里 2-D/3-D 发射次数 = 0"是错的（grep 漏了不带显式 `<2>` 的 `nd_range(`），公开更正**；**但 `QR_GRID = 65535` ⇒ 帧内全部 quant 形状 `ngroups ≤ 8,160` ⇒ `gy ≡ 1` ⇒ Y 维从未被使用 ⇒ 上游 Y-fastest 病理对我们结构性不可达**；**对照臂（GX=4/GY=64）首批 32 起始 = 每个 gy 的 4 个 gx 全到、gy 段之间散序 ⇒ X 内层 + 段间散序，与上游"Mesa X / Windows Y"的干净二态都不同**；
+- **每组起始没有 µs 级间距**：空-launch 地板 = 110/113/142 µs；G=8349 墙钟 = 157-174 µs ⇒ **整张网格在 47-64 µs 内全部起完 = 平均 5.6-7.7 ns/组**；G ≤ 2135 的臂全贴地板（≲5 ns/组）；**时钟分辨率 1.8-6.3 µs/跳 ⇒ 94% 相邻起始落在同一跳**；
+**⇒ 上游"短 K GEMM 在 Windows 被逐 column block 从 DRAM 重读 A"的时间尺度在我们这里不存在：组是成批涌入，不是排队进场。**
+### ③ 为什么翻也没钱（容量侧）
+**帧内 gemm 的 A/B 两面都装得进 L2**：最大形 `gemm_int8_residual` M=192, N=1024, K=4096 ⇒ A 1,048,576 B + B 4,194,304 B = **31.2% of 16 MB**；`qres` ≤ 2.4 MB；`f16v2` 最大 B 面 8,355,840 B = 51% ⇒ **"重读"发生在 L2 内而非 DRAM**；**既有旁证**：`tools/l2_traffic_model.csv`（11-05）对这些形改 BN（等价于改重读次数）测得 **−0.8% .. +1.5%**；`tools/traffic_breakdown.csv` 对 M=32640/N=64/K=64 记 **A_reread 0.065 MB、B_reread 0.033 MB、残差面 4.178 MB ⇒ 该腿的钱在 skip/C 面（军规 178），不在 tile 顺序**。
+### ④ 仪器两条坑（进军规 194）
+**(a) 跨片可见性不能用 `volatile` 全局读**（每片 L1 不一致 ⇒ 自旋臂烧满迭代上限，v2 因此每腿假性 2.03 s，b7 读数只能当结构统计用）；**(b) 发号探针的共享计数器必须按 256 B 分行**，否则原子争用把时钟压到 µs/跳、**把 ns/组 的量级读成 µs/组（差 3 个数量级）**。
+### ⑤ 判定与现场
+**第 3 步未触发（前置条件为空：没有坏方向的核）；引擎未动 ⇒ 无 diff、无 `C24_wip.diff`、无需四闸**；**B 案第一铲（W1）关闭**；若还要这条杠杆，唯一有物理意义的实验是 `s8v8::gemm_b_res` 的 M=192/N=1024/K=4096（NB=16/MB=2），**预测降幅 ≈ 0，不建议花 GPU**；
+`git status --porcelain` 空、**零 git 写**；两槽 `A2C3009F…` / 3,335,168 B 复验未动；三金标未动；只写了 `E:\DSH\s6\**` 与 `E:\DSH\tools\**`；状态 `s6/layer1.md §111`；文件 `s6/c24_walkorder{,2,3}.cpp`、**`s6/pe_c24.ps1`（新工装，带 `-Src/-Exe/-Batch`，`BusyWait` 已含 `LOP-Win64-Shipping`+`nr_replay_now`+`icx`+`ocloc`）**、`s6/C24_walk_b{4,7,8}_p{1,2,3}.log`、`tools/C24_walkorder_audit.csv`、`tools/C24_walkorder_probe.csv`、`tools/c24_join.py`、`tools/c24_verify.py`、`tools/c24_mkprobe_csv.py`。
