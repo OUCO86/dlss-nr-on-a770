@@ -3713,3 +3713,34 @@ WINDOW_BLOCK RED (9 fails)
 **本轮未做（C31 补）**：**ocloc 逐 ELF 对照**、**40 门链**（镜像已按军规 197 设计：`tmp\gatemirror` = 运行时硬链接但排除 `libxmx_sycl.dll` + 候选件副本 + `gatemirror\out\SHIPPED_MD5.txt`）；
 **两次失误已记 §117.5**：整文件 replace 搅坏源码（靠 checkout + 重放刀恢复）；**level 6 首轮被 twin 劫持**（选择块没按档关门 ⇒ 第一批 s6* 读数作废，修成 `lvl ∈ [1,3]` 后才对）；
 **level 4（拆帧）按裁决在 §117.7 记为弃用，原因 = 写域自缚**，不再为它做桶或报收益；**GPU = 12 冷腿 ≈ 13 分钟**，每腿 `RECORD_FAILED=0` ✓。
+
+## 179. ★★★★ **C31：找到可扩展的守法（每只 launcher 只加 2 行、调用点一行不改），已守 12 处；但覆盖仍不完整 ⇒ 半复用未消 ⇒ 不可交付。部分早退只赚 −1.02（fused）/ −1.6（plain）ms/帧**
+### ① ★ 守法（本铲真正的产出，后续全照此）
+`.cpp` 的 **`lc_begin(int i)`**（plain-loop / record pass / warm pass 三条路径都调）顺手记 **`g_vit_run_cmd = i`** ⇒ 运行期"当前第几只闭包"随时可得；新 helper **`vit_gate(cmd)`** 返回 `g_vit_vg + 1 + cmd`（level<6 或越界 ⇒ `nullptr`）；
+**header launcher 在 `q.submit` 前一行**：`const int* vit_g_ = vit_gate(g_vit_run_cmd);`（**被核 lambda 的 `[=]` 自动捕获**）+ **核体第一句**（在 `esimd::slm_init` 之前 ⇒ 不写 SLM、不写面）：`if (vit_g_ && vit_g_[-1] && *vit_g_) return;`
+（`gate[-1]` = `vg[0]` = 本帧 flag；`*gate` = 本闭包是否在被标的 span 内）⇒ **每个 launcher 只加 2 行、调用点一行不改**；flag 在 capture 期 memset、marks 一次 memcpy ⇒ **全 in-order、主机零参与**。
+### ② 覆盖进度：**已守 12 处 / 未守 4 处**
+**已守**：`att5_fused_kernel.hpp::fused`（C30）+ **`gemm_s8_v8_kernel.hpp` 全部 11 只 launcher**（`gemm / gemm_b / gemm32_b / gemm32 / gemm_b_pub / gemm32_b_pub / gemm_b_pub_slm / gemm_b_res / gemm_b_res_batch / gemm_b_res8 / gemm_b_res_window`：11 个 submit 点 + 11 个核体首句）；
+**未守（工作单，按 ms 从大到小，含为什么这刀没做）**：
+| 未守点 | 段内只数 | ms | 原因 / 修法 |
+|---|---|---|---|
+| `s6_ffn_block_kernel.hpp`(`s6_ffn_run`) + `b6_res_kernel.hpp` | residual 16 的非 A5 半边 | **~6.0** | **md5 守卫**：`build_shipped.ps1:37` 见 `490647A9…` 不符就 `exit 1` ⇒ 改它就没件可编；**重基线归父级（`shipped_build.defs`）** |
+| `window_block_mega.hpp`（`qkv_norm_scatter_vit_esimd` 等） | qkv 8 | 1.90 | 同一 2 行式改后 **icx exit=1**（那里的 lambda 不是 `[=]` 捕获 ⇒ `vit_g_` 进不去）⇒ 已 `git checkout` 回退未留伤；**修法 = 给 ~11 处 lambda 捕获表补 `vit_g_`** |
+| `quantize_row_kernel.hpp`（`qr_launch_esimd` / `qr_kernel_rowthread<K>` / rowgroup） | quant 8 | 0.80 | 核体是 **functor 工厂** ⇒ gate 要做成 functor 成员字段，每 K 档（64/128/256/512/1024/2048/4096）都改 |
+| `f16v1::gemm`（入口 GEMM）+ `.cpp:4443/5144/5593/5694` inline 核 | 1 + GA 8 | **~4.0** | **纯 `.cpp` 定点 edit 就够、风险最低 ⇒ 最先做** |
+### ③ 修复与缺口
+**64-bit sum 已修**：`g_vit_acc` → `long long*`（4 cells：max / sum / arrived / 备用），三处 `atomic_ref` 全改 `long long`，`asum.fetch_add((long long)sm)` 去掉每 item 钳位，写 `hf` 时才钳进 int（只为日志）⇒ **`−45,974,272` 这类翻号值从源头消除**（**本轮未重跑 trace 腿 ⇒ 复验排下一刀第一条腿**）；
+**level 6 的 face 自证缺口**（军规 196②）：本轮 `stamp run=… f1287=` **0 次** —— 因为 stamp 只挂在 twin 路径（level 6 没有 twin）⇒ **下一刀在早退分支里补 2 行 stamp 写**（`if (gate && gate[-1] && *gate) { 写 magic+计数进 1287; return; }`）。
+### ④ 验收读数
+**`REUSE=0` 四闸逐字节 EXACT**（fused 1301 `254C02B7` / features `CACD2029` / result `AE050ED1` + plain 1301 `DD49827D` + 槽件控制腿）⇒ **加守卫不动出货数值** ✓；
+**静止 8 帧 × 7 面逐帧 FNV：`s6fc` vs `s6f` = DIFF 34/56** ⇒ **半复用仍在**（run 0 起 `result/history/head/1267` 分叉）⇒ **覆盖率不完整时 (A) 不可交付**；**这条 face 测试就是检测器**；
+**帧 ms**：`statc` 46.47（基准）｜`s6fc` **45.58**（level 6、flag 不触发；比基准 −0.89 ⇒ **不是收益，是调度扰动，需要专门对照腿**）｜`s6f` **44.56**（触发、部分覆盖 ⇒ vs `s6fc` **−1.02 ms/帧** = 已守 12 处的占比）｜`s6p` **38.99**（plain 触发 ⇒ vs plain 基准 40.6-40.9 = **−1.6**）｜对照 `statf`（twin 全段溶解）42.39 = **−4.08**；
+**⇒ 部分早退只拿回约 25% 收益且画面变；只有守全 73 才既拿 −4 量级又保 EXACT。**
+### ⑤ 守卫与门链
+**ocloc 逐 ELF**（A = 槽件 4 ELF / 271 实例，B = c31d level-6 缓存 5 ELF / 276；log `C31_zeinfo1.log`）：**`scratch≠0 = 0` ✓、`grf>128 = 0` ✓**；新增 7 = 判据核 + `xmx_graph_run_one` 改名两对 + `vit_reuse_apply` 的 lambda；删除 2 = 旧 `xmx_graph_run` 两只 lambda（改名不是丢核）；**共有实例 metadata 变化 = 1，且只是 `Intel_Symbol_Table_Void_Program`（符号表占位，不是核）** ⇒ **11 只 s8v8 GEMM + att5 核的 `grf/simd/slm/scratch` 逐字段不变 ⇒ +1 load +1 branch 没溢出、没落 spill** ✓（`slm` 一律 ABSENT；**ocloc 不输出指令计数 ⇒ dpas 只能表述为"ELF 实例集合里没有核被增删"**）；
+**40 门链（`tmp\gatemirror`，军规 197 配方）= 27 GREEN / 13 RED，13 个 RED 全是工装前提不是刀**：镜像按令搭（运行时硬链接但**排除 `libxmx_sycl.dll`**、候选件**副本**命名之、非 DLL 输入复制、`gatemirror\out\SHIPPED_MD5.txt` = 候选件 md5、新建空缓存）；**12 只数值门 RED 的原因** = 门日志自报 `[xmx_init] ur_adapter_level_zero NOT loaded yet` ⇒ `backend=1 (OpenCL)` ⇒ 在 OpenCL 上跑（`gate_unary` 528 differ/maxulp=1048576、`gate_vit_softmax` reciprocals bits-equal=False、`gate_global_attention` 193 outside-one、`gate_window_block` target differs）；**对照能跑的腿**（同一批 DLL、宿主 = `nr_replay_c27.exe`）：`ur_adapter_level_zero ALREADY loaded` ⇒ `backend=2` 先枚举 ⇒ L0 正常 ⇒ **差别在宿主进程**（门的宿主是 dsh 运行时的 `python.exe`，适配器不在其 exe 目录）；**把 5 只关键 DLL 改成真副本再跑 3 只门 ⇒ 仍 0 GREEN / 3 RED ⇒ 排除 hard-link 因**；**`gate_skip_graph` RED** = `FAIL 缺 out/SHIPPED_MD5.txt —— 身份守卫`，而该文件确实存在 ⇒ **它找的不是 `$RUNDIR/out/` 这个位置，镜像配方还差这一条**；**复现性**：C29 在 `c26rt` 跑同一门链得到**一模一样的 27/13 名单** ⇒ 两次独立复现 ⇒ **RED 集合稳定 = 工装性质**；**⇒ 门链等 staged 之后在 `oneapi` 一侧由父级跑**。
+### ⑥ 件、刀、新 md5、现场
+**三版都 icx exit=0**：`c31a-…184020`（`91CD3853…` 3,422,720 B = 只修 64-bit sum）→ `c31b-…184233`（`70166362…` 3,427,840 B = gate 管道 + s8v8 11 处）→ **`c31d-…184408` = `B80CD8915D1324E96908CAF334A39BB3`，3,427,840 B（出表版）**；`c31c-…184350` 编译失败（wbmega 未捕获 ⇒ 已回退该 header 未留伤）；
+**新 md5 只上报、未写 `shipped_build.defs`**：`att5_fused_kernel.hpp` `96222E87…` → **`CC14B1486C097539445C2F563D25ABE6`**；`gemm_s8_v8_kernel.hpp` `E2991804…` → **`C9AA3CBD94BF5D6BE6DC552EBECE45A4`**；`libxmx_sycl.cpp`（apply 后）= **`C3A7A43BA19932B280C115498FFFE7CC`**；`s6_ffn_block_kernel.hpp` 未改（仍 `490647A9…` ✓）；`window_block_mega.hpp` 未改（仍 `872DA837…`）；
+**刀** = `E:\DSH\tools\C31_engine_u8.diff`：**74,206 B、26 hunk、+901/−5、LF、UTF-8 无 BOM、`git apply --check` exit 0**（含三文件；清单与新 md5 由 `tools/wb_c30_export.py` 打印）；
+**现场**：porcelain 0、`.cpp` 回 `CC48937E…` = HEAD、两 header 回 HEAD；未 commit/staged/promote；两槽两次对账均 `A2C3009F…` / 3,335,168 B = `out/SHIPPED_MD5.txt` ✓、`fsutil hardlink list` 只剩一条 ✓；三金标、四面基线、`shipped_build.defs`、门脚本/golden、受管缓存未写（只新增 `out\nr_vit_trace*.log` + `tmp\gatemirror`、`tmp\syclcache_c31gates`）；每腿新建空缓存、腿间 62 s、每腿 `RECORD_FAILED=0`；**GPU ≈ 17 分钟**（预算 45）；状态 `s6/layer1.md §118`。
