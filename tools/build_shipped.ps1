@@ -9,6 +9,9 @@
 #   3. compiles with the /D list in tools/shipped_build.defs (same icx recipe as build_dll.sh)
 #   4. product -> E:\DSH\builds\libxmx_<Tag>.dll   (md5 printed; nothing staged)
 # Guard: s6_ffn_block_kernel.hpp must be the pre-S6_BAR state (md5 490647A9444955B5DE0B9A634A0A317E).
+#   2026-11-09 19:58 C32 re-baseline (parent): 490647A9... -> C38025BB... = SAME pre-S6_BAR state PLUS the
+#   2-line ViT-reuse gate (extern decls + vit_gate() decl after q.submit + early-return before slm_init).
+#   Old state is one `git checkout` away; if the ViT-reuse line is dropped, revert this guard too.
 # ASCII only (host shell is Windows PowerShell 5.1; see knife2b.md P8/P11).
 param(
   [string]$Tag  = 'ship1',
@@ -34,8 +37,11 @@ function Get-Md5Of([string]$p) { (Get-FileHash -LiteralPath $p -Algorithm MD5).H
 # ---- guard: header state must match the shipped basis -------------------------------------
 $hpp = Join-Path $HERE 's6_ffn_block_kernel.hpp'
 $hppMd5 = Get-Md5Of $hpp
-if ($hppMd5 -ne '490647A9444955B5DE0B9A634A0A317E') {
-  Write-Host "GUARD FAIL: s6_ffn_block_kernel.hpp = $hppMd5 (expected 490647A9... = pre-S6_BAR state)"; exit 1 }
+# Two accepted states: pre-gate (490647A9...) = shipped basis; gated (C38025BB...) = same + ViT-reuse gate.
+# Anything else (e.g. the reverted S6_BAR experiment) still fails the build.
+if (($hppMd5 -ne 'C38025BBB193D70E350970D048907B7C') -and ($hppMd5 -ne '490647A9444955B5DE0B9A634A0A317E')) {
+  Write-Host "GUARD FAIL: s6_ffn_block_kernel.hpp = $hppMd5 (expected C38025BB... = pre-S6_BAR + ViT gate, or 490647A9... = pre-gate)"; exit 1 }
+Write-Host ("header ok: s6_ffn_block_kernel.hpp = $hppMd5  gate=" + $(if ($hppMd5 -eq 'C38025BBB193D70E350970D048907B7C') {'ON'} else {'OFF'}))
 Write-Host "header ok: s6_ffn_block_kernel.hpp = $hppMd5"
 foreach ($f in (Join-Path $HERE 'libxmx_sycl.cpp'), $Defs, (Join-Path $Repo 'tools\patch_testdefs.py'), $PY) {
   if (-not (Test-Path -LiteralPath $f)) { Write-Host "MISSING $f"; exit 1 } }
