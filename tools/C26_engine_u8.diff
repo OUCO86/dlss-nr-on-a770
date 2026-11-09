@@ -1,5 +1,5 @@
 diff --git a/src/bench/sycl/libxmx_sycl.cpp b/src/bench/sycl/libxmx_sycl.cpp
-index ac28b43..4eb711b 100644
+index ac28b43..0ba867d 100644
 --- a/src/bench/sycl/libxmx_sycl.cpp
 +++ b/src/bench/sycl/libxmx_sycl.cpp
 @@ -1543,6 +1543,7 @@ int xmx_buf_destroy(int id) {
@@ -25,7 +25,7 @@ index ac28b43..4eb711b 100644
      return 0; }
  
  // ==================== NR_SKIP_CHAINS: whole-block-chain skip (2026-11-02, B2 跳块铲) ====
-@@ -1713,6 +1716,384 @@ static void skip_chains_apply(std::vector<std::function<void()>>& cmds,
+@@ -1713,6 +1716,449 @@ static void skip_chains_apply(std::vector<std::function<void()>>& cmds,
      std::fflush(stdout);
  }
  
@@ -78,6 +78,7 @@ index ac28b43..4eb711b 100644
 +static std::vector<VitGemmNote>  g_vit_gemm;        // record-scoped GEMM notes
 +static std::vector<VitUnaryNote> g_vit_unary;       // record-scoped UNARY notes
 +static std::vector<VitChain> g_vit_chains;          // resolved at capture time
++static std::vector<char> g_vit_kill;                // C27: per-closure "dissolve in the twin"
 +static size_t g_vit_span_from = 0, g_vit_span_to = 0;   // the dissolved span (S2)
 +static std::vector<std::function<void()>> g_vit_twincmds;
 +static bool  g_vit_twinready = false;
@@ -316,7 +317,9 @@ index ac28b43..4eb711b 100644
 +    if (!g_vit_shadow) g_vit_shadow = (sycl::uint4*)sycl::malloc_device(halfs * 2u, *GQ);
 +    if (g_vit_items2 && !g_vit_shadow2)
 +        g_vit_shadow2 = (sycl::uint4*)sycl::malloc_device(halfs2 * 2u, *GQ);
-+    if (!g_vit_dcnt)   g_vit_dcnt   = (int*)sycl::malloc_shared((g_vit_items + g_vit_items2) * 4u, *GQ);
++    if (!g_vit_dcnt)   g_vit_dcnt   = (getenv("NR_VIT_VREAD") && strcmp(getenv("NR_VIT_VREAD"), "shr") == 0)
++        ? (int*)sycl::malloc_shared((g_vit_items + g_vit_items2) * 4u, *GQ)
++        : (int*)sycl::malloc_device((g_vit_items + g_vit_items2) * 4u, *GQ);
 +    if (!g_vit_shadow || !g_vit_dcnt || (g_vit_items2 && !g_vit_shadow2)) {
 +        std::printf("[vit-reuse] graph=%d REFUSED: criterion buffers did not allocate\n", graphid);
 +        std::fflush(stdout); g_vit_chains.clear(); return;
@@ -360,19 +363,47 @@ index ac28b43..4eb711b 100644
 +                });
 +        };
 +    }
-+    // ---- the twin closure list: SAME count, the segment (or the chains) dissolved ----
-+    g_vit_twincmds = cmds;
-+    size_t noops = 0;
-+    if (segmode) {
-+        for (size_t i = g_vit_span_from; i <= g_vit_span_to; ++i) { g_vit_twincmds[i] = [](){}; ++noops; }
-+    } else {
++    // ---- the twin closure list: SAME count, the selected SPAN dissolved. C27 adds the
++    // bisect sets (entry / attn / ffn) so the "which half moves `result`" question can be
++    // answered without touching anything else in the mechanism. ----
++    const char* setname = vit_reuse_set();
++    auto in_chain = [&](size_t i) -> bool {
 +        for (const VitChain& c : g_vit_chains)
-+            for (size_t i = c.from; i <= c.to; ++i) { g_vit_twincmds[i] = [](){}; ++noops; }
++            if (i >= c.qcmd && i <= c.to) return true;
++        return false;
++    };
++    g_vit_kill.assign(cmds.size(), 0);
++    size_t noops = 0;
++    if (!segmode) {                                   // chain: the C25 S1 set
++        for (const VitChain& c : g_vit_chains)
++            for (size_t i = c.from; i <= c.to; ++i)
++                if (!g_vit_kill[i]) { g_vit_kill[i] = 1; ++noops; }
++    } else if (strcmp(setname, "entry") == 0) {       // S-a: only the ViT entry GEMM
++        g_vit_kill[g_vit_span_from] = 1; noops = 1;
++    } else if (strcmp(setname, "attn") == 0) {        // S-b: only the 8 attention chains
++        for (const VitChain& c : g_vit_chains)
++            for (size_t i = c.qcmd; i <= c.to; ++i)
++                if (!g_vit_kill[i]) { g_vit_kill[i] = 1; ++noops; }
++    } else if (strcmp(setname, "ffn") == 0) {         // S-c: only the 8 FFN sub-blocks
++        for (size_t i = g_vit_span_from + 1; i <= g_vit_span_to; ++i)
++            if (!in_chain(i)) { g_vit_kill[i] = 1; ++noops; }
++    } else {                                          // S-d: the whole segment (C26)
++        for (size_t i = g_vit_span_from; i <= g_vit_span_to; ++i)
++            if (!g_vit_kill[i]) { g_vit_kill[i] = 1; ++noops; }
 +    }
++    if (g_vit_kill[host_cmd]) {
++        std::printf("[vit-reuse] graph=%d REFUSED: set=%s would dissolve the criterion host "
++                    "cmd=%zu -- the verdict would stop being produced\n", graphid, setname,
++                    host_cmd);
++        std::fflush(stdout); g_vit_chains.clear(); return;
++    }
++    g_vit_twincmds = cmds;
++    for (size_t i = 0; i < g_vit_kill.size(); ++i)
++        if (g_vit_kill[i]) g_vit_twincmds[i] = [](){};
 +    g_vit_twinready = true;
 +    std::printf("[vit-reuse] graph=%d level=%d set=%s chains=%zu span=%zu..%zu noop=%zu "
 +                "criterion cmd=%zu face=%p halfs=%zu items=%zu face2=%p items2=%zu\n",
-+                graphid, lvl, segmode ? "segment" : "chain", g_vit_chains.size(),
++                graphid, lvl, setname, g_vit_chains.size(),
 +                g_vit_span_from, g_vit_span_to, noops, host_cmd, g_vit_face, halfs, g_vit_items,
 +                g_vit_face2, g_vit_items2);
 +    std::fflush(stdout);
@@ -382,6 +413,22 @@ index ac28b43..4eb711b 100644
 +// extra sync point is added to the frame.
 +static void vit_verdict_update(void) {
 +    const int lvl = vit_reuse_level();
++    // C27 DIAGNOSTIC ONLY (attribution of the run-1 divergence): NR_VIT_DELAY=<microseconds>
++    // inserts a pure host pause at this point in the inter-frame gap -- no queue op, no
++    // memory read -- and NR_VIT_NOREAD=1 suppresses the counter read entirely. If a bare
++    // pause reproduces the same divergence, the frame is TIMING-sensitive (an intra-frame
++    // order hazard in the shipped graph), and no property of the reuse or of the read is
++    // implicated.
++    {
++        static int delay_us = getenv("NR_VIT_DELAY") ? atoi(getenv("NR_VIT_DELAY")) : 0;
++        if (delay_us > 0) {
++            auto t0 = std::chrono::steady_clock::now();
++            while ((int)std::chrono::duration_cast<std::chrono::microseconds>(
++                       std::chrono::steady_clock::now() - t0).count() < delay_us) {}
++        }
++    }
++    static int noread = getenv("NR_VIT_NOREAD") ? 1 : 0;
++    if (noread) { g_vit_lastdiff = -3; return; }   // keeps skip_next as-is (0 at start)
 +    if (!lvl || g_vit_twin < 0) { g_vit_skip_next = 0; return; }
 +    if (lvl == 2) { g_vit_skip_next = 1; return; }   // force skip (the quality instrument)
 +    if (lvl == 3) { g_vit_skip_next = 0; return; }   // never skip (prices the criterion)
@@ -389,7 +436,25 @@ index ac28b43..4eb711b 100644
 +    // criterion verdict exists yet.
 +    if (!g_vit_ran_once) { g_vit_skip_next = 0; g_vit_lastdiff = -2; return; }
 +    long tot = 0;
-+    for (size_t i = 0; i < g_vit_items + g_vit_items2; ++i) tot += g_vit_dcnt[i];
++    // C27 attribution: the counters are now DEVICE memory and come over by an explicit
++    // memcpy, instead of the host dereferencing malloc_shared pages (the shipped replay
++    // already host-syncs at this point -- ext_oneapi_graph(...).wait() -- so this adds no
++    // new sync KIND, only a 9 KB copy). Reason: with the shared-USM dereference the frame
++    // trajectory diverged from the never-read control (REUSE=3) at run 1, i.e. BEFORE any
++    // skip and identically for every skip set (entry/attn/ffn/segment) -- so the read
++    // itself, not the reuse, was the perturbation. NR_VIT_VREAD=shr restores the old path.
++    static int vread_dev = getenv("NR_VIT_VREAD") && strcmp(getenv("NR_VIT_VREAD"), "shr") == 0 ? 0 : 1;
++    const size_t n = g_vit_items + g_vit_items2;
++    static int* hs = nullptr;
++    if (vread_dev) {
++        if (!hs) hs = (int*)malloc(n * 4u);
++        if (hs) {
++            GQ->memcpy(hs, g_vit_dcnt, n * 4u).wait();
++            for (size_t i = 0; i < n; ++i) tot += hs[i];
++        }
++    } else {
++        for (size_t i = 0; i < n; ++i) tot += g_vit_dcnt[i];
++    }
 +    g_vit_lastdiff = tot;
 +    static int th = getenv("NR_VIT_REUSE_TH") ? atoi(getenv("NR_VIT_REUSE_TH")) : 0;
 +    g_vit_skip_next = (tot <= (long)th) ? 1 : 0;
@@ -410,7 +475,7 @@ index ac28b43..4eb711b 100644
  // ==================== KNIFE 1: NR_BMERGE -- same-shape residual legs merged into ONE launch ====
  // notes/shape-merge-plan.md 7.1 knife 1, A3 slice (xmx_rec_gemm_int8_residual: 16 sites of
  // 2040x256x256 + 12 sites of 8160x128x128, all ALIVE on the load slot per tools/shapes_alive.csv).
-@@ -2331,6 +2712,7 @@ int xmx_graph_capture(void) {
+@@ -2331,6 +2777,7 @@ int xmx_graph_capture(void) {
      // graph is stored (default empty => this function is never entered; see the block above).
      skip_chains_apply(g_cmds, g_cmd_names, (int)g_graphs.size());
      bmerge_apply(g_cmds);      // KNIFE 1: runs AFTER the skip pass, so skipped legs cannot merge
@@ -418,7 +483,7 @@ index ac28b43..4eb711b 100644
      bmerge_order_apply();      // B step 2 (i): presence-gated REORDER (NR_BMERGE_ORDER), default off
      bmerge_order_report();     // what it moved, so the declared-set check has something to read
      pgraph_final_dump();       // the FROZEN touch sets, i.e. after any reorder -- [pgt] cannot show it
-@@ -2354,12 +2736,48 @@ int xmx_graph_capture(void) {
+@@ -2354,12 +2801,48 @@ int xmx_graph_capture(void) {
      g_pending_fold_slot = SIZE_MAX; g_fold_slot.clear(); // with the stream (10-27 audit)
      s6_reset();                                          // S6 chain candidate: ditto
      g_recording = false;
@@ -468,7 +533,7 @@ index ac28b43..4eb711b 100644
      int passes = (int)g_graphs[id].size();
      g_lc_vec = ((size_t)id < g_graph_launch.size() && g_graph_launch[id].size() == g_graphs[id].size())
                 ? &g_graph_launch[id] : nullptr;
-@@ -3821,6 +4239,8 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
+@@ -3821,6 +4304,8 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
      if (!g_recording) FAILMSG("not recording");
      if (!M || !N || !K || (N % 16u) || (K % 16u))
          FAILMSG("gemm f16 needs N%%16==0, K%%16==0 (our tile)");
@@ -477,7 +542,7 @@ index ac28b43..4eb711b 100644
      const bool transposed = (bt & 1u) != 0u;   // scores leg: B stored (N,K), ldb->K
      if (bt & 0x800000u) FAILMSG("pooled window residual belongs to the window_block family");
      auto ia = g_bufs.find(a), ib = g_bufs.find(b), ic = g_bufs.find(c);
-@@ -4430,6 +4850,8 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
+@@ -4430,6 +4915,8 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
      const size_t na = (size_t)Mp * C, nb = (size_t)NH * C;
      g_cmd_names.push_back(__func__);
      pgraph_ids({a,b,q,k,v,a_scale,b_scale,qkv_scale});   // PGRAPH touch-set (conservative: every operand id)
@@ -486,7 +551,7 @@ index ac28b43..4eb711b 100644
          flop_note("int8_qkv",M,3u*channels,channels,1);
          if (getenv("NR_SHAPE_DUMP")) { static long qv=0,qnv=0; if(flags&0x2000u) qv++; else qnv++;
              std::printf("[qkv-vit] vit=%ld nonvit=%ld (running)\n", qv, qnv); }
-@@ -5126,6 +5548,8 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
+@@ -5126,6 +5613,8 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
      static int ustop = getenv("NR_U_STOP") ? atoi(getenv("NR_U_STOP")) : 0;
      if (ustop == 9) { g_cmd_names.push_back(__func__);pg_push([](){}); return 0; }
      pgraph_ids({a,b,c,d});   // PGRAPH touch-set (conservative: every operand id)
@@ -495,7 +560,7 @@ index ac28b43..4eb711b 100644
      const unsigned flags = kind;                 // the plan's arg0 IS the flags word
      const unsigned sub = flags & 0xFFu;
      auto ia = g_bufs.find(a), ic = g_bufs.find(c);
-@@ -6757,6 +7181,8 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
+@@ -6757,6 +7246,8 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
      static int qstop = getenv("NR_Q_STOP") ? atoi(getenv("NR_Q_STOP")) : 0;
      if (qstop == 9) { g_cmd_names.push_back(__func__);pg_push([](){}); return 0; }
      pgraph_ids({source,packed,scale});   // PGRAPH touch-set (conservative: every operand id)

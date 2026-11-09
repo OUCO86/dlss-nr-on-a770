@@ -3591,3 +3591,29 @@ WINDOW_BLOCK RED (9 fails)
 **C27 刀口（已下令，仍由同一条铲做）**：① **harness 逐帧 dump `r->result` / `r->history` / `r->neural`**（handle 都在 replay 结构里）**找第一处发散的帧**；② **二分 span**（只跳入口 GEMM / 只跳 8 条 FFN / 只跳 8 条注意力）**看是哪一半动了 result**；③ **若坐实 (a)，S2 必须先做 capture 期 scratch 依赖普查（`g_cmds_poolblk` + `[poolseq-canon]` + `NR_PG_TOUCHDUMP`）再谈认证**。
 ### ⑤ 现场
 **主树 CLEAN**（`git status --porcelain` 空、引擎 md5 `CC48937E8B62…` = HEAD = 出货同源）；**刀在 `E:\DSH\tools\C26_engine_u8.diff`（31,753 B、9 hunk、+427/−1、LF、UTF-8 无 BOM，`git apply --check` exit 0 ⇒ 可干净重放；它是 C25 刀的超集 ⇒ 续刀只 apply 这一份）**；git 只用了父级授权的两件（apply 重放、checkout 回退），**未 commit / 未 staged / 未 promote**；两槽 `A2C3009F…` / 3,335,168 B、三金标、四面基线、`shipped_build.defs`、`out/SHIPPED_MD5.txt` 全未动；状态 `s6/layer1.md §113`。
+
+## 175. ★★★★★ **C27 归因：S2 的 `result` 单面发散不是复用造成的，也不是 span/scratch/history 造成的——是"判据计数器的那一次主机读"（军规 196）。S2 的静止收益仍成立；变化序列的画面台账全部带 (c) 污染，修好前不能当画质依据**
+### ① 判决表（fused 8 帧、同一 reseed 序列 `WIN=8192 PCT=60`；harness `s6/nr_replay_c27.c` + 新 env `NR_FRAMEHASH=1`（默认 OFF、在计时打印之后才下载 ⇒ 不污染帧价）；分析 `tools/wb_c27_frames.py`；表 `C27_frames1.log`）
+| 腿 | 做什么 | 结果 |
+|---|---|---|
+| `ctlN` | `REUSE=3`（判据核跑、**不读**、不跳） | 基准 |
+| **`noread`** | `REUSE=1` + `NR_VIT_NOREAD`（不读、不跳） | **8 帧 × 7 面全等 = 基准** |
+| **`dly200`** | `REUSE=3` + `NR_VIT_DELAY=200`（只加 200 µs 主机停顿） | **全等 = 基准** ⇒ 停顿不是因 |
+| `segS` | `REUSE=1 TH=0`（读 + 跳 73 只） | **run 1 起 `result / history / head(1301) / 1285 / 1267` 全 DIFF**（`1271` / features 仍等）；**该帧引擎打印选的是 MASTER（没跳）** |
+| `entS` / `attS` / `ffnS` | 同上，只换溶解集 **1 / 40 / 32 只**（1+40+32=73 ✓） | **run 1 指纹与 `segS` 一模一样** ⇒ **二分法失效：只溶 1 只也分叉 ⇒ 因不在集里** |
+| `thbig` | `REUSE=1 TH=1e6`（读 + 每帧都跳） | 与 `segS` 逐字节全等 |
+**停滞检查**：`ctlN / entS / attS / ffnS` 八帧无一面停滞 ⇒ 这三腿每帧都真算了段，却已与不读基准分叉。
+**复现性**：`ctlN vs ctlN2`、`segS vs segS2`（换进程）全等 ⇒ 无跨进程不确定性；`c27a ctlN vs c27c ctlN`（换 build）全等 ⇒ 不是编译漂移；**`shared USM deref` 与 `malloc_device + memcpy` 两种读法互相全等 ⇒ 触发器是"帧间隙里一次主机侧访问设备可见内存"本身**。
+### ② 排除链（都做了普查，不是猜）
+- **(a) 未登记跨闭包 scratch 读 ⇒ 排除**：`NR_POOLSEQ=1 + NR_PG_TOUCHDUMP=1` 腿 `poolq`（880 行 `[poolblk]`、3,534 条 `[poolseq]`）：**池级** 78 块里 5 块被 span/非 span 先后 `get`（正常回收，gets 1,779 / puts 1,755，差 24 = 帧末仍借走）；**指针级 `[pgt]`：段内 98 / 段外 849 / 跨边界共享 7，且 7 个全是 plan 面句柄（1309-1317），池 scratch 跨边界共享 = 0**；
+- **(b) post 的上一帧 result 反馈 ⇒ 是放大器不是起因**：run 2..7 网络面重新全等、只有 `result + history` 永久 DIFF（`post` 读又写同一块 history；`pre` 对 history 不敏感是因为 table 里"history 是否本帧 colour"那位开关 ⇒ features 才能重新全等）；
+- **★ (c) 真因 = 判据计数器的那一次主机读**（军规 196 已立）。
+### ③ 修法与净价（子代理不动手，交我决策）
+**首选**：**计数器换 `sycl::malloc_host`**（核写 9,216 B 到主机内存，主机读普通指针 ⇒ **零驱动调用、零队列 op**）；**净价 ≈ 每帧 9 KB PCIe 写 ≈ 1-3 µs 设备侧**；**验证只需两腿**（`noread` 已证"不读 ⇒ EXACT"，再证"`malloc_host` 读 ⇒ 仍 EXACT"）；读路径已做成 `NR_VIT_VREAD=dev|shr`（默认 dev）⇒ **换分配类型只改一行**；
+**次选**：**完全留设备侧**（判据写 flag、段内 16 只核入口读 flag 早退）⇒ 不需要主机读，但省的是核内工作量而非 submission ⇒ 收益从 −13.9 ms 缩水到 −(13.9 − 启动开销)，字节代价 ≈ 每核 +1 load +1 branch；
+**C26 那批读数的可用性**：**静止序列 −3.92 / −4.04 ms 与四面 EXACT 仍成立**（`fstatic` 与 `fctl` 的 result 也全等 ⇒ 静止下 (c) 造成的轨迹差不可见）；**但变化序列的画面台账（含 `fskip` 的 92% / 52% 分桶）全部带 (c) 污染，(c) 修好前不能当画质依据**；
+**引擎侧独立项（不归 S2）**：**出货 cgraph 路对"帧间隙里一次主机可见内存访问"敏感** ⇒ 另开一铲：用 `noread / dly200 / 读` 三腿 + 只读 1 个 int 的最小探针，把这条灵敏度钉到具体闭包（首猜 1267 累加链 / 池块回收顺序 / `g_wcache`）。
+### ④ 现场
+**主树 CLEAN**（porcelain 0、引擎 md5 `CC48937E8B62…` = HEAD = 出货同源）；**刀已更新：`E:\DSH\tools\C26_engine_u8.diff` = 35,677 B、9 hunk、+492/−1、LF/UTF-8 无 BOM、`git apply --check` exit 0**（含 C25 机制 + C26 两面判据 / segment + C27 的 entry/attn/ffn 三档与三个诊断 knob，**全部 env 门控默认 OFF**）；
+**件（都 icx exit=0）**：`libxmx_vitreuse_c27a-…143644.dll`（`5E3CC9A2…` 3,380,736 B）→ `c27b-…151409`（`3AA3DB6D…` 3,381,248 B）→ **`c27c-…151848`（`1AE797083CB340DC9B046A0BEE17FF64`，3,381,760 B = 出表那版）**；harness `E:\DSH\builds\nr_replay_c27.exe`（`21D3C24F…`，1,135,104 B）+ 硬链接运行时 `E:\DSH\tmp\c26rt`；
+**每腿都验了军规 195**：`cgraph_lines=1 / RECORD_FAILED=0` ✓；**GPU = 14 冷腿 ≈ 15 分钟**（预算 40）；未认证、未跑 16 对、未 staged；两槽 `A2C3009F…` / 3,335,168 B、三金标、四面基线、`shipped_build.defs`、`out/SHIPPED_MD5.txt`、受管缓存全未动；git 只用 apply + checkout；状态 `s6/layer1.md §114`；新文件 `s6/nr_replay_c27.c`、`s6/cc_c27_replay.ps1`、`s6/pe_c27.ps1`、`tools/wb_c27_frames.py`；日志 `E:\DSH\logs\C27_*`（`C27a_*` 留档）、dumps `E:\DSH\tmp\c27dump\`。
