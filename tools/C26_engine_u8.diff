@@ -1,5 +1,5 @@
 diff --git a/src/bench/sycl/libxmx_sycl.cpp b/src/bench/sycl/libxmx_sycl.cpp
-index ac28b43..f1c04cf 100644
+index ac28b43..4141433 100644
 --- a/src/bench/sycl/libxmx_sycl.cpp
 +++ b/src/bench/sycl/libxmx_sycl.cpp
 @@ -1543,6 +1543,7 @@ int xmx_buf_destroy(int id) {
@@ -25,7 +25,7 @@ index ac28b43..f1c04cf 100644
      return 0; }
  
  // ==================== NR_SKIP_CHAINS: whole-block-chain skip (2026-11-02, B2 跳块铲) ====
-@@ -1713,6 +1716,496 @@ static void skip_chains_apply(std::vector<std::function<void()>>& cmds,
+@@ -1713,6 +1716,615 @@ static void skip_chains_apply(std::vector<std::function<void()>>& cmds,
      std::fflush(stdout);
  }
  
@@ -81,6 +81,20 @@ index ac28b43..f1c04cf 100644
 +static std::vector<char> g_vit_kill;                // C27: per-closure "dissolve in the twin"
 +static size_t g_vit_span_from = 0, g_vit_span_to = 0;   // the dissolved span (S2)
 +static std::vector<std::function<void()>> g_vit_twincmds;
++// ---- C29 (NR_VIT_REUSE=4): the SAME-FRAME split. The twin of C25-C28 had the right saving
++// but the wrong semantics: its verdict is computed inside frame N-1 from 1271(N-1) vs
++// 1271(N-2), so it can never certify the frame it gates. Level 4 splits the frame at the
++// criterion closure: A = [0..criterion], Bm = the rest computed, Bt = the rest with the ViT
++// segment dissolved. The host reads THIS frame's counters (malloc_host: a plain deref, no
++// driver call) between the two submits, so produce and consume happen in the same frame.
++static std::vector<std::function<void()>> g_vit_A, g_vit_Bm, g_vit_Bt;
++static std::vector<const char*> g_vit_Anm, g_vit_Bmnm, g_vit_Btnm;
++static std::vector<std::vector<void*>> g_vit_Atch, g_vit_Bmtch, g_vit_Bttch;
++static bool    g_vit_splitready = false;
++static int     g_vit_gA = -1, g_vit_gBm = -1, g_vit_gBt = -1;
++static size_t  g_vit_hostcmd_stored = SIZE_MAX;
++static int*    g_vit_mcnt = nullptr;                // per-item max |delta| in the 16-bit code field
++static int*    g_vit_scnt = nullptr;                // per-item sum |delta| in the same units
 +static bool  g_vit_twinready = false;
 +static int   g_vit_master = -1, g_vit_twin = -1;
 +static void* g_vit_face = nullptr;                  // the compared plan face (frozen ptr)
@@ -95,6 +109,7 @@ index ac28b43..f1c04cf 100644
 +static int     g_vit_skip_next = 0;                 // verdict for the next frame
 +static int     g_vit_ran_once = 0;                  // has a criterion verdict been produced?
 +static long    g_vit_lastdiff = -1;                 // the verdict's raw number
++static long    g_vit_lastmax = 0, g_vit_lastsum = 0;  // C29: max / sum |delta| in code units
 +static int     g_vit_frames = 0, g_vit_skips = 0;   // bookkeeping for the print
 +static void vit_reset(void) {
 +    g_vit_qnotes.clear(); g_vit_qkvs.clear(); g_vit_gemm.clear(); g_vit_unary.clear();
@@ -326,11 +341,20 @@ index ac28b43..f1c04cf 100644
 +    if (!g_vit_shadow) g_vit_shadow = (sycl::uint4*)sycl::malloc_device(halfs * 2u, *GQ);
 +    if (g_vit_items2 && !g_vit_shadow2)
 +        g_vit_shadow2 = (sycl::uint4*)sycl::malloc_device(halfs2 * 2u, *GQ);
-+    if (!g_vit_dcnt)   g_vit_dcnt   = (getenv("NR_VIT_VREAD") && strcmp(getenv("NR_VIT_VREAD"), "shr") == 0)
++    auto vkind_host = [&](void) { return lvl == 4 || (getenv("NR_VIT_VREAD") && strcmp(getenv("NR_VIT_VREAD"), "host") == 0); };
++    auto vkind_shr  = [&](void) { return lvl != 4 && getenv("NR_VIT_VREAD") && strcmp(getenv("NR_VIT_VREAD"), "shr") == 0; };
++    if (!g_vit_dcnt)   g_vit_dcnt   = vkind_shr()
 +        ? (int*)sycl::malloc_shared((g_vit_items + g_vit_items2) * 4u, *GQ)
-+        : (getenv("NR_VIT_VREAD") && strcmp(getenv("NR_VIT_VREAD"), "host") == 0)
++        : vkind_host()
 +        ? (int*)sycl::malloc_host((g_vit_items + g_vit_items2) * 4u, *GQ)
 +        : (int*)sycl::malloc_device((g_vit_items + g_vit_items2) * 4u, *GQ);
++    // C29: the magnitude arrays live in the SAME memory kind as the word counters.
++    if (!g_vit_mcnt) g_vit_mcnt = vkind_shr() ? (int*)sycl::malloc_shared((g_vit_items + g_vit_items2) * 4u, *GQ)
++                             : vkind_host() ? (int*)sycl::malloc_host((g_vit_items + g_vit_items2) * 4u, *GQ)
++                             : (int*)sycl::malloc_device((g_vit_items + g_vit_items2) * 4u, *GQ);
++    if (!g_vit_scnt) g_vit_scnt = vkind_shr() ? (int*)sycl::malloc_shared((g_vit_items + g_vit_items2) * 4u, *GQ)
++                             : vkind_host() ? (int*)sycl::malloc_host((g_vit_items + g_vit_items2) * 4u, *GQ)
++                             : (int*)sycl::malloc_device((g_vit_items + g_vit_items2) * 4u, *GQ);
 +    if (!g_vit_shadow || !g_vit_dcnt || (g_vit_items2 && !g_vit_shadow2)) {
 +        std::printf("[vit-reuse] graph=%d REFUSED: criterion buffers did not allocate\n", graphid);
 +        std::fflush(stdout); g_vit_chains.clear(); return;
@@ -338,10 +362,13 @@ index ac28b43..f1c04cf 100644
 +    GQ->memset(g_vit_shadow, 0xFF, halfs * 2u).wait();
 +    if (g_vit_items2) GQ->memset(g_vit_shadow2, 0xFF, halfs2 * 2u).wait();
 +    GQ->memset(g_vit_dcnt, 0, (g_vit_items + g_vit_items2) * 4u).wait();
++    GQ->memset(g_vit_mcnt, 0, (g_vit_items + g_vit_items2) * 4u).wait();
++    GQ->memset(g_vit_scnt, 0, (g_vit_items + g_vit_items2) * 4u).wait();
 +    std::function<void()> twin_host_body;           // C28: the twin's stamped criterion body
 +    size_t twin_host_cmd = SIZE_MAX;
 +    {
 +        void* f = g_vit_face; sycl::uint4* sh = g_vit_shadow; int* dc = g_vit_dcnt;
++        int* mc = g_vit_mcnt; int* sc = g_vit_scnt;
 +        void* f2 = g_vit_face2; sycl::uint4* sh2 = g_vit_shadow2; int* dc2 = dc + g_vit_items;
 +        void* fl = g_vit_flag;
 +        if (fl && !g_vit_tcnt) g_vit_tcnt = (int*)sycl::malloc_device(4u, *GQ);
@@ -357,26 +384,42 @@ index ac28b43..f1c04cf 100644
 +        // then PROVES which graph ran, so host prints are no longer used for frame
 +        // attribution (the C27 "off by one frame" wrinkle).
 +        auto make_crit = [&](int stamp) {
-+            return [old, f, sh, dc, items, f2, sh2, dc2, items2, fl, tc, stamp]() {
++            return [old, f, sh, dc, items, f2, sh2, dc2, items2, fl, tc, mc, sc, stamp]() {
 +                old();
-+                GQ->parallel_for(sycl::range(items), [f, sh, dc, fl, tc, stamp](sycl::item<1> it) {
++                GQ->parallel_for(sycl::range(items), [f, sh, dc, mc, sc, fl, tc, stamp](sycl::item<1> it) {
 +                    constexpr int PER = 16;
 +                    const sycl::uint4* a = (const sycl::uint4*)f;
 +                    size_t b = it.get_id(0) * PER;
-+                    int d = 0;
++                    int d = 0, mx = 0; long sm = 0;
 +                    for (int i = 0; i < PER; ++i) {
 +                        sycl::uint4 x = a[b + i], y = sh[b + i];
++                        // C29 magnitude form of the criterion: the per-half |delta| in the
++                        // 16-bit code field (max and sum), computed BEFORE the shadow is
++                        // written -- the first build folded the copy into the updated
++                        // memory and measured |x-x| = 0 (caught by face evidence, 2026-11-09).
++                        // The word-count alone was proven to be a cliff (0 or 85-95% of the
++                        // words), so it cannot carry a perceptual threshold (see 115.4).
++                        {
++                            const unsigned int* w = (const unsigned int*)&y;
++                            for (int q = 0; q < 4; ++q) {
++                                for (int hh = 0; hh < 2; ++hh) {
++                                    unsigned int o = (unsigned int)x[q], p = w[q];
++                                    unsigned int u = (hh ? (o >> 16) : (o & 0xFFFFu));
++                                    unsigned int v = (hh ? (p >> 16) : (p & 0xFFFFu));
++                                    unsigned int dd = (u > v) ? (u - v) : (v - u);
++                                    if ((int)dd > mx) mx = (int)dd;
++                                    sm += (long)dd;
++                                }
++                            }
++                        }
 +                        if (x[0] != y[0] || x[1] != y[1] || x[2] != y[2] || x[3] != y[3]) {
 +                            ++d; sh[b + i] = x;
 +                        }
 +                    }
 +                    dc[it.get_id(0)] = d;
++                    if (mc) mc[it.get_id(0)] = mx;
++                    if (sc) sc[it.get_id(0)] = (int)(sm > 0x7FFFFFF0 ? 0x7FFFFFF0 : sm);
 +                    if (stamp == 1 && it.get_id(0) == 0 && fl) {
-+                        // C28: the stamp carries a DEVICE-side execution counter too, so the
-+                        // face dump says not only "a twin frame wrote this" but WHICH twin
-+                        // execution it was -- that settles the frame attribution without any
-+                        // host print (the C27 off-by-one wrinkle). Item 0 only, and the graph
-+                        // is in_order, so a plain load/store is enough (no atomics needed).
 +                        unsigned e = tc ? (unsigned)(*tc) + 1u : 0u;
 +                        if (tc) *tc = (int)e;
 +                        *(sycl::uint4*)fl = sycl::uint4(sycl::uint(0xC28A571Du), sycl::uint(0x51E771C8u),
@@ -384,18 +427,34 @@ index ac28b43..f1c04cf 100644
 +                    }
 +                });
 +                if (items2)
-+                    GQ->parallel_for(sycl::range(items2), [f2, sh2, dc2](sycl::item<1> it) {
++                    GQ->parallel_for(sycl::range(items2), [f2, sh2, dc2, mc, sc, items, items2](sycl::item<1> it) {
 +                        constexpr int PER = 16;
 +                        const sycl::uint4* a = (const sycl::uint4*)f2;
 +                        size_t b = it.get_id(0) * PER;
-+                        int d = 0;
++                        int d = 0, mx = 0; long sm = 0;
 +                        for (int i = 0; i < PER; ++i) {
 +                            sycl::uint4 x = a[b + i], y = sh2[b + i];
++                            {
++                                const unsigned int* w = (const unsigned int*)&y;
++                                for (int q = 0; q < 4; ++q) {
++                                    for (int hh = 0; hh < 2; ++hh) {
++                                        unsigned int o = (unsigned int)x[q], p = w[q];
++                                        unsigned int u = (hh ? (o >> 16) : (o & 0xFFFFu));
++                                        unsigned int v = (hh ? (p >> 16) : (p & 0xFFFFu));
++                                        unsigned int dd = (u > v) ? (u - v) : (v - u);
++                                        if ((int)dd > mx) mx = (int)dd;
++                                        sm += (long)dd;
++                                    }
++                                }
++                            }
 +                            if (x[0] != y[0] || x[1] != y[1] || x[2] != y[2] || x[3] != y[3]) {
 +                                ++d; sh2[b + i] = x;
 +                            }
 +                        }
++                        size_t k = it.get_id(0) + items;
 +                        dc2[it.get_id(0)] = d;
++                        if (mc) mc[k] = mx;
++                        if (sc) sc[k] = (int)(sm > 0x7FFFFFF0 ? 0x7FFFFFF0 : sm);
 +                    });
 +            };
 +        };
@@ -436,6 +495,42 @@ index ac28b43..f1c04cf 100644
 +                    "cmd=%zu -- the verdict would stop being produced\n", graphid, setname,
 +                    host_cmd);
 +        std::fflush(stdout); g_vit_chains.clear(); return;
++    }
++    // ---- C29 level 4: the same-frame SPLIT (A = [0..criterion], Bm = the rest computed,
++    // Bt = the rest with the segment dissolved). The decision is taken by the host BETWEEN
++    // the two submits from THIS frame's own counters, so it certifies the frame it gates.
++    if (lvl == 4) {
++        if (host_cmd + 1 != g_vit_span_from) {
++            std::printf("[vit-reuse] graph=%d REFUSED (level 4 split): the segment must start "
++                        "right after the criterion host (host=%zu span=%zu..%zu)\n", graphid,
++                        host_cmd, g_vit_span_from, g_vit_span_to);
++            std::fflush(stdout); g_vit_chains.clear(); return;
++        }
++        g_vit_A.assign(cmds.begin(), cmds.begin() + (host_cmd + 1));
++        g_vit_Bm.assign(cmds.begin() + (host_cmd + 1), cmds.end());
++        g_vit_Bt = g_vit_Bm;
++        for (size_t i = g_vit_span_from; i <= g_vit_span_to; ++i)
++            g_vit_Bt[i - (host_cmd + 1)] = [](){};
++        // face self-attestation (rule 196): Bt's first closure stamps the attribution face
++        // (plan 1287 -- every writer and reader of it is inside the dissolved span). In the
++        // computed path the span overwrites that face with real quant data; in the dissolved
++        // path the stamp survives into the face dump, so the dump says which B ran -- with a
++        // device-side execution counter that numbers the reuses.
++        void* fl2 = g_vit_flag; int* tc2 = g_vit_tcnt;
++        if (fl2)
++            g_vit_Bt[0] = [fl2, tc2]() {
++                GQ->parallel_for(sycl::range((size_t)1), [fl2, tc2](sycl::item<1> it) {
++                    if (it.get_id(0) != 0 || !fl2) return;
++                    unsigned e = tc2 ? (unsigned)(*tc2) + 1u : 0u;
++                    if (tc2) *tc2 = (int)e;
++                    *(sycl::uint4*)fl2 = sycl::uint4(sycl::uint(0xC28A571Du), sycl::uint(0x51E771C8u),
++                                                     e, sycl::uint(0x00000002u));
++                });
++            };
++        g_vit_hostcmd_stored = host_cmd;
++        g_vit_splitready = true;
++        std::printf("[vit-reuse] graph=%d SPLIT ready: A=0..%zu  B=%zu..%zu (Bt dissolves %zu..%zu)\n",
++                    graphid, host_cmd, host_cmd + 1, cmds.size() - 1, g_vit_span_from, g_vit_span_to);
 +    }
 +    g_vit_twincmds = cmds;
 +    for (size_t i = 0; i < g_vit_kill.size(); ++i)
@@ -506,15 +601,39 @@ index ac28b43..f1c04cf 100644
 +    static int th = getenv("NR_VIT_REUSE_TH") ? atoi(getenv("NR_VIT_REUSE_TH")) : 0;
 +    g_vit_skip_next = (tot <= (long)th) ? 1 : 0;
 +}
++// C29 level 4 verdict: reduce THIS frame's counters on the host (malloc_host arrays: a plain
++// dereference, no driver call, no queue op -- C28 proved the read itself is neutral) and
++// gate on the MAGNITUDE pair (max |delta| and sum |delta| in the 16-bit code field), with
++// the old word-count threshold kept as a third, optional gate.
++static void vit_verdict_update4(void) {
++    const size_t n = g_vit_items + g_vit_items2;
++    long words = 0, mx = 0, sm = 0;
++    if (g_vit_dcnt && g_vit_mcnt && g_vit_scnt) {
++        for (size_t i = 0; i < n; ++i) {
++            words += g_vit_dcnt[i];
++            if ((long)g_vit_mcnt[i] > mx) mx = g_vit_mcnt[i];
++            sm += (long)g_vit_scnt[i];
++        }
++    }
++    static long thmax = getenv("NR_VIT_REUSE_THMAX") ? atol(getenv("NR_VIT_REUSE_THMAX")) : 0;
++    static long thsum = getenv("NR_VIT_REUSE_THSUM") ? atol(getenv("NR_VIT_REUSE_THSUM")) : 0;
++    static long thw   = getenv("NR_VIT_REUSE_TH") ? atol(getenv("NR_VIT_REUSE_TH")) : -1;  // -1 = not used
++    g_vit_lastdiff = words; g_vit_lastmax = mx; g_vit_lastsum = sm;
++    g_vit_skip_next = (mx <= thmax && sm <= thsum && (thw < 0 || words <= thw)) ? 1 : 0;
++}
 +static void vit_frame_note(int id) {   // presence-gated print of the reuse ledger
 +    g_vit_frames++;
-+    if (id == g_vit_twin) g_vit_skips++;
++    if (g_vit_skip_next) g_vit_skips++;   // level 4 reuses via g_vit_gBt, not the twin id
 +    static int every = getenv("NR_VITDBG") ? 1 : 60;
 +    // (the modulo test must not be used with every=1: frames % 1 is always 0)
 +    if (every <= 1 || (g_vit_frames - 1) % every == 0) {
-+        std::printf("[vit-reuse] frames=%d skipped=%d lastdiff=%ld items=%zu thresh=%d -> %s\n",
-+                    g_vit_frames, g_vit_skips, g_vit_lastdiff, g_vit_items,
-+                    getenv("NR_VIT_REUSE_TH") ? atoi(getenv("NR_VIT_REUSE_TH")) : 0,
++        std::printf("[vit-reuse] frames=%d skipped=%d lastdiff=%ld lastmax=%ld lastsum=%ld items=%zu "
++                    "th=%s/%s/%s -> %s\n",
++                    g_vit_frames, g_vit_skips, g_vit_lastdiff, g_vit_lastmax, g_vit_lastsum,
++                    g_vit_items,
++                    getenv("NR_VIT_REUSE_TH") ? getenv("NR_VIT_REUSE_TH") : "0",
++                    getenv("NR_VIT_REUSE_THMAX") ? getenv("NR_VIT_REUSE_THMAX") : "0",
++                    getenv("NR_VIT_REUSE_THSUM") ? getenv("NR_VIT_REUSE_THSUM") : "0",
 +                    g_vit_skip_next ? "TWIN" : "MASTER");
 +        std::fflush(stdout);
 +    }
@@ -522,7 +641,7 @@ index ac28b43..f1c04cf 100644
  // ==================== KNIFE 1: NR_BMERGE -- same-shape residual legs merged into ONE launch ====
  // notes/shape-merge-plan.md 7.1 knife 1, A3 slice (xmx_rec_gemm_int8_residual: 16 sites of
  // 2040x256x256 + 12 sites of 8160x128x128, all ALIVE on the load slot per tools/shapes_alive.csv).
-@@ -2331,6 +2824,7 @@ int xmx_graph_capture(void) {
+@@ -2331,6 +2943,7 @@ int xmx_graph_capture(void) {
      // graph is stored (default empty => this function is never entered; see the block above).
      skip_chains_apply(g_cmds, g_cmd_names, (int)g_graphs.size());
      bmerge_apply(g_cmds);      // KNIFE 1: runs AFTER the skip pass, so skipped legs cannot merge
@@ -530,11 +649,12 @@ index ac28b43..f1c04cf 100644
      bmerge_order_apply();      // B step 2 (i): presence-gated REORDER (NR_BMERGE_ORDER), default off
      bmerge_order_report();     // what it moved, so the declared-set check has something to read
      pgraph_final_dump();       // the FROZEN touch sets, i.e. after any reorder -- [pgt] cannot show it
-@@ -2354,12 +2848,48 @@ int xmx_graph_capture(void) {
+@@ -2354,12 +2967,99 @@ int xmx_graph_capture(void) {
      g_pending_fold_slot = SIZE_MAX; g_fold_slot.clear(); // with the stream (10-27 audit)
      s6_reset();                                          // S6 chain candidate: ditto
      g_recording = false;
 -    return (int)g_graphs.size() - 1;
+-}
 +    // C25 NR_VIT_REUSE: the twin (the same closure COUNT, the 8 ViT attention chains
 +    // dissolved) is stored as an EXTRA graph id so xmx_graph_run needs nothing but the
 +    // id swap. Default OFF => g_vit_twinready is false and this block never runs.
@@ -559,11 +679,62 @@ index ac28b43..f1c04cf 100644
 +                    (int)g_vit_twinready);
 +        std::fflush(stdout);
 +    }
++    // C29 level 4: store the three split graphs (A / Bm / Bt) as extra ids. The plan only
++    // ever names the MASTER; xmx_graph_run does the split itself.
++    if (g_vit_splitready && vit_reuse_level() == 4 && g_vit_master >= 0 &&
++        g_vit_A.size() + g_vit_Bm.size() == g_graphs[g_vit_master].size()) {
++        const size_t hc = g_vit_hostcmd_stored;
++        auto push_slice = [&](std::vector<std::function<void()>>& lst, size_t from, size_t to) {
++            g_graphs.push_back(std::move(lst));
++            const std::vector<const char*>& nm = g_graph_names[g_vit_master];
++            g_graph_names.push_back(std::vector<const char*>(nm.begin() + from, nm.begin() + to));
++            const std::vector<std::vector<void*>>& tt = g_graph_touch[g_vit_master];
++            g_graph_touch.push_back(std::vector<std::vector<void*>>(tt.begin() + from, tt.begin() + to));
++            g_graph_launch.push_back(std::vector<LCount>(to - from));
++            if (g_graph_ids.size() == (size_t)g_vit_master + 1) {
++                const std::vector<std::vector<int>>& idv = g_graph_ids[g_vit_master];
++                if (idv.size() == g_graphs[g_vit_master].size())
++                    g_graph_ids.push_back(std::vector<std::vector<int>>(idv.begin() + from, idv.begin() + to));
++                else g_graph_ids.push_back(std::vector<std::vector<int>>());
++            } else g_graph_ids.push_back(std::vector<std::vector<int>>());
++            if (g_graph_name.size() == (size_t)g_vit_master + 1) {
++                const std::vector<const char*>& an = g_graph_name[g_vit_master];
++                if (an.size() == g_graphs[g_vit_master].size())
++                    g_graph_name.push_back(std::vector<const char*>(an.begin() + from, an.begin() + to));
++                else g_graph_name.push_back(std::vector<const char*>());
++            } else g_graph_name.push_back(std::vector<const char*>());
++            return (int)g_graphs.size() - 1;
++        };
++        g_vit_gA  = push_slice(g_vit_A,  0,           hc + 1);
++        g_vit_gBm = push_slice(g_vit_Bm, hc + 1,      g_graphs[g_vit_master].size());
++        g_vit_gBt = push_slice(g_vit_Bt, hc + 1,      g_graphs[g_vit_master].size());
++        std::printf("[vit-reuse] SPLIT stored: A=%d (0..%zu) Bm=%d Bt=%d (closures=%zu, master=%d)\n",
++                    g_vit_gA, hc, g_vit_gBm, g_vit_gBt, g_graphs[g_vit_master].size(), g_vit_master);
++        std::fflush(stdout);
++    }
 +    g_vit_twincmds.clear(); g_vit_twinready = false;
-+    return g_vit_master;   // the plan's graph id stays the MASTER; the twin is only ever
-+                           // reached by xmx_graph_run's own selection (never by the plan)
- }
++    return g_vit_master;   // the plan's graph id stays the MASTER; the twin and the split
++                           // graphs are reached only by xmx_graph_run's own selection
++}
++static int xmx_graph_run_one(int id);   // fwd: the shipped single-graph replay path
++// C29: the public entry. Level 4 (NR_VIT_REUSE=4) runs the frame as TWO submits -- A up to
++// and including the criterion closure, then Bm (segment computed) or Bt (segment dissolved)
++// chosen from THIS frame's counters -- so the reuse decision certifies the frame it applies
++// to. Every other level (and the shipped default 0) is the single existing path.
  int xmx_graph_run(int id) {
++    if (vit_reuse_level() == 4 && g_vit_splitready && g_vit_gA >= 0 && id == g_vit_master) {
++        int pa = xmx_graph_run_one(g_vit_gA);
++        if (pa < 0) return pa;
++        vit_verdict_update4();
++        int pb = xmx_graph_run_one(g_vit_skip_next ? g_vit_gBt : g_vit_gBm);
++        vit_frame_note(g_vit_skip_next ? g_vit_gBt : g_vit_gBm);
++        g_vit_ran_once = 1;
++        if (pb < 0) return pb;
++        return pa + pb;
++    }
++    return xmx_graph_run_one(id);
++}
++static int xmx_graph_run_one(int id) {
      if (g_recording) FAILMSG("cannot replay during recording");
      if (id < 0 || id >= (int)g_graphs.size() || g_graphs[id].empty())
          FAILMSG("graph is not live");
@@ -580,7 +751,7 @@ index ac28b43..f1c04cf 100644
      int passes = (int)g_graphs[id].size();
      g_lc_vec = ((size_t)id < g_graph_launch.size() && g_graph_launch[id].size() == g_graphs[id].size())
                 ? &g_graph_launch[id] : nullptr;
-@@ -3821,6 +4351,8 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
+@@ -3821,6 +4521,8 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
      if (!g_recording) FAILMSG("not recording");
      if (!M || !N || !K || (N % 16u) || (K % 16u))
          FAILMSG("gemm f16 needs N%%16==0, K%%16==0 (our tile)");
@@ -589,7 +760,7 @@ index ac28b43..f1c04cf 100644
      const bool transposed = (bt & 1u) != 0u;   // scores leg: B stored (N,K), ldb->K
      if (bt & 0x800000u) FAILMSG("pooled window residual belongs to the window_block family");
      auto ia = g_bufs.find(a), ib = g_bufs.find(b), ic = g_bufs.find(c);
-@@ -4430,6 +4962,8 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
+@@ -4430,6 +5132,8 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
      const size_t na = (size_t)Mp * C, nb = (size_t)NH * C;
      g_cmd_names.push_back(__func__);
      pgraph_ids({a,b,q,k,v,a_scale,b_scale,qkv_scale});   // PGRAPH touch-set (conservative: every operand id)
@@ -598,7 +769,7 @@ index ac28b43..f1c04cf 100644
          flop_note("int8_qkv",M,3u*channels,channels,1);
          if (getenv("NR_SHAPE_DUMP")) { static long qv=0,qnv=0; if(flags&0x2000u) qv++; else qnv++;
              std::printf("[qkv-vit] vit=%ld nonvit=%ld (running)\n", qv, qnv); }
-@@ -5126,6 +5660,8 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
+@@ -5126,6 +5830,8 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
      static int ustop = getenv("NR_U_STOP") ? atoi(getenv("NR_U_STOP")) : 0;
      if (ustop == 9) { g_cmd_names.push_back(__func__);pg_push([](){}); return 0; }
      pgraph_ids({a,b,c,d});   // PGRAPH touch-set (conservative: every operand id)
@@ -607,7 +778,7 @@ index ac28b43..f1c04cf 100644
      const unsigned flags = kind;                 // the plan's arg0 IS the flags word
      const unsigned sub = flags & 0xFFu;
      auto ia = g_bufs.find(a), ic = g_bufs.find(c);
-@@ -6757,6 +7293,8 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
+@@ -6757,6 +7463,8 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
      static int qstop = getenv("NR_Q_STOP") ? atoi(getenv("NR_Q_STOP")) : 0;
      if (qstop == 9) { g_cmd_names.push_back(__func__);pg_push([](){}); return 0; }
      pgraph_ids({source,packed,scale});   // PGRAPH touch-set (conservative: every operand id)

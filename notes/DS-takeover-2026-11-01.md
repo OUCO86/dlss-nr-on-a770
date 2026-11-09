@@ -3656,3 +3656,28 @@ WINDOW_BLOCK RED (9 fails)
 ⇒ **画质风险的落点不在网络（1301/features 末帧仍全等）而在合成链 `result` 的放大**，**根因是跨帧判据的语义，不是阈值大小**。
 ### ⑥ 现场
 **主树 CLEAN**（porcelain 0、引擎 md5 `CC48937E8B62…` = HEAD = 出货同源）；**刀已重导 `E:\DSH\tools\C26_engine_u8.diff` = 39,492 B、9 hunk、+539/−1、LF、UTF-8 无 BOM、`git apply --check` exit 0**；状态 `s6/layer1.md §115`（§114 的 (c) 已按军规 188 就地改口径）；新文件 `tools/wb_c28_stamp.py`、`tools/wb_c28_sweep.py`；harness 重建 `9CA9FF2A…`（加 `stamp run=N f1287=`）；日志 `C28_{stamp1,sweep_m1,sweep_m2,buckets1}.log` + `C27_{noread,hostread,devread,segS,statf,statc,statp,m1*,m2*}.log`（`C28a_*` 留档）；dumps `E:\DSH\tmp\c27dump\f.c27_*`；**不认证、未跑 16 对、未 staged；两槽、三金标、四面基线、`out/SHIPPED_MD5.txt`、`shipped_build.defs`、受管缓存全未动**。
+
+## 177. ★★★★★ **C29（同帧决定 + 幅度判据）：画质风险被证明"来自判决晚一帧的错复用，不是复用语义"；代价是拆帧 +2.19 ms ⇒ 只剩六成收益；另记一次工装事故（硬链接写穿槽件，已复原）**
+### ① ★ 工装事故与复原（子代理自查自纠，我已独立复验）
+**成因**：`s6/mk_c26rt.ps1` 把 `E:\DSH\oneapi` 的**全部** `*.dll`（**含槽件 `libxmx_sycl.dll`**）硬链接进 `E:\DSH\tmp\c26rt\`；随后 `Copy-Item -Force` 放候选件 ⇒ **穿过硬链接写进了 oneapi 槽件本体**（16:50:37，一度 3,413,504 B / `0B7789D3…`）。
+**复原与复验（17:35 我实测）**：删硬链接 → 从 pristine `builds\libxmx_wbph_c18-20261109-052655.dll` 恢复 ⇒ **两槽 `out\libxmx.dll` 与 `oneapi\libxmx_sycl.dll` 均 = `A2C3009F5EC9C7F48B304346CE5A36D9` / 3,335,168 B = `out/SHIPPED_MD5.txt` ✓**；**`fsutil hardlink list` 两处各只剩一条路径 ✓**；`tmp\c26rt\` 已无 `libxmx_sycl.dll` ✓；工装已改成**永不硬链接槽件**；三金标（`DD49827D…`/`249A46F3…`）与 `out\libxmx.before-c18.keep`（`8658C786…`）未受影响。
+**影响面**：窗口内只有 `exctl`（16:52，plain 1301 `DD49827D` EXACT ✓）与门链读到污染件；**没有任何认证/staged 判定用过它**；C29 读数全部来自显式路径 `builds\…c29d.dll` ⇒ **结论不受影响**。**已立军规 197（硬链接不是副本；镜像运行时只链接依赖、绝不链接被试件本体；每轮开工/收工跑两槽 md5 对账）。**
+### ② 同帧链设计（level 4）与两条自我纠正
+**时序**：`submit#1 = graph A（闭包 0..312，判据核两次 parallel_for，把 words/max/sum 写进 `malloc_host`）→ wait → 同帧主机判决（普通指针读，零驱动调用）→ submit#2 = Bm（313..692 段照常）或 Bt（同长、313..385 溶解，noop=73）`；**Bt 首只闭包把 `{magic, 设备 reuse 计数}` 写进 plan face 1287 ⇒ 帧归属由 face 自证**；
+**五条要点**：判据在段之前（**`host_cmd+1 != span_from` 直接 REFUSED：检查而非假设** ✓）、同帧产生同帧消费 ✓、影子在设备侧 ✓、溶解 = 面保持上帧值（与 §113.1 一致）✓、**无 `parallel_for` 外语句、闭包数不变（A+B = 693 = 原 693）✓ 但每帧多一次 submit**（代价实测，见 ④）；
+**纠正 (a)**：**§115.3 说的"打印与物理执行差一帧"不存在**——计划末尾的 `OP_XMX_GRAPH_RUN` 会让引擎多打一行 verdict（9 行 / 8 run），脚本从前往后配对 ⇒ 整体错位一帧；**改成取后 N 行配对后 face stamp 与打印逐帧一致**（`statf`：run0 MASTER、runs1-7 TWIN#1..#7 全 OK）⇒ **缺陷 (i) 撤回**；（§113/§115 的 ms 分组按旧配对有一帧错分，但两组皆稳态 ⇒ 头条 −3.92/−4.04/−4.08 不受影响，已注口径）；
+**纠正 (b)**：**首版幅度判据读回 0**（先写影子后算 |Δ| ⇒ 测成 |x−x|）⇒ **首帧误复用**；已改成**先算 max/sum、后写影子**；另修一个真 bug：**split 存储块曾被插在 `return` 之后（死代码，`c29b` 那轮 level 4 根本没生效）**；件链：`c29a` 编译失败（缺前置声明）→ `c29b` `D92D5C03…`（死代码）→ `c29c` `0B7789D3…`（split 生效但幅度读 0）→ **`c29d-20261109-171424` = `F5698AA7268F7E1340B335ABD651BC7E`，3,413,504 B，icx exit=0（出表版）**。
+### ③ ★ 写域边界（子代理按令上报，未擅自扩域）
+**纯设备侧 flag 早退做不到**：段内 73 只闭包 **`pf=0`**（`NR_RUN_TIMING` 计数）⇒ **它们的核全在头文件**（`wbmega::qkv_norm_scatter_*`、`s6_ffn_run` / `s6_ffn_block_kernel.hpp`【md5 守卫 `490647A9…`】、`a5_att_run`），**`.cpp` 里那 9 处 `GQ->parallel_for` 对段内闭包的覆盖 = 0** ⇒ **level 4 只能用"拆帧"换同帧语义**。
+**我的裁决 = (A)**：授权改这些头文件（判据 flag 在段内核入口读 + 早退），**md5 守卫的新值只许上报、由父级改 `shipped_build.defs`**；**(B) 拆帧作后备**；**(C) 维持 twin 但绝不用跨帧判据**——已否决（语义不安全）。
+### ④ 读数（静止 / 变化两档 / 收益差）
+**静止 8 帧 × 7 面逐帧 FNV：两路都 ALL EQUAL**（fused `s4fc` vs `s4f`；plain `s4pc` vs `s4p`）⇒ **立命之本保住**；
+**变化两档 THMAX = 0/8/64/512：触发复用帧数 m1 = 2、m2 = 1，四档完全相同**（那些帧 `max = 0` ⇒ 都是真恒等帧）；帧 ms 46.5-46.8 持平（无可测收益）；
+**★ 画面桶：`1301`、`features`、`result` 全部 EXACT（0 字节不同）** ⇒ **同帧判据下复用零画面改动**；对照 C28 跨帧判据的 `result` 27.43%（m1）/4.41%（m2）+ 新 NaN 11,656/2,000 ⇒ **那批画质风险来自"判决晚一帧的错复用"，不是复用语义本身**；
+**幅度判据也是悬崖（新发现）**：改 1 个偶数字节（m1）⇒ `max|Δcode| ≈ 50,048-52,096`（满值 65,535）、`sum ≈ 5.8-8.9 亿`；改 ~15 字节（m2）同量级 ⇒ **输入侧不存在感知档**（int8 量化链把任意扰动放大成 ~80% 码域变化）⇒ **档位问题必须挪到真实帧料（实机）**；
+**收益差（诚实）**：fused 单 submit 基准 46.47 → 拆帧不复用 **48.66（+2.19 ms/帧 = 拆帧代价）** → 复用 **43.72 ⇒ 净 −2.75 ms/帧（−5.9%）**；plain 40.87 → 42.69（+1.82）→ 38.49 ⇒ **净 −2.38 ms/帧（−5.8%）**；**上轮 twin（单 submit）= −4.08 / −3.92 ⇒ 同帧拆帧方案只剩约六成收益**。
+### ⑤ 守卫与门链
+**`REUSE=0` 四闸 4/4 逐字节 EXACT（出表件 c29d，两条路 + 槽件控制腿 `exctl`）** ✓；**ocloc 逐 ELF**（A = 槽件 271 实例 / B = c29d level-4 276）：新增 7 = 判据核（幅度版）+ Bt stamp + 改名 2 对；删除 2 = 旧 `xmx_graph_run` lambda（改名不是丢核）；**全部 `grf=128`、`simd=16/32`、`slm ABSENT`；`scratch≠0 = 0`、`grf>128 = 0`、共有实例 metadata 移动 = 0** ✓；
+**40 门链在 `tmp\c26rt`（候选件）= 27 GREEN / 13 RED**，**RED 全是工装前提不成立**（该目录自报 `ur_adapter_level_zero NOT loaded → backend=1 (OpenCL)`；`gate_skip_graph` 按设计只认槽件身份）⇒ **候选件的门要在正确镜像里跑或 staged 后跑**（已写进军规 197③）。
+### ⑥ 现场
+主树 **CLEAN**（porcelain 0、引擎 md5 `CC48937E…` = HEAD = 出货同源）；**刀已重导 `E:\DSH\tools\C26_engine_u8.diff` = 51,134 B、9 hunk、+710/−1、LF、UTF-8 无 BOM、`git apply --check` exit 0**；git 只用 apply/checkout，**未 commit/staged/promote**；三金标、四面基线、`shipped_build.defs`、门脚本/golden、受管缓存未动；每腿新建空缓存、腿间 62 s、每腿 `RECORD_FAILED=0`；**GPU ≈ 27 分钟**（预算 60）；日志 `C29_{stamp1,buckets1,zeinfo1}.log`、`C27_{s4fc,s4f,s4pc,s4p,m1c4,m1t8,m1t64,m1t512,m2c4,m2t512,g_off_f}.log`、`gate_*_c29.log`；状态 `s6/layer1.md §116`。
