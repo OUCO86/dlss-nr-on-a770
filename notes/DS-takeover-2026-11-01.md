@@ -3617,3 +3617,42 @@ WINDOW_BLOCK RED (9 fails)
 **主树 CLEAN**（porcelain 0、引擎 md5 `CC48937E8B62…` = HEAD = 出货同源）；**刀已更新：`E:\DSH\tools\C26_engine_u8.diff` = 35,677 B、9 hunk、+492/−1、LF/UTF-8 无 BOM、`git apply --check` exit 0**（含 C25 机制 + C26 两面判据 / segment + C27 的 entry/attn/ffn 三档与三个诊断 knob，**全部 env 门控默认 OFF**）；
 **件（都 icx exit=0）**：`libxmx_vitreuse_c27a-…143644.dll`（`5E3CC9A2…` 3,380,736 B）→ `c27b-…151409`（`3AA3DB6D…` 3,381,248 B）→ **`c27c-…151848`（`1AE797083CB340DC9B046A0BEE17FF64`，3,381,760 B = 出表那版）**；harness `E:\DSH\builds\nr_replay_c27.exe`（`21D3C24F…`，1,135,104 B）+ 硬链接运行时 `E:\DSH\tmp\c26rt`；
 **每腿都验了军规 195**：`cgraph_lines=1 / RECORD_FAILED=0` ✓；**GPU = 14 冷腿 ≈ 15 分钟**（预算 40）；未认证、未跑 16 对、未 staged；两槽 `A2C3009F…` / 3,335,168 B、三金标、四面基线、`shipped_build.defs`、`out/SHIPPED_MD5.txt`、受管缓存全未动；git 只用 apply + checkout；状态 `s6/layer1.md §114`；新文件 `s6/nr_replay_c27.c`、`s6/cc_c27_replay.ps1`、`s6/pe_c27.ps1`、`tools/wb_c27_frames.py`；日志 `E:\DSH\logs\C27_*`（`C27a_*` 留档）、dumps `E:\DSH\tmp\c27dump\`。
+
+## 176. ★★★★★ **C28：我上一条 §175/军规 196 的 (c) 结论是错的，公开作废并改写；S2 的真因是"跨帧主机判据永远晚一帧"⇒ 复用必须在设备侧同帧决定**
+### ① 干净对照腿（件 `c28a`=`71DE801E…` 3,386,368 B → **`c28b`=`0C0F9D26693FCDC049B48454895B013F`，3,387,392 B**，都 icx exit=0；同一 reseed 序列、8 帧、7 面逐帧 FNV；GPU 20 冷腿 ≈ 24 分钟；每腿 `RECORD_FAILED=0` + `cgraph_lines≥1` ✓ 军规 195）
+- **A `noread`（不读不跳）= 基准**；
+- **B `NR_VIT_VREAD=host`（计数器换 `sycl::malloc_host`：核写 9,216 B、主机读普通指针；`TH=-1` 读但永不跳）⇒ 与 A 8 帧 × 7 面全部 EQUAL**；
+- **C `VREAD=dev`（读但永不跳）⇒ 也与 A 全部 EQUAL** ⇒ **★ 主机读从来不扰动 ⇒ §175 的 (c) 判决作废**；
+- **D `segS`（读 + `TH=0` ⇒ 有真跳过）⇒ 从 run 1 起分叉**（run 1：`result/history/head/1285/1267` DIFF、`1271/features` 仍等；run 2-7：只剩 `result+history` DIFF）；
+**⇒ 唯一因子 = "那一帧真的跳过了段"**；**C27 的分叉四腿都有跳过、全等三腿都没有跳过 ⇒ 那是混淆，不是灵敏度**；
+**方法学教训（已写进修正版军规 196①）**：**归因铲必须设计"只动机制、不触发效果"的对照腿**（这里 = `TH=-1`：读、决定不跳）；**只比"全开 vs 全关"会把机制与效果混成一个变量**。
+### ② 帧归属改用设备 face 自证（新工装 `tools/wb_c28_stamp.py` → `C28_stamp1.log`）
+**做法**：判据核第一次 `parallel_for` 的 item 0 把 `{0xC28A571D, 0x51E771C8, 设备侧 twin 执行计数, 1}` 写进 **plan face 1287**（**它的每个写者与读者都在被溶解的 span 内** ⇒ master 帧必用真量化数据覆盖、twin 帧留下 stamp），harness 逐帧下载前 16 B；
+| 腿 | face 证据 | 引擎打印 | 判定 |
+|---|---|---|---|
+| `statf` 静止 TH=0 | **run 1..7 = TWIN#1..#7** | MASTER@run1、TWIN@run2..7（只报 6 帧） | **打印滞后一帧且少算一帧** |
+| `segS` 变化 TH=0 | **run 1 = TWIN#1**、run 2..7 = 真数据 | MASTER@run1、TWIN@run2 | **同一次跳过被打印标到 run 2，物理发生在 run 1** |
+| `m1t123` | **run 1 = TWIN#1**、run 6 = TWIN#2 | 两处都打印 MASTER | 差一帧复现 |
+⇒ **C26 红点的帧级成因坐实**：被复用的那一帧（run 1）相对 run 0 的输入**确实变了**（`lastdiff` 31k-34k）⇒ **那次复用不是惰性的** ⇒ 1301 在 run 1 变、之后重新全等，`result` 经 post 答案历史永久 DIFF ✓ 与 C26 观测完全吻合。
+### ③ ★ 两条缺陷（一条实现、一条语义，语义更根本）
+**(i) 实现**：主机打印的帧归属与物理执行差一帧（代码 `2886-2893` 顺序看着是对的，本铲没修，留给下一铲）；
+**(ii) 语义**：**跨帧主机判据永远晚一帧**——第 N 帧的跳/不跳用的是第 N-1 帧内核里算出的、比较 **N-1 与 N-2** 的结论 ⇒ **没有任何一帧的复用被"本帧输入未变"证明过**；**静止序列上两者巧合无害（已证 8 帧 × 7 面逐字节全等），变化序列上必然出事**；
+**⇒ S2 唯一站得住的形态 = 设备侧同帧决定**（判据核写 flag、段内核入口读 flag 早退）：**无主机读、无跨帧滞后、无差一帧**；代价 = 省的是核内工作量而非 submission（**−13.9 ms 串行账会缩水**），字节代价 ≈ 每核 +1 load +1 branch + 4 B flag。
+### ④ TH 分档：字数判据在这条合成路径上没有档（要换幅度型）
+两档轻微变化：**m1 = `WIN=128 PCT=1`（每帧约改 1 个偶数字节）**、**m2 = `WIN=1024 PCT=3`（约 15 字节）**；每档扫 **TH = 0/12/123/1229/12288** + `TH=-1` control：
+**跳过帧数：m1 每档 2 帧、m2 每档 1 帧 ⇒ 五档完全相同，且五档的 8×7 逐帧 FNV 互相逐字节全等**；
+**定量原因**：判据满值 **36,864** 个 16 B 字，实测 `lastdiff` = **31,396/31,412（m1）**、**34,810-34,816（m2）** ⇒ **85-95% 的字变了** ⇒ **改动是悬崖型（要么 0、要么 ~3 万）⇒ 字数阈值不可能落在感知档上**；
+**⇒ 要做感知档必须换成幅度型判据**（每面 `max|Δcode|` + `Σ|Δcode|`；核内每半字多 2 个 op、同流量、无额外提交；verdict 加 `NR_VIT_REUSE_THMAX/THSUM`）。
+### ⑤ 帧 ms 与画面桶（修法后）
+**静止（复跑，确认未退化）**：fused `statc` 46.47 → `statf` **42.39 = −4.08 ms/帧（−8.8%）✓**；plain twin **36.86** vs C26 `tctlp` 40.87（不同 vintage）≈ **−4.0 ms**；**静止 8 帧 × 7 面（`result/history/head/1285/1267/1271/features`）逐帧全等**（不再只比末帧）；
+**变化**：m1 46.53→46.50、m2 46.50→46.46 ⇒ **≈ 0**（只跳 1-2 帧，且 twin 首用要付 52.4 ms 暖机）；
+**画面桶（vs 本档 control、末帧；`C28_buckets1.log`）**：
+| 档 | 面 | 字节不同 | % | 4 B 单元（像素） | 码步 1/2/3-8/9-64/65-1k/>1k | max | median | NaN | Inf | 新 NaN |
+|---|---|---|---|---|---|---|---|---|---|---|
+| m1 | **1301 / features** | **EXACT** | — | — | — | — | — | — | — | — |
+| m1 | **result** | **573,102** | **27.43%** | **349,629 / 522,240** | 68,928/23,837/31,750/88,488/60,300/184,674 | 63,517 | 128 | 32,241→32,270 | 1→0 | **11,656** |
+| m2 | 1301 / features | **EXACT** | — | — | — | — | — | — | — | — |
+| m2 | **result** | 92,110 | **4.41%** | 64,798 | 22,612/2,027/923/17,284/2,921/32,028 | 63,490 | 64 | 32,419→32,413 | 0→0 | 2,000 |
+⇒ **画质风险的落点不在网络（1301/features 末帧仍全等）而在合成链 `result` 的放大**，**根因是跨帧判据的语义，不是阈值大小**。
+### ⑥ 现场
+**主树 CLEAN**（porcelain 0、引擎 md5 `CC48937E8B62…` = HEAD = 出货同源）；**刀已重导 `E:\DSH\tools\C26_engine_u8.diff` = 39,492 B、9 hunk、+539/−1、LF、UTF-8 无 BOM、`git apply --check` exit 0**；状态 `s6/layer1.md §115`（§114 的 (c) 已按军规 188 就地改口径）；新文件 `tools/wb_c28_stamp.py`、`tools/wb_c28_sweep.py`；harness 重建 `9CA9FF2A…`（加 `stamp run=N f1287=`）；日志 `C28_{stamp1,sweep_m1,sweep_m2,buckets1}.log` + `C27_{noread,hostread,devread,segS,statf,statc,statp,m1*,m2*}.log`（`C28a_*` 留档）；dumps `E:\DSH\tmp\c27dump\f.c27_*`；**不认证、未跑 16 对、未 staged；两槽、三金标、四面基线、`out/SHIPPED_MD5.txt`、`shipped_build.defs`、受管缓存全未动**。

@@ -1,5 +1,5 @@
 diff --git a/src/bench/sycl/libxmx_sycl.cpp b/src/bench/sycl/libxmx_sycl.cpp
-index ac28b43..0ba867d 100644
+index ac28b43..f1c04cf 100644
 --- a/src/bench/sycl/libxmx_sycl.cpp
 +++ b/src/bench/sycl/libxmx_sycl.cpp
 @@ -1543,6 +1543,7 @@ int xmx_buf_destroy(int id) {
@@ -25,7 +25,7 @@ index ac28b43..0ba867d 100644
      return 0; }
  
  // ==================== NR_SKIP_CHAINS: whole-block-chain skip (2026-11-02, B2 跳块铲) ====
-@@ -1713,6 +1716,449 @@ static void skip_chains_apply(std::vector<std::function<void()>>& cmds,
+@@ -1713,6 +1716,496 @@ static void skip_chains_apply(std::vector<std::function<void()>>& cmds,
      std::fflush(stdout);
  }
  
@@ -68,9 +68,9 @@ index ac28b43..0ba867d 100644
 +    return v;
 +}
 +static const int VIT_U4PER = 16;                    // uint4 words per criterion item
-+struct VitQNote { size_t cmd; int src; unsigned M, K; };
++struct VitQNote { size_t cmd; int src; int packed, scale; unsigned M, K; };
 +struct VitQkvNote { size_t cmd; unsigned ch, heads, tokens; int src; unsigned M, K; };
-+struct VitChain { size_t qkv, from, to, qcmd; int srcid; unsigned M, K; };
++struct VitChain { size_t qkv, from, to, qcmd; int srcid, scaleid; unsigned M, K; };
 +struct VitGemmNote { size_t cmd; int a, c; unsigned M, N, K; };      // S2: the ViT entry GEMM
 +struct VitUnaryNote { size_t cmd; int a, b, c, d; unsigned n; };     // S2: the patch-merge UNARY
 +static std::vector<VitQNote> g_vit_qnotes;          // record-scoped (cleared with the stream)
@@ -84,6 +84,8 @@ index ac28b43..0ba867d 100644
 +static bool  g_vit_twinready = false;
 +static int   g_vit_master = -1, g_vit_twin = -1;
 +static void* g_vit_face = nullptr;                  // the compared plan face (frozen ptr)
++static void* g_vit_flag = nullptr;                  // C28: attribution face the twin stamps
++static int*    g_vit_tcnt = nullptr;                // C28: device counter of twin executions
 +static sycl::uint4* g_vit_shadow = nullptr;         // device: last frame's face
 +static void* g_vit_face2 = nullptr;                 // S2: the segment's OTHER input stream
 +static sycl::uint4* g_vit_shadow2 = nullptr;        //   (the residual plane the chains skip
@@ -116,8 +118,8 @@ index ac28b43..0ba867d 100644
 +    static const char* v = getenv("NR_VIT_REUSE_SET") ? getenv("NR_VIT_REUSE_SET") : "segment";
 +    return v;
 +}
-+static void vit_note_quant(size_t cmd, int source, unsigned M, unsigned K) {
-+    VitQNote n{ cmd, source, M, K };
++static void vit_note_quant(size_t cmd, int source, int packed, int scale, unsigned M, unsigned K) {
++    VitQNote n{ cmd, source, packed, scale, M, K };
 +    g_vit_qnotes.push_back(n);
 +}
 +static void vit_note_qkv(size_t cmd, unsigned channels, unsigned heads, unsigned tokens) {
@@ -186,10 +188,10 @@ index ac28b43..0ba867d 100644
 +                g_vit_chains.clear(); return;
 +            }
 +            // the opening QUANT of this chain: its source face is the chain's input
-+            VitChain c{ q, 0, e, q - 1, -1, 0, 0 };
++            VitChain c{ q, 0, e, q - 1, -1, -1, 0, 0 };
 +            bool found = false;
 +            for (const VitQNote& n : g_vit_qnotes)
-+                if (n.cmd == q - 1) { c.srcid = n.src; c.M = n.M; c.K = n.K; found = true; break; }
++                if (n.cmd == q - 1) { c.srcid = n.src; c.scaleid = n.scale; c.M = n.M; c.K = n.K; found = true; break; }
 +            if (!found) {
 +                std::printf("[vit-reuse] graph=%d REFUSED: opening QUANT of cmd=%zu not noted\n",
 +                            graphid, q);
@@ -296,9 +298,16 @@ index ac28b43..0ba867d 100644
 +    // patch-merge face is bit-identical but the residual plane moved MUST NOT be reused
 +    // (rule 192: the judge/criterion covers EVERY input face). In chain mode the opening
 +    // QUANT's own face IS the criterion face, so there is no second stream.
-+    g_vit_face2 = nullptr; g_vit_items2 = 0;
++    g_vit_face2 = nullptr; g_vit_items2 = 0; g_vit_flag = nullptr;
 +    size_t halfs2 = 0;
 +    if (segmode) {
++        // C28 attribution face: the chain's scale plane (768 B in this plan) -- every writer
++        // and reader of it sits INSIDE the dissolved span, so in a reused frame the twin's
++        // stamp is the only thing there, and a master frame overwrites it with real quant
++        // data. The face dump then proves the frame attribution by itself (no host print).
++        auto bf = g_bufs.find(C0.scaleid);
++        if (bf != g_bufs.end() && bf->second.p && bf->second.bytes >= 16 && bf->second.bytes <= 65536u)
++            g_vit_flag = bf->second.p;
 +        auto b2 = g_bufs.find(C0.srcid);
 +        if (b2 != g_bufs.end() && b2->second.p && C0.M && C0.K) {
 +            halfs2 = (size_t)C0.M * (size_t)C0.K;
@@ -319,6 +328,8 @@ index ac28b43..0ba867d 100644
 +        g_vit_shadow2 = (sycl::uint4*)sycl::malloc_device(halfs2 * 2u, *GQ);
 +    if (!g_vit_dcnt)   g_vit_dcnt   = (getenv("NR_VIT_VREAD") && strcmp(getenv("NR_VIT_VREAD"), "shr") == 0)
 +        ? (int*)sycl::malloc_shared((g_vit_items + g_vit_items2) * 4u, *GQ)
++        : (getenv("NR_VIT_VREAD") && strcmp(getenv("NR_VIT_VREAD"), "host") == 0)
++        ? (int*)sycl::malloc_host((g_vit_items + g_vit_items2) * 4u, *GQ)
 +        : (int*)sycl::malloc_device((g_vit_items + g_vit_items2) * 4u, *GQ);
 +    if (!g_vit_shadow || !g_vit_dcnt || (g_vit_items2 && !g_vit_shadow2)) {
 +        std::printf("[vit-reuse] graph=%d REFUSED: criterion buffers did not allocate\n", graphid);
@@ -327,41 +338,70 @@ index ac28b43..0ba867d 100644
 +    GQ->memset(g_vit_shadow, 0xFF, halfs * 2u).wait();
 +    if (g_vit_items2) GQ->memset(g_vit_shadow2, 0xFF, halfs2 * 2u).wait();
 +    GQ->memset(g_vit_dcnt, 0, (g_vit_items + g_vit_items2) * 4u).wait();
++    std::function<void()> twin_host_body;           // C28: the twin's stamped criterion body
++    size_t twin_host_cmd = SIZE_MAX;
 +    {
 +        void* f = g_vit_face; sycl::uint4* sh = g_vit_shadow; int* dc = g_vit_dcnt;
 +        void* f2 = g_vit_face2; sycl::uint4* sh2 = g_vit_shadow2; int* dc2 = dc + g_vit_items;
++        void* fl = g_vit_flag;
++        if (fl && !g_vit_tcnt) g_vit_tcnt = (int*)sycl::malloc_device(4u, *GQ);
++        if (fl && g_vit_tcnt) GQ->memset(g_vit_tcnt, 0, 4u).wait();
++        int* tc = g_vit_tcnt;
 +        const size_t items = g_vit_items, items2 = g_vit_items2;
 +        auto old = std::move(cmds[host_cmd]);
-+        cmds[host_cmd] = [old, f, sh, dc, items, f2, sh2, dc2, items2]() {
-+            old();
-+            GQ->parallel_for(sycl::range(items), [f, sh, dc](sycl::item<1> it) {
-+                constexpr int PER = 16;
-+                const sycl::uint4* a = (const sycl::uint4*)f;
-+                size_t b = it.get_id(0) * PER;
-+                int d = 0;
-+                for (int i = 0; i < PER; ++i) {
-+                    sycl::uint4 x = a[b + i], y = sh[b + i];
-+                    if (x[0] != y[0] || x[1] != y[1] || x[2] != y[2] || x[3] != y[3]) {
-+                        ++d; sh[b + i] = x;
-+                    }
-+                }
-+                dc[it.get_id(0)] = d;
-+            });
-+            if (items2)
-+                GQ->parallel_for(sycl::range(items2), [f2, sh2, dc2](sycl::item<1> it) {
++        // C28: the criterion body comes from a factory so the MASTER copy and the TWIN copy
++        // carry a different stamp. The twin stamps its identity (16 magic bytes) into
++        // g_vit_flag -- a plan face whose EVERY writer and reader lies inside the dissolved
++        // span (the chain's 768 B scale face): in a master frame the span overwrites it with
++        // real quant data, in a twin frame the magic survives into the face dump. The dump
++        // then PROVES which graph ran, so host prints are no longer used for frame
++        // attribution (the C27 "off by one frame" wrinkle).
++        auto make_crit = [&](int stamp) {
++            return [old, f, sh, dc, items, f2, sh2, dc2, items2, fl, tc, stamp]() {
++                old();
++                GQ->parallel_for(sycl::range(items), [f, sh, dc, fl, tc, stamp](sycl::item<1> it) {
 +                    constexpr int PER = 16;
-+                    const sycl::uint4* a = (const sycl::uint4*)f2;
++                    const sycl::uint4* a = (const sycl::uint4*)f;
 +                    size_t b = it.get_id(0) * PER;
 +                    int d = 0;
 +                    for (int i = 0; i < PER; ++i) {
-+                        sycl::uint4 x = a[b + i], y = sh2[b + i];
++                        sycl::uint4 x = a[b + i], y = sh[b + i];
 +                        if (x[0] != y[0] || x[1] != y[1] || x[2] != y[2] || x[3] != y[3]) {
-+                            ++d; sh2[b + i] = x;
++                            ++d; sh[b + i] = x;
 +                        }
 +                    }
-+                    dc2[it.get_id(0)] = d;
++                    dc[it.get_id(0)] = d;
++                    if (stamp == 1 && it.get_id(0) == 0 && fl) {
++                        // C28: the stamp carries a DEVICE-side execution counter too, so the
++                        // face dump says not only "a twin frame wrote this" but WHICH twin
++                        // execution it was -- that settles the frame attribution without any
++                        // host print (the C27 off-by-one wrinkle). Item 0 only, and the graph
++                        // is in_order, so a plain load/store is enough (no atomics needed).
++                        unsigned e = tc ? (unsigned)(*tc) + 1u : 0u;
++                        if (tc) *tc = (int)e;
++                        *(sycl::uint4*)fl = sycl::uint4(sycl::uint(0xC28A571Du), sycl::uint(0x51E771C8u),
++                                                        e, sycl::uint(0x00000001u));
++                    }
 +                });
++                if (items2)
++                    GQ->parallel_for(sycl::range(items2), [f2, sh2, dc2](sycl::item<1> it) {
++                        constexpr int PER = 16;
++                        const sycl::uint4* a = (const sycl::uint4*)f2;
++                        size_t b = it.get_id(0) * PER;
++                        int d = 0;
++                        for (int i = 0; i < PER; ++i) {
++                            sycl::uint4 x = a[b + i], y = sh2[b + i];
++                            if (x[0] != y[0] || x[1] != y[1] || x[2] != y[2] || x[3] != y[3]) {
++                                ++d; sh2[b + i] = x;
++                            }
++                        }
++                        dc2[it.get_id(0)] = d;
++                    });
++            };
 +        };
++        cmds[host_cmd] = make_crit(0);
++        twin_host_body = make_crit(1);
++        twin_host_cmd = host_cmd;
 +    }
 +    // ---- the twin closure list: SAME count, the selected SPAN dissolved. C27 adds the
 +    // bisect sets (entry / attn / ffn) so the "which half moves `result`" question can be
@@ -400,12 +440,18 @@ index ac28b43..0ba867d 100644
 +    g_vit_twincmds = cmds;
 +    for (size_t i = 0; i < g_vit_kill.size(); ++i)
 +        if (g_vit_kill[i]) g_vit_twincmds[i] = [](){};
++    // C28: the twin's criterion copy carries stamp=1 (it marks the attribution face), the
++    // master's carries stamp=0. Same work, same nodes, one captured constant apart -- so a
++    // face dump can tell the two graphs apart without trusting any host print.
++    if (twin_host_cmd != SIZE_MAX && twin_host_cmd < g_vit_twincmds.size() && !g_vit_kill[twin_host_cmd])
++        g_vit_twincmds[twin_host_cmd] = twin_host_body;
 +    g_vit_twinready = true;
 +    std::printf("[vit-reuse] graph=%d level=%d set=%s chains=%zu span=%zu..%zu noop=%zu "
-+                "criterion cmd=%zu face=%p halfs=%zu items=%zu face2=%p items2=%zu\n",
++                "criterion cmd=%zu face=%p halfs=%zu items=%zu face2=%p items2=%zu flag=%p vread=%s\n",
 +                graphid, lvl, setname, g_vit_chains.size(),
 +                g_vit_span_from, g_vit_span_to, noops, host_cmd, g_vit_face, halfs, g_vit_items,
-+                g_vit_face2, g_vit_items2);
++                g_vit_face2, g_vit_items2, g_vit_flag,
++                getenv("NR_VIT_VREAD") ? getenv("NR_VIT_VREAD") : "dev");
 +    std::fflush(stdout);
 +}
 +// the per-frame verdict: shared-memory counters, read AFTER the frame's graph wait (the
@@ -443,7 +489,8 @@ index ac28b43..0ba867d 100644
 +    // trajectory diverged from the never-read control (REUSE=3) at run 1, i.e. BEFORE any
 +    // skip and identically for every skip set (entry/attn/ffn/segment) -- so the read
 +    // itself, not the reuse, was the perturbation. NR_VIT_VREAD=shr restores the old path.
-+    static int vread_dev = getenv("NR_VIT_VREAD") && strcmp(getenv("NR_VIT_VREAD"), "shr") == 0 ? 0 : 1;
++    static int vread_dev = (getenv("NR_VIT_VREAD") && strcmp(getenv("NR_VIT_VREAD"), "shr") == 0) ? 0
++                         : (getenv("NR_VIT_VREAD") && strcmp(getenv("NR_VIT_VREAD"), "host") == 0) ? 0 : 1;
 +    const size_t n = g_vit_items + g_vit_items2;
 +    static int* hs = nullptr;
 +    if (vread_dev) {
@@ -475,7 +522,7 @@ index ac28b43..0ba867d 100644
  // ==================== KNIFE 1: NR_BMERGE -- same-shape residual legs merged into ONE launch ====
  // notes/shape-merge-plan.md 7.1 knife 1, A3 slice (xmx_rec_gemm_int8_residual: 16 sites of
  // 2040x256x256 + 12 sites of 8160x128x128, all ALIVE on the load slot per tools/shapes_alive.csv).
-@@ -2331,6 +2777,7 @@ int xmx_graph_capture(void) {
+@@ -2331,6 +2824,7 @@ int xmx_graph_capture(void) {
      // graph is stored (default empty => this function is never entered; see the block above).
      skip_chains_apply(g_cmds, g_cmd_names, (int)g_graphs.size());
      bmerge_apply(g_cmds);      // KNIFE 1: runs AFTER the skip pass, so skipped legs cannot merge
@@ -483,7 +530,7 @@ index ac28b43..0ba867d 100644
      bmerge_order_apply();      // B step 2 (i): presence-gated REORDER (NR_BMERGE_ORDER), default off
      bmerge_order_report();     // what it moved, so the declared-set check has something to read
      pgraph_final_dump();       // the FROZEN touch sets, i.e. after any reorder -- [pgt] cannot show it
-@@ -2354,12 +2801,48 @@ int xmx_graph_capture(void) {
+@@ -2354,12 +2848,48 @@ int xmx_graph_capture(void) {
      g_pending_fold_slot = SIZE_MAX; g_fold_slot.clear(); // with the stream (10-27 audit)
      s6_reset();                                          // S6 chain candidate: ditto
      g_recording = false;
@@ -533,7 +580,7 @@ index ac28b43..0ba867d 100644
      int passes = (int)g_graphs[id].size();
      g_lc_vec = ((size_t)id < g_graph_launch.size() && g_graph_launch[id].size() == g_graphs[id].size())
                 ? &g_graph_launch[id] : nullptr;
-@@ -3821,6 +4304,8 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
+@@ -3821,6 +4351,8 @@ int xmx_rec_gemm(int a, int b, int c, unsigned M, unsigned N, unsigned K,
      if (!g_recording) FAILMSG("not recording");
      if (!M || !N || !K || (N % 16u) || (K % 16u))
          FAILMSG("gemm f16 needs N%%16==0, K%%16==0 (our tile)");
@@ -542,7 +589,7 @@ index ac28b43..0ba867d 100644
      const bool transposed = (bt & 1u) != 0u;   // scores leg: B stored (N,K), ldb->K
      if (bt & 0x800000u) FAILMSG("pooled window residual belongs to the window_block family");
      auto ia = g_bufs.find(a), ib = g_bufs.find(b), ic = g_bufs.find(c);
-@@ -4430,6 +4915,8 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
+@@ -4430,6 +4962,8 @@ int xmx_rec_gemm_int8_qkv(int a, int b, int q, int k, int v, int a_scale, int b_
      const size_t na = (size_t)Mp * C, nb = (size_t)NH * C;
      g_cmd_names.push_back(__func__);
      pgraph_ids({a,b,q,k,v,a_scale,b_scale,qkv_scale});   // PGRAPH touch-set (conservative: every operand id)
@@ -551,7 +598,7 @@ index ac28b43..0ba867d 100644
          flop_note("int8_qkv",M,3u*channels,channels,1);
          if (getenv("NR_SHAPE_DUMP")) { static long qv=0,qnv=0; if(flags&0x2000u) qv++; else qnv++;
              std::printf("[qkv-vit] vit=%ld nonvit=%ld (running)\n", qv, qnv); }
-@@ -5126,6 +5613,8 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
+@@ -5126,6 +5660,8 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
      static int ustop = getenv("NR_U_STOP") ? atoi(getenv("NR_U_STOP")) : 0;
      if (ustop == 9) { g_cmd_names.push_back(__func__);pg_push([](){}); return 0; }
      pgraph_ids({a,b,c,d});   // PGRAPH touch-set (conservative: every operand id)
@@ -560,12 +607,12 @@ index ac28b43..0ba867d 100644
      const unsigned flags = kind;                 // the plan's arg0 IS the flags word
      const unsigned sub = flags & 0xFFu;
      auto ia = g_bufs.find(a), ic = g_bufs.find(c);
-@@ -6757,6 +7246,8 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
+@@ -6757,6 +7293,8 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
      static int qstop = getenv("NR_Q_STOP") ? atoi(getenv("NR_Q_STOP")) : 0;
      if (qstop == 9) { g_cmd_names.push_back(__func__);pg_push([](){}); return 0; }
      pgraph_ids({source,packed,scale});   // PGRAPH touch-set (conservative: every operand id)
 +    if (vit_reuse_level())               // C25: remember the opening QUANT of a ViT chain
-+        vit_note_quant(g_cmds.size(), source, M, K);
++        vit_note_quant(g_cmds.size(), source, packed, scale, M, K);
      if (!M || !K || K % 16u) FAILMSG("quant needs K a multiple of 16");
      auto s = g_bufs.find(source), p = g_bufs.find(packed), c = g_bufs.find(scale);
      if (s == g_bufs.end() || p == g_bufs.end() || c == g_bufs.end()) FAILMSG("bad quant operand");
