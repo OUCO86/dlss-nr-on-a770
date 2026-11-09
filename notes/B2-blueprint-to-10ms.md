@@ -459,3 +459,9 @@ SM_LW | 分支=b1-wblock-resident（origin 已推）。
 ④ **没有时间尺度**：G=8349 的整张网格在 47-64 µs 内全部起完 = **平均 5.6-7.7 ns/组**（空-launch 地板 110-142 µs），**组是成批涌入不是排队进场**；
 ⑤ **容量侧也不成立**：帧内 gemm 的 A+B = 31.2%-51% of 16 MB L2 ⇒ 重读发生在 L2 内；既有旁证 `tools/l2_traffic_model.csv` 改 BN 只 −0.8%..+1.5%、`tools/traffic_breakdown.csv` 记该腿的钱在 skip/C 面（军规 178）。
 **要求**：今后引用外部"位不变的放置级杠杆"时，**第一步必须先验我们自己的派发结构与容量是否满足它的前提**（组是否排队进场、Y 维是否被用到、工作集是否超 L2），**不满足就当场关闭，不许做 A/B**；**并且注意父级自己也会犯 grep 错——"引擎里没有 2-D 发射"这条是我 grep 漏了不带显式 `<2>` 的 `nd_range(`，公开更正（军规 189 的同族错误）。**
+195. ★ **计时/复现用的 exe 必须与 oneAPI 运行时 DLL 同处一个目录（或用硬链接把它们放一起），否则 UR 只枚举到 OpenCL ⇒ `cgraph` 录制失败 ⇒ 读数会给出一个假的帧价。**
+**正案（2026-11-09 C26）**：把自建的 `nr_replay_c26.exe` 放在 `E:\DSH\builds\` 跑：`SetDllDirectory(out)` 之后 **`libxmx_sycl.dll` 的 `xmx_begin` 里 UR 只枚举到 OpenCL 后端** ⇒ 日志出现 **`[cgraph] RECORD FAILED: opencl backend is not supported`** ⇒ **帧价读成 46 ms 的假数**（且 fused 路直接 refuse）。**解法 = `tools/mk_c26rt.ps1`：把 exe 与 `E:\DSH\oneapi` 的运行时 DLL 用硬链接放进 `E:\DSH\tmp\c26rt\` 再跑（零拷贝、不写 oneapi）**；控制腿 `exctl`（新 exe + 槽件）plain 1301 = `DD49827D…` EXACT、40.5-41.2 ms ⇒ **忠实控制腿**。
+**配套两条**：
+① **这台机部署的 `nr_replay_now.exe` 没有 `NR_SELFREP`（源码里有）⇒ fused 路只有 1 帧** ⇒ 这就是 C25 那轮在融合路测不到"跳过帧"的原因；**要测多帧行为必须自建 replay exe 并按本节摆放**；
+② **判据/机制的净价要同时报"串行腿价"和"wall 价"**：C26 的判据净价 = **+0.07~0.27 ms 串行**，但 **wall 独立量到 +0.31 ms/帧**（`tctlp` 40.87 vs `offp` 40.56）⇒ **只报串行会低估机制开销**（与军规 166/188 同一族）。
+**要求**：任何新计时工装开工第一步先确认 **`[cgraph] RECORD`/`REPLAY` 行存在且没有 `RECORD FAILED`**；出现 `opencl backend is not supported` 或 `refuse` ⇒ **读数全部作废，先修目录布局**。
