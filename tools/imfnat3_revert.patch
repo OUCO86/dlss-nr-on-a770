@@ -1,0 +1,114 @@
+diff --git a/src/bench/sycl/cosine_tree_kernel.hpp b/src/bench/sycl/cosine_tree_kernel.hpp
+index 105728a..57cf69e 100644
+--- a/src/bench/sycl/cosine_tree_kernel.hpp
++++ b/src/bench/sycl/cosine_tree_kernel.hpp
+@@ -24,8 +24,11 @@ static const float COSINE_NORM_FLOOR = 0.00006198883056640625f;
+ static const float VIT_ROOT = 5.65625f;   // half(sqrt(32)), cosine_tree.glsl:58
+ 
+ // the half-fma spelling: half_round(l*r + acc) with the multiply-add NOT contracted
++#pragma clang fp contract(off)   // imfnat3: tight region for the helper below only (jun129)
++static inline float cr_plain_div(float a, float b) { return a / b; }   // ONE correctly-rounded div.rn (pre_kernel.hpp:40-41 recipe)
++#pragma clang fp contract(fast)
+ static inline float cr_hfma(float l, float r, float acc) {
+-    return qr_half_round(sycl::ext::intel::math::fadd_rn(sycl::ext::intel::math::fmul_rn(l, r), acc));
++    return qr_half_round(cr_add(cr_mul(l, r), acc));   // imfnat2 knife 2: cr_mul/cr_add are already the native op under contract(off) (publish_kernel.hpp:28-31); was fadd_rn(fmul_rn(...))
+ }
+ static inline float cr_hmul(float l, float r) { return qr_half_round(cr_mul(l, r)); }
+ static inline float cr_hadd(float l, float r) { return qr_half_round(cr_add(l, r)); }
+@@ -47,7 +50,7 @@ static inline float cosine_reciprocal(const float* h) {
+     for (int lane = 0; lane < 4; ++lane)
+         for (int p = 0; p < 2; p++) one[lane][p] = cr_hadd(two[lane][p], two[lane ^ 1][p]);
+     float norm = sycl::max(cr_hadd(one[0][0], one[0][1]), qr_half_round(COSINE_NORM_FLOOR));
+-    return qr_half_round(sycl::ext::intel::math::fdiv_rn(1.0f, sycl::sqrt(norm)));
++    return qr_half_round(cr_plain_div(1.0f, sycl::sqrt(norm)));   // imfnat3: div.rn under contract(off), was ext::intel::math::fdiv_rn
+ }
+ 
+ // cosine_reciprocal_32 -- GENERATED (kdis/gen_cr32.py) from the exact tree of
+@@ -57,7 +60,7 @@ static inline float cosine_reciprocal_32(float h0, float h1, float h2, float h3,
+     float one00 = cr_hadd(cr_hadd(cr_hadd(cr_hfma(h8,h8,cr_hmul(h0,h0)), cr_hfma(h24,h24,cr_hmul(h16,h16))), cr_hadd(cr_hfma(h12,h12,cr_hmul(h4,h4)), cr_hfma(h28,h28,cr_hmul(h20,h20)))), cr_hadd(cr_hadd(cr_hfma(h10,h10,cr_hmul(h2,h2)), cr_hfma(h26,h26,cr_hmul(h18,h18))), cr_hadd(cr_hfma(h14,h14,cr_hmul(h6,h6)), cr_hfma(h30,h30,cr_hmul(h22,h22)))));
+     float one01 = cr_hadd(cr_hadd(cr_hadd(cr_hfma(h9,h9,cr_hmul(h1,h1)), cr_hfma(h25,h25,cr_hmul(h17,h17))), cr_hadd(cr_hfma(h13,h13,cr_hmul(h5,h5)), cr_hfma(h29,h29,cr_hmul(h21,h21)))), cr_hadd(cr_hadd(cr_hfma(h11,h11,cr_hmul(h3,h3)), cr_hfma(h27,h27,cr_hmul(h19,h19))), cr_hadd(cr_hfma(h15,h15,cr_hmul(h7,h7)), cr_hfma(h31,h31,cr_hmul(h23,h23)))));
+     float norm = sycl::max(cr_hadd(one00, one01), qr_half_round(COSINE_NORM_FLOOR));
+-    return qr_half_round(sycl::ext::intel::math::fdiv_rn(1.0f, sycl::sqrt(norm)));
++    return qr_half_round(cr_plain_div(1.0f, sycl::sqrt(norm)));   // imfnat3
+ }
+ 
+ // cosine_tree.glsl:47-54, the ViT variant (opendlss_reference), verbatim.
+@@ -67,7 +70,7 @@ static inline float vit_reciprocal(const float* h) {
+     for (int c = 0; c < 8; ++c) r[c] = cr_hadd(r[c], r[c + 8]);
+     for (int c = 0; c < 4; ++c) r[c] = cr_hadd(r[c], r[c + 4]);
+     float norm = sycl::max(cr_hadd(cr_hadd(r[0], r[2]), cr_hadd(r[1], r[3])), qr_half_round(COSINE_NORM_FLOOR));
+-    return qr_half_round(sycl::ext::intel::math::fdiv_rn(1.0f, sycl::sqrt(norm)));
++    return qr_half_round(cr_plain_div(1.0f, sycl::sqrt(norm)));   // imfnat3
+ }
+ 
+ // kernel: rows x 32 f32 in, normalized f32 out (each output element itself half-rounded,
+diff --git a/src/bench/sycl/post_kernel.hpp b/src/bench/sycl/post_kernel.hpp
+index 43fc7fe..c6ce3d8 100644
+--- a/src/bench/sycl/post_kernel.hpp
++++ b/src/bench/sycl/post_kernel.hpp
+@@ -24,8 +24,10 @@ namespace postpass {
+ // correctly-rounded div/sub (the .comp's `/` and `-`; section 20/74 division discipline).
+ // cr_sub(a,b) = fadd_rn(a,-b): IEEE subtraction and adding the negation are both
+ // correctly rounded and give the same result.
+-static inline float cr_div(float a, float b) { return sycl::ext::intel::math::fdiv_rn(a, b); }
+-static inline float cr_sub(float a, float b) { return sycl::ext::intel::math::fadd_rn(a, -b); }
++#pragma clang fp contract(off)   // imfnat3: opened/closed tightly around these two definitions only (jun129)
++static inline float cr_div(float a, float b) { return a / b; }   // imfnat3: ONE correctly-rounded div.rn (the pre_kernel.hpp:40-41 recipe); was ext::intel::math::fdiv_rn
++static inline float cr_sub(float a, float b) { return a - b; }   // imfnat3: native sub.rn (was ext::intel::math::fadd_rn(a,-b))
++#pragma clang fp contract(fast)  // imfnat3: close the region (nothing below changes)
+ 
+ static inline float half_(float x) { return (float)sycl::half(x); }
+ 
+@@ -106,7 +108,7 @@ static inline auto post_kernel(PostArgs A) {
+         rgb[1] = decode11((word >> 11u) & 0x7FFu);
+         rgb[2] = decode10((word >> 22u) & 0x3FFu);
+         if (exposure > 0.0f)
+-            for (int ch = 0; ch < 3; ch++) rgb[ch] = sycl::ext::intel::math::fdiv_rn(rgb[ch], exposure);
++            for (int ch = 0; ch < 3; ch++) rgb[ch] = cr_div(rgb[ch], exposure);   // imfnat3: back to a plain division (no double rounding); CSE hoists it once per pixel
+         float shown[3];
+         for (int ch = 0; ch < 3; ch++) shown[ch] = rgb[ch];
+         float proxyScale = to_proxy_scale(luminance(rgb[0], rgb[1], rgb[2]));
+diff --git a/src/bench/sycl/quantize_row_kernel.hpp b/src/bench/sycl/quantize_row_kernel.hpp
+index f906c85..aefe988 100644
+--- a/src/bench/sycl/quantize_row_kernel.hpp
++++ b/src/bench/sycl/quantize_row_kernel.hpp
+@@ -19,6 +19,15 @@
+ 
+ static const unsigned QR_GRID = 65535u;   // x-extent cap, same as the GLSL
+ 
++// imfnat3 (2026-11-08): the plain-SYCL quantise chain used ext::intel::math::fdiv_rn, which inlines a
++// ~777-instruction correctly-rounded software sequence per site. The engine already proved the cheaper
++// route in pre_kernel.hpp:40-48: inside a contract(off) region a plain / IS a single div.rn (the same
++// value, no fixups). Opened and closed tightly around this one helper (jun129).
++#pragma clang fp contract(off)
++static inline float qr_div(float a, float b) { return a / b; }
++#pragma clang fp contract(fast)
++
++
+ // prods/recips are diagnostics-only (nullptr in production paths).
+ inline auto qr_kernel() {
+     return [](sycl::half* a_src, sycl::uint2* packed, float* scales,
+@@ -107,11 +116,11 @@ inline auto qr_kernel() {
+             // scale 1 ULP low -> 63.499996 vs 63.5 -> dev 64 vs gold 63). The header's
+             // own rule ("ONE correctly-rounded division") applies to BOTH divisions;
+             // the earlier gates' data simply never hit a bad peak.
+-            float scale = (peak == 0.0f) ? 1.0f : sycl::ext::intel::math::fdiv_rn(peak, 127.0f);
++            float scale = (peak == 0.0f) ? 1.0f : qr_div(peak, 127.0f);   // imfnat3: div.rn under contract(off)
+             if (row >= m) return;
+-            if (within == 0u) { scales[row] = scale; if (recips) recips[row] = sycl::ext::intel::math::fdiv_rn(1.0f, scale); }
++            if (within == 0u) { scales[row] = scale; if (recips) recips[row] = qr_div(1.0f, scale); }   // imfnat3
+             auto grid = [&](float v) {
+-                int r = (int)sycl::rint(sycl::ext::intel::math::fdiv_rn(v, scale));
++                int r = (int)sycl::rint(qr_div(v, scale));   // imfnat3: div.rn under contract(off)
+                 return (r < -127 ? -127 : (r > 127 ? 127 : r));
+             };
+             auto pack4 = [](int x0, int x1, int x2, int x3) {
+@@ -139,7 +148,7 @@ inline auto qr_kernel() {
+                         float f[8]; halves(sw, f);
+                         int g[8]; for (int i = 0; i < 8; ++i) g[i] = grid(f[i]);
+                         out = sycl::uint2(pack4(g[0],g[1],g[2],g[3]), pack4(g[4],g[5],g[6],g[7]));
+-                        if (prods) for (int i = 0; i < 8; ++i) prods[(size_t)row * k + w * 8u + i] = sycl::ext::intel::math::fdiv_rn(f[i], scale);
++                        if (prods) for (int i = 0; i < 8; ++i) prods[(size_t)row * k + w * 8u + i] = qr_div(f[i], scale);   // imfnat3
+                     }
+                 }
+                 dst[at] = out;
