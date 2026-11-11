@@ -3850,3 +3850,31 @@ A = 4 ELF / 271 实例，B = 4 ELF / **273**；**ADDED 4 / REMOVED 2**（= `xmx_
 - **功能同一性**：用重建件跑 fused `REUSE=0` ⇒ **三面逐字节 = 基线**（`254C02B7…` / `CACD2029…` / `AE050ED1…`），`run 0 = 60.22 ms / 693 passes`；
 - **⇒ 军规 169②（HEAD == 出货件源码态）现在有了可执行的证明方式**：**"重编 + 字节差计数（应只有个位数）+ 面 EXACT"**，**而不是要求 dll md5 相等**（本配方每次 Tag 都带时间戳 ⇒ 相等是不可能的）；已按此写进 `notes/DEPLOYED_ARTIFACT.md` 的覆盖块口径。
 - **现役最终状态（11-12 03:50）**：两槽 = **`6C4D7AF793CC5F6769EACB70107E2FCA`**（3,454,976 B）、`out/SHIPPED_MD5.txt` 同值、**HEAD `90a43ee`、工作树 CLEAN、无进程**；`out\nr_ship.conf` = 出货态（`reuse=1 / mode=1 / period=16 / global 1.0 / local 50.0 / image 1.0 / gap 500 / trace=0`）；`out\libxmx.before-vitreuse.keep` = `A2C3009F`（C18）；**40 门链 40 GREEN / 0 RED**（`logs/gates_c37.txt`）。
+
+## 185. ★★★★ **C38 第 2 层达标审计（零 GPU）：三族欠 5.44-7.59 ms/帧，含 `ffn` 则 6.5-11.3 ⇒ 与已收的 −5.115 同量级，第 2 层没到头。表已并入 `notes/layer2-gains.md` + `tools/L2_scoreboard.csv`**
+### ① 口径（这次钉死，以后每次重算照此）
+**腿表**：fused = C18 之后的 master 串行表 `logs/C26_mstlgt_run_timing.txt`（693 闭包 / 126.237 ms）；**plain 只有 11-02 的 `tools/rt_per_closure.csv` ⇒ PRE-C18，已在列里标注**；
+**字节** = touched-plane hop 普查（`leg_decomp.csv` 的 `hop_per_closure_MB`，**不是申报 footprint**）；
+**地板** = 同 MB ÷ `access_bw.csv` 实测形态臂（连续 305.5 / tile8 走 219.9 / 跨列 244.1 / gather5 224.8 / 2× 上采样 260.9 / pack 散布写 190 GB/s）；
+**生成器** `tools/wb_c38_scoreboard.py`（可重跑）。
+### ② 达标表（旧倍数 → 新倍数）
+| 族 | fused 闭包 | 每闭包 ms | 家族 ms | 执行字节/帧 | 地板 ms（形态） | 倍数 | 到 2.0× 还差 ms/帧 | 判定 |
+|---|---|---|---|---|---|---|---|---|
+| **`window_block`** | 10 | **1.275**（巨头 3.06-3.08 / 兄弟 0.82-1.03） | **12.751** | **794.1 MB** | 4.179（pack 散布写）/ 3.611（tile8 走） | 3.9-6.2× ⇒ **3.05-3.53×** | **4.39 / 5.53** | ❌ **最贵** |
+| **`global_attention`** | 8 | **0.465**（0.421-0.509） | **3.717** | **378.2 MB** | 1.682（gather5）/ 1.238（连续） | 2.1-3.3× ⇒ **2.21-3.00×** | **0.35 / 1.24** | ❌ **最接近达标** |
+| **`ffn_merge`** | 1 | **1.529** | **1.529** | **108.6 MB** | 0.416（2× 上采样读）/ 0.356（连续） | 2.8-4.5× ⇒ **3.67-4.30×** | **0.70 / 0.82** | ❌ |
+| **`ffn`（chip_cs2）** | 8 | **0.701**（0.461-0.951） | **5.606** | **17.11 GFLOP/帧**（**无 hop 普查**） | 2.273（XMX f16 屋顶中位行 7.53 TOPS）/ 0.959（最好行 17.84） | 未测 ⇒ **2.47-5.84×（形状敏感，只当粗账）** | **1.06 / 3.69** | ❌ 且普查缺 |
+### ③ 缺口排序 = 第 2 层还欠多少（唯一硬数）
+**1. `window_block` 4.39→5.53；2. `ffn` 1.06→3.69（数最不实）；3. `ffn_merge` 0.70→0.82；4. `global_attention` 0.35→1.24**
+⇒ **三族合计欠 5.44-7.59 ms/帧；含 `ffn` 则 6.5-11.3 ms/帧**；对照已收 **−5.115 ms/帧**（C5+C7+C18）⇒ **剩下的钱与已收的钱同一量级**；
+**性价比排序 ≠ 缺口排序**：`global_attention` 只差 0.35-1.24 ms 且有一条"已点名未付"的 **IMF 第二刀**；`window_block` 缺口最大但**去复制线已收割完** ⇒ 必须换结构性（少发 submission / persistent stage / 换形状）。
+### ④ 未试杠杆与已判死（全部带出处，详表在 `notes/layer2-gains.md` 追加块）
+**`window_block`**：判死 = SLM 减字节换驻留（149/§58 `s6/slm_probe.cpp`：LW=64 恒 64 并发 WG）、纯指令量（§六 `imfnat3` 帧 −0.049）、去复制线（§七/§八/§十）、要更多 GRF 的路（182：全实例 `grf=128` 顶格）、magic-add（163）；**未试 = P1 合并相邻 WB 闭包（`bmerge_apply` 现成，WB 族本身从没试过）、P2 S3 persistent stage（消 1267 边界读写；touched 最大面 1313=616.4 / 1309=547.7 / 1311=532.1 MB/帧）、P3 WG 再切细**；
+**`global_attention`**：判死 = softmax 旧形（已转正 §二#2）、`w[k]` 复用、不在关键路径的遮蔽（§二#6 `com4′` +0.043）、占用/SLM；**未试 = P4 IMF 第二刀（`cosine_tree_kernel.hpp:28 cr_hfma`、`:50/60/70 fdiv_rn`，GA 指纹剩 ≈4,392 行）、P5 pack 发射侧（每闭包 6 发里 4 发是 pack，price_per_launch ≈0.229 ms）、P6 int8 算术（必须先量 XMX 占用；C19 chip 是其 XMX 时间 12× ⇒ 很可能不是 XMX-bound）**；
+**`ffn_merge`**：判死 = 指令量（§六）、占用/SLM（149：2.06 per-WG 比值不是驻留）；**未试 = P7 拆相位/两发流水、P8 f32→f16 残差流面（§四② 0.48-0.78 ms，`f16_saving_MB_per_frame` 1313=308.2 / 1309=273.9 / 1311=266.0 MB/帧；改数值 ⇒ 必须用户实机裁）**；
+**`ffn`**：**P0a 把 `ffnc::launch_ffn_chip` 的 plane 边并入 hop 普查**（现在这行最不实）；**P0b 补一条 plain 路 `NR_RUN_TIMING` 腿**（plain 口径别一直停在 PRE-C18）。
+### ⑤ 数据质量红旗（诚实挂着）
+① **plain 全是 PRE-C18**；② **执行字节沿用 C18 之前的 hop 普查**（C5/C7/C18 只减重复计算、不减 touched plane ⇒ 假设成立但**未复核**）；③ **`ffn` 地板用 XMX 屋顶 ⇒ 形状敏感**（17.84 vs 7.53 TOPS）；④ **形态臂跨进程散布 ±30%**（CONTIG 305.5 与重测 223.9）⇒ **0.3 ms 级差异不可读**。
+### ⑥ 现场与下一铲
+**C38 全程零 GPU、未改源、未编译、未 staged、主树 CLEAN**；两槽开工/收工对账均 `6C4D7AF7…` / 3,454,976 B = `out/SHIPPED_MD5.txt` ✓；git 只用只读命令；状态 `s6/layer1.md §124` + `§124.5b` 一条更正；交付物 `E:\DSH\tools\L2_scoreboard.md`（8,119 B）与 `L2_scoreboard.csv`（1,405 B）。
+**C39 已下令（04:07）**：先跑 P0a / P0b（1 腿）/ P6（dpas 占比 <30% 就判死 int8）/ P1（**必须先回答"合并省的是 µs 级 submission 还是 MB 级重复读"，若是前者直接降级**），**然后只开一把刀**（先验排序 = **P4 GA 的 IMF 第二刀**，理由：同族同型 `imfnat3` 在 WB 上实测 −2.556 ms/帧，且这是已点名未付的账；**但定价必须先过 25% 线**）；**动手前先跑一条腿确认现役件（`6C4D7AF7…`）四面基线仍 EXACT**。
