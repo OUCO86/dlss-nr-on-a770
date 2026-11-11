@@ -1,10 +1,8 @@
 vit_reuse = 1
 vit_mode = 1
-vit_period = 4   # changed from 16 to 4 WITHOUT rebuilding
-# thresholds (parsed, not used by the period decision)
+vit_period = 16
 vit_global = 1.0
 vit_local = 50.0
 vit_image = 1.0
 vit_reset_gap_ms = 500
-vit_trace = 1
-bogus_key = 7
+vit_trace = 0

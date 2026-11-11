@@ -58,3 +58,16 @@
 | **fused 口径（游戏那条路，每进程一个值）** | 变体 **58.79 / 59.42 ms**；控制（昨日 `8658C786`）此前测得 **60.54 / 60.87 / 61.67** ⇒ **≈ −2 至 −2.9 ms**（正式 4 对在跑） |
 | **回退链** | `builds\libxmx_shfc7.dll`（`8658C786`，C7）→ `libxmx_shfc5.dll`（`2F3ACF6C`，C5）→ `libxmx_imfnat3.dll`（`66FEC931`，用户 11-08 06:39 实机验收）→ `libxmx_shfimf1.dll`（`AF5A19B3`，49.83 认证值）；**staged 前的旧两槽另存 `out\libxmx.before-c18.keep`** |
 | **这条线累计** | **C5 −1.793 + C7 −0.766 + C18 −2.556 = −5.115 ms/帧**（**全部逐位不变、全部 16/16、全部四闸 EXACT**） |
+
+## ★ **覆盖上表：现役 = C37 ViT 周期复用 — 2026-11-12 03:35 staged（用户实机验收通过）**
+| 项 | 值 |
+|---|---|
+| **两槽** | `E:\DSH\out\libxmx.dll` = `E:\DSH\oneapi\libxmx_sycl.dll` = **`6C4D7AF793CC5F6769EACB70107E2FCA`**（**3,454,976 B**）；`out/SHIPPED_MD5.txt` = `6c4d7af793cc5f6769eacb70107e2fca` |
+| **源状态** | HEAD = **`e2dd81d`**（**HEAD == 出货件源码态，军规 169②**），工作树 CLEAN；改动面 = **只 `src/bench/sycl/libxmx_sycl.cpp`（+1090/−5、30 hunk）**，五只 header 未动，`s6_ffn_block_kernel.hpp` md5 守卫仍是单态 `490647A9…` |
+| **机制** | **ViT 段（fused 313..385 / plain 312..384 = 73 只闭包）按帧周期整段溶解复用**：`idx = 帧计数 % period`，`0 ⇒ 全算`，其余 ⇒ 溶解；**闭集 ⇒ 没有半复用**；**决策全主机侧、零设备读、无判据核** |
+| **外置参数（用户自己调，不用重编）** | **`E:\DSH\out\nr_ship.conf`**（样例在 `tools/nr_ship.conf.example`）：`vit_reuse=1`、`vit_mode=1`、**`vit_period=16`（合法 1..16 = lmxx 硬上限）**、`vit_global=1.0`、`vit_local=50.0`、`vit_image=1.0`（后三个本轮只解析，mode 1 判据未接）、`vit_reset_gap_ms=500`、`vit_trace=0`；**优先级 env > conf > 内置默认**；**只在 init 读一次**（每帧零 open、零队列 op）；未知键忽略、越界夹取并记 `conf clamped` |
+| **帧收益（bench，三进程）** | **fused 46.26 → 42.15 = −4.08 ms/帧**；**plain 40.65 → 36.71 = −3.94 ms/帧**（period=16）；period=8 ⇒ −1.56 / −1.71；period=4 ⇒ −0.79 / −1.20；**master 帧代价 ≈ +15 ms/帧**（16 帧里 1 帧） |
+| **本次 staged 件上的实测** | 四闸在 `REUSE=0` 下全部 EXACT（`254C02B7` / `CACD2029` / `AE050ED1` / `DD49827D`）；**`REUSE=1`（默认）单帧回放路上三面同样 EXACT**；**40 门链 40 GREEN / 0 RED**（`logs/gates_c37.txt`，自检行 md5 = `6c4d7af7…`）；fused `run 0` 60.99（off）→ **53.35（on）** |
+| **用户实机裁决（2026-11-12 03:24）** | **“设置 4-16 画面没问题，帧数有提高，反倒是 4-16 不同设置帧数变化不大，应该是动态画面吃这个提升有损耗，表现和 lmxx 那边基本上一致。这个就过了。外挂参数保留，以后我想调整自己调整就好。”** |
+| **回退链（只用于换数值，不是取消机制）** | `builds\libxmx_vitreuse_c37b-20261112-020910.dll`（`6C4D7AF7`，现役）→ `libxmx_wbph_c18-20261109-052655.dll`（`A2C3009F`，C18）→ `libxmx_shfc7.dll`（`8658C786`）→ `libxmx_shfc5.dll`（`2F3ACF6C`）→ `libxmx_imfnat3.dll`（`66FEC931`）→ `libxmx_shfimf1.dll`（`AF5A19B3`）；**staged 前旧两槽另存 `out\libxmx.before-vitreuse.keep`（`A2C3009F`）** |
+| **今天累计** | **C5 −1.793 + C7 −0.766 + C18 −2.556 = −5.115 ms/帧（逐位不变）+ ViT 周期复用 −4.08 fused / −3.94 plain（有损、用户已验收）≈ −9.2 ms/帧** |

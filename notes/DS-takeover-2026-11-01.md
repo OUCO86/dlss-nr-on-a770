@@ -3830,3 +3830,16 @@ s6ns (同配置 THMAX=-1 ⇒ flag 恒 0):          f1..f9:k=0/73                
 A = 4 ELF / 271 实例，B = 4 ELF / **273**；**ADDED 4 / REMOVED 2**（= `xmx_graph_run`→`xmx_graph_run_one` 改名对 + host 侧新 lambda；**period 模式下判据核根本不编译** ⇒ 比 level-6 那版的 +19/−14 干净）；**`scratch≠0 = 0` ✓、`grf>128 = 0` ✓、共有实例 metadata 变化 = 0 ✓**（连符号表占位都没动）。
 ### ⑥ 现场与工具
 主树 **CLEAN**（porcelain 0；`.cpp` = `CC48937E…` = HEAD；五 header = HEAD 字节 ✓ 军规 199）；未 commit/staged/promote；三金标、四面基线、`out/SHIPPED_MD5.txt`、`shipped_build.defs`、`build_shipped.ps1`（父级改）、门脚本/golden、受管缓存未写；本轮只写 `out\nr_ship.conf`（外置参数文件）与 `out\nr_vit_trace.log`；每腿新建空缓存、腿间 62 s、每腿 `RECORD_FAILED=0` ✓；**GPU 18 腿 ≈ 20 分钟**（预算 30）；工具新增 `s6/c37_probe.py`、`c37_fix.py`、`c37_defs.py`、`c37_defs2.py`、`tools/wb_c37_report.py`、`wb_c37_report2.py`、`wb_c37_ms.py`；**刀 `E:\DSH\tools\C37_engine_u8.diff` = 89,301 B、30 hunk、+1090/−5、LF、UTF-8 无 BOM、`git apply --check` exit 0，只改 `libxmx_sycl.cpp`**；状态 `s6/layer1.md §123`。
+
+## 183. ★★★★★ **C37 转正并 staged：ViT 周期复用上线（用户实机验收通过），外置参数保留给用户自己调；本次 staged 件上四闸 + 40 门链全绿，且默认 ON 时单帧回放三面 EXACT**
+- **用户裁决（11-12 03:24，原话）**：“**设置 4-16 画面没问题，帧数有提高，反倒是 4-16 不同设置帧数变化不大，应该是动态画面吃这个提升有损耗，表现和 lmxx 那边基本上一致。这个就过了。外挂参数保留，以后我想调整自己调整就好。**” ⇒ **机制常驻、数值他自调**；
+- **staged**：两槽 = **`6C4D7AF793CC5F6769EACB70107E2FCA`**（3,454,976 B）、`out/SHIPPED_MD5.txt` 已更新；**HEAD `e2dd81d` = 出货件源码态**（只改 `libxmx_sycl.cpp`，+1090/−5）；**旧两槽存 `out\libxmx.before-vitreuse.keep`（`A2C3009F`）**；
+- **staged 后的独立复验（新建空缓存、串行、腿间 62 s）**：
+ - `REUSE=0`：**fused 1301 `254C02B7` ✓ / features `CACD2029` ✓ / result `AE050ED1` ✓ / plain 1301 `DD49827D` ✓**；
+ - **`REUSE=1`（现役默认，period=16）在单帧回放路上：三面同样 EXACT** ⇒ 静止/同输入下复用惰性在出货件上复现；
+ - **40 门链 = 40 GREEN / 0 RED**（`logs/gates_c37.txt`，`[gate-selfcheck] loaded dll md5 = 6c4d7af7…`）；
+ - fused `run 0`：off **60.99** → on **53.35 ms**（单值、冷启动，只作方向佐证；稳态三进程数在 §182③：**fused −4.08 / plain −3.94**）；
+- **conf 已清理为出货态**（去掉测试残留的 `bogus_key` 与误导注释，**`vit_trace=0`** 免得每帧写日志）：`vit_reuse=1 / vit_mode=1 / vit_period=16 / vit_global=1.0 / vit_local=50.0 / vit_image=1.0 / vit_reset_gap_ms=500 / vit_trace=0`，样例入库 `tools/nr_ship.conf.example`；
+- **口径提醒（记进台账，免得以后误读）**：**period 的收益是"平均数"**：**8 帧窗口里多数是复用帧 ⇒ 只有均值能体现"多久算一次"**；**master 帧本身比复用帧贵 ≈ 15 ms** ⇒ **用户观察到的"4 与 16 帧数差别不大"与我们的账一致**（fused：−0.79 / −1.56 / −4.08 是平均意义上的，动态场景里被 master 尖峰与真实变化率吃掉一部分）；
+- **今天累计**：**逐位不变那三刀 −5.115 ms/帧** + **ViT 周期复用 −4.08 fused / −3.94 plain（有损、已验收）** ⇒ **≈ −9.2 ms/帧**；
+- **未结（诚实挂着，不当已定论）**：**lmxx 的 mode 1 判据 + `reuse_finish` 的 anchor/gain 外推还没移植**（语义表已做完，§181④）⇒ **现在只有"纯周期冻结"**；**若要把 4-16 档的动态画质再往上推，那条是下一步的可选项**（不是必须）；**另外 `vit_global/local/image` 三个键现在只解析不使用，接上判据前不要在 conf 里当功能告诉用户**。
