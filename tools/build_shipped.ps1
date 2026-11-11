@@ -38,12 +38,12 @@ function Get-Md5Of([string]$p) { (Get-FileHash -LiteralPath $p -Algorithm MD5).H
 # ---- guard: header state must match the shipped basis -------------------------------------
 $hpp = Join-Path $HERE 's6_ffn_block_kernel.hpp'
 $hppMd5 = Get-Md5Of $hpp
-# Two accepted states: pre-gate (490647A9...) = shipped basis; gated (20A44A6E...) = same + ViT-reuse gate.
-#   (C38025BB... was a BROKEN gate copy: externs landed inside a comment -> syntax error; superseded 19:52.)
-# Anything else (e.g. the reverted S6_BAR experiment) still fails the build.
-if (($hppMd5 -ne '20A44A6E090B585FE3731C7FB18BE770') -and ($hppMd5 -ne '490647A9444955B5DE0B9A634A0A317E')) {
-  Write-Host "GUARD FAIL: s6_ffn_block_kernel.hpp = $hppMd5 (expected 20A44A6E... = pre-S6_BAR + ViT gate, or 490647A9... = pre-gate)"; exit 1 }
-Write-Host ("header ok: s6_ffn_block_kernel.hpp = $hppMd5  gate=" + $(if ($hppMd5 -eq '20A44A6E090B585FE3731C7FB18BE770') {'ON'} else {'OFF'}))
+# Single accepted state: pre-gate 490647A9... = the shipped basis.
+#   2026-11-12: the ViT-reuse gated copy (20A44A6E..., and the broken C38025BB...) is RETIRED - C35 touches
+#   only libxmx_sycl.cpp, so the header guard goes back to one state. Re-baseline if a future shovel gates s6.
+if ($hppMd5 -ne '490647A9444955B5DE0B9A634A0A317E') {
+  Write-Host "GUARD FAIL: s6_ffn_block_kernel.hpp = $hppMd5 (expected 490647A9... = pre-S6_BAR state)"; exit 1 }
+Write-Host "header ok: s6_ffn_block_kernel.hpp = $hppMd5"
 
 foreach ($f in (Join-Path $HERE 'libxmx_sycl.cpp'), $Defs, (Join-Path $Repo 'tools\patch_testdefs.py'), $PY) {
   if (-not (Test-Path -LiteralPath $f)) { Write-Host "MISSING $f"; exit 1 } }

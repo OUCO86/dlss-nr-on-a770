@@ -3773,3 +3773,34 @@ s6ns (同配置 THMAX=-1 ⇒ flag 恒 0):          f1..f9:k=0/73                
 ### ④ 判定与现场
 **判定（我下）**：**不 staged、不认证**；这条线记为 **"未达标，停在覆盖 32/73"**；**要继续就还差 17 只闭包的守法（`b6_res` + 共用 launcher 的命中格 + 捕获形态差异），预期把收益推到 ≈ −2.4 ms/帧（静止），仍低于 twin 的 −4.08，且运动场景只亏 +0.37 ⇒ 风险轮廓最好**；**明早由用户裁决是否补完**。
 **现场**：主树 **CLEAN**（porcelain 0；六文件回 HEAD：`.cpp` `CC48937E…`、`s6` `490647A9…`）；未 commit/staged/promote；两槽开工与收工两次对账均 `A2C3009F…` / 3,335,168 B = `out/SHIPPED_MD5.txt` ✓；三金标、四面基线、`shipped_build.defs`、`build_shipped.ps1`（父级改）、门脚本/golden、受管缓存未写；每腿新建空缓存、腿间 62 s、`RECORD_FAILED=0` ✓；日志 `C27_{s6t,s6ns}.log`、`build_vitreuse_c34a-…log`；状态 `s6/layer1.md §120、§121`。
+
+## 181. ★★★ **C35：外置参数机制完全工作（改文件即改行为，已验）+ `REUSE=0` 四闸 EXACT；但 ON 路一进 `graph_run` 就 `std::bad_function_call` ⇒ 三档验收测不到（不含糊上报）**
+### ① 配置层（这是用户要的能力，已交付并验证）
+**一张表 + 一个通用 getter**：`NrCfgKey{name, env, is_float, def, lo, hi}`，本轮 10 键：`vit_reuse=1`、`vit_mode=1`(1..3)、**`vit_period=16`**(1..16 = lmxx 硬上限)、`vit_global=1.0`、`vit_local=50.0`、`vit_image=1.0`、`vit_reset_gap_ms=500`、`vit_trace=1`、`nr_fused_synth`、`nr_run_timing`（后两个**只解析+打印、不改行为**，避免碰捕获/认证地盘 147/148/183；**cgraph、skip-chains、缓存路径故意不进表**）；
+**优先级 = env > `E:\DSH\out\nr_ship.conf` > 内置默认**；**只在 init 读一次**（函数内 `static` ⇒ 每帧零 open、零队列 op、`parallel_for` 外无新语句 ✓）；**文件缺失/坏值不失败**：未知键 ⇒ `conf: unknown key <k> (ignored)`；越界/NaN ⇒ 夹进 `[lo,hi]` + `conf clamped: …`；末尾 `conf loaded: N keys, clamped: M` + `[vit-cfg] …`；**"加一个可调参数"的三步写进 `s6/layer1.md §122.1`**；
+**★ 改文件即生效的证据腿（不重编）**：`confp` 腿不设 env、文件里写 `vit_period = 4` ⇒ 日志 `conf loaded: 8 keys, clamped: 0` + `[vit-cfg] … period=4 …` + `[vit-reuse] PERIOD frame=0 decision=master period=4 idx=0 reset=recapture` ✓；
+**决策器（全主机侧、零设备读）**：period 模式下**判据核整个不装** ⇒ master 与 twin 只差"溶解的 73 只闭包"（**闭集、全有或全无 ⇒ 没有半复用、没有 stamp、没有计数器**）；`idx = pframe % period`，`idx==0 ⇒ master` 否则 `twin`；**重置**：capture 完成 ⇒ 计数归零（覆盖几何/模式/重录）、墙钟帧间隔 > `vit_reset_gap_ms` ⇒ 归零（`reset=gap`）、首帧必算；**history/seed 的内容变化在纯主机方案里不可见**（要设备读，正是这套设计刻意避免的；lmxx 的 reset 也只到 `n` 几何粒度）⇒ **period 就是用户可调的有损旋钮**；每帧一行日志 → `out\nr_vit_trace.log`。
+### ② ON 路崩溃（三腿定位到唯一结构差异）
+| 腿 | 配置 | 结果 |
+|---|---|---|
+| `g_off_f` | `REUSE=0` | **exit=0**、`cgraph_lines=1`、**四闸逐字节 EXACT**（fused 1301 `254C02B7` ✓ features `CACD2029` ✓ result `AE050ED1` ✓） |
+| `p16f` | ON, period=16 | **exit=1**：`step 5252 (xmx_graph_run): graph_run: bad function call` |
+| `p1f` | ON, **period=1（永远 master、从不选 twin）** | **同样崩** ⇒ 崩不在"选 twin"这步 |
+| `p16nc` | ON + `NR_CGRAPH=0`（纯 plain 路） | **同样崩** ⇒ 与 cgraph 无关 |
+| 对照 | **c34a**（判据核照装） | **exit=0** ✓（昨天 20:2x 验过、今天 01:4x 复跑仍 0） |
+**⇒ 唯一结构差异 = period 模式下判据核不装**；`GERR="bad function call"` = **`std::bad_function_call` ⇒ 有个空的 `std::function` 被调用**；
+**下一刀的三条探针（各一条腿，写在 §122.3）**：① 装一个"只调 `old()`、不加任何核"的包装体（闭包身份与数量与 C34 一致）⇒ 不崩即证明某处以"判据核存在"为前提；② 扫 `twin_host_body` / `g_vit_A/Bm/Bt` / level-4 split 的 push 点，找未初始化即被调的 `std::function`（`twin_host_cmd` 有 `SIZE_MAX` 守卫 ✓，split 那条在 `lvl≠4` 时是否仍被 push 进 `g_graphs` 要查）；③ 在 plain pass 的 `g_graphs[id][fi]()` 前加 `if (!f) FAILMSG("closure %zu empty")` 的诊断腿 ⇒ 一条腿就指出是哪只闭包空。
+### ③ 件与刀
+**`c35a` 编译失败**（att5 调用点还带 C34 的 21 实参、而 header 已回 20 参 ⇒ **军规 199 的连锁**）→ **`c35b-20261112-012552` = `51FA3C9C373A2579E3D6962740EF4C53`，3,454,976 B，icx exit=0 ✓，`header ok: s6 = 490647A9… gate=OFF`**；
+**刀 `E:\DSH\tools\C35_engine_u8.diff` = 87,529 B、28 hunk、+1082/−4、LF、UTF-8 无 BOM、`--check` exit 0，只改 `libxmx_sycl.cpp` 一个文件**；**五只 header 全部回到 HEAD 字节 ⇒ 我为 s6 做的二次解锁可以撤销，`build_shipped.ps1` 恢复单态**（已在本条同期执行，`20A44A6E…` 记为已退役值）。
+### ④ C36 lmxx 语义表（零 GPU 读码，全文 §122.4）——**"调到最大也不觉得画质崩"的另一半 = 增益外推，不是单纯冻结**
+- **`reuse_image_stats`**（`hip/deep_fast.hip:1109-1116`）：按 **32×32 tile 精确均值**（边缘钳位），非有限 ⇒ `delta=1e30`；`delta[tile]=Σ|Δch|/max(Σ|anchor|,1e-6)`；
+- **`reuse_token_stats`**（1083-1091）：一 wave 一个 token（含 raster↔token 位重排）：`d=Σ|v−old|`、`a=Σ|old|`、`ratio=d/max(a,16)`、**`changed` = 任一通道位不同（XOR bits）**；
+- **`reuse_decide`**（1092-1101，256 线程一 wave）：`image_peak` 取 **2×2 tile 邻域的 min 再 max**（避免孤立近黑边缘一票否决平移）；**reason 码**：1 无 state、2 mode==2 强制完整、3 周期到点（mode1 延长除外）、4 非有限/哨兵、**0 = 允许复用（mode==3 直接走这条 = 纯周期）**、5 `rel>global`、6 `peak>local`、7 `image_peak>image`、**8 = mode1 且 `changed==0` 且到周期 ⇒ 位相同可超过 period 继续用缓存**；`state[0..7]` = 复用标志/age/have_state/帧计数/rel/peak/reason/image_peak；
+- **`reuse_finish`**（1103-1107，★ 关键）：复用帧 **`out[i] = (v==anchor_in[i]) ? anchor_out[i] : fma(gain[i%1024], v−anchor_in[i], anchor_out[i])`**；**anchor 只在完整帧更新**（近似帧不递归喂）；
+- **门控**（`hip_reference_network.h:710-711`）：**每帧都跑 `Vit(31..38)` 的外壳**，块内核带**可空门控参数**（文档：DLL 与 HIP 模块必须成套，旧 DLL 混新模块会炸）；复用时块内核不写输出，**输出由 finish 的 anchor+gain 混出来**；
+- **gain**（688-692）：默认从资产算 —— `for block 31..38, part ∈ {contract, projection}` 读 `block<B>-<part>.f32`（matrix = 4,194,304 / 1,048,576 floats + **尾部 1024**），**`product[i] (double) *= weight[matrix+i]`（16 个因子）** ⇒ `gain[i]=float(product[i])`；可用 `DLSS5_VIT_REUSE_GAIN=<4096 B f32>` 覆盖；非有限 ⇒ throw；
+- **前置与重置**：`mode>3`、`graph`、`!fast_deep`、`!pooled`、`vit_byte_stream`、**跨 31-38 的 skip** ⇒ throw；`multi_pass>1 ⇒ mode=0`；`adaptive_dirty`（模式切换）、state 缺失、`adaptive_n != n`（几何）、空闲 > `DLSS5_VIT_ADAPTIVE_IDLE_MS`（默认 500）⇒ 重置。
+**移植到我们引擎的六步（C37 的料，按依赖排序）**：① 我们的 8 条 ViT 链（闭包 313..385）与 lmxx 的 block 31..38 一一对应 ⇒ **在权重资产里定位每条链 contract/projection 的 1024 通道尾缩放**（字段名出处 `scripts/get_weights.py`、`src/tools/hnet_weights.py`；我们是 int8 打包 + f32 scale 尾 ⇒ 先确认尾部布局），**零 GPU、纯 python 就能算出 4096 B gain 表**；② 两块 `n×1024` anchor 面（我们 ViT 输出面 1285 = 393,216 halfs ⇒ 每块 ≈1.5 MB）；③ **span 出口加一只 finish 闭包**（或并入出口 GEMM 的 publish），只在完整帧更新 anchor；④ 门控复用 C31-C34 已建的 `lc_begin → g_vit_run_cmd → vit_gate()` 管道（40 处已守），**但必须守全 49 只**（C34 只有 32/73）；⑤ 决策：**mode 3 = 纯周期（本轮已实现）**、mode 1 = lmxx 判据（我们的 words/max/sum 是它的子集，要补 tile 均值 + 2×2 邻域 min + age/period 状态机）；⑥ **硬顺序约束：走"门控 + 混合"就必须先有 finish**，否则就是 C33/C34 那种半复用。
+### ⑤ 现场
+主树 CLEAN（`.cpp` = `CC48937E…` = HEAD、五 header = HEAD）；未 commit/staged/promote；两槽开工与收工两次对账均 `A2C3009F…` / 3,335,168 B ✓；三金标、四面基线、`out/SHIPPED_MD5.txt`、`shipped_build.defs`、门脚本/golden、受管缓存未写；**新增 `out\nr_ship.conf`（外置参数文件 = 用户授权的交付物）与 `out\nr_vit_trace.log`（允许）**；每腿新建空缓存、腿间 62 s；**GPU 11 腿 ≈ 13 分钟**；状态 `s6/layer1.md §122`。
