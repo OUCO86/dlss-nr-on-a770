@@ -3992,3 +3992,19 @@ A = 4 ELF / 271 实例，B = 4 ELF / **273**；**ADDED 4 / REMOVED 2**（= `xmx_
 ⇒ **口径申请的三段写法**：**(A) 换分母救 GA 一族（2.12× ⇒ 1.11-1.44× 达标）；WB 与 `ffn_merge` 两个分母下都不达标 ⇒ 它们的超额是"每窗口/每块的核内指令链"，派发与 barrier 只解释 9-12% 与 1.7% ⇒ 要过线只剩三条路：改算术链（C13/C16/宽存/gather 已全撞墙）、改数值（P8：1.09-1.76 ms/帧、SNR 58-66 dB）、或把达标线改成算术族专用线（如 D2 ≤ 3.5×）**。
 ### ④ 现场
 **1 次编译（icx exit=0）+ 5 个冷进程**（GPU ≈ 7-8 分钟，预算内）；骨架件只在 `E:\DSH\tmp\c44\`（`c44_skel.cpp/.exe` + `c44_cache_p1..5`）⇒ **未 staged、未进两槽、未写 golden**；**未改任何引擎源文件**（porcelain 0、`.cpp` = `98F521EF…`）、未编译引擎件；两槽对账 `6C4D7AF7…` / 3,454,976 B = `out/SHIPPED_MD5.txt` ✓；conf 未动；195/197 摆放（排除 `libxmx_sycl.dll` ✓）、in_order ✓、min-of-9、每进程新建空缓存、进程间 62 s ✓；日志 `C44_skel_p1..5.log`；状态 `s6/layer1.md §130`。
+﻿## 191. ★★★★ **C45（0 GPU）：P8 的第一条边被普查否掉，并且推翻我自己 C41 的报价 —— `1313` 是混位宽 SLAB、qkv 的 K 输出早已是 int8+scale；真正的肉在 `1309` 的 `gemm_int8_residual -> quant_window` f32 交接（~1,000 MB/帧 => 折半 500 MB/帧 = 1.6-2.6 ms/帧，只有 2 个站点，但 HIGH 风险）**
+### ① 普查与否证
+**身份**：计划缓冲 **1274 = ViT 全局注意力的 K 面**（`wb_ga_ops.csv:5927+` 写死 `q=1275 k=1274 v=1276 merged=1277`；`.cpp:1769` 链注释 `GEMM_INT8_QKV(1286,w -> 1275,1274,1276)`）；**run-plane = 1313**（artifact `dumps/bgP_on.1274.bin`，33.55 MB、f32、n=8,388,608 = 522,240x16、**87.6% 精确 0**、f16 往返改 11.74% 元素、误差恰 1 ulp）；
+**`1313` 是混位宽 SLAB**（`plane_traffic` 原话：qkv k-output **int8** 60x2.09=125 MB + window_attention out **f16** 52x~1.0 + gemm c **f32** + quant packed ⇒ **"把这一面变 f16"不适定，刀必须是一条边**)；
+**站点 = 6**（`(family, operand-position)`）：`gemm_int8_qkv@3`（写 K，A5-fused 见 `:1104`）、`gemm@0`、`gemm@2`、`gemm_int8_batched@2`（`:5057`）、`gemm_int8_residual@7`、`window_attention` 读侧（`:1678-1680`）；
+**★ 否证**：**现役出货路的 qkv K 输出已经是 int8 + scale**（记录器名就是 `gemm_int8_qkv`，`main_edges` 也标 int8）⇒ **"f32->f16 切 1274" 这条边大半已实现（int8 比 f16 还省）**；
+**⇒ 我在 C41 的 as-if 里按"整面 f32"给 `1313` 折的 0.6-1.0 ms/帧 对这条边是夸大 ⇒ 公开更正**（军规 188/203 这次落在我自己头上：**报价的分子必须按边取，不能按面取**）。
+### ② 换靶（P8 真正的肉，等用户点头才建刀）
+**`1267` / run-plane `1309` 的 `gemm_int8_residual -> quant_window` 这条边**：`main_edges` 原文 —— 写 **f32 C**（68 calls x 8.36 MB = **568 MB**）-> `quant_window` 读它（52 x 8.36 = **435 MB**）⇒ **f32 交接 ≈ 1,000 MB/帧 ⇒ 折半 = 500 MB/帧 = 1.6-2.6 ms/帧**（190-305.5 GB/s 两臂）；
+**站点只有 2 处**：写侧 C 面 publish 的元素类型 + 读侧 `quant_window` 的 load 类型；
+**判级 HIGH**（量化前累加器、**99.95% 元素会变**）⇒ **风险在下游 requant 阈值边界被推过去（局部块状差异）**；**SNR 本身不差**：残差链仿真 12 级 **65.5 dB** / 68 级 **58.3 dB** ⇒ **比已死的 RES8 字节面（17 dB）好 41-48 dB**；
+**第三条候选（`1313` 上 `window_attention` 的 f16 输出边）`main_edges` 已标 f16 ⇒ 同样大半已实现 ⇒ 肉小，不建议**。
+### ③ 守卫状态核对（这条对以后每把 P8 刀都省事）
+`build_shipped.ps1:39-45` 现在只登记 **`s6_ffn_block_kernel.hpp` = `490647A9…` 单态** ⇒ **`publish_kernel.hpp` / `gemm_s8_v8` / `gemm_s8_v9` / `att5_fused_kernel.hpp` / `softmax_kernel.hpp` / `window_block_v4*.hpp` 都未登记 ⇒ 可定点 edit，不需要 §181① 解锁** ✓
+### ④ 现场
+**GPU = 0**（预算 25 分钟全省）；未改任何源文件（porcelain 0、`.cpp` = `98F521EF…`）、未编译、未 staged、无刀可导；两槽对账 `6C4D7AF7…` / 3,454,976 B = `out/SHIPPED_MD5.txt` ✓（开工/收工各一次）；conf 未动 `AF12FFC8…`；无进程；交付 `tools/C45_1274_sites.md` + `tools/wb_c45_census.py`、`wb_c45_sites.py`；状态 `s6/layer1.md §131`（含 §131.2 更正）。
