@@ -3843,3 +3843,10 @@ A = 4 ELF / 271 实例，B = 4 ELF / **273**；**ADDED 4 / REMOVED 2**（= `xmx_
 - **口径提醒（记进台账，免得以后误读）**：**period 的收益是"平均数"**：**8 帧窗口里多数是复用帧 ⇒ 只有均值能体现"多久算一次"**；**master 帧本身比复用帧贵 ≈ 15 ms** ⇒ **用户观察到的"4 与 16 帧数差别不大"与我们的账一致**（fused：−0.79 / −1.56 / −4.08 是平均意义上的，动态场景里被 master 尖峰与真实变化率吃掉一部分）；
 - **今天累计**：**逐位不变那三刀 −5.115 ms/帧** + **ViT 周期复用 −4.08 fused / −3.94 plain（有损、已验收）** ⇒ **≈ −9.2 ms/帧**；
 - **未结（诚实挂着，不当已定论）**：**lmxx 的 mode 1 判据 + `reuse_finish` 的 anchor/gain 外推还没移植**（语义表已做完，§181④）⇒ **现在只有"纯周期冻结"**；**若要把 4-16 档的动态画质再往上推，那条是下一步的可选项**（不是必须）；**另外 `vit_global/local/image` 三个键现在只解析不使用，接上判据前不要在 conf 里当功能告诉用户**。
+
+## 184. ★★★ **出货件可复现性证据 + 一条新军规：`build_shipped.ps1` 的 dll md5 跨次不可复现（嵌入戳差 4 字节），源码↔出货件要用"面 EXACT + 字节差计数"来证，不用 dll md5 相等**
+- **HEAD `90a43ee` 重编**：`build_shipped.ps1 -Tag verify_c37` ⇒ `header ok: s6 = 490647A9…`（单态守卫 ✓）、**`icx exit=0`（0.8 分钟）**、件 `E:\DSH\builds\libxmx_verify_c37-20261112-034434.dll` = **`E5B97249A190BCD6B57A406F47439AF6`、3,454,976 B**；
+- **与 staged 件 `6C4D7AF7…` 比对**：**字节数完全相同**、**只有 4 个字节不同（0.0001%）** ⇒ 差异是嵌入的构建戳/路径，不是代码；
+- **功能同一性**：用重建件跑 fused `REUSE=0` ⇒ **三面逐字节 = 基线**（`254C02B7…` / `CACD2029…` / `AE050ED1…`），`run 0 = 60.22 ms / 693 passes`；
+- **⇒ 军规 169②（HEAD == 出货件源码态）现在有了可执行的证明方式**：**"重编 + 字节差计数（应只有个位数）+ 面 EXACT"**，**而不是要求 dll md5 相等**（本配方每次 Tag 都带时间戳 ⇒ 相等是不可能的）；已按此写进 `notes/DEPLOYED_ARTIFACT.md` 的覆盖块口径。
+- **现役最终状态（11-12 03:50）**：两槽 = **`6C4D7AF793CC5F6769EACB70107E2FCA`**（3,454,976 B）、`out/SHIPPED_MD5.txt` 同值、**HEAD `90a43ee`、工作树 CLEAN、无进程**；`out\nr_ship.conf` = 出货态（`reuse=1 / mode=1 / period=16 / global 1.0 / local 50.0 / image 1.0 / gap 500 / trace=0`）；`out\libxmx.before-vitreuse.keep` = `A2C3009F`（C18）；**40 门链 40 GREEN / 0 RED**（`logs/gates_c37.txt`）。
