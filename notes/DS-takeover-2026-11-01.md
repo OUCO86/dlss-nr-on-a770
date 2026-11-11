@@ -3923,3 +3923,23 @@ A = 4 ELF / 271 实例，B = 4 ELF / **273**；**ADDED 4 / REMOVED 2**（= `xmx_
 ### ⑤ 交付与现场
 **`tools/L2_asif_f16.md`**（6,854 B：as-if 表 + 风险账 + 三问结论）+ **`tools/wb_c41_asif2.py`**（正确版：按 `plane_map` 的 recorder×slot 份额折面）+ **`wb_c41_asif.py`**（保留一个坑的记录：**plan-buffer id ≠ run-plane id，直接查会低估**）+ **`wb_c41_snr.py`**（残差链 SNR 仿真）+ **`wb_c41_p2p7.py` / `p2p7b.py`**；
 **GPU = 0 条腿 ✓**；未改源、未编译、未 staged；主树 CLEAN、`.cpp` = `98F521EF…`；两槽对账 `6C4D7AF7…` / 3,454,976 B = `out/SHIPPED_MD5.txt` ✓；`out/nr_ship.conf` 未动（`AF12FFC8…`）；状态 `s6/layer1.md §127`。
+
+## 188. ★★★★★ **C42（0 GPU）：WB 换形状的四条方向全部被已判死的结论覆盖 ⇒ "没有新形状可试"；第 2 层的非数值杠杆到此出尽 ⇒ 递交口径申请（`tools/L2_criterion_request.md`）**
+### ① 第 0 步答辩（源码实证）
+**现役形状**（`window_block_v4ph.hpp:34-38`）：`constexpr uint LW = 64u;` + `nd_range<1>(range(windows*LW), range(LW))` + `esimd::slm_init<45056>()` ⇒ **一只 WG（64 lane）正好服务一只 8×8 窗口（64 token、C=32）**，`simd 1`、**`grf=128` 顶格**；
+**巨头 = 闭包 2（pool 8160 窗，2.888 ms / 108.7 MB；`wb_ga_ops.csv:5313` H=544 W=960 across=120 C=32 tokens=64）与闭包 691（head 8349 窗，3.063 ms / 75.2 MB）= 家族 47%**；**六只兄弟 0.82-0.87 ms 已在地板 1.1-1.3× ⇒ 换形状对它们无肉**。
+**换形状只有四个方向，每个都被覆盖**：
+1. **`LW=32`（半窗一 WG、每 lane 干 2 token）** ⇒ 每 lane live range 翻倍 ⇒ **`grf` 必须 >128 ⇒ 撞军规 182**；同族变体已在 **C13 §95 的四个候选形（C13a/C13c 两切点三路拆 + C13b 核内缩 live range）全部撞墙** ✓
+2. **`LW=128`（一 WG 服务两窗、共享 staging）** ⇒ **SLM 45,056×2 = 90,112 > 每 WG 65,536 上限**（§58 实测：65,536 是 **per-WG cap**、不是每片池）⇒ **当场非法**；其宽存/宽读表亲 = **C16 §99-101（v4full "CANDIDATE A IS DEAD AT THE GATE"，实测 +1.5..+ ms）** 与 **P0 gather 加宽 §87（`send.ugm` 执行槽真从 4 砍到 2，墙钟只值 −2.1~-3%）** ✓
+3. **跨 WG 拆相位（全局 scratch 接）** ⇒ **`scratch≠0` ⇒ 军规 182**；"拆开消等待" = **C13 §94/§95**；"改遍历方向减 gather 冲突" = **C24 判死**；"胖 M / BN32 / wide-merge" = **C15 §98 DEAD** ✓
+4. **减 SLM 换驻留** = **军规 149 / §58 已否证**（**LW=64 恒驻 64 个 WG，SLM 从来不是约束**）✓
+⇒ **答不出与这七条的差异，因为不存在这样的形状** ⇒ **不探针、不建腿**（GPU 0 条）。
+### ② 口径申请草案（全文 `tools/L2_criterion_request.md`）
+**事实**：**四个字节敏感族已按 2.0× 地板全过** —— `gemm_window_int8_residual` **1.09×**、`gemm_int8_residual` **1.20×**、`gemm_int8_qkv` **1.23×**、`window_attention` **1.69×**（现役件新普查）；`ffn` **2.21×** 贴线；**未过三族 = WB 3.05× / ffn_merge 4.17× / GA 2.12×，其 XMX 占比只有 1.9-17.8%** ⇒ **既不是带宽-bound 也不是 XMX-bound，超额在核内依赖链**；
+**(A) 改分母**（对这三族用可辩护的屋顶）：**诚实提醒：XMX 屋顶不是正确分母**（C19 §105：chip 是其 XMX 时间的 12×；C22 §108：ViT 段三臂骨架探针 20% 不过线、§107 的分母前提已否证）⇒ **若走 (A)，分母应是延迟/依赖链屋顶**，需先从 `stall_hotspots_bb_aware.csv`（`ffn2::fused` 首用 p50 9-12、p90 29-45 周期）+ `barrier_audit_after.csv`（12 道 SG barrier、WG=0）取数 ⇒ **那是另一把取证铲**；
+**(B) 允许走 P8 帧时间刀**（改数值）：只切 `1313` 边 ⇒ **0.6-1.0 ms/帧、SNR ≈66 dB**；连 `1309` 一起切 ⇒ **1.09-1.76 ms/帧、残差链 12 级 65.5 dB / 68 级 58.3 dB** ⇒ **比已死的 RES8（17 dB << 40 dB 线）安全 41-48 dB**；**但 P8 修不了倍数**（as-if：WB 3.05→3.08×、GA 2.12→2.12×、ffn_merge 4.17→4.17×）⇒ **只是帧时间刀**，且 `1309` 是量化前累加器（HIGH）⇒ **必须用户实机裁**；
+**(C) 承认第 2 层实际收敛**：已收 **−5.115 ms/帧（逐位不变）+ 周期复用 −4.08/−3.94（用户已验收）≈ −9.2 ms/帧**；**第 2 层剩余非数值上界只有 2-3 ms/帧（对照缺口 5.24-7.38）** ⇒ 申请把预算转投下一层，或按 (B) 收帧时间；
+**子代理建议排序：C 为主、B 为可执行项、A 需先补一把延迟屋顶取证铲。**
+### ③ 现场
+**GPU = 0 条腿**（预算 20 全省）；未改源、未编译、未 staged；主树 CLEAN、`.cpp` = `98F521EF…` = 现役 HEAD 源码态；`oneapi\libxmx_sycl.dll` = `6C4D7AF7…` / 3,454,976 B = `out/SHIPPED_MD5.txt` ✓（开工/收工各一次）；`out/nr_ship.conf` 未动（`AF12FFC8…`）；无进程残留；git 只读；状态 `s6/layer1.md §128`。
+**另记一条卫生问题（它顺手只读列举时发现的）**：`libxmx_sycl.dll` 在别处还有若干副本 —— `E:\DSH\dlss-nr-on-a770\src\bench\sycl\`（`C18FF196…`）、`E:\DSH\tmp\bis*` 若干、**游戏树里 `196C9245…` / `679B71AC…`**；**它这一铲没有写任何这些路径**；**两槽的对账口径始终是 `out\libxmx.dll` + `oneapi\libxmx_sycl.dll`**（游戏树那颗是引擎自己加载用的槽位，归父级管，见 `notes/DEPLOYED_ARTIFACT.md`）。
