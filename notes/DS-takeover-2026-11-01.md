@@ -3804,3 +3804,29 @@ s6ns (同配置 THMAX=-1 ⇒ flag 恒 0):          f1..f9:k=0/73                
 **移植到我们引擎的六步（C37 的料，按依赖排序）**：① 我们的 8 条 ViT 链（闭包 313..385）与 lmxx 的 block 31..38 一一对应 ⇒ **在权重资产里定位每条链 contract/projection 的 1024 通道尾缩放**（字段名出处 `scripts/get_weights.py`、`src/tools/hnet_weights.py`；我们是 int8 打包 + f32 scale 尾 ⇒ 先确认尾部布局），**零 GPU、纯 python 就能算出 4096 B gain 表**；② 两块 `n×1024` anchor 面（我们 ViT 输出面 1285 = 393,216 halfs ⇒ 每块 ≈1.5 MB）；③ **span 出口加一只 finish 闭包**（或并入出口 GEMM 的 publish），只在完整帧更新 anchor；④ 门控复用 C31-C34 已建的 `lc_begin → g_vit_run_cmd → vit_gate()` 管道（40 处已守），**但必须守全 49 只**（C34 只有 32/73）；⑤ 决策：**mode 3 = 纯周期（本轮已实现）**、mode 1 = lmxx 判据（我们的 words/max/sum 是它的子集，要补 tile 均值 + 2×2 邻域 min + age/period 状态机）；⑥ **硬顺序约束：走"门控 + 混合"就必须先有 finish**，否则就是 C33/C34 那种半复用。
 ### ⑤ 现场
 主树 CLEAN（`.cpp` = `CC48937E…` = HEAD、五 header = HEAD）；未 commit/staged/promote；两槽开工与收工两次对账均 `A2C3009F…` / 3,335,168 B ✓；三金标、四面基线、`out/SHIPPED_MD5.txt`、`shipped_build.defs`、门脚本/golden、受管缓存未写；**新增 `out\nr_ship.conf`（外置参数文件 = 用户授权的交付物）与 `out\nr_vit_trace.log`（允许）**；每腿新建空缓存、腿间 62 s；**GPU 11 腿 ≈ 13 分钟**；状态 `s6/layer1.md §122`。
+
+## 182. ★★★★★ **C37：崩因找到并最小修好；三组读数全部拿到 ⇒ ViT 周期复用现在是"既省又准"：静止逐字节不变、period=16 实测 fused −4.08 / plain −3.94 ms/帧**
+### ① 崩因（一条诊断腿定位）与修法（取最小方案）
+**诊断**：在 `xmx_graph_run_one` 的两处闭包调用点（record pass、warm pass）各加 `if (!g_graphs[id][fi]) FAILMSG("closure %zu EMPTY in graph %d …")` ⇒ `p16f` 当场报 **`step 5252 (xmx_graph_run): closure 312 EMPTY in graph 0 (warm pass)`**；
+**根因**：`vit_reuse_apply` 在包装前先做了 **`auto old = std::move(cmds[host_cmd]);`**（`.cpp:2235`，C28 为"包装体调旧体"写的）；**C35 的 period 分支跳过安装 ⇒ 旧体被搬走却没放回 ⇒ master 图里 312 号是空 `std::function`** ⇒ 一调用就 `std::bad_function_call`（`what()` = "bad function call"）⇒ **所以 period=1（永不选 twin）照崩、`NR_CGRAPH=0` 照崩：崩在 master 自己身上**；
+**修法 = 最小方案 (i)**：period 分支里 **`cmds[host_cmd] = std::move(old);`**（旧体原样放回）⇒ **不注册包装、不重新引入判据核 ⇒ +0.37 ms 管道代价不带回来**；**两处 EMPTY 检查保留**（只在 record/warm 的 host 路径，不进核不进 replay）⇒ **把静默 UB 变成当场报号**；
+**件**：**`c37b-20261112-020910` = `6C4D7AF793CC5F6769EACB70107E2FCA`，3,454,976 B，icx exit=0 ✓**，打印 `header ok: s6_ffn_block_kernel.hpp = 490647A9444955B5DE0B9A634A0A317E`（**= 撤销二次解锁后的单态，与仓库现值一致 ✓**）；`c37a`（`0600608C…`，只带探针）用于定位。
+### ② ★ 静止惰性证明 ✓✓ + 四闸 ✓
+**8 帧 × 7 面逐帧 FNV**：`p16f / p8f / p4f` vs `s0f`(REUSE=0)、`p16p / p8p / p4p` vs `s0p` ⇒ **六个全部 ALL 8×7 EQUAL** ✓✓（七面 = `result / history / head / 1285 / 1267vit / 1271vit / features`）⇒ **静止上周期复用完全惰性（溶解的是闭集）** ⇒ C33/C34 那 34/40 项 DIFF 在这条路上不存在；
+**决策序列也对**：period16 `ma, tw×8`；period8 `ma, tw×6, ma`；period4 `ma, tw, tw, tw, ma, tw, tw, tw, ma`（**首帧必算 ✓**）；
+**四闸在 `REUSE=0` 下全部 EXACT**：fused 1301 `254C02B7…` ✓、features `CACD2029…` ✓、result `AE050ED1…` ✓（plain 1301 `DD49827D…` 同族件已验）⇒ **机制在场不改出货数值** ✓。
+### ③ 帧 ms（**三进程，均值与散布**）与"用户调的就是这个平均数"
+| 路 | `REUSE=0` | **period=16** | period=8 | period=4 |
+|---|---|---|---|---|
+| **fused** | 46.26 | **42.15**（42.13 / 42.27 / 42.15，散布 0.14）⇒ **Δ −4.08** | 44.70（−1.56） | 45.48（−0.79） |
+| **plain** | 40.65 | **36.71**（36.61 / 36.60 / 36.93，散布 0.33）⇒ **Δ −3.94** | 38.94（−1.71） | 39.45（−1.20） |
+⇒ **period=16 拿回 twin 的量级**（twin −4.08 / −3.92 ⇒ 本轮 −4.08 / −3.94）✓✓ **且静止逐字节不变**；
+**口径提醒（重要）**：报的是**均值**——8 帧窗口里多数是复用帧，**"多久算一次"只有均值能体现**；**master 帧实测代价 ≈ +15 ms/帧**（`p8f` max 57.58、`p4f` 58.09、`p8p` 49.60、`p4p` 49.77）⇒ **用户调的 period 就是"平均省多少 / 每 N 帧卡一次"的权衡**。
+### ④ 画面桶（period=16，合成 reseed 料；对照 = 同序列 `REUSE=0` 腿）——**给用户看的账，不是红线**
+- **m1**：`1301` **6,749,414 B = 80.77%**（4B 单元 2,088,960；半字 4,157,403；码步 40,429 / 40,286 / 232,253 / 1,096,266 / 610,842 / 2,137,327；max 65,522；median 1,957；NaN 64,939→65,068；Inf 144→140；**新 NaN 63,060**）；`result` **809,268 B = 38.74%**（454,940 个 4B 单元；median 192；max 63,527；**新 NaN 15,671**）；**`features` EXACT ✓（输入侧没被动）**；
+- **m2**：`1301` 81.04%（新 NaN 63,084）；`result` 36.21%（新 NaN 14,031）；`features` EXACT ✓；
+⇒ **合成 reseed 料上 period=16 是重损**（9 帧里 8 帧不算段）；**比 C28 跨帧判据的 m1（`result` 27.43%、新 NaN 11,656）更狠** ⇒ **真实玩法下该用哪一档，必须由用户眼睛裁**（军规 156）；**这正是 lmxx 语义里"mode 3 = 纯周期"的代价**，也是他 mode 1 判据 + **gain 外推**（§181.④）存在的理由。
+### ⑤ ocloc 逐 ELF（c37b vs 槽件，`C37_zeinfo1.log`）
+A = 4 ELF / 271 实例，B = 4 ELF / **273**；**ADDED 4 / REMOVED 2**（= `xmx_graph_run`→`xmx_graph_run_one` 改名对 + host 侧新 lambda；**period 模式下判据核根本不编译** ⇒ 比 level-6 那版的 +19/−14 干净）；**`scratch≠0 = 0` ✓、`grf>128 = 0` ✓、共有实例 metadata 变化 = 0 ✓**（连符号表占位都没动）。
+### ⑥ 现场与工具
+主树 **CLEAN**（porcelain 0；`.cpp` = `CC48937E…` = HEAD；五 header = HEAD 字节 ✓ 军规 199）；未 commit/staged/promote；三金标、四面基线、`out/SHIPPED_MD5.txt`、`shipped_build.defs`、`build_shipped.ps1`（父级改）、门脚本/golden、受管缓存未写；本轮只写 `out\nr_ship.conf`（外置参数文件）与 `out\nr_vit_trace.log`；每腿新建空缓存、腿间 62 s、每腿 `RECORD_FAILED=0` ✓；**GPU 18 腿 ≈ 20 分钟**（预算 30）；工具新增 `s6/c37_probe.py`、`c37_fix.py`、`c37_defs.py`、`c37_defs2.py`、`tools/wb_c37_report.py`、`wb_c37_report2.py`、`wb_c37_ms.py`；**刀 `E:\DSH\tools\C37_engine_u8.diff` = 89,301 B、30 hunk、+1090/−5、LF、UTF-8 无 BOM、`git apply --check` exit 0，只改 `libxmx_sycl.cpp`**；状态 `s6/layer1.md §123`。
