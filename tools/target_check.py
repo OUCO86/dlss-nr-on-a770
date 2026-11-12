@@ -62,9 +62,9 @@ def main():
     h = d.get("hardware_by_user_2026_11_12")
     if h:
         print("硬件对照（用户 2026-11-12 给表，永久作废'装不下'借口）：")
-        a = h["A770_Xe_HPG"]; n = h["RTX3080Laptop_GA104"]
-        print("  A770(Xe-HPG): %s / 单线程 %s / 每 %s" % (a["max_regs_per_thread"], a["reg_bytes_per_thread"], a["regs_per_EU"]))
-        print("  3080L(GA104): %s / 单线程 %s / 每 %s" % (n["max_regs_per_thread"], n["reg_bytes_per_thread"], n["regs_per_SM"]))
+        ah = h["A770_Xe_HPG"]; nh = h["RTX3080Laptop_GA104"]
+        print("  A770(Xe-HPG): %s / 单线程 %s / 每 %s" % (ah["max_regs_per_thread"], ah["reg_bytes_per_thread"], ah["regs_per_EU"]))
+        print("  3080L(GA104): %s / 单线程 %s / 每 %s" % (nh["max_regs_per_thread"], nh["reg_bytes_per_thread"], nh["regs_per_SM"]))
         print("  结论：%s" % h["verdict"])
     rf = d.get("roofline_measured")
     if rf:
