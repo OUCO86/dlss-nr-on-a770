@@ -4434,3 +4434,20 @@ GPU = 0；主树 CLEAN（porcelain 0、HEAD `d3fb77a`）；六份 md5 原状（`
 **C66 已下令（最迟 18:40，GPU ≤25 分钟）**：试验层 **C64 窗口链**（一块 64 token × C64 ⇒ SLM 16.4-21.5 KB；48 KB 实测不亏；`grf≤128/scratch=0` 现役已守；LW=16 已证 8,160-8,928 WG）；**A0 = 现形 split 链（中间 plane 照写）**、**A1 = 一核吃完整链、块内中间量只在 SLM、一个中间 plane 都不写 global**（只允许链头读 `1267`/skip + 链尾写 `1267`；`pack_b` 权重仍可 global 读）；**判据 = Δ ≥25% 且消掉 region 字节 ≥ 链现形 50%，按 854.6 GB/s 折算**；必报 **Δ、A0/A1 的 region 字节账（静态 + 动态）、ocloc 三闸、对拍 8/8 EXACT（A1 与 A0 逐元素同值 = 零数值风险）**；**出口**：过线 ⇒ 开引擎刀 S6-C64；10-25% ⇒ 归因分列；**<10% 且字节确实消掉 ≥50% 才是"驻留无效"的真证据**；建不出来 ⇒ 说清卡在哪一行，**不许用"硬件不行"收尾**（用户 11:30 硬件表已作废那个借口）。
 ### ⑤ 现场
 两铲 **GPU = 0、零编译、零源改动**；主树 CLEAN（porcelain 0、HEAD `7ff93e1`）；六份 md5 原状（`98F521EF…`/`E2991804…`/`64952F2F…`/**守卫件 `490647A9…` 未碰**/`CAC3C50D…`/`69C9BA9E…`）；两槽未写；conf 只读未改（`AF12FFC8…`）；产物 `tools/c65_p8_price.txt`、`wb_c65_price.py`、`wb_c65_flags.py`；状态 `s6/layer1.md §162`。
+## 218. ★★★★★ **C66（2 分钟 GPU）：那条"缺失的决定性实验"其实不缺 —— `b6_res_kernel.hpp` 就是 A1（中间量全在 SLM、global 只写链尾）；跑出来 Δ 六读数全在 ±2%、48/48 EXACT、region 消掉 ≥50%（3.858 GB/帧 = 4.51 ms 的 L2 时间）而 Δ≈0 ⇒ 驻留不是绑住我们的资源；我两次计价（DRAM-only、L2-roof）在同一方向上都不成立**
+### ① 它自己更正了我引用过的旧描述（代码为证）
+`src/bench/sycl/b6_res_kernel.hpp` = **A1 臂本体**：头注释 `:12-13` 原话 **"stage-3's global Out store REPLACED by ATT joins into the dead tile region"**；SLM 分区 `:32-33` = **X0 8K | Z0 16K（scores/PKT+AS2）| Y0 8K（temps/probs）| QT 8K | KT 8K | VT 8K**，`SLMB = 57,344`（`:55-56`）⇒ **Q/K/V/PKT/scores/probs 全在 SLM**；到 global 的写只有链尾 `:483-484 copy_to(Out2 + out)` 与 **nullptr 门控的 debug 写**（`:67 DbgPKT = nullptr`、`:383-408`）⇒ 默认不发射；`:72 nd_range(windows*16, 16)` = LW=16；`:91/:94 slm_block_store(..., lid*128)` = 已证 256 B/lane-owned ⇒ **我定的硬约束（中间面不得作为 global buffer）满足 ✓**
+### ② Δ（3 冷进程 × min-of-9）
+| windows | A0 `qres+wa+quant+wres` trio | A1 b6 单核 | Δ |
+|---|---|---|---|
+| 510 | 0.6290 / 0.6286 / 0.6216 | 0.6307 / 0.6329 / 0.6330 | **+0.27% / +0.68% / +1.83%** |
+| 558 | 0.6897 / 0.6806 / 0.6797 | 0.6805 / 0.6679 / 0.6832 | **−1.33% / −1.87% / +0.52%** |
+⇒ **|Δ| 均值 ≈ 0.9%，六个读数全在 ±2% ⇒ Δ < 10%**
+### ③ region 归账（换币种）+ 对拍
+`tools/wb_c66_region.py`：`chain_map.csv` 的 **8 条 C64 链（86 只闭包）= 3.858 GB/帧 = 全帧 30.85 GB 的 12.5%**；族分布 `gir 679.3｜wres 655.0｜quant_window 609.1｜quant 599.9｜qkv 416.0｜batched 397.1｜wa 378.4｜unary 112.8｜gemm 10.5 MB/帧`；**A1 按构造消掉链内部全部 plane 往返 ⇒ 消掉 ≥50%** ⇒ **按 `B_L2_reuse` 854.6 GB/s 有 4.51 ms/帧 的 L2 时间被消掉，而 Δ≈0**；**对拍 48/48 EXACT**（每进程每形状 8 张面，例 `diff 0 / 2,088,960`）⇒ **A1 与 A0 逐元素同值 = 零数值风险**。
+### ④ ★ 判决与含义
+**"驻留无效"现在有真证据**（有臂、有对拍、有 region 归账）⇒ **S6 块驻留判死恢复入账**；**我的两次计价（DRAM-only 与 L2-roof）在同一方向上都不成立 ⇒ 我们是指令量/依赖链受限**（与 C58 自校验的编码链 **13.98 ms 串行 / 5.02 ms 帧内可见** 一致）；
+**唯一混淆项**：A1 的 SLM **57,344 B 超了 C53 实测安全的 48 KB 档** ⇒ Δ≈0 里可能混了一点占用率损失 ⇒ **C66b（10-12 分钟 GPU）把 band plan 压到 ≤48 KB（QT/KT/VT 复用 Z0 死区）重跑同臂 + 补 `grf/scratch` 普查**：**若仍 ±2% ⇒ 判死定档；若明显变正 ⇒ 再补 32 KB 档并给出"驻留 + 占用率"的真实杠杆大小**；
+**下一把（C67，等 C66b 定档后开）= 编码链指令量刀 SWAR e4m3**（`×2^-8` 统一对齐 + 硬件 abs-modifier + 单 LEA；作者第 6 刀形 pack 13→9→5 条 SASS）：**上界 0.63-2.51 ms/帧**；作用面 = gir/batched/qkv 三族 pub 尾；**边界：赢在 pub 长链、输在短链（§六.二十七），短链不回锅**；**先跑现成 `bench_e4m3vec` 判官门（0/4096 全值域 + 随机 ±500 + boundary/tie/−0.0）判逐位再上引擎**。
+### ⑤ 现场
+GPU ≈ 2 分钟（预算 25）；主树 CLEAN（porcelain 0、HEAD `d67075a`）；六份 md5 原状（守卫件 `490647A9…` 未碰）；两槽未写（`6C4D7AF7…`/3,454,976 B = `out/SHIPPED_MD5.txt`）；conf/`fused_face_baseline.md`/`target.json`/`target_check.py`/三金标/defs/build_shipped/门脚本/受管缓存未动；未 commit；无进程；日志 `logs\C66_b6_arm.log`；工具新增 `tools/wb_c66_region.py`；bench 只在 `tmp\c47\`（复用现成仪器，未自研寻址）；状态 `s6/layer1.md §163`。
