@@ -4169,3 +4169,22 @@ BK=64 + BN=128            : 两侧都 256 B，总 SLM 49,152 B ⇒ 已超 hardwa
 **C54 = publish 尾巴仗（已下令，bench 先定价）**：epilogue 32→64 B `merge`、publish 64→128→256 B（写侧同样受 `hardware.md:38` 的 256 B 上限约束）、publish 折进生产者 store、BK=64 组合臂、无 pub 对照臂；**出口**：pub 口径 Δ ≥25% ⇒ 开引擎刀；10-25% ⇒ 归因分列；<10% ⇒ publish 尾巴判死，**剩下唯一的战役刀 = 作者的 N 展开 + A 驻留（至今零实测）**，那时我向用户报"其余非数值杠杆已出尽"。
 ### ⑤ 现场
 **GPU = 3 冷进程 ≈ 2.5 分钟**（预算 25）；未改任何引擎源文件（porcelain 0；`.cpp` = `98F521EF…`、`bench_s8v8_tile.cpp` = `3D01A235…`、`gemm_s8_v8_kernel.hpp` = `E2991804…` 原件未动）、未编译引擎件、未 staged；standalone 只在 `E:\DSH\tmp\c53\`（运行时 hard-link **排除 `libxmx_sycl.dll`** ⇒ `libxmx present = False` ✓ 军规 197）；两槽对账 `6C4D7AF7…` / 3,454,976 B = `out/SHIPPED_MD5.txt` ✓；conf `AF12FFC8…` 未动；日志 `C53_tile_p1/2/3.log`；工具新增 `tools/wb_c53_delta.py`、`wb_c53_asm.py`；状态 `s6/layer1.md §140`；收工主树 CLEAN。
+﻿## 199. ★★★★ **C54（1 冷进程）：自建 bench 没过第 0 关 ⇒ 六臂全作废、Δ 不交（正确处置）；但保住两组有效数，并更正我写窄的一条工具链事实**
+### ① 第 0 关判红（所以本轮没有 Δ）
+`W32 holes=8,126,216 / W64 8,126,224 / W128 8,126,240 / W256 8,126,272`（nbad=0）；`SLM2G_W32 holes=8,322,304 nbad=40,480`、`SLM2G_W128 holes=8,322,304 nbad=40,448`（payload = 8,388,608 int32 = 33.55 MB）
+⇒ **覆盖门 holes≠0 + 确定性门 nbad≠0 ⇒ 六臂作废**；**印出来的 −17%..−26% 是漏写导致的空转 ⇒ 不引用**。
+### ② 根因（三行可修）+ 自检要升级
+- `pub_direct<N>` 基址错：应为 **`base = group*(LW*256) + lid*256`、`grid = n32/(LW*256)`**（每线程搬 `simd<int32_t,256>` = 256 元素；现按 `LW*N` ⇒ 区间重叠、只覆盖前 1/32）；
+- `pub_slm<N>` 的 nbad≠0：每线程只 stage 自己 128 B，但发布循环 `gbase + lid*128 + r*N` 的 r 上限与 SLM 16 KB 布局不一致 ⇒ **读到别的线程未初始化区（缺 barrier / 偏移映射错）**；
+- **★ 规则升级（已立军规 206）**：**写侧 bench 必须同时报 `holes=0`、`nbad=0`、`written == payload` 精确计数** —— `holes` 只证明写过、`nbad` 只证明可重复，两者都能被"漏写 + 0xAA 残留"骗过（**C50 切片臂与 C54 六臂都栽在这**）。
+### ③ 仍然有效的两组数（不依赖作废臂）
+- **pub 尾代价（来自 C53 已过对拍 diff=0 的仪器）**：`gemm_b 0.5665` vs `gemm_b_pub 0.8647` @M=130560/N=384/K=128/b=1（wg=6120）⇒ **pub 尾 = 0.2982 ms/发 = raw 的 +52.6%**（同形状 raw 已 472 GB/s = 纸面 84%）；
+- **消息宽度现实**：epilogue 是 `slm_block_store<int32_t,8>` = 32 B/线程 × 每 tile 每线程 32 条（`gemm_s8_v8_kernel.hpp:754-768`）；**BN=64 时每线程连续只有 16 个 int32 = 64 B ⇒ 可达上限就是 32→64 B（砍半），不是 256 B**；
+- **上界（明确标注：上界、非实测）**：若 pub 的宽度/往返全免费，`gir+batched+qkv`（腿账 42.1 ms）里 pub 份额 ≈0.35 ⇒ **潜在 6-9 ms/帧**；但 C53 已示警 `bn128_ser_*` 的 pub **+20~22%（变差）** ⇒ **pub 成本里有相当一块是寄存器/局部性，不是消息宽度** ⇒ 必须真仪器分开测。
+### ④ 工具链事实更正（我此前写窄了，已进 `target.json`）
+**`esimd::block_load / block_store`（可带 `overaligned_tag<16>`）才是全局向量读写的正确 API**（见 `gemm_s8_v8_kernel.hpp:76/79`）；我那条"没有 `esimd::load/store`"只对裸名字成立 ⇒ 已更正。
+**`select<Size,Stride>(运行时偏移)` 合法；三参版 `Index` 必须编译期常量；`select` 返回表达式代理 ⇒ 传给 store 前必须先物化成 `simd` 变量**。
+### ⑤ 判定与下一铲
+**本轮既不能判 publish 尾巴死、也不能判活（Δ 未测）**；能判的是**这条仗需要一个修好的 bench** ⇒ **C55 已下令**：修三处索引 + 加 `written==payload` 自检 ⇒ 跑绿后测 **W32/W64/（W128 需 BN=128）/SLM2G 两档 × BK32/BK64**，交 **Δ + LSC 消息数 + 三闸 + pub 份额 ms**（对齐 0.5665/0.8647 这把标尺），**并把"寄存器/局部性"与"消息宽度"两条分开测**；**出口**：pub 尾 Δ ≥25%（0.298 → ≤0.22 ms/发）⇒ 开引擎刀；10-25% ⇒ 归因分列；<10% ⇒ publish 尾巴判死 ⇒ 那时我向用户报：非数值杠杆只剩"作者的 N 展开 + A 驻留"这一条战役刀（至今零实测）。
+### ⑥ 现场
+**GPU = 1 冷进程 ≈ 1 分钟**（预算 20）；未改引擎源文件（porcelain 0、`.cpp` = `98F521EF…`）、未编译引擎件、未 staged；两槽对账 `6C4D7AF7…` / 3,454,976 B ✓；conf `AF12FFC8…` 未动；standalone 只在 `E:\DSH\tmp\c54\`；无进程；状态 `s6/layer1.md §141`；收工主树 CLEAN。

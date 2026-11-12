@@ -82,6 +82,24 @@
       "GRF": "不是致命闸（11-12 用户硬件表 + C50 出处更正）：DG2 1 GRF = 32 B（256 bit，hardware.md:20 算例 float 8x8 = 256 B = 8 GRF）=> 128 GRF = 4 KB/线程，是 NVIDIA 255x4B=1020 B/线程的约 4 倍；开 Large GRF（256 GRF，线程 8->4/VE）= 8 KB/线程约 8 倍，且 Large GRF 我们从未试过（作者只记它对 joint_matrix 为负，对 ESIMD 手写核未测）。要守的实测三条：grf_count<=128（或 Large 256）、scratch=0（不许 spill 到 private）、SLM<=65,536 B/每 WG；但真正的闸门是作者经验拐点 SLM/每 WG 约 32 KB 以上开始丢常驻 WG（hardware.md:67）——现役件 slm_init<65536> 9 处、<45056> 5 处都在拐点之上，与 §58 的实测口径冲突，必须实测钉死。超寄存器是可实现缺陷（照 v4ph/b6 已证写法改），禁止当出口",
       "A3": "驻留必须与 A3（B 操作数常驻）成对做（ARM1a/ARM1b），否则 §六.十八 的 5.3x SLM 读放大吃掉省下的 DRAM"
     },
+    "toolchain_facts_2026_11_12": {
+      "esimd_api_names": "全局向量读写的正确 API 是 esimd::block_load / esimd::block_store（可带 overaligned_tag<16>，见 gemm_s8_v8_kernel.hpp:76/79）；我此前写的『没有 esimd::load/store』只对裸 load/store 这个名字成立，写窄了 => 已更正。SLM 访问用 esimd::slm_block_load/slm_block_store(字节偏移, simd)",
+      "select_semantics": "select<Size,Stride>(运行时偏移) 合法；select<Size,Stride,Index> 三参版的 Index 必须编译期常量；select 返回表达式代理 => 传给 store 前必须先物化成 simd 变量（否则 no matching function）",
+      "queue_props": "这个 DPC++ 没有 queue(dev, propA{}, propB{}) 构造 => 用 property_list{enable_profiling(), in_order()}",
+      "large_grf": "-Xs \"-device dg2 -options -doubleGRF\" 编译过但 JIT 下跑死（exit -1073740791、日志空）=> Large GRF 要走 AOT/offline spv，未测不等于无用",
+      "asm_dump": "ocloc disasm 的 .asm 文件名超长 => 普通 glob 返回 0，必须 \\\\?\\ 长路径前缀 + os.listdir",
+      "write_side_selfcheck_rule": "任何写侧 bench 必须同时报三条：holes=0、nbad=0、written==payload 精确计数。只报 holes/nbad 会被『漏写 + 0xAA 残留』骗过（C50 切片臂与 C54 六臂都栽在这里 => C54 印出的 -17%..-26% 全部作废不引用）"
+    },
+    "pub_tail_measured": {
+      "_source": "C53 已过对拍（diff=0）的 bench_s8v8_tile 仪器",
+      "gemm_b_ms": 0.5665,
+      "gemm_b_pub_ms": 0.8647,
+      "pub_tail_ms_per_launch": 0.2982,
+      "pub_tail_pct_on_raw": 52.6,
+      "shape": "M=130560 N=384 K=128 b=1, wg=6120, raw 已 472 GB/s = 纸面 560 的 84%",
+      "message_width_reality": "epilogue 是 slm_block_store<int32_t,8> = 32 B/线程 x 每 tile 每线程 32 条（gemm_s8_v8_kernel.hpp:754-768）；BN=64 时每线程连续只有 16 个 int32 = 64 B => 可达上限就是 32->64 B（砍半），不是 256 B",
+      "upper_bound_not_measured": "若 pub 的宽度/往返全免费，gir+batched+qkv（腿账 42.1 ms）里 pub 份额约 0.35 => 潜在 6-9 ms/帧；但 C53 示警 bn128_ser_* 的 pub +20~22%（变差）=> pub 成本里有相当一块是寄存器/局部性，不是消息宽度，必须真仪器分开测"
+    },
     "levers_untried_with_source": {
       "widen_SLM_messages_to_256B": "我们现役 slm_block_load/store 每次只有 32-64 B（float N=16 / int32 N=16 / half N=32），而 DG2 上限是 256 B（512 B 是 PVC-only，hardware.md:38-39）=> 只用掉 1/4 消息宽度 => LSC 消息数天然是 4x 下限；正对上 §六.十八 的 5.3x SLM 读放大与 §六.九 的 SLM 消息 171 vs dpas 112。作者另记：256 B 已跨满 SLM bank，手工 bank padding 反而破坏对齐（实测为负）=> 加宽消息、不要碰 bank padding",
       "Large_GRF_mode": "-Xs \"-device dg2 -options -doubleGRF\"（api-usage.md:276）=> 256 GRF/线程（8 KB）、线程数 8->4 每 VE；oneDNN 的 A770 XMX GEMM 就是 ngen + Large GRF（hardware.md:72）；作者只记它对 joint_matrix 为负（03-…:57）=> 对我们 ESIMD 手写 megakernel 是未测杠杆",
