@@ -77,7 +77,7 @@
       "excess_ms": 9.0
     },
     "gates": {
-      "SLM_per_WG": "他只用 10,240 B，我们上限 65,536 B => 有余量",
+      "SLM_per_WG": "硬上限 65,536 B/每 WG（§58 实测）；作者经验拐点 ~32 KB（hardware.md:67）在我们 LW=32 的 s8v8 族上不复现 —— C53 实测 12/18/24-32/36-48 KB 四档：wg=6120 时 18 KB 0.5665 -> 32 KB 0.5513 -> 48 KB 0.5536 ms（48 KB 仍比 18 KB 快 2.3%），wg=510 时 18 KB 0.1396 -> 48 KB 0.1398（+0.1%）=> 新可用数：S6 的 SLM 预算可放到 ~48 KB/每 WG 而不吃常驻代价（实测，出处 logs/C53_tile_p1..3.log）",
       "parallelism": "他 grid 34,560 / 8,833 / 8,760 => @544p 仍数千 WG，天然过闸",
       "GRF": "不是致命闸（11-12 用户硬件表 + C50 出处更正）：DG2 1 GRF = 32 B（256 bit，hardware.md:20 算例 float 8x8 = 256 B = 8 GRF）=> 128 GRF = 4 KB/线程，是 NVIDIA 255x4B=1020 B/线程的约 4 倍；开 Large GRF（256 GRF，线程 8->4/VE）= 8 KB/线程约 8 倍，且 Large GRF 我们从未试过（作者只记它对 joint_matrix 为负，对 ESIMD 手写核未测）。要守的实测三条：grf_count<=128（或 Large 256）、scratch=0（不许 spill 到 private）、SLM<=65,536 B/每 WG；但真正的闸门是作者经验拐点 SLM/每 WG 约 32 KB 以上开始丢常驻 WG（hardware.md:67）——现役件 slm_init<65536> 9 处、<45056> 5 处都在拐点之上，与 §58 的实测口径冲突，必须实测钉死。超寄存器是可实现缺陷（照 v4ph/b6 已证写法改），禁止当出口",
       "A3": "驻留必须与 A3（B 操作数常驻）成对做（ARM1a/ARM1b），否则 §六.十八 的 5.3x SLM 读放大吃掉省下的 DRAM"

@@ -4144,3 +4144,28 @@ BK=64 + BN=128            : 两侧都 256 B，总 SLM 49,152 B ⇒ 已超 hardwa
 **出口**：某臂 ≥25% ⇒ 我建引擎刀（recorder + 发射参数改形，三关 + 四闸 + 16 对）；全 <25% ⇒ 交归因分列并明确 B3 是否判死；**49.2 KB 档若明显掉常驻 ⇒ 把测出的 SLM 预算上限写进 `tools/target.json` 的 gates**。
 ### ④ 现场
 **GPU = 0**（预算 30 全省）；未改任何引擎源文件（porcelain 0、`.cpp` = `98F521EF…`、`gemm_s8_v8_kernel.hpp` = `E2991804…`、`wa_res_kernel.hpp` = `FA5A8CC6…` 原件未动）、未编译、未 staged、**无刀文件**；两槽对账 `6C4D7AF7…` / 3,454,976 B = `out/SHIPPED_MD5.txt` ✓；conf `AF12FFC8…` 未动；`target.json`/`target_check.py` 未碰；git 只读；无进程；工具新增 `tools/wb_c52_census.py`；状态 `s6/layer1.md §139`；收工主树 CLEAN。
+﻿## 198. ★★★★★ **C53（3 冷进程 ≈ 2.5 分钟）：tile 形状仗作为战役刀判死；但量出两条可用的新事实 —— 48 KB SLM/每 WG 实测不亏（作者 ~32 KB 拐点在我们族上不复现）与 gemm 本体已贴带宽（472 GB/s = 纸面 560 的 84%）⇒ 肉改指 publish 尾巴**
+### ① 六臂 Δ（仪器 = 现成忠实的 `bench_s8v8_tile.cpp`，`template<BNV,BKV,NTV,NBUF,MODE,PUB>`，每变体与 shipped `gemm_b` 逐元素对拍、**全部 diff=0**（含 48 KB 档）；3 冷进程 × 5 形状 × 11 变体）
+| 形状（wg） | 最佳臂 | Δ(raw) |
+|---|---|---|
+| M=2040 N=128 K=256 b=8（wg=32） | `bn128_ser_bk64_d1` | **−12.5%**（`bn128_nt64_bk64_d1` −11.7%、`bk64_d1` −5.6%） |
+| **M=32640 N=128 K=64 b=2（wg=510，现役窗口族）** | `bn128_naive` / `bn128_ser_bk64_d1` | **−2.8% / −2.7%**（`bk64_d1` +0.9%：K=64 时 BK=64 只 1 次迭代 ⇒ 无从发挥） |
+| M=640 N=64 K=256 b=8（wg=5） | `bk64_d1` | −10.4%（极小形状，噪声大） |
+| M=8160 N=128 K=128 b=4（wg=128） | `bn128_naive` | −7.3%（`bn128_nt64_bk64_d1` −2.5%） |
+| **M=130560 N=384 K=128 b=1（wg=6120，帧尺度最大 gemm）** | `bn128_ser_bk64_d1` | **−4.3%**（`bn128_nt64_bk64_d1` −2.7%、`bk64_d1` −2.3%） |
+⇒ **全线 < 25% 门槛**；**pub 口径**：`gemm_b_pub` 比 `gemm_b` **贵 +53%**（0.8647 vs 0.5665 @wg=6120），而 tile 变体对 pub 只帮 −2.5~-4%，`bn128_ser_*` 的 pub 反而 **+20~22%**；
+**口径标注**：该仪器用 profiling 事件 + 7 次循环（现成件未改）⇒ **不是 `in_order` + min-of-9 ⇒ 只做臂内相对比较，不外推帧账**。
+### ② ★ 新事实一：常驻拐点在我们族上不复现（已写进 `tools/target.json` 的 gates）
+**12 / 18 / 24-32 / 36-48 KB 四档同族同形状**：**wg=6120：18 KB 0.5665 → 32 KB 0.5513 → 48 KB 0.5536 ms（48 KB 仍比 18 KB 快 2.3%）**；**wg=510：18 KB 0.1396 → 48 KB 0.1398（+0.1%）**
+⇒ **`hardware.md:67` 的 ~32 KB 拐点对我们 LW=32 的 s8v8 族不适用 ⇒ S6 的 SLM 预算可放到 ~48 KB/每 WG 而不吃常驻代价（实测，`logs/C53_tile_p1..3.log`）**；
+**ocloc**：两跑缓存各 3 ELF / 60 实例 ⇒ **`scratch≠0 = 0`、`grf>128 = 0`、A/B 元数据零移动** ✅（含 48 KB 档）。
+### ③ ★ 新事实二：机理账闭环（LSC 消息计数，补上 C51 欠项）
+`ocloc disasm` 静态条数：**64/32 = 37 send / 21 ugm；64/64 = 45/23；128/32/M2 = 73/43；128/64/M2 = 85/45**；**动态 = 静态 × (K/BK)** ⇒ **BK=64 把动态 LSC 消息砍 ~30%（0.70×）、MODE2 砍 ~42%（0.58×）**；
+**Δ 与消息数同向**（BK64：小形状 −5.6~-12.5%、大形状 −2.3~-4.3%）；**§六.十八 的 5.3× 读放大随 BK 加倍降到 ≈2.7×**（每 kb 读 32→16 KB、unique 6 KB）；
+**坑入册**：dump 里 `.asm` 文件名超长 ⇒ 普通 `glob` 返回 0 ⇒ **必须 `\\?\` 长路径前缀 + `os.listdir`**。
+### ④ 判定与下一铲
+**B3 tile 刀作为"到 20 ms 的战役"= 判死**；**归因分列**：① **gemm 本体已贴带宽**（472 GB/s = 纸面 560 的 84%，且 > 实测 DRAM 连续读 291.1 的 1.6× ⇒ 本体没有可省字节，只剩 ~4%）；② **肉在 publish 尾（+53%）**；③ 常驻拐点不是限制；④ 并行度不是限制；⑤ dpas 半宽不是限制；
+**BK=64 是真小刀但不是战役刀**（diff=0、三闸守住、动态 LSC −30%；改动面 = recorder 发射参数 + BK=64 需要不同 A pack 映射（`bench_s8v8_tile.cpp:40`），`pack_b` 是 kk32-block ⇒ BK-INDEPENDENT）；
+**C54 = publish 尾巴仗（已下令，bench 先定价）**：epilogue 32→64 B `merge`、publish 64→128→256 B（写侧同样受 `hardware.md:38` 的 256 B 上限约束）、publish 折进生产者 store、BK=64 组合臂、无 pub 对照臂；**出口**：pub 口径 Δ ≥25% ⇒ 开引擎刀；10-25% ⇒ 归因分列；<10% ⇒ publish 尾巴判死，**剩下唯一的战役刀 = 作者的 N 展开 + A 驻留（至今零实测）**，那时我向用户报"其余非数值杠杆已出尽"。
+### ⑤ 现场
+**GPU = 3 冷进程 ≈ 2.5 分钟**（预算 25）；未改任何引擎源文件（porcelain 0；`.cpp` = `98F521EF…`、`bench_s8v8_tile.cpp` = `3D01A235…`、`gemm_s8_v8_kernel.hpp` = `E2991804…` 原件未动）、未编译引擎件、未 staged；standalone 只在 `E:\DSH\tmp\c53\`（运行时 hard-link **排除 `libxmx_sycl.dll`** ⇒ `libxmx present = False` ✓ 军规 197）；两槽对账 `6C4D7AF7…` / 3,454,976 B = `out/SHIPPED_MD5.txt` ✓；conf `AF12FFC8…` 未动；日志 `C53_tile_p1/2/3.log`；工具新增 `tools/wb_c53_delta.py`、`wb_c53_asm.py`；状态 `s6/layer1.md §140`；收工主树 CLEAN。
