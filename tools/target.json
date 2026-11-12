@@ -114,6 +114,8 @@
       "large_grf": "-Xs \"-device dg2 -options -doubleGRF\" 编译过但 JIT 下跑死（exit -1073740791、日志空）=> Large GRF 要走 AOT/offline spv，未测不等于无用",
       "asm_dump": "ocloc disasm 的 .asm 文件名超长 => 普通 glob 返回 0，必须 \\\\?\\ 长路径前缀 + os.listdir",
       "esimd_block_store_scalar_base_pitfall": "ESIMD 里 block_store 用标量基址 + nd_range 时，per-lane 的 get_local_id 偏移不会进入寻址 => 一个 WG 只有 lid=0 那块落地、其余线程写进同一区，覆盖恰好 = 1/LW（C55 实测：八臂 written = payload/32，与宽度/SLM/barrier 无关）。对策：写侧 bench 必须带 written==payload 硬门；并优先复用地址语义已证的现成仪器（bench_s8v8_tile / bench_b6 / bench_lfw2），不要自研寻址",
+      "esimd_no_horizontal_sum": "ESIMD 有 hmax/hmin/exp2/div_ieee/recip，但没有 hsum/reduce_add/reduce_max（横向求和）（出处 …\\sycl\\ext\\intel\\esimd\\math.hpp，C79 实测查）=> softmax 的行和必须自建（SLM 归约或 permute 树），这就是 WINDOW_ATTENTION 里 softmax/求和独立成段的真实原因，也是把 WA 融进 megakernel 的新增成本点",
+      "c512_launch_floor_without_numerics": "数值不变时 C512 链的发数极限约 10 而不是 4：链上有 6 个量化边界（5 发 QUANT + 1 发 QUANT_WINDOW，quant 行长 = 512（QKV 输出）/ 2048（FFN expand））；一个 WG 装不下整行（3x64x512 int8 = 98,304 B > 65,536 每 WG 上限）；跨 WG 归约必须落 global => 塌缩失败；树内一手 libxmx_sycl.cpp:5233-5239（行 max 横跨两组 => per-WG fused requantize 无效，gate P1-broadcast-2blocks 就是这么红的）=> 要 <=4 发只能走带内 scale（改数值）。实测塌缩收益：QKV 三面 3 发 0.0911-0.1316 ms -> 1 发（N=96）0.0687-0.0697 ms（-25~-47%、效率 x4），但两行都未过 diff=0（bad=1/393,216 与 2/1,179,648，三进程一致）=> 未冒充过门；链级合账 0.342 -> 0.315 ms/链、12 -> 9 发 = 3.15x，离 1.0x 还差 -0.215 ms/链，其中 >=0.105 是 6 发 QUANT 的搬移（数值不变砍不动）",
       "write_side_selfcheck_rule": "任何写侧 bench 必须同时报三条：holes=0、nbad=0、written==payload 精确计数。只报 holes/nbad 会被『漏写 + 0xAA 残留』骗过（C50 切片臂与 C54 六臂都栽在这里 => C54 印出的 -17%..-26% 全部作废不引用）"
     },
     "pub_tail_measured": {
