@@ -4451,3 +4451,17 @@ GPU = 0；主树 CLEAN（porcelain 0、HEAD `d3fb77a`）；六份 md5 原状（`
 **下一把（C67，等 C66b 定档后开）= 编码链指令量刀 SWAR e4m3**（`×2^-8` 统一对齐 + 硬件 abs-modifier + 单 LEA；作者第 6 刀形 pack 13→9→5 条 SASS）：**上界 0.63-2.51 ms/帧**；作用面 = gir/batched/qkv 三族 pub 尾；**边界：赢在 pub 长链、输在短链（§六.二十七），短链不回锅**；**先跑现成 `bench_e4m3vec` 判官门（0/4096 全值域 + 随机 ±500 + boundary/tie/−0.0）判逐位再上引擎**。
 ### ⑤ 现场
 GPU ≈ 2 分钟（预算 25）；主树 CLEAN（porcelain 0、HEAD `d67075a`）；六份 md5 原状（守卫件 `490647A9…` 未碰）；两槽未写（`6C4D7AF7…`/3,454,976 B = `out/SHIPPED_MD5.txt`）；conf/`fused_face_baseline.md`/`target.json`/`target_check.py`/三金标/defs/build_shipped/门脚本/受管缓存未动；未 commit；无进程；日志 `logs\C66_b6_arm.log`；工具新增 `tools/wb_c66_region.py`；bench 只在 `tmp\c47\`（复用现成仪器，未自研寻址）；状态 `s6/layer1.md §163`。
+﻿## 219. ★★★★ **C66b（GPU 0）：占用率混淆项用算术注销 ⇒ S6 块驻留判死定档；并更正 SLM 档位线（43,690 / 65,536，不是 32 KB/48 KB）**
+- **档位算术**（出处 `hardware.md:22-25`：SLM **128 KB / Xe-core**、**64 KB / 每 WG 上限**；常驻 WG/Xe-core = `floor(131,072 / SLM 每 WG)`）：
+| A1 的 SLM | 常驻 WG/Xe-core | 合法性 |
+|---|---|---|
+| **现役 b6 = 57,344 B**（`b6_res_kernel.hpp:56 SLMB`） | **2** | ✓ < 65,536 |
+| ≤48 KB 版（49,152 / 48,000 B） | **2**（同档） | ✓ |
+| **升到 3 WG 的门槛** | **≤ 43,690 B** | 本链需 X0 8K + Z0 16K + Y0 8K + QT/KT/VT 24K = **56K ⇒ 3-WG 档不可达** |
+⇒ **57,344 B 与 ≤48 KB 落在同一档 ⇒ 重跑那条臂不会改变任何 Δ ⇒ 占用率混淆项按构造注销 ⇒ C66 的 Δ≈0 不是占用率假象** ✓✓；
+- **★ 更正我引用过的措辞**：C53 的 **48 KB 实测不亏** 只是说 48 KB 与 18 KB 同为 2 WG（没掉档）；**真正的掉档线是 65,536（2→1）与 43,690（3→2）**；`hardware.md:67` 的 **> ~32 KB 开始丢常驻 WG 在我们 LW=16 形上不成立**（48 KB 与 57 KB 都还是 2 WG）⇒ **以后 megakernel 的 SLM 预算按 43,690 / 65,536 定档**（已写进 `target.json` 的 `slm_occupancy_tiers_DG2`）；
+- **补上 C66 欠的两项（ocloc 普查，CPU only）**：`tmp\c47_cache_p1`（B）vs 基线缓存（A）：**A = 4 ELF/271 实例、B = 2 ELF/65 实例**；**`GUARD scratch≠0 in B = 0` ✓、`GUARD grf>128 in B = 0` ✓** ⇒ **三闸齐**（`grf≤128` / `scratch=0` / SLM 57,344 B = 合法 2-WG 档）；
+- **S6 块驻留判死定档**：有臂（`b6_res_kernel.hpp`，中间量全在 SLM、只写链尾）、有对拍（**48/48 EXACT**）、有 region 归账（**3.858 GB/帧 = 按 854.6 GB/s 的 4.51 ms L2 时间被消掉**）、无占用率混淆 ⇒ **绑住我们的是指令量/依赖链**；
+- **为什么本铲不跑腿（诚实账）**：那条 ≤48 KB 臂要先证 `Z0` 的 scores/PKT 在 phase-2 之后确实死（真值判定，不是搬运），而算术已说明**即使证成也不改变 Δ** ⇒ 省下 12 分钟 GPU，改交算术 + 普查；
+- **C67 已下令（最迟 19:10，GPU ≤20 分钟）**：**SWAR e4m3 编码链刀**：现成仪器 `bench_e4m3vec` 三臂（A0 现形 `e4m3_vec_v8`；A1 `e4m3_vec_swar` = `×2^-8` 统一 normal/subnormal 对齐 + 硬件 abs-modifier + 单 LEA，作者第 6 刀形 pack 13→9→5 条 SASS；A2 = A1 + 与 `gate_vec_v8` 融合）；**判官门必须先全绿才计时：0/4096 全值域逐位 + 随机 ±500 + boundary/tie/−0.0 ⇒ 与 `e4m3_vec_v8` 逐位相同（编码函数必须 bit-exact，不是近似）**；**指令账用 `ocloc disasm` 数每臂每 8 值的 SASS/`send` 条数**；**门槛：bench 内 Δ ≥25%（指令数 ≥30% 下降）⇒ 下一铲开引擎刀（只打长链：gir/batched/qkv 三族 pub 尾）；10-25% 交归因；<10% 或 bit-exact 门不过 ⇒ 判死**；
+- **现场**：GPU = 0；主树 CLEAN（porcelain 0、HEAD `9fefa5d`）；六份 md5 原状（守卫件 `490647A9…` 未碰；`b6_res_kernel.hpp`/`bench_b6.cpp` 只读引用）；未编译、无刀；两槽未写；conf/`fused_face_baseline.md`/`target_check.py`/三金标/defs/build_shipped/门脚本/golden/受管缓存未写；未 commit（本条除外）；无进程；日志 `logs/C66b_zeinfo.log`；工具新增 `tools/wb_c66b_read.py`；状态 `s6/layer1.md §164`。
