@@ -45,9 +45,19 @@ def main():
     print("大刀（钱在这里，不在单核刀）：")
     b = d["big_knife"]
     print("  %s" % b["name"])
-    print("  面 %s：现 %.1f GB/帧 -> 块驻留后 %.1f GB/帧；屋顶 %.1f ms -> %.1f ms"
-          % (b["face"], b["traffic_now_GB"], b["traffic_after_block_residency_GB"], b["roof_now_ms"], b["roof_after_ms"]))
+    tr = b["traffic_region_census_per_frame"]
+    print("  口径钉死（C48）：面/流量账一律用 region（执行）普查；帧账与靶只用实测 wall。")
+    print("  全面合计 %.2f GB/帧；残差 ping-pong split %.3f GB/帧；块驻留可消 %.3f GB/帧 = %.2f-%.2f ms"
+          % (tr["all_planes_total_GB"], tr["residual_ping_pong_split_GB"], tr["killable_by_block_residency_GB"],
+             tr["killable_ms_at_560GBps"], tr["killable_ms_at_190GBps"]))
+    c = b["c32_wave1_segment"]
+    print("  正确试验层 = C32 wave1 全分辨率段：我们 %d 闭包 / 腿 %.1f ms / region %.2f GB每帧；lmxx %s = @544p %.1f ms => 超额 %.1f ms（与第一战役目标同量级）"
+          % (c["our_closures"], c["our_leg_ms"], c["our_region_GB_per_frame"], c["lmxx_cores"], c["lmxx_equiv_ms_at_544p"], c["excess_ms"]))
+    for k, v in b["gates"].items():
+        print("  闸门[%s]: %s" % (k, v))
     print("  为什么 B6-1 没兑现：%s" % b["why_B6_1_died"])
+    print("  为什么不选 C64：%s" % b["why_not_C64"])
+    print("  坑：%s" % b["pitfall"])
     print("=" * 78)
     if a.claim_pass:
         if not beat_routeA:
