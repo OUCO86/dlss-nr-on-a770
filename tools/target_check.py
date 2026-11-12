@@ -59,6 +59,25 @@ def main():
     print("  为什么不选 C64：%s" % b["why_not_C64"])
     print("  坑：%s" % b["pitfall"])
     print("=" * 78)
+    h = d.get("hardware_by_user_2026_11_12")
+    if h:
+        print("硬件对照（用户 2026-11-12 给表，永久作废'装不下'借口）：")
+        a = h["A770_Xe_HPG"]; n = h["RTX3080Laptop_GA104"]
+        print("  A770(Xe-HPG): %s / 单线程 %s / 每 %s" % (a["max_regs_per_thread"], a["reg_bytes_per_thread"], a["regs_per_EU"]))
+        print("  3080L(GA104): %s / 单线程 %s / 每 %s" % (n["max_regs_per_thread"], n["reg_bytes_per_thread"], n["regs_per_SM"]))
+        print("  结论：%s" % h["verdict"])
+    rf = d.get("roofline_measured")
+    if rf:
+        print("-" * 78)
+        print("实测 roofline（达标判定只认这些；出处 bandwidth.md:43-45,55-56,83-84）：")
+        print("  fp16 峰值 %.1f TF；DRAM 读 %.1f / 拷贝 %.1f / strided %.1f GB/s；L2 复用 %.1f；SLM 读 %.1f GB/s"
+              % (rf["fp16_peak_TFLOPS"], rf["DRAM_read_GBps"], rf["DRAM_copy_GBps"], rf["DRAM_strided_GBps"],
+                 rf["L2_reuse_GBps"], rf["SLM_read_GBps"]))
+        print("  ridge：DRAM %.1f、L2 %.1f FLOP/B；规则：%s" % (rf["ridge_DRAM_FLOP_per_B"], rf["ridge_L2_FLOP_per_B"], rf["_rule"]))
+        e = rf["_our_engine_measured_by_him"]
+        print("  工程师对我们引擎的实测（1080p）：%d GEMM 调用、%.1f GB/帧、%d GFLOP、AI %.1f FLOP/B、实得 %.0f GB/s = DRAM 的 %d%%、dispatch 间空洞约 %.0f ms"
+              % (e["gemm_calls_per_frame_1080p"], e["GB_per_frame"], e["GFLOP"], e["AI_FLOP_per_B"], e["achieved_GBps"], e["pct_of_DRAM"], e["unattributed_ms_dispatch_tail"]))
+    print("=" * 78)
     if a.claim_pass:
         if not beat_routeA:
             print("GATE: 声称达标被拒 -- 还没比过 3080L 路线 A（%.2f ms > %.1f ms）" % (ours, N["equal_pixel_target_ms"]))

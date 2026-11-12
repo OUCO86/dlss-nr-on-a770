@@ -4075,3 +4075,25 @@ SLM（2×64×C×esz）：`C64 16,384 ✅｜C128 32,768 ✅｜C256 65,536 顶格�
 **对拍忠实度写死**：切片只覆盖"四相 + 一个面的 ping-pong"，**不覆盖 pyramid 12 层、不覆盖 `quant(FUSED-pack)` 的 144 只 ⇒ 不许把切片当整段外推**。
 ### ⑤ 现场
 **GPU = 0 次 kernel 执行**（一次编译失败）；未改引擎源文件（porcelain 0、`.cpp` = `98F521EF…`）、未编译引擎件、未 staged；standalone 只在 `E:\DSH\tmp\c49\`；两槽对账 `6C4D7AF7…` / 3,454,976 B ✓；conf 只读未改；无进程；状态 `s6/layer1.md §136`（含纪律自查：显式 in_order ✅、§96 安全族 ✅、`select` 坑的另一面已入册、WA_KT 未触、未塞诊断分支；**30 秒自检/判官哈希/operand 尺寸写了但没跑成 ⇒ C50 补全**）。
+﻿## 195. ★★★★★ **C50 查证铲（零 GPU、零编译）：硬件事实表带出处落地，纠正我三条错；第 2 层缺口按实测分母重算 = 10.9-12.5 ms/帧（旧纸面口径偏松）**
+### ① 三条更正（都有出处）
+1. **`1 GRF = 32 B（256 bit）`**（`refs/A770-Kernel-Optimization/references/hardware/hardware.md:20` 的算例：float 8×8 累加器 = 256 B = 8 GRF）⇒ **128 GRF = 4 KB/线程**；**我 11:3x 写的"64 B ⇒ 8 KB"错 2×**；对 NVIDIA `255×4 B = 1020 B/线程` ⇒ **我们每线程字节预算 ≈ 4×（开 Large GRF = 256 GRF ⇒ 8 KB ≈ 8×）**；**结论方向不变：GRF 不是借口**；
+2. **真正的 S6 闸门不是 64 KB 硬上限，而是作者的经验拐点：`SLM/每 WG 超 ~32 KB 开始丢常驻 WG`**（`hardware.md:67`，8 缓冲 B(32 KB) 实测为负）；**审计：现役 `slm_init<65536>` 有 9 处、`<61440>` 1、`<49152>` 1、`<45056>` 5 ⇒ 全在拐点之上**，与 §58"SLM 大小不影响并发 WG"存在**口径冲突 ⇒ 必须实测钉死**（C51 的常驻拐点臂就是为它设的）；
+3. **我们的 SLM 块消息只有 32-64 B，而 DG2 上限是 256 B（512 B 是 PVC-only）**（`hardware.md:38-39`）⇒ **只用掉 1/4 消息宽度 ⇒ 消息数天然是 4× 下限**（正对上 §六.十八 的 5.3× SLM 读放大）⇒ **加宽 SLM 消息到 256 B = 有出处、从未试的正解**；
+**另两条未试杠杆入册**：**Large GRF（`-Xs "-device dg2 -options -doubleGRF"`，`api-usage.md:276`；作者只记它对 joint_matrix 为负，对 ESIMD 手写核未测）**；**DG2 无 `load_2d/prefetch_2d`、无 `named_barrier`、无 `joint_matrix_prefetch`**（`hardware.md:40-41`）⇒ **驻留形不能靠硬件预取，只能靠每 WG 多活 + 深 K + 双缓冲**；**我们全部 dpas 是 `dpas<8,8,float>` 338 处 + `dpas<8,8,int32_t>` 196 处 ⇒ 合规、没踩 `ExecutionSize=16`（DG2 上能编译但 78/128 结果错）**。
+### ② 实测 roofline 分母（今起达标只认这些）
+**fp16 峰值 100.6 TF**（纸面 137 只作规格）；**DRAM 连续读 291.1 / 拷贝 340.0 / reduce 290.6 / strided 277.0 GB/s**；**L2 复用 854.6（copy 1300.9）**；**SLM 读 4115.8**；ridge **DRAM 345.7、L2 117.7 FLOP/B**；
+**规则（作者原话 `03-a770-reference-and-roofline.md:39-40`）**：算术强度远低于 ridge 且实得带宽已接近该访问模式基线时，**不要再追带宽**，去看指令量、冗余读取和 launch 开销；**L2/SLM 臂只用来判断某条边是否已被 L2 吸收——吸收掉的字节不是可省字节**。
+**工程师对我们引擎的实测（1080p）**：**516 GEMM 调用、读 7203 + 写 5109 = 12.3 GB/帧、895 GFLOP、AI 72.7 FLOP/B < L2 ridge ⇒ memory-bound、实得 216 GB/s = DRAM 的 74%**；**另有约 11 ms 不属于任何 pass（pass 合计 45.7）= `libxmx.c:1386` 的 "each dispatch's exposed tail" ⇒ 只有减 dispatch 次数能消，加大 workgroup 无效**；
+**他的决定性 stride_probe（`03-…:74-91`）**：`inner=16` 搬 25 MB 要 0.53 ms = **47 GB/s（16% 带宽）**；`inner=256` 6× 数据只多 36%；固定 FLOP 减波数 **8 波 150 → 1 波 102 GB/s** ⇒ **"窄形状既不是算力受限也不是跨步受限，而是每个 workgroup 的活太少、取数延迟藏不住"**；**他的换方案（`03-…:99-120`，未实测）**：一 WG 沿 N 展开、A 只取一次（先进 SLM 再从 SLM 读）⇒ A 全局流量 ÷4、每 WG 工作量 ×4、强度 21.3→42.6；路由条件 `n ≥ 2*BN` 且 `k` 放得进 SLM。
+### ③ 失败账重判（资源够用但形不对 / 真撞硬限）
+**形不对**：**C13 拆核**（拆 = 每 WG 活更少 ⇒ 正撞 stride_probe）；**C16 v4full 宽存刀**（宽存 ≠ 宽消息；我们 SLM 消息 32-64 B、上限 256 B）；**B6-1**（只消 L2 已吸收的小面 1277/1272/1270 + 融合后每 WG 工作量下降）；**SLICE 2**（BN=32 半宽 dpas ⇒ 每 dpas 摊更少活）；**P0 gather 加宽**（加宽的是 global 消息，瓶颈却是每 WG 活太少 ⇒ 方向对、层级错）；
+**真撞硬限**：**wide-merge→BN32 / fat-M**（作者：RM/RN>4 寄存器溢出、16x32 为负、32x32 只快 4%）；**§六.十七 跨 WG SLM 接力**（`named_barrier` DG2 不支持 + SLM 是 WG 私有）；**任何靠硬件预取的方案**（`load_2d/prefetch_2d` PVC-only）；
+**中性/口径**：**C20 LW32**（加大 workgroup 对 exposed tail 无效，作者原话）；**C19 的"chip 是 XMX 时间 12×"**（AI 72.7 < ridge ⇒ memory-bound 的正常表现，fp16 100.6 TF 下 895 GFLOP/帧只值 2-9 ms，不是 XMX 不够）。
+### ④ 按实测分母重算的第 2 层缺口（对照表 `tools/L2_scoreboard_measured_denominators.md`）
+**`window_block` 7.29-8.07 + `global_attention` 2.57-2.68 + `ffn_merge` 0.74-0.84 + `ffn` 0.25-0.92 ≈ 10.9-12.5 ms/帧**（旧纸面口径 5.24-7.38 ⇒ 偏松）；
+**C32 段驻留上界（实测分母）**：可消 4.2-5.1 GB/帧 ⇒ **按 L2 854.6 = 4.9-6.0 ms/帧；按 DRAM 291.1 = 14.4-17.5 ms/帧**（旧 560 GB/s 纸面值算出的 7.5-9.1 是不合规分母）。
+### ⑤ 现场与下一铲
+**C50 零 GPU、零编译、未改源、未 staged**；两槽 `6C4D7AF7…` / 3,454,976 B = `out/SHIPPED_MD5.txt` ✓；`nr_ship.conf` 未动；工具新增 `tools/wb_c50_facts.py`、`wb_c50_verify.py`、`wb_c50_audit.py`、`wb_c50_denom.py` + `tools/L2_scoreboard_measured_denominators.md`；
+**C49/C50 的切片臂自检未过（holes=12,582,912、nbad=978-3449、ARM1b 是算术不等价的死代码伪影）⇒ Δ 未交、不外推（正确处置）**；
+**C51 已下令（≤20 分钟 GPU，12:30 交回）**：忠实 bench 四臂 **ARM0 split 现形（两块沿 N + quant pack 相 + 块间 skip）／ARM1 两块驻留 + SLM 消息加宽到 256 B／ARM2 = ARM1 + Large GRF／ARM3 = ARM1 去 A3**；**先过对拍（8/8 EXACT + holes=0 + nbad=0）才许计时**；必报 **ocloc（grf/SLM/scratch + LSC 消息条数加宽前后）**、**常驻拐点实测（21.5 KB vs 43 KB）**、**Δ%（3 进程 min-of-9、显式 in_order）**、**消掉的 MB/帧（region 口径）**；**判定只认实测分母**。

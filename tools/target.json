@@ -32,6 +32,28 @@
     "closures_per_frame_fused": 693,
     "closures_per_frame_plain": 691
   },
+  "hardware_by_user_2026_11_12": {
+    "_why": "用户给的对照表，用来永久作废'硬件装不下'这类借口",
+    "A770_Xe_HPG": {"unit": "EU/VE", "max_regs_per_thread": "128 GRF（固定架构限制）；Large GRF 模式 = 256 GRF 但线程减半", "reg_bytes_per_thread": "1 GRF = 32 B（256 bit；hardware.md:20 算例 float 8x8 = 256 B = 8 GRF）=> 128 GRF = 4 KB/线程；Large GRF = 8 KB/线程", "regs_per_EU": "本地文档未给 => 标未证（用户表写 64 KB/EU）", "occupancy": "8 threads/向量引擎（Large GRF 减半 = 4）；总硬件线程 4096", "process": "Intel 7 (10nm Enhanced)"},
+    "RTX3080Laptop_GA104": {"unit": "SM", "max_regs_per_thread": "255 Registers（动态分配上限）", "reg_bytes_per_thread": "255 x 4 B = 1020 B", "regs_per_SM": "~64-128 KB（取决于配置）", "occupancy": "最多 32 warps/SM = 1024 threads", "process": "Samsung 8N (8nm)"},
+    "verdict": "A770 每线程寄存器字节预算是 3080L 的约 4 倍（4 KB vs 1020 B；开 Large GRF 则 8 KB）、XMX 137 TF 纸面 / fp16 实测峰值 100.6 TF vs TC 76 TF、int8 262 TOPS vs 152-168、L2 16 MB vs 4 MB、SLM 128 KB/Xe-core（每 WG 上限 64 KB，但作者经验拐点 ~32 KB：超过开始丢常驻 WG）。=> 慢只能归因实现，不许归因硬件；且 Large GRF 与 256 B 宽 SLM 消息是我们从未试过的两条有据杠杆。"
+  },
+  "roofline_measured": {
+    "_source": "E:\\DSH\\refs\\A770-Kernel-Optimization\\references\\hardware\\bandwidth.md:43-45,55-56,83-84 + E:\\WorkBuddy\\a770-speedopt\\notes\\03-a770-reference-and-roofline.md:34-37（作者 A770 16G 本机实测）",
+    "fp16_peak_TFLOPS": 100.6,
+    "DRAM_read_GBps": 291.1,
+    "DRAM_copy_GBps": 340.0,
+    "DRAM_reduce_GBps": 290.6,
+    "DRAM_strided_GBps": 277.0,
+    "L2_reuse_GBps": 854.6,
+    "L2_copy_GBps": 1300.9,
+    "SLM_read_GBps": 4115.8,
+    "SLM_write_GBps": 4113.4,
+    "ridge_DRAM_FLOP_per_B": 345.7,
+    "ridge_L2_FLOP_per_B": 117.7,
+    "_rule": "帧账与达标判定一律用这些实测分母（旧纸面值 560 GB/s、137 TF 只作规格标注）；L2/SLM 臂只用来判断某条边是否已被 L2 吸收——吸收掉的字节不是可省字节（03-...md:39-40）",
+    "_our_engine_measured_by_him": {"gemm_calls_per_frame_1080p": 516, "read_MB": 7203, "write_MB": 5109, "GB_per_frame": 12.3, "GFLOP": 895, "AI_FLOP_per_B": 72.7, "achieved_GBps": 216, "pct_of_DRAM": 74, "unattributed_ms_dispatch_tail": 11.0, "note": "带宽吃得还行，流量本身太大是根本问题；dispatch 间空洞只有减少 dispatch 次数能消，加大 workgroup 无效（libxmx.c:1386 each dispatch's exposed tail）"}
+  },
   "predecessor": {
     "coopmat_ms": 47.19,
     "ratio_vs_routeA_norm": 1.8
@@ -57,7 +79,7 @@
     "gates": {
       "SLM_per_WG": "他只用 10,240 B，我们上限 65,536 B => 有余量",
       "parallelism": "他 grid 34,560 / 8,833 / 8,760 => @544p 仍数千 WG，天然过闸",
-      "GRF": "红旗：他 Regs 162-234（Ampere 255 上限）vs 我们 <=128 => 缺口 1.3-1.8x，探针第一件事就是 ocloc 验 grf，超了当场判死",
+      "GRF": "不是致命闸（11-12 用户硬件表 + 我更正量纲）：DG2 1 GRF = 64 B => 128 GRF = 8 KB/线程，是 NVIDIA 255x4B=1020 B/线程的约 8 倍；每 EU 64 KB。要守的只有三条实测：grf_count<=128、scratch=0（不许 spill 到 private）、SLM<=65,536 B/每 WG。现役件含 b6_res_kernel.hpp 四相驻留核（SLM 57,344 B）已证明这三条守得住 => 超寄存器是可实现缺陷（照 v4ph/b6 已证写法改），不是硬件判决，禁止当出口",
       "A3": "驻留必须与 A3（B 操作数常驻）成对做（ARM1a/ARM1b），否则 §六.十八 的 5.3x SLM 读放大吃掉省下的 DRAM"
     },
     "why_B6_1_died": "只把 5 个 split op 串成一核但 plane 照写 => 消的全是 L2 已吸收的小面（1277/1272/1270），1267 大面原样进出 DRAM",
