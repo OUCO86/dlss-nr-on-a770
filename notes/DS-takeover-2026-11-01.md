@@ -4097,3 +4097,23 @@ SLM（2×64×C×esz）：`C64 16,384 ✅｜C128 32,768 ✅｜C256 65,536 顶格�
 **C50 零 GPU、零编译、未改源、未 staged**；两槽 `6C4D7AF7…` / 3,454,976 B = `out/SHIPPED_MD5.txt` ✓；`nr_ship.conf` 未动；工具新增 `tools/wb_c50_facts.py`、`wb_c50_verify.py`、`wb_c50_audit.py`、`wb_c50_denom.py` + `tools/L2_scoreboard_measured_denominators.md`；
 **C49/C50 的切片臂自检未过（holes=12,582,912、nbad=978-3449、ARM1b 是算术不等价的死代码伪影）⇒ Δ 未交、不外推（正确处置）**；
 **C51 已下令（≤20 分钟 GPU，12:30 交回）**：忠实 bench 四臂 **ARM0 split 现形（两块沿 N + quant pack 相 + 块间 skip）／ARM1 两块驻留 + SLM 消息加宽到 256 B／ARM2 = ARM1 + Large GRF／ARM3 = ARM1 去 A3**；**先过对拍（8/8 EXACT + holes=0 + nbad=0）才许计时**；必报 **ocloc（grf/SLM/scratch + LSC 消息条数加宽前后）**、**常驻拐点实测（21.5 KB vs 43 KB）**、**Δ%（3 进程 min-of-9、显式 in_order）**、**消掉的 MB/帧（region 口径）**；**判定只认实测分母**。
+﻿## 196. ★★★★ **C51（忠实 bench，GPU 2 冷进程 ≈ 2 分钟）：先过对拍再计时 ⇒ "链内 fused 但 plane 照写"在忠实对照下判死（Δ −0.5% / −0.4%，四组独立测量全在 ±1%）；同时更正我 C50 审计的一条错：b6 已经在用 256 B 满宽 SLM 消息**
+### ① 第 0 关先绿（这次守住了规矩）
+**8 项 diff 全 EXACT × 两形状**（`PKT / AS / ATT-head0 / ATT-head1 / Q / K / V / 1270-out`，diff=0）；**队列补上显式 `in_order`**；**计时用仪器内建 `twall`（min-of-9 + warm）**；
+**新坑入册**：这个 DPC++ **没有 `queue(dev, propA{}, propB{})` 构造** ⇒ 必须写 `property_list{enable_profiling(), in_order()}`。
+### ② ocloc 与一条自我更正
+跑缓存 2 ELF / 65 实例：**`scratch≠0 = 0`、`grf>128 = 0`** ✅；b6 **SLM = 57,344 B/每 WG**；
+**★ 更正 C50 审计**：`b6_res_kernel.hpp:100-103` 用的正是 **`slm_block_load<int8_t,256>` = 256 B 满宽消息**（我那条正则漏了带 `overaligned_tag` 第二参的调用）⇒ **"只用 1/4 消息宽度"对 s8v8 / wa_res 的 32 B 调用成立（`int8_t N=32` ×34 处），对 b6 不成立** ⇒ **加宽这条刀真正没用的是 s8v8 三兄弟与 wa_res**（= C52 的目标）；**LSC/`send` 消息条数未数**（要 `ocloc disasm`，本轮时间不够 ⇒ C52 补）。
+### ③ Δ 与两条未测（诚实标注）
+- **windows=510：split 0.6329 vs b6 单核 0.6295 ⇒ ratio 1.01× ⇒ Δ = −0.5%**；**windows=558：0.6818 vs 0.6792 ⇒ Δ = −0.4%**；**与 C47 三进程读数（−0.7% / +0.3%）一致 ⇒ 四组独立测量全在 ±1% ⇒ 落在 "<10%" 出口**；
+- **ARM2（Large GRF）未测**：`-Xs "-device dg2 -options -doubleGRF"` **编过（icx exit=0）但跑死**（`exit = −1073740791`、日志空）⇒ **大概率 JIT 不接受该 option（`api-usage.md:276` 那条是给 AOT/DG2 SDP 的）⇒ 要 Large GRF 得走 AOT/offline spv；未证，不许当"Large GRF 无用"**；
+- **ARM3（去 A3）未测**：改 `b6_res_kernel_noA3.hpp` 时丢了 `c00..c11` 声明作用域（`use of undeclared identifier 'c00'`）⇒ 编译失败；**正确改法 = 保留声明、只把 `slm_block_load` 移进 dpas 表达式**。
+### ④ 字节账与判定边界（画清，不越界）
+**b6 消掉的 = `1277` 往返 + `1272`(pk/scales) 往返 + `pack_a` 一发** ⇒ C64 层合计可消 **117 MB/帧 = 0.40 ms @291.1 / 0.35 ms @340**；**`1267` 大面消掉 = 0 MB** ⇒ **字节账与 Δ≈0 互相印证**；
+**判定**：**"把 5 个 split op 融成一核、plane 照写"这条形 = 在忠实对照下不成立（有据判死）**；
+**但这不等于"C32 块驻留形判死"**：本铲测的是 **C64 层的现成仪器 `b6`**；**作者方案（`03-a770-reference-and-roofline.md:99-120`：每 WG 沿 N 展开 ×4、A 全局流量 ÷4、强度 21.3→42.6，A 先进 SLM 再读 SLM）至今零实测**；
+**边界**：**链内 fused 保留 plane = 判死（有据）；N 展开 + A 驻留 + 宽消息 = 未测（不是负结果）**。
+### ⑤ 下一铲清单（已按此下令 C52）
+① **把 s8v8 三兄弟 + wa_res 的 SLM 块消息加宽到 256 B**（出处 `hardware.md:38-39`；只改装载形状不改数学 ⇒ **四闸应逐字节 EXACT，EXACT 不过就当场停**）；② **写 C32 的 N 展开 resident 核**（照 `b6_res_kernel.hpp:74-133` 的 SLM/256 B/lane-owned 模板；**两块 43 KB 与一块 21.5 KB 各测一次 ⇒ 把 `hardware.md:67` 的 32 KB 拐点钉成我们的实测**）；③ **ARM3 按上面改法、ARM2 走 AOT**；④ **`ocloc disasm` 补 LSC 消息计数**。
+### ⑥ 现场
+**GPU = 2 次冷进程 ≈ 2 分钟**（预算 20）；未改任何引擎源文件（`.cpp` = `98F521EF…`；`b6_res_kernel.hpp` 原件 md5 `1712F991…` 未动，只改 `tmp\c51\` 副本）；未编译引擎件、未 staged；两槽对账 `6C4D7AF7…` / 3,454,976 B ✓；conf `AF12FFC8…` 未动 ✓；日志 `C51_v1_p1.log`、`C51_v2_p1.log`；无进程；状态 `s6/layer1.md §138`。
