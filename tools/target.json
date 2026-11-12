@@ -101,7 +101,10 @@
       "message_width_reality": "epilogue 是 slm_block_store<int32_t,8> = 32 B/线程 x 每 tile 每线程 32 条（gemm_s8_v8_kernel.hpp:754-768）；BN=64 时每线程连续只有 16 个 int32 = 64 B => 可达上限就是 32->64 B（砍半），不是 256 B",
       "upper_bound_not_measured": "若 pub 的宽度/往返全免费，gir+batched+qkv（腿账 42.1 ms）里 pub 份额约 0.35 => 潜在 6-9 ms/帧；但 C53 示警 bn128_ser_* 的 pub +20~22%（变差）=> pub 成本里有相当一块是寄存器/局部性，不是消息宽度，必须真仪器分开测"
     },
-    "campaign_status_2026_11_12": {
+    "known_defects_2026_11_12": {
+    "skip_chains_name_offset_refused": "libxmx_sycl.cpp:1691-1709 的 off = names.size() - cmds.size()：plan 录两遍（scratch BEGIN@3922->ABORT@5295，graph BEGIN@5308->CAPTURE@6644），xmx_abort 丢 g_cmds 但不丢 g_cmd_names => names 带被中止那一遍的前缀。C37 的 ViT 周期复用把 fused 路变成 693 闭包后 names=1385 => off=692 => 692 % 693 != 0 => [skip-chains] graph=0 REFUSED（logs/C61c_base.log 实测），而 11-09 plain 路 cmds=691/names=1382 => off=691 = 1x691 整遍通过。后果：今后任何人开 NR_SKIP_CHAINS 都会被静默拒绝（现在只是 printf 后 return）。修法（单独一铲）：xmx_abort 时同步丢 names，或让 REFUSED 显式判红并打印 off/cmds/names 三个数。注意：它不是 plain-1301 红的原因（今天所有腿都没有请求 skip：set NR_SKIP 未定义、conf 无 skip 键）。"
+  },
+  "campaign_status_2026_11_12": {
       "S6_block_residency_N_expansion": "判死（有据，C53 已测 + C57 机理闭环）：现成仪器 bench_s8v8_tile.cpp 的 MODE==2/3 就是作者的 N 展开 + A 驻留（注释原话 second-sweep fast path … touches global ZERO），帧代表形状 raw 只有 -2.1~-4.3%、pub 口径 +20~22% 变差；机理：我们 A 只有 2.09-16.7 MB（16.7 MB ≈ L2 16 MB）=> A 重复读已被 L2 吸收（854.6 GB/s，残值 0.10 ms），流量主体是 C 输出（200 MB），且 NB 减半使 wg 510->255、6120->3060 并行度下降",
       "pub_width_merge": "判停（C56 上界）：publish 全局写侧早已 64 B（block_store<int32_t,16>），只剩 SLM staging 32 B 且 merge 不减字节 => 上限 0.13-0.26 ms/帧 = 整帧 0.3-0.6%",
       "chain_fused_planes_written": "判死（C47/C51 四组独立测量全在 ±1%）：Δ -0.5%~-0.7%，且 1267 大面消掉 0 MB",
