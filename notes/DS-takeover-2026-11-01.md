@@ -4477,3 +4477,25 @@ GPU ≈ 2 分钟（预算 25）；主树 CLEAN（porcelain 0、HEAD `d67075a`）
 4. **★ 先花 5 分钟查 ISA 有没有 fp8 转换指令**（`cvt` 到 e4m3）：**没查过**；`hardware.md` 的 DPAS 表没提 fp8 cvt ⇒ **要去 oneAPI ESIMD 头文件里 grep `f16_to_e4m3` / `saturated_convert` / `convert<...e4m3...>`**；**若暴露 ⇒ 编码链一步塌成一条 ⇒ 这是本块收益上限最高的一条**；
 - **框架**：按军规 210 记为**"这块未达标 + 未试方法"**，不写判死；靶不变（lmxx 3080L 路线 A），`target_check` 判定行不变（42.15 ms ⇒ 1.60× / 2.05× / 2.11×）。
 - **现场**：GPU ≈ 1.5 分钟（预算 20）；bench 只在 `tmp\c67\c67_e4m3_swar.cpp`（仓库 `bench_e4m3vec.cpp` 与 `bench_s8v8_tile.cpp` 原件未动）；未改任何引擎源文件、未编译引擎件、未 staged；两槽未写；conf/`fused_face_baseline.md`/`target.json`/`target_check.py`/三金标/defs/build_shipped/门脚本/受管缓存未动；无进程；日志 `C67_build.log`、`C67_p1/2/3.log`；**C68（逐块达标审计 + 逐块方法清单）进行中，19:20 前交**。
+﻿## 221. ★★★★★ **C69（4 分钟 GPU）：两条改变全局判断的纠正 + C512 这块的真实差距与已证菜单**
+### ① ★★ 纠正一：九铲的 plain-1301 假红 = 构建宏差异（我亲自复核成立）
+`tools/shipped_build.defs:21` = `T_SKIP_CHAINS_DEF="18,…,32"`、`build_shipped.ps1:80` 读 defs ⇒ **出货件默认跳 14 条 C512 链**（`notes/promote-skip-c512.md`：`chains_skipped=14 refused=0 closures_noop=168 passes=691`；16 对 **−4.794 ms/帧**、B 赢 16/16；新金标 `bk.1301.skip.bin = DD49827D…`，旧 `bk.1301.pre-skip-1a.bin = 249A46F3…`）；
+而 **C61 系列测试件由 `s6/c61b_build.ps1:19-20` 编，只带 `/D_CRT_SECURE_NO_WARNINGS`** ⇒ 没有跳块默认 ⇒ plain-1301 自然回到未跳块那张面 ⇒ **九铲里那个"真红"是构建配置差异，不是 BK=64 配对**（与 C61k 的 48/48 逐位证真一致）⇒ **已立军规 211：要比面的测试件必须用 shipped defs 编或显式设 `NR_SKIP_CHAINS`**。
+### ② ★★ 纠正二：C512 这块的真实差距（换成分母之前先把每链效率钉死）
+`chain_map.csv` C=512 ⇒ **16 条链 / 193 闭包 / 腿 27.345 ms**（每链 1.585-1.881 ms；63 只已是 no-op）；lmxx 同块 @544p **1.60 ms ⇒ 每链 ≈0.10 ms**
+⇒ **每链 17.1×**；**shipped 口径（跳 14 链、2 链在跑）这块 = 3.687 ms vs 0.21 ms ⇒ 省 3.48 ms/帧**；**不跳块 = 27.345 vs 1.60**。（旧表里 31.299/19.6× 是并入 `window_block`/`mh` 的另一归组，**不作为这块的判据**。）
+### ③ 已证逐位、可上引擎的菜单（`tmp\c69\c69_c512.cpp` = C53 仪器的 C512 形状版，全部 diff=0，3 冷进程 × min-of-9）
+| 形（M=768/960、N=512、K=512、b=1） | raw ms | pub ms | SLM |
+|---|---|---|---|
+| 现形 `gemm_b` / `gemm_b_pub`（A0） | 0.0353 / 0.0400 | **0.0803 / 0.0855** | 18 KB |
+| `bk64_d1` | 0.0305（**−14%**） | 0.0755（−7%） | 24 KB |
+| **`bn128_nt64_bk64_d1`** | **0.0281（−20%）** | 0.0740（−9%） | 32 KB |
+| **`bn128_ser_bk64_d1`（A 常驻 / 二趟快路）** | 0.0423-0.0486 | **0.0583-0.0703（pub −19~−30%）** | 32 KB |
+⇒ **pub 尾在 C512 形状上比 raw 贵 100-140% ⇒ 编码链是这块的主要成本之一**；**A 常驻形把 pub 砍 19-30% = 这块第一把已证逐位的刀**；三形 SLM 18/24/32 KB ⇒ **都 ≤43,690 ⇒ 3-4 WG/Xe-core** ✓
+### ④ 解剖折叠表 + 资源解（已在 §167.1/§167.2）
+每链 12 只里 **`QUANT_WINDOW + GEMM_INT8_QKV + WINDOW_ATTENTION + 1 发 QUANT + GEMM_WINDOW_INT8_RESIDUAL` 全折进他的 `c512_qkv_attention_compact` 一发**（出处 `DevHistory.md:58/49/57`）；**剩下 6 只对应他的 mh 三发**（`mh_attention_project_frag_c512_w16_u4_bout` 15 发 2.157 + `…_u4` 0.145 + `mh_pool_project_group_c512_out8_f8w16` 1 发 0.079，**grid 40 / SMem 8,320**）⇒ **只有链头读 1267、链尾写 1267、`pack_b` 权重留在外面**；
+**资源解选形**：**C 分带 4×128 ⇒ `2×64×128×1B = 16,384 B` ⇒ SLM 32 KB ⇒ 4 WG/Xe-core ⇒ 832 WG**（**并行度用分带解决，不是"一块一核"的 24-30 WG**）；f16 全宽 131,072 B 超上限、int8 全宽 65,536 只有 1 WG（6.5 波尾巴大）⇒ **两条排除为形，不是排除这条路**；
+### ⑤ C70 已下令（最迟 23:40，GPU ≤60 分钟，仍只打这块）
+**(a) 用 shipped defs 重建 BK=64 测试件重跑四闸**（结清九铲的账；若 4/4 EXACT ⇒ BK=64 复活并上到 C512 的 gemm 腿）；**(b) `bn128_nt64_bk64_d1` + `bn128_ser_bk64_d1` 上到 C512 的 5 条 gemm 腿**（开关默认 OFF、staged 归我；硬门 = shipped defs 编 ⇒ 四闸 4/4 ⇒ 块级腿账 ⇒ 帧 ms 两口径）；**(c) bench 建一发 compact 核骨架**（C 分带 832 WG 形，A0 = 现形 12 只/链 vs A1 = 一核吃五只、中间量不落 global）；**开工先读 `notes/C512-外部参考.md`**（另一条调研铲产，只读）；
+### ⑥ 现场
+GPU ≈ 4 分钟（预算 60）；未改任何引擎源文件、未编译引擎件、未 staged；主树 CLEAN（porcelain 0、HEAD `e0b1194`）；七份 md5 原状（含 bench 原件 `3D01A235…`）；两槽未写；conf/`fused_face_baseline.md`/`target.json`/`target_check.py`/三金标/`dumps\bk.1301*.bin`/defs/build_shipped/门脚本/golden/受管缓存未写；未 commit；无进程；日志 `C69_usage.log`、`C69_p1/2/3.log`、`C69_build.log`；工具 `tools/wb_c69_anatomy.py`；状态 `s6/layer1.md §167`。

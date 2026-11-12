@@ -553,3 +553,7 @@ SM_LW | 分支=b1-wblock-resident（origin 已推）。
 2. **未达标就交方法清单**：三栏 —— **A lmxx 这块用的手法**（带 `DevHistory`/`CHANGELOG` 原文行号）、**B 我们这块已有什么**（对应到文件/开关）、**C 这块还缺什么手法**（未试、有出处、给预计 ms 量级与改动面）；
 3. **不许拿旧反证否掉没试过的形**：例如"b6 链内融合 Δ≈0"只否掉**它测过的那个形**（C64 链、另一种阶段组合），**不能用来否掉 C512 的 QKV+attention 合一**；引用反证必须先写清它测的形与要打的形是否同一形。
 **配套**：军规 204（不换分母/参考）、203（先算上界）、209（面 EXACT 先查 last writer）。
+﻿211. ★ **要比面的测试件必须用 `tools/shipped_build.defs` 编译（或显式设 `NR_SKIP_CHAINS` env），否则面比对结论无效。判"面红"之前必须先核对构建宏一致。**
+**正案（2026-11-12 C69 复核）**：出货件带 `/DT_SKIP_CHAINS_DEF="18,19,20,21,22,23,24,26,27,28,29,30,31,32"`（`shipped_build.defs:21`，`build_shipped.ps1:80` 读 defs 喂 icx）⇒ **出货路默认跳 14 条 C512 链**（`notes/promote-skip-c512.md`：`chains_skipped=14 refused=0 closures_noop=168 passes=691`，16 对 −4.794 ms/帧 B 赢 16/16 转正；新金标 `bk.1301.skip.bin = DD49827D…`，旧名 `bk.1301.pre-skip-1a.bin = 249A46F3…`）。
+**铲子自建的 `s6/c61b_build.ps1:19-20` 只带 `/D_CRT_SECURE_NO_WARNINGS`** ⇒ 测试件没有跳块默认 ⇒ plain-1301 自然回到未跳块那张面 `249A46F3…`。**⇒ C61 系列九铲里那个"plain-1301 真红"是构建配置差异，不是 BK=64 配对错**（与 C61k 主机侧 48/48 逐位证真完全一致）。
+**要求**：① 自建编译脚本要么读 `shipped_build.defs`，要么在腿 env 里显式设 `NR_SKIP_CHAINS` 并把值写进日志；② 判面前先比 md5 之外的**构建宏**；③ 宏名注意是 `T_SKIP_CHAINS_DEF`（MSYS 下写 `//DT_SKIP_CHAINS_DEF`），grep 全树要用 `T_SKIP_CHAINS_DEF`（`shipped_build.defs:12-14` 已记过这次的混淆）；④ 与军规 199（登记件字节冻结）、209（面结论先查 last writer）、210（不达标不换块）配套。
