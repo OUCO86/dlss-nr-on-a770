@@ -559,3 +559,8 @@ SM_LW | 分支=b1-wblock-resident（origin 已推）。
 **要求**：① 自建编译脚本要么读 `shipped_build.defs`，要么在腿 env 里显式设 `NR_SKIP_CHAINS` 并把值写进日志；② 判面前先比 md5 之外的**构建宏**；③ 宏名注意是 `T_SKIP_CHAINS_DEF`（MSYS 下写 `//DT_SKIP_CHAINS_DEF`），grep 全树要用 `T_SKIP_CHAINS_DEF`（`shipped_build.defs:12-14` 已记过这次的混淆）；④ 与军规 199（登记件字节冻结）、209（面结论先查 last writer）、210（不达标不换块）配套。
 ﻿
 **军规 211 口径修正（C70 实测，11-12 23:2x）**：**HEAD 源码里没有 `T_SKIP_CHAINS_DEF` 的处理（只有 `libxmx_sycl.cpp:942` 的注释）⇒ 带 shipped defs 编译也不生效**（带 `-D` 编出的测试件 plain-1301 仍是未跳块的 `249A46F3…`）。**⇒ 正确做法：腿的 env 里显式设 `NR_SKIP_CHAINS="18,19,20,21,22,23,24,26,27,28,29,30,31,32"` 并把该值写进日志**（或用带钩子的 `08e8b62` 树编）。判面前必须核对：**腿 env 一致 + 构建宏一致 + 面 last writer 一致（209）**。
+﻿212. ★ **两条仪器规范（C79/C80 自伤换来，写 bench 时一律遵守）**：
+① **总结行必须打三个数：`correct=… bad=… of tot=…`**。**绝不允许用 `correct = tot - bad` 这种格式串冒充 bad** —— C79 就是这样被我读成 `bad=1/393,216`（真意是"只有 1 个元素正确"），导致一条其实没过门的形被当成"差 1 个元素"。
+② **bench 的操作数必须由引擎自己的打包器生成**（`packdev::gather_pack_a_b / gather_pack_b_b`、`pack_a*`、`pack_b`），**不许把 raw 数组手拷进 packed 缓冲**：核按 `kk32-block` 等打包布局索引，喂 raw 会得到"几乎全错但时间有效"的读数（C79 那次就是这么错的：raw `B96` 拷进 `Bp`）。
+**推论**：**时间读数与门读数是两回事** —— 未打包的输入仍会产生可用的时间数（工作量与访存相同），但**绝不能当逐位正确的证据**；任何"塌缩/换形"结论必须先 `bad=0 of tot=N` 再报 Δ。
+**配套**：军规 206（写侧三硬门）、190（探针 in_order + 自检）、192（判官哈希全部输入面）、211（面比对必须同构建宏与同腿 env）、209（面结论先查 last writer）。
