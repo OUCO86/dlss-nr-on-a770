@@ -4230,3 +4230,19 @@ BK=64 + BN=128            : 两侧都 256 B，总 SLM 49,152 B ⇒ 已超 hardwa
 **这条不再是宽度而是指令量** —— 正是 `03-a770-reference-and-roofline.md:39-40` 那句判据指向的地方（强度低于 ridge 且实得带宽已接近基线 ⇒ 去看指令量、冗余读取和 launch 开销）。
 ### ⑥ 现场
 GPU = 0；未改任何引擎源文件（porcelain 0；`.cpp` = `98F521EF…`、`gemm_s8_v8_kernel.hpp` = `E2991804…`、`bench_s8v8_tile.cpp` = `3D01A235…` 全未动）、未编译、未 staged、`tmp\c57\` 未建；两槽对账 `6C4D7AF7…` / 3,454,976 B ✓；conf `AF12FFC8…` 未动；git 只读；无进程；状态 `s6/layer1.md §144`。
+﻿## 203. ★★★★ **C58（0 GPU）：SWAR e4m3 判停（上界 1.5-6.0%）；但自校验把「编码链 ≈ 整个 pub 尾」钉死；并且我拦下一句「非数值杠杆已出尽」—— C32 段驻留（4.9-17.5 ms 区间）还没定价**
+- **军规 202 存在性核对（本铲最值钱的一条）**：**「编码链向量化」这一半已经付了** —— 出货件里 `e4m3_vec_v8<N>`（14 条真 SIMD 指令/向量，`bit_cast_view` 免费）、`gate_vec_v8<N>`（22 条/向量）、`pub_vec_v8<N>(epi,…)` 组装，全是 **branch-free SIMD 形**；`bench_e4m3vec.cpp:1-5` 头注释就是这件事（"qr_e4m3_scalar has 3 branches → masked-SIMD divergence cost … Judge: bit-exact over random ±500 + boundary/tie/−0.0 edges"）；`gate_vec_v8` 里的 **BLADE-6 注释**还留着已收的一刀（gemm-f16 族 32 个 epi=2 调用 ⇒ "cold" 标量支路其实 HOT，15-30 instrs/element）⇒ **标量→向量化已砍过一轮**；
+ **未付的只是「两值一 lane 的打包 SWAR」**：`swar|SWAR|0x80008000|0x7F7F|prmt|swap_bytes` 在 `src/bench/sycl/*` = **0 命中** ✓；
+ **§六.二十七 边界确认**：ffn 侧 pub 8→16 已付（`ffn_chip_kernel.hpp:183/188/206` = `pub_vec_v8<16>`，注释 `:202` "4x vec8 pub → 2x vec16"），短链仍是 vec8（`:209-210`）⇒ **ffn-5/6 已输不回锅**；**LUT vs 原生已对照**（`logs/build_e4m3lut.log`、`build_e4m3nat.log`，11-08）⇒ **LUT 路线别再排**；
+- **上界精算**：编码元素 **3.415e8 = 342 M 值/帧**（residual 68 只 4.60e7｜batched 72 只 1.85e8｜qkv 60 只 5.03e7｜window_res 52 只 4.88e7｜gemm_int8 24 只 1.15e7）；发射口径 32 EU × 2.10 GHz = 672 亿条/s：
+| 向量宽 | 链 | 指令/帧 | 串行 ms | 帧内可见（×0.359） | 占 42.15 |
+|---|---|---|---|---|---|
+| N=8 | e4m3（14 条） | 5.98e8 | 8.89 | **3.19** | 7.6% |
+| N=8 | gate+e4m3（22 条） | 9.39e8 | 13.98 | **5.02** | 11.9% |
+| N=16 | gate+e4m3 | 4.70e8 | 6.99 | 2.51 | 6.0% |
+**★ 自校验**：模型算出 gate+e4m3 = **13.98 ms 串行** vs C53 实测 pub 尾份额 **14.55 ms** ⇒ **编码链 ≈ 整个 pub 尾**（对上 §六.二十六 的 98%）✓✓；
+**SWAR 净收益**：已付的是每 lane 一值的向量链 ⇒ 打包最多 **指令 ×0.5~0.75** ⇒ **省 1.25-2.51 ms/帧（N=8）或 0.63-1.25（N=16）= 整帧 1.5-6.0% < 10% ⇒ 判停、零腿**；
+- **战役账（要交给用户的那句）**：**即便把整条编码链全部消掉（16.2% 极端上界），42.15 → 35.3 ms**；**等像素靶 26.3 的缺口 15.9 ms、20 ms 目标缺口 22 ms ⇒ 已测过的非数值杠杆合起来补不上**；
+- **我拦下「全部出尽」**：**C32 wave1 段驻留还没定价**（C48 换靶时写的：284 闭包 / 腿 16.6 ms / region 6.76 GB/帧，可消 4.2-5.1 GB/帧 ⇒ **按 DRAM 291.1 = 14.4-17.5 ms/帧、按 L2 854.6 = 4.9-6.0 ms/帧**）；C56/C57/C58 测的是 pub 宽度、gemm 的 N 展开、编码链，**都不是这 284 只的段驻留** ⇒ **在定价之前不许说非数值杠杆已出尽**；
+- **C59 已下令**：先把 6.76 GB/帧 **按面拆成 DRAM 服务 vs L2 吸收**（用 `hardware.md:25` 的 working-set 判据），**可信上界 <4 ms/帧 ⇒ 判停并入已算死清单；≥4 ms/帧 ⇒ 做一条忠实 bench 臂（只许复用现成仪器 `bench_res`/`bench_qv3`/`bench_unary`/`bench_packvec`，不许自研寻址）**；四道门（`holes=0`、`nbad=0`、`written==payload`、`diff=0`）+ `in_order` + 3 冷进程 min-of-9 + ocloc 三闸；
+- **现场**：GPU = 0；未改任何引擎源文件（`.cpp` = `98F521EF…`、`gemm_s8_v8_kernel.hpp` = `E2991804…`、`ffn_chip_kernel.hpp`/`publish_kernel.hpp`/`bench_e4m3vec.cpp` 全未动）、未编译、未 staged、`tmp\c58\` 未建；两槽对账 `6C4D7AF7…` / 3,454,976 B ✓；conf `AF12FFC8…` 未动；git 只读；无进程；工具新增 `tools/wb_c58_bound.py`；状态 `s6/layer1.md §145`。
