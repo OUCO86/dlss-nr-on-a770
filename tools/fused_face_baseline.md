@@ -44,3 +44,28 @@ nr_replay_now.exe E:\DSH\oneapi\libxmx_sycl.dll E:\DSH\out\plan_960x544.bin E:\D
 ## ★ 一条顺带结论（否证了"构建不确定性会改数值"）
 同一源码的**两只不同构建**（子代理 `libxmx_imfnat1.dll` = `9D69BDDB…`，12:43；父级正式件 `libxmx_shfimf1.dll` = `AF5A19B3…`，13:05）**三面 md5 完全一致**（`254C02B7 / CACD2029 / DAC32974`）
 ⇒ **icx/SYCL 构建差异不改数值** ⇒ **20:09 那次 `6AEE1ADE` 的门红与"同源码不同构建"无关**，回到"缓存态 / 口径"那条解释（军规 146/147/148）。
+
+---
+
+## 环境限定重基线（2026-11-12 16:35，父级登记；旧值保留为历史，不删）
+
+**为什么重基线**：C61d 的判决腿（同一台、同一 conf、每腿新建空缓存、`NR_VIT_REUSE=0` 显式入 env）显示
+**A = 现役出货件 `6C4D7AF793CC5F6769EACB70107E2FCA`（3,454,976 B）** 与
+**B = `out\libxmx.before-vitreuse.keep` = `A2C3009F5EC9C7F48B304346CE5A36D9`（C18）两面完全一致**：
+| 面 | A（现役） | B（C18） | 判定 |
+|---|---|---|---|
+| fused 1301 | `254C02B73108E18FCF68221D4C6D530C` | 同 | **一致** |
+| features | `CACD202969C821D87CBDC033879CA7AB` | 同 | **一致** |
+| **result** | **`4D90CCA5B642194147BF996AA8F821C0`** | **同** | **一致** |
+| plain 1301 | `DD49827DD33A7EF07C2C17892F18970D` | 同 | **一致** |
+⇒ **无回归**（ViT 周期复用件在 `REUSE=0` 下与 C18 逐字节一致，判决级证据）；
+**而历史登记的 result 值 `AE050ED1B1A5075BF41BCB93FD043298` 在当前 harness 下两件都复现不出** ⇒ 它是**旧环境指纹下的读数**，不是任何一件件的缺陷证据。
+
+**本次基线的环境指纹（今后引用必须一致，否则不许判红/判绿）**
+- 腿 exe：`E:\DSH\tmp\c26rt\nr_replay_c27.exe`（CWD `E:\DSH\oneapi`，运行时目录按 195/197 摆放、**排除 `libxmx_sycl.dll`**）
+- 槽件：`E:\DSH\oneapi\libxmx_sycl.dll` = `6C4D7AF7…` = `out/SHIPPED_MD5.txt`
+- `out\nr_ship.conf` md5 = `AF12FFC85D3D…`（8 keys、clamped 0）；**`NR_VIT_REUSE=0` 显式在 env**
+- 面哈希由 `E:\DSH\s6\c61c_dumpab.ps1` + `tools/wb_c61c_diffdump.py` 产（dump 后逐面 MD5）
+- 每腿新建空 `SYCL_CACHE_DIR`、腿间 62 s、日志须无 `RECORD FAILED`
+**引用方式**：任何刀的"四闸 EXACT"必须**在同一指纹下与上表比**；换 exe / conf / skip 集合 / walk 之一 ⇒ 先重跑参照件（现役槽）取四面，再比。
+**旧值存档**：`AE050ED1…`（C18 时代 11-09 登记）、`249A46F3…`（= `bk.1301.pre-skip-1a.bin` 金标，仍是 plain-1301 在**旧 skip 集合**下的读数）。
