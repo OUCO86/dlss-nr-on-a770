@@ -530,3 +530,9 @@ SM_LW | 分支=b1-wblock-resident（origin 已推）。
 5. **倍数表（`tools/L2_scoreboard*.csv/md`）降级为定位工具**：它只回答"钱在核内链 / 搬运 / 派发"，**永远不能当达标证据**。
 **靶的数值（背下来，不许再问用户）**：**对手 111.300 ms @2.21 Mpx ⇒ 等像素 26.3 ms @0.522 Mpx；带宽归一 20.6 ms；第一战役目标 20 ms；同等融合深度的物理地板 10-12 ms。我们：42.15（fused，含 ViT 周期复用）/ 46.26（不开复用）/ plain 36.71 / 40.65 ⇒ 仍慢 1.6-1.8x。前辈 coopmat 47.19。**
 **大刀（钱在这，不在单核刀）**：**S6 块驻留 = 一块一 megakernel、中间量不落 global**；`1267` 残差面 **26.7 GB/帧 → 4.8 GB/帧**，屋顶 **47.7 ms → 8.6 ms**；**B6-1 没兑现是因为它只把 5 个 split op 串成一核但 plane 照写，消的全是 L2 已吸收的小面（1277/1272/1270），1267 原样进出 DRAM**。
+﻿205. ★ **写 ESIMD/SLM 驻留类 bench 之前，先照这三条工具链事实（2026-11-12 C49 撞出来的，别再撞第二遍）**：
+1. **本 DPC++（oneAPI 2026.1.1）没有 `esimd::load<T,N>(ptr)` / `esimd::store(ptr,v)`** ⇒ **全局向量读写只能走标量元素访问**；SLM 只能用 **`esimd::slm_block_load / slm_block_store(字节偏移, simd)`**；**`esimd::slm_init<N>()` 是语句、返回 void**（赋给指针 = 8 处 error）；
+2. **`simd::select<Size,Stride,Index>` 的 `Index` 必须是编译期常量** ⇒ **"B 常驻 GRF、按 k 取列"这类 A3 直白写法编不出来**；**A3 必须走 s8v8 的 lane-owned 权重向量形**（每 lane 固定拥有自己的权重段，dpas 直接吃）；
+3. **`simd` 没有 `.front()` / 标量导出** ⇒ SLM 块结果写回 global 只能整块或逐 lane（现役核用 `slm_block_store` + 少量标量 global 写完成 publish）。
+**配套量纲更正（父级红旗误判）**：**DG2 的 `grf=128` 不等于 Ampere 的 `Regs 128`** —— **一个 GRF = 128 B/lane-group ⇒ 128 GRF ≈ 16 KB/线程**，而 NVIDIA `234 regs × 4 B = 936 B` ⇒ **按字节我们的预算比 lmxx 的核大得多**；**真实约束是 `grf_count=128` 顶格 + 不许 spill/private/scratch**（现役件 `grf>128 = 0`、`scratch≠0 = 0` 已守住）。**今后引用别人核的 regs 做可行性判断，必须先换算成字节，不许直接比数值。**
+**与军规 96（plain 核里 SLM-fed dpas 静默归零 ⇒ 走 ESIMD `nd_range` + `slm_init` 安全族）、182（grf 顶格）、190/192（探针纪律）、203（先算上界再建腿）配套。**

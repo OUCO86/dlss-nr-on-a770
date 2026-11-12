@@ -4056,3 +4056,22 @@ SLM（2×64×C×esz）：`C64 16,384 ✅｜C128 32,768 ✅｜C256 65,536 顶格�
 **新坑入册**：**独立 bench TU 必须自带 `LC_TICK/LC_ADD` 宏定义**（引擎 TU 才有 ⇒ 直接编 bench 会 8 处 undeclared；解法 `s6/c47_shim.py`）。
 ### ④ 现场
 **GPU = 1 编译 + 3 冷进程 ≈ 6-8 分钟**（standalone 仪器，不是引擎腿）；未改引擎源文件（porcelain 0、`.cpp` = `98F521EF…`）、未编译引擎件、未 staged；两槽开工/收工对账 `6C4D7AF7…` / 3,454,976 B = `out/SHIPPED_MD5.txt` ✓；`nr_ship.conf` 只读未改；骨架件只在 `E:\DSH\tmp\c47\`；日志 `C47_b6_p1/2/3.log`、`C47_zeinfo1.log`；无进程残留；状态 `s6/layer1.md §134`（含 §134.1 闸门修正、§134.6 坑名单打勾）。
+﻿## 194. ★★★★ **C49（0 次 kernel 执行）：C32 驻留的字节上界过线（可消 4.2-5.1 GB/帧 > 3.4 门槛），但 gate bench 没编出 ELF ⇒ 实测未做；换来三条工具链硬事实 + 更正我自己一条红旗误判**
+### ① 第 0 步闸门（资源需求与已证证据）
+**C32 一块一核的资源**：tile = 64 px × 32 ch × f32 = **8,192 B/面** ⇒ 两块交替 + 权重 4 KB + scale 1 KB = **SLM 21,504 B/每 WG**（lmxx `c32_wave1_*` 只用 10,240）= **我们 65,536 上限的 33%，余 44 KB ✅**；
+**闸门可过的实测证据（不是猜）**：C47 的 ocloc 普查（`logs/C47_zeinfo1.log`，65 个 bench 实例）**`scratch≠0 = 0`、`grf>128 = 0`**，其中含 **`b6_res_kernel.hpp` 的四相驻留核（QT/KT/VT 各 8K ⇒ `SLMB = 57,344 B`，`:33/:56`）** ⇒ **"多相 + 中间量全在 SLM"的核在 `grf≤128 / scratch=0` 下编得出来**（同族 C64 已实测成立）；**但 C32 这一形自己还没编出来验过 ⇒ 诚实记为未证**；
+**★ 更正我（父级）上一条红旗**：lmxx `Regs 162-234` vs 我们 `grf=128` **不是 1.3-1.8× 缺口，量纲不同**：DG2 一个 GRF = 128 B/lane-group ⇒ 128 个 ≈ 16 KB/线程；他们 234×4 B = 936 B ⇒ **按字节他们预算小得多**；**真实约束 = `grf_count=128` 顶格 + 不许 spill/private/scratch**（现役件已守住）。
+### ② 三个硬数
+**硬数①（region 流量账，已算清）**：一个 C32 面（66.85 MB）在 split 四相 = **8 次面过界（4 读 + 4 写）= 534.8 MB**；驻留形 = **1 读 + 1 写 = 133.7 MB** ⇒ **每面相链消 401 MB**；C32 段（`pre 2 + unary 16 + quant(FUSED-pack) 144 + gemm(f16) 42 + quant 80` = 284 闭包）现役 region **6.76 GB/帧** ⇒ **整段转驻留的上界可消 4.2-5.1 GB/帧（62-75%）> 门槛 3.4 GB/帧 ✅**（C64 那铲只有 0.117 GB）⇒ 按 560/190 GB/s 折 **7.5-9.1 / 21-27 ms/帧** ⇒ **Δ 门槛（4.15 ms）在字节账上可达，必须实测定生死**；
+**硬数②（Δ%）：未测**（编译未过 ⇒ 无 min-of-9、无 1a/1b 差）；**不外推**（字节可达 ≠ 实测可达）；
+**硬数③（WG/并行度）**：C32 驻留形并行度天然够（lmxx grid 34,560 / 34,945 / 8,833 / 8,640-8,760；**我们的 64px-tile 形在 522,240 px 上 = 8,160 WG ✅**，远超 slice1 的 510-558 死形）⇒ **本铲没有并行度红旗**。
+### ③ 本铲真正的产出 = 三条工具链硬事实（下次写驻留 bench 直接照，别再撞）
+1. **这个 DPC++ 没有 `esimd::load<T,N>(ptr)` / `esimd::store(ptr,v)`**（`no member named 'load' in namespace 'sycl::ext::intel::esimd'`）⇒ **全局向量读写必须走标量元素访问**，SLM 走 **`esimd::slm_block_load/store(字节偏移, simd)`**；且 **`esimd::slm_init<N>()` 是语句、返回 void**（第一次把它赋给 `float*` ⇒ 8 处 error）；
+2. **`simd::select<Size,Stride,Index>` 的 `Index` 必须是编译期常量** ⇒ **"B 常驻 GRF + 按 k 取列"这种 A3 直白写法编不出来** ⇒ **A3 必须照 s8v8 的 lane-owned 权重向量写法**（每 lane 固定拥有自己的权重段，dpas 直接吃）；
+3. **`simd` 没有 `.front()` / 标量导出** ⇒ SLM 块结果写回 global 只能整块/逐 lane（现役核靠 `slm_block_store` + 少量标量 global 写完成 publish）。
+### ④ 判定与下一铲（C50 已下令）
+**不建引擎刀、也不判死路线**（第 0 步实测闸没过 = bench 没编出来）；**路线证据链四项全绿**：SLM 33% ✅ + 并行度 8,160 WG ✅ + 同族驻留核 `b6` 已证 `grf≤128/scratch=0` ✅ + 字节上界过 3.4 GB 门槛 ✅，**缺的只是 C32 形自己的 ocloc 实测**；
+**C50 = 用 v4ph/b6 既有写法重写 gate bench → ocloc 闸（先于计时）→ 三臂对拍（ARM0 split / ARM1a 四相驻留无 A3 / ARM1b + lane-owned A3）→ Δ 实测**；**判定口径写死**：**Δ ≥25% ⇒ 下一铲建引擎刀 S6-C32**；**10-25% ⇒ 交归因分列**（SLM 读放大 / 依赖链 / 派发 / publish）；**<10% 或过不了 ocloc 闸 ⇒ 驻留路线判死**，我把 C46-C50 全部账目拿去向用户申请转靶；
+**对拍忠实度写死**：切片只覆盖"四相 + 一个面的 ping-pong"，**不覆盖 pyramid 12 层、不覆盖 `quant(FUSED-pack)` 的 144 只 ⇒ 不许把切片当整段外推**。
+### ⑤ 现场
+**GPU = 0 次 kernel 执行**（一次编译失败）；未改引擎源文件（porcelain 0、`.cpp` = `98F521EF…`）、未编译引擎件、未 staged；standalone 只在 `E:\DSH\tmp\c49\`；两槽对账 `6C4D7AF7…` / 3,454,976 B ✓；conf 只读未改；无进程；状态 `s6/layer1.md §136`（含纪律自查：显式 in_order ✅、§96 安全族 ✅、`select` 坑的另一面已入册、WA_KT 未触、未塞诊断分支；**30 秒自检/判官哈希/operand 尺寸写了但没跑成 ⇒ C50 补全**）。
