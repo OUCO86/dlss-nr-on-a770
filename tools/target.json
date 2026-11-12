@@ -79,8 +79,14 @@
     "gates": {
       "SLM_per_WG": "他只用 10,240 B，我们上限 65,536 B => 有余量",
       "parallelism": "他 grid 34,560 / 8,833 / 8,760 => @544p 仍数千 WG，天然过闸",
-      "GRF": "不是致命闸（11-12 用户硬件表 + 我更正量纲）：DG2 1 GRF = 64 B => 128 GRF = 8 KB/线程，是 NVIDIA 255x4B=1020 B/线程的约 8 倍；每 EU 64 KB。要守的只有三条实测：grf_count<=128、scratch=0（不许 spill 到 private）、SLM<=65,536 B/每 WG。现役件含 b6_res_kernel.hpp 四相驻留核（SLM 57,344 B）已证明这三条守得住 => 超寄存器是可实现缺陷（照 v4ph/b6 已证写法改），不是硬件判决，禁止当出口",
+      "GRF": "不是致命闸（11-12 用户硬件表 + C50 出处更正）：DG2 1 GRF = 32 B（256 bit，hardware.md:20 算例 float 8x8 = 256 B = 8 GRF）=> 128 GRF = 4 KB/线程，是 NVIDIA 255x4B=1020 B/线程的约 4 倍；开 Large GRF（256 GRF，线程 8->4/VE）= 8 KB/线程约 8 倍，且 Large GRF 我们从未试过（作者只记它对 joint_matrix 为负，对 ESIMD 手写核未测）。要守的实测三条：grf_count<=128（或 Large 256）、scratch=0（不许 spill 到 private）、SLM<=65,536 B/每 WG；但真正的闸门是作者经验拐点 SLM/每 WG 约 32 KB 以上开始丢常驻 WG（hardware.md:67）——现役件 slm_init<65536> 9 处、<45056> 5 处都在拐点之上，与 §58 的实测口径冲突，必须实测钉死。超寄存器是可实现缺陷（照 v4ph/b6 已证写法改），禁止当出口",
       "A3": "驻留必须与 A3（B 操作数常驻）成对做（ARM1a/ARM1b），否则 §六.十八 的 5.3x SLM 读放大吃掉省下的 DRAM"
+    },
+    "levers_untried_with_source": {
+      "widen_SLM_messages_to_256B": "我们现役 slm_block_load/store 每次只有 32-64 B（float N=16 / int32 N=16 / half N=32），而 DG2 上限是 256 B（512 B 是 PVC-only，hardware.md:38-39）=> 只用掉 1/4 消息宽度 => LSC 消息数天然是 4x 下限；正对上 §六.十八 的 5.3x SLM 读放大与 §六.九 的 SLM 消息 171 vs dpas 112。作者另记：256 B 已跨满 SLM bank，手工 bank padding 反而破坏对齐（实测为负）=> 加宽消息、不要碰 bank padding",
+      "Large_GRF_mode": "-Xs \"-device dg2 -options -doubleGRF\"（api-usage.md:276）=> 256 GRF/线程（8 KB）、线程数 8->4 每 VE；oneDNN 的 A770 XMX GEMM 就是 ngen + Large GRF（hardware.md:72）；作者只记它对 joint_matrix 为负（03-…:57）=> 对我们 ESIMD 手写 megakernel 是未测杠杆",
+      "workgroup_spans_N_and_A_staged_once": "作者换方案（03-…:99-120，spv 已编过但未实测收益）：一个 workgroup 沿 N 展开、A 只取一次（先进 SLM 再从 SLM 读 4115.8 GB/s 对 DRAM 291.1）=> A 全局流量 /4、每 WG 工作量 x4、强度 21.3->42.6；路由条件 n >= 2*BN 且 k 放得进 SLM；这直接对治他的 stride_probe 结论（每 WG 活太少 => 取数延迟藏不住，inner=16 只有 47 GB/s）",
+      "reduce_dispatch_count": "工程师实测我们引擎有约 11 ms 不属于任何 pass（libxmx.c:1386 each dispatch's exposed tail），加大 workgroup 无效，只有减 dispatch 次数能消"
     },
     "why_B6_1_died": "只把 5 个 split op 串成一核但 plane 照写 => 消的全是 L2 已吸收的小面（1277/1272/1270），1267 大面原样进出 DRAM",
     "why_not_C64": "C48 零 GPU 上界：C64 全层可消 117 MB/帧 = 0.21-0.62 ms，只到 25% 门槛（2.60 ms）的 8-24% => 当场判死不建腿；C64 能驻留但没钱",
