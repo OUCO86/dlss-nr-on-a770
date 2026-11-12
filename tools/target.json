@@ -1,0 +1,48 @@
+{
+  "_what": "性能靶（唯一标准，不许换）。任何【达标 / 收工 / 换战场】的结论，必须先跑 tools/target_check.py 并把它的输出原样贴进报告。",
+  "_source": "lmxx 3080L 路线 A = 71 层完整模型 / 每帧 35 核；出处 DevHistory.md §4.4（1x Original 1080p 1920x1152, Total=111.300ms）；已抄录进 notes/靶-lmxxf-3080L.md",
+  "_forbidden_references": [
+    "31-block Small（720p 5.62 / 900p 8.38 / 1080p 11.07 ms）= 后来降画质模型，不是靶",
+    "9070XT hip-port 10.4 ms@1080p = fp8 + 3.7x 带宽卡，只作实现手法参考，不是对手"
+  ],
+  "lmxx_3080L_routeA": {
+    "model": "71-layer full",
+    "cores_per_frame": 35,
+    "total_ms_at_1080p_2p21Mpx": 111.300,
+    "px_at_1080p": 2.21,
+    "ms_at_900p": 75.3
+  },
+  "normalization": {
+    "our_px_960x544": 0.522,
+    "pixel_factor": 4.23,
+    "equal_pixel_target_ms": 26.3,
+    "bandwidth_norm_ms": 20.6,
+    "bw_ratio_560_over_448": 1.25
+  },
+  "campaign_goals_ms": {
+    "first_campaign": 20.0,
+    "physical_floor_same_fusion_depth": 11.0
+  },
+  "ours": {
+    "shipped_dll_md5": "6C4D7AF793CC5F6769EACB70107E2FCA",
+    "frame_ms_fused_with_vit_reuse": 42.15,
+    "frame_ms_fused_no_reuse": 46.26,
+    "frame_ms_plain_with_vit_reuse": 36.71,
+    "frame_ms_plain_no_reuse": 40.65,
+    "closures_per_frame_fused": 693,
+    "closures_per_frame_plain": 691
+  },
+  "predecessor": {
+    "coopmat_ms": 47.19,
+    "ratio_vs_routeA_norm": 1.8
+  },
+  "big_knife": {
+    "name": "S6 块驻留 / 一块一 megakernel（no global intermediate）",
+    "face": "1267 residual ping-pong",
+    "traffic_now_GB": 26.7,
+    "traffic_after_block_residency_GB": 4.8,
+    "roof_now_ms": 47.7,
+    "roof_after_ms": 8.6,
+    "why_B6_1_died": "只把 5 个 split op 串成一核但 plane 照写 => 消的全是 L2 已吸收的小面（1277/1272/1270），1267 大面原样进出 DRAM"
+  }
+}
