@@ -4307,3 +4307,25 @@ GPU = 0；未改任何引擎源文件（porcelain 0、`libxmx_sycl.cpp` = `98F52
 - **C61c 已下令（最迟 16:50）**：**改 packer 而不是改 gather**：新增 `pack_a64` / `pack_a_fused64`（写序 = 核内 `load_grf` 要的 `[wi][kc][row][k]`，块 1024、`off%64`、`Mp` 排布跟改）+ **`s8v8b::load_block` 退回线性 256 B/线程**（五行）+ **只在 gir 的 A 产路切新 packer**（**先查清 gir 的 A 是显式 `pack_a*` 还是上游 `quant(FUSED-pack)` epilogue 直写**）；**`pack_b` 与 B 侧不动**；**既有 packer 一律不改 ⇒ 其他族按构造逐位不变**；**硬门：编译 → ocloc 三闸 + LSC → 四闸必须 4/4 EXACT（仍红就不要再猜第三处，交定位证据）→ gir 腿级 Δ → 帧 ms 3 进程两口径**；
 - **资产**：刀 `E:\DSH\tools\C61b_engine_u8.diff`（14,456 B、LF、无 BOM、不含 `builds/`、`git apply --check` exit=0）；备份 `E:\DSH\tools\C61b_pre_engine.hpp`（145,514 B）；测试件 `E:\DSH\builds\libxmx_c61b.dll`（md5 `56954471382DE067396E9BEE2E1C7E42`，**未覆盖槽**）；
 - **现场**：GPU = 2 条腿（四闸）≈ 1 分钟 / 预算 60；改动已 revert（porcelain 0、HEAD `20d4c6d`、主树 CLEAN）；`libxmx_sycl.cpp` = `98F521EF…`、`gemm_s8_v8_kernel.hpp` = `E2991804…`、守卫件 `s6_ffn_block_kernel.hpp` = `490647A9…` 原状 ✓；两槽未写（`oneapi` 槽 `6C4D7AF7…`/3,454,976 B = `out/SHIPPED_MD5.txt` ✓）；conf 未动；`target.json`/`target_check.py` 未碰；未 commit；无进程；日志 `C61b_build.log`、`C61b_zeinfo.log`、`C61b_zeinfo2.log`、`C27_s0f.log`、`C27_s0p.log`；状态 `s6/layer1.md §149`。
+﻿## 208. ★★★★ **C61c（5 腿 ≈4 分钟）：packer 侧修对了（fused 路三张面全 EXACT + LSC −28% 复现），但 plain-1301 真红 1/4 ⇒ 停在四闸；并牵出一条必须判决的基线疑点**
+### ① 改了什么（已 revert）
+**`pack_device.hpp` 新增 76 行（既有函数一字未改 ⇒ 其他族按构造不变）**：`pack_a_fused64_k<KMAX>`（量化表达式**逐字照抄已证单读形**：`block_load<half,KMAX>`→`hmax(abs)`→`div_ieee(peak,127)`→`scales[srow]`→`div_ieee(seg,scale)`→`rnde`→`clamp±127`→`convert<int>`→`convert<int8_t>`；**只换目的地址** `Ap + (per_blk + kb*8)*1024 + kc*512 + row*32`、`per_blk=(w*kb_n)*8+wi`、`kb_n=KMAX/64`、`seg=reg.select<32,1>(kb*64+kc*32)` ⇒ `[w][kb64][wi][kc][row][k]` ✓）；`pack_a_fused64`（K∈{64,128,256,512} 分派，否则 return 配合回落）；`pack_a64`（标量 BK=64，含 `srow>=M` 补零）；
+**`gemm_s8_v8_kernel.hpp`（s8v8b 两处）**：A 复制退回**线性 256 B/线程**（bench 已证形）、`apb = Ap + (wg_row*(K/BK))*8192`；**B 侧与 `pack_b` 不动** ✓；
+**`libxmx_sycl.cpp:5837-5842`**：`K%64==0 && K<=512 && fused_r` ⇒ `pack_a_fused64`；`K%64==0 && K<=512` ⇒ `pack_a64`；否则回落原 pair；**gemm 侧守卫改成完全同一谓词**（`K%64==0 && K<=512u`）⇒ C61b 那种 packer/reader 谓词不一致从构造上堵掉 ✓；
+**★ A 产路结论**：gir 现役路只有 `:5831/5832`；**但还有第二个 A 打包点没切**：bmerge 捕获路 **`:2762/2763`**（`BmResSite` 在 `:5821-5824` 登记、`bmerge_apply` 捕获期重 pack A 给 `gemm_b_res_batch`）⇒ 仍是 BK=32 序；S6-fused/rb8 的 gir 腿在 `:5813` 前 `return 0`，走 `s6_ffn_block_kernel.hpp`（守卫件未碰）⇒ 不受影响 ✓
+### ② 四闸 + 一条必须上报的基线疑点
+**先校准参照（把现役出货件只读重跑，`NR_VIT_REUSE=0`）**：fused-1301 `254C02B7…` ✓、features `CACD2029…` ✓、**result `4D90CCA5…`**、plain-1301 `DD49827D…`
+⇒ **登记的 result 基线 `AE050ED1…` 与现役件当前读数不符 ⇒ 基线过期或存在真回归**（`AE050ED1` 是 C18 时代 `s6/C27_s0f.log` 的读数；C37 自己的 `s6/C37_s0f.log` 早就是 `4D90CCA5`）⇒ **C61b 我把 result 记成红其实是基线陈旧**；
+**C61c 四闸（同环境）**：fused-1301 ✓、features ✓、result ✓（与现役件当前读数一致）、**plain-1301 `249A46F3…` vs 现役 `DD49827D…` ⇒ 真红 1/4**；
+**真红定位**：plain-1301 逐字节差分 = **6,904,834 / 8,355,840 字节 = 82.6% 整面不同** ⇒ **不是某段切片错，而是整面换了一套输入序** ⇒ 典型签名 = **同族内混合布局**（有的实例按 BK=32 打包、按 BK=64 读或反之）⇒ **首要嫌疑 = 未切的第二个 A 产路 `:2762/2763`**；次要 = plain 路里 `K<=512` 谓词内外的不对称实例；
+### ③ ocloc / LSC
+新 packer 确实上线（腿缓存 ADDED 含 `pack_a_fused64_k<64/128/256/512>` 与 `pack_a64` ✓）；三闸沿用 C61b 实测 **grf=128 / SLM=36,864 / scratch=0** ✓；**LSC 动态 72→52 = −28%** ✓（复现）
+### ④ 判定
+**不交腿级 Δ、不交帧 ms**（1/4 真红；顺手读数 `run 7` fused 47.68 / plain 47.31 ms @REUSE=0 只作参照不作测量）；
+**这把刀没判死**：三闸绿 + LSC −28% + **fused 路三张面全 EXACT** ⇒ **BK=64 的 packer/reader 配对在主路（fused gir）上已经对了**，差的是 **plain 路的混合布局**（第二个 A 产路未切）；
+**C61d 已下令**：**第 0 步先判决基线疑点**（同一环境、`REUSE=0` 显式入 env，跑 A=现役 `6C4D7AF7…` 与 B=`out\libxmx.before-vitreuse.keep`（`A2C3009F…`）各 s0f/s0p 两条腿交四面 md5；**若 A≠B 的 result ⇒ 真回归 ⇒ 停所有刀，逐 region 差分定位到第一个不同的闭包，不许猜**；若 A=B ⇒ 登记漏更 ⇒ 我重跑 40 门链并更新四面基线）；**第 1 步（仅当判为登记漏更）**：切 `:2762/2763` bmerge 捕获路到同一 64 序 + **谓词抽成 `gir_bk64_ok(Mp,N,K)` 让 packer 与 gemm 共用** ⇒ 构造上杜绝混合；四闸 4/4 才交腿账与帧账。
+### ⑤ 新坑（已立军规 207）
+**`core.autocrlf=true` 时用 python 往 CRLF 文件里插 LF 块 ⇒ 刀在 LF 归一后 `git apply --check` 失败（本次 LF 版失败、原始 CRLF 版 exit=0）⇒ 插块必须按目标文件行尾写（或 `newline=''`）**；
+**资产**：刀 `E:\DSH\tools\C61c_engine_u8.diff`（21,301 B、CRLF 上下文、`apply --check` exit=0、UTF-8 无 BOM、不含 `builds/`）；备份 `C61b_pre_engine.hpp`；脚本 `s6/c61c_edit.py`、`s6/c61c_dumpab.ps1`、`s6/c61b_build.ps1`；工具 `tools/wb_c61c_diffdump.py`；测试件 `E:\DSH\builds\libxmx_c61c.dll`（md5 `1721B121BBD386D0B80521A6E236AA2C`，未覆盖槽）。
+### ⑥ 现场
+**GPU = 5 腿 ≈ 4 分钟**（预算 40）；改动已 revert ⇒ 主树 CLEAN（porcelain 0、HEAD `1837264`）；六份文件 md5 全原状（`libxmx_sycl.cpp` `98F521EF…`、`gemm_s8_v8_kernel.hpp` `E2991804…`、`pack_device.hpp` `64952F2F…`、守卫件 `s6_ffn_block_kernel.hpp` `490647A9…`、`quantize_row_kernel.hpp` `CAC3C50D…`、`publish_kernel.hpp` `69C9BA9E…`）✓；**两槽未写**（槽 `6C4D7AF7…`/3,454,976 B = `out/SHIPPED_MD5.txt`）；conf/`target.json`/`target_check.py`/门脚本/golden/受管缓存未写；未 commit；无进程；日志 `C61c_*`、`C27_s0f/s0p`；状态 `s6/layer1.md §150`。
