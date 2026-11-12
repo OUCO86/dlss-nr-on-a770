@@ -4383,3 +4383,21 @@ GPU = 0；未改任何引擎文件（porcelain 0、HEAD `18a1519`）；六份 md
 - **军规 209**：本铲未编译未跑腿 ⇒ 不引用四闸/面结论；唯一面归属判断（1301 有读者）已核 last writer：**1301 的写手正是 gir/quant 闭包 ⇒ 剪 `1301→1302` 必然动 gir 写手 ⇒ 更危险不是更省**；
 - **判定**：**C62 移进"已算死"栏**（与 C56/C58/C59/C60 同栏，已写进 `target.json`）；
 - **C63 已下令（最迟 18:30，GPU ≤45 分钟）**：按用户 15:11 的令进改数值 —— **先零 GPU 三行排序（收益 / 改动面 / 是否连带 recorder-plan）选收益最大的那把，然后直接做最大化版本**：候选① **消阶段间 requant**（2.76-3.26 ms/帧）、候选② **P8 两张大面一起 f16 化**（≈2.0 ms/帧）；**不做 golden 考古、不做 dB/SNR 预估、不做保守回退版**；仍守工程门：编译 → ocloc 三闸 → 四闸读数照跑但**不当 EXACT 判据**（数值改了面必变，交**新四面 md5 + 与旧面字节差 %** 只作观测）→ **1000 帧 walk 无 `RECORD FAILED`/无非法访问** → **帧 ms 3 冷进程两口径**；**新形必须挂 `NR_*` 开关默认 OFF，staged 由我开**（用户实机看画面由我 staged 后交他）。
+﻿## 216. ★★★★★ **C63（零腿）：两把改数值候选的排序 —— ① 消阶段间 requant 是算术净负一个数量级（永久出局）；② P8 f16 大面成立且引擎侧三件套早已实现，只差 flag 与几何**
+### ① 排序表
+| 候选 | 收益 | 改动面 | 连带 recorder/plan |
+|---|---|---|---|
+| **① 消阶段间 requant** | 名义 2.76-3.26 ms/帧 ⇒ **实为净负 −30~−60 ms/帧** | 链上每一级操作数 dtype 全换 | 是 |
+| **② P8 大面 f16 化**（`1309`=plan 1274? 不，`1309`=plan **1267**、`1313`=plan **1274**） | **2.00 ms/帧**（region 执行普查：`547.7 + 616.4 = 1,164.1 MB/帧`，减半 582 MB ⇒ @291.1 = **2.00 ms**） | **引擎侧 0 处**；plan/recorder 侧 **2 个 flag 位 + 2 个 OP_BUF 尺寸** | **是，且只在 plan 侧** |
+**★ ① 为什么净负（引擎自己的腿账实测吞吐）**：`gemm_int8_batched` **6,941 TOPS**、`gemm_int8_qkv` **4,407**、`gemm_int8` 3,471、`gemm_window_int8_residual` 1,419、`gemm_int8_residual` **1,384** vs **`gemm`(f16) 只有 653 TFLOPS**（`bandwidth.md:83` fp16 峰值 100.6 TF、`hardware.md:29` DPAS 8×8×16）⇒ **让下一级吃 f16/f32 操作数 = 73.2 ms 串行 / 181.2 GFLOP 的 int8 gemm 从 1,384-6,941 TOPS 掉到 653 档 ⇒ 多花 50-150 ms 串行换 2.76-3.26 ms ⇒ 净负一个数量级，①出局（算术，不是保守）**；
+### ② ②号靶的 op 级清单（`tools/plane_map.csv`）
+- **`1309` = plan 1267**（f32，face 66.85 MB，`w_slots 140 / r_slots 260`，200 命令/帧）：写手 `gemm_int8_residual ×136`（位 @2×120、@5×16）、`gemm_window_int8_residual ×104`（@5）；读者 `quant_window ×104`、`window_block ×20`、`ffn ×16`（@3）、`quant ×16`、`ffn_merge@5`、`ffn_stem@4`。台账原话：**risk HIGH（pre-quantise accumulator）、"99.95% of values change -> user bench, keep last"**；artifact `dumps/bgP_on.1267.bin`；
+- **`1313` = plan 1274**（f32，face 33.55 MB，`w_slots 254 / r_slots 278`，266 命令/帧）：写手 `gemm_int8_qkv ×120`（@3）、`gemm ×74`（@0/@2）、`gemm_int8_batched ×72`（@2）；读者 `window_attention ×104`、`quant ×88`、`unary ×24`、`gemm_int8@2`、`gemm_int8_residual@7`。台账原话：**risk LOW-MEDIUM（sparse plane，f16-safe range，误差 = 11.7% 的值上 1 ulp）、"BEST byte-knife candidate this round；value-changing -> user bench"**；artifact `dumps/bgP_on.1274.bin`；
+### ③ ★ 引擎侧已同时支持两种 dtype ⇒ ②真正要改的是 flag 与几何（不是算法）
+- **写侧**：`narrow = (flags & 0x1000u)`（`libxmx_sycl.cpp:755/780/816/1085`）⇒ `gemm_b_res` 尾 `if (narrow) convert<half>(pub).copy_to((half*)Cout…) else copy_to((float*)Cout…)` ⇒ **f16 输出已实现** ✓；
+- **读侧 skip**：`half_skip = (flags & 0x40000u)` ⇒ 尾里 `block_load<half,16>((const half*)skip + …)` ⇒ **把 1267 当 half 读已实现** ✓；**且现役 ViT 段 `GEMM_INT8_RESIDUAL` 的 flags = `0x41100` = 0x40000+0x1000+0x100 ⇒ narrow 与 half_skip 都已开**（`:1771` 注释）⇒ **同一支核在别的段已经按 f16 面在跑** ✓✓；
+- **读侧 quant**：`packdev::pack_a_fused(q, const sycl::half* A_f16, …)` + `pack_a_fused_sr_k<KMAX>`（K≤512）⇒ **f16 源的量化+打包已实现** ✓；
+⇒ **②不需要改引擎算法一行；要改的是 1267/1274 两个 OP_BUF 的 dtype/尺寸 + 相关 op 的 narrow/half_skip 位 + 所有读者的元素步长**；plan 是输入件（`out/plan_960x544.bin`，纪律内不可写）⇒ **C64 = 引擎侧 `NR_P8_F16` 开关（默认 0）做 flag override + 几何一致，两张面一次做满**；
+**硬门**：**`NR_P8_F16=0` 时四闸必须逐字节 EXACT（开关惰性证明）**；`=1` 时四闸只作观测（新四面 md5 + 字节差 %），但必须过 **1000 帧 walk 无 `RECORD FAILED`/无非法访问** + ocloc 三闸 + 帧 ms 两口径；**不动守卫件 `s6_ffn_block_kernel.hpp`**（若 S6-fused 路也读这两张面，写明"该路未覆盖"）。
+### ④ 现场
+GPU = 0；主树 CLEAN（porcelain 0、HEAD `d3fb77a`）；六份 md5 原状（`98F521EF…`/`E2991804…`/`64952F2F…`/`490647A9…`/`CAC3C50D…`/`69C9BA9E…`）；两槽未写；conf/`fused_face_baseline.md`/`target.json`(我改)/`target_check.py`/三金标/defs/build_shipped/门脚本/golden/受管缓存未写；git 只读；无进程；状态 `s6/layer1.md §160`。
