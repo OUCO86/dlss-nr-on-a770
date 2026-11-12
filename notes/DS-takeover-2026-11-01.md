@@ -4008,3 +4008,29 @@ A = 4 ELF / 271 实例，B = 4 ELF / **273**；**ADDED 4 / REMOVED 2**（= `xmx_
 `build_shipped.ps1:39-45` 现在只登记 **`s6_ffn_block_kernel.hpp` = `490647A9…` 单态** ⇒ **`publish_kernel.hpp` / `gemm_s8_v8` / `gemm_s8_v9` / `att5_fused_kernel.hpp` / `softmax_kernel.hpp` / `window_block_v4*.hpp` 都未登记 ⇒ 可定点 edit，不需要 §181① 解锁** ✓
 ### ④ 现场
 **GPU = 0**（预算 25 分钟全省）；未改任何源文件（porcelain 0、`.cpp` = `98F521EF…`）、未编译、未 staged、无刀可导；两槽对账 `6C4D7AF7…` / 3,454,976 B = `out/SHIPPED_MD5.txt` ✓（开工/收工各一次）；conf 未动 `AF12FFC8…`；无进程；交付 `tools/C45_1274_sites.md` + `tools/wb_c45_census.py`、`wb_c45_sites.py`；状态 `s6/layer1.md §131`（含 §131.2 更正）。
+﻿## 192. ★★★★★ **C46 逐层对表（0 GPU）：按 71 层靶把我们的 693 只闭包归到 lmxx 3080L 路线 A 的 35 核类 ⇒ 最贵的超额在解码器大块层（C512 +29.7、C256 +22.7、C128 +14.3），不是 WB；资源闸门把可做的层筛成只剩 C128 全绿**
+### ① 逐层对表（全表 `tools/L71_vs_lmxx.md` 11,062 B + `L71_vs_lmxx.csv`；工具 `wb_c46_arch/bounds/lmxx/tiers.py`；`logs/C46_targetcheck.txt`）
+| lmxx 类（@544p 等效 ms） | 我们对应层（闭包） | fused 腿 ms | MB/帧 | 比值 | **绝对超额** |
+|---|---|---|---|---|---|
+| `c512_qkv_attention_compact` + `mh_attention_c512` = **1.60** | **C512 层 16 链（193 只）** | **31.299** | 7,859 | **19.6×** | **+29.7** |
+| `c256_wave2_*` + **`sp_run256_w16`（persistent，我们从未建）** = **4.78** | **C256 层 16 链（169）** | **27.490** | 7,654 | **5.75×** | **+22.7** |
+| `c128_wave2_*` = **3.93** | **C128 层 12 链（136）** | **18.249** | 5,899 | **4.64×** | **+14.3** |
+| `vit_stream_* / vit_expand / split_ffn_one / split_projection / decoder / vit_gather` ≈ **4.9** | **ViT 段（GA8 + ffn8 + stem/merge + gemm_int8 8 + qkv 8）** | ≈16.5（窄口径 13.94） | ≈2,600 | **3.4×** | +11.6 |
+| `mh_pool_project_* / mh_attention_project_*`（单发 0.077-0.216）≈ **0.63** | **`window_block`（10 只）** | **12.751** | 794 | **≈20×** | +10.7 |
+| `c64_wave2_*` = **3.50** | **C64 层 8 链（86）** | 10.416 | 3,858 | 2.98× | +6.9 |
+**归一假设写死**：**4.23 线性只对 token 数正比类成立**；**非线性的** = `c32_wave1_*`（全分辨率 + 上采样折进下块首层）、`mh_pool/attention_project`（grid 与 pool/head 尺寸相关，他们 C512 pool 只发 **40 组 / SMem 8 KB**）、`sp_run256`（grid 893 固定）；
+**口径纪律**：**串行腿 ms ≠ 帧 wall（cgraph 重叠吃掉 ~55%，§六.二十八）⇒ 帧级对比只认 `target_check` 的 1.60× / 2.05× / 2.11×**；本表的比值用于**定位钱在哪一层**。
+### ② 资源闸门（能不能干，先决条件）
+一块 = 64 token × C，五阶段要**两块 64×C plane 交替** ⇒ **SLM 需求**：`C32 8.2 KB ✅｜C64 16.4 ✅｜C128 32.8 ✅（余 32 KB 放权重/skip）｜C256 f16 = 65,536 顶格（0 余量）⇒ 必须 int8（32.8 KB）或 32-token 子块｜C512 f16 = 131 KB ✗ 2× 超、int8 也顶格 ⇒ 只能 32-token 子块（int8 32.8 ✅）= dpas 半宽代价（slice2 实测半宽 ⇒ 帧负）`；
+**GRF 闸门**：lmxx `Regs 240-255 + LMem 576`（persistent 靠 local memory）⇒ **我们 128 GRF/线程（§六.三十 s8v8 8 累加器已顶格）+ scratch 必须 0 ⇒ `sp_run256` 形不可照搬（regs 缺口 1.9-2.6×、无 LMem 等价物）⇒ 只能"一块一核、非 persistent"**；
+**第二闸门（SLM 读放大）**：§六.十八 已证 s8v8 有 **5.3× SLM 读放大**（32 KB vs unique 6 KB；SLM 带宽 ~2× 压过 XMX）⇒ **驻留必须与 A3（GRF 常驻 B 操作数）同做，否则省下的 DRAM 被 SLM 代价吃掉**；
+**并行度闸门**：一块一核 ⇒ WG = 该层 block 数，**必须 ≥ split 的 ~1,020 WG**（slice1 510-558 ⇒ 帧 +0.5；slice2 1020-1116 但半宽 ⇒ +1.5；B6-1 ⇒ +1.08）
+**⇒ C128 是唯一"满宽 BN=64 + SLM 有余量 + 并行度可对齐"的层。**
+### ③ 第一把骨架探针（C47 已下令建）
+**C128 层一条链**（`chain_map.csv`：tier C128、C=128、M_att 35712/32640、**op_seq 11 只**：`QUANT_WINDOW → QKV → WINDOW_ATTENTION → QUANT → GEMM_WINDOW_INT8_RESIDUAL → QUANT → BATCHED → QUANT → BATCHED → QUANT → GEMM_INT8_RESIDUAL`）；
+**ARM0** = 这 11 只照 split 跑（`1272/1274/1275/1276/1277/1270` 全过 DRAM）；**ARM1** = 一核吃完整链、中间量只在 SLM、**1267 每块 1 读（skip）+ 1 写**；
+**先算再建**：C128 层 hop **5,899 MB/帧**、链内中间 **2.6-3.4 GB** ⇒ @560 GB/s ≈ **4.6-6.1 ms/帧（12 链）= 每链 0.38-0.51 ms ⇒ 正压在 25% 门槛（该链 1.52 ms ⇒ 需省 ≥0.38）⇒ 探针必做**；
+**验收硬条件（防重犯 B6-1）**：**必须报"消掉的 MB 里有多少是 1267/1274 大面"**；
+**开工前必过坑名单**：`wa_res` 的 **WA_KT 2KB sizing OVERLAPPED QT 半行错**；§96 **plain 核里 SLM-fed dpas 静默归零 ⇒ 走 ESIMD `nd_range` + SLM 常驻（v4full/wa_res/lfw2 同族，不开 global scratch）**；`select<N,1>(k)` 先问偏移还是块号；诊断分支必须同二进制带/不带对照（§六.二十九）。
+### ④ 现场
+**GPU = 0**；未改引擎源文件（porcelain 0、`.cpp` = `98F521EF…`、HEAD `4995e95`）、未编译、未 staged；两槽开工/收工对账 `6C4D7AF7…` / 3,454,976 B = `out/SHIPPED_MD5.txt` ✓；`nr_ship.conf` 只读未改（`AF12FFC8…`）；git 只读；旧 §132 已打"参照系作废"修正标记；状态 `s6/layer1.md §133`。

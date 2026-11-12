@@ -1,0 +1,24 @@
+lmxx_class,lmxx_calls,lmxx_ms_at544,our_class,our_closures,our_fused_leg_ms,our_plain_leg_ms,our_MB_per_frame,ratio_fused,planes_involved,normalization_note
+c32_wave1_prefix_b8d_w16,1,2.06,pre + quant(FUSED-pack) + gemm(f16) 全分辨率段,~60,见 OUTSIDE-CHAIN 行,同左,~1500,见下,1265/1266/1272/1273,非线性：C32 = 全分辨率、像素因子 4.23 对它同样成立（linear）
+c32_wave1_post_b8_w16,1,1.80,同上,同上,同上,同上,同上,同上,同上,同上
+c32_wave1_chain_w16,4,1.72,同上,同上,同上,同上,同上,同上,同上,同上
+c32_wave1_up_b8_w16 + finish*2 + mapped,4,1.87,unary / unary2（上采样与收尾）,17,2.938,2.72,953,1.57x,1265/1267,上采样折进下一块首层 = lmxx 0.36 的账；我们已用 U 系 SIMD 化
+c64_wave2_bi_bo,5,2.08,C64 层（8 条链）合计,86,10.416,9.622,3858.1,2.98x,1267/1272/1274/1275/1276/1286,线性（token 数按像素 4.23 缩放）
+c64_wave2_bi / bi_ho / up_lb_sh,3,1.42,同上（已并入 C64 合计）,同上,同上,同上,同上,同上,同上,同上
+c128_wave2_bi_bo,10,3.22,C128 层（12 条链）合计,136,18.249,17.440,5899.1,4.64x,同上族,线性
+c128_wave2_bi_ho + up_lb_sh,2,0.71,同上,同上,同上,同上,同上,同上,同上,同上
+c256_wave2_bi_bo_w16 + c256_wave2_bi_w16,4,1.18,C256 层（16 条链）合计,169,27.490,25.033,7654.1,5.75x,同上族,线性
+sp_run256_w16（C256 persistent 版）,2,3.60,同上（我们的对应形态 = 尚未建：无 persistent stage）,同上,同上,同上,同上,同上,同上,**这一格是形态缺口不是速度缺口**：他们用 2 发 persistent 吃掉整个 C256 层的 wave2 工作
+c512_qkv_attention_compact_w16,16,1.09,C512 层（16 条链）合计,193,31.299,4.080(失真),7858.7,**19.6x**,1267/1272/1274/1275/1276/1286/1287,plain 列失真：chain 范围按 fused 闭包号，plain id 有 −1 位移
+mh_attention_project_frag_c512_w16_u4_bout,15,0.51,window_block（10 只：pool 8160w + head 8349w + 8 兄弟）,10,12.751,12.687,794.1,**~25x 对 mh 类**,1267/1303/1266/1270/1240-1262,非线性弱：mh 的 grid 与 pool 尺寸相关（我们 pool 8160 窗 vs 他们 1080 grid）
+mh_pool_project_* + 单发 0.08-0.15,~16,~1.5,同上,同上,同上,同上,同上,同上,同上,同上
+vit_stream_qkv_frag_bin_w5f8,8,1.02,ViT 段（gemm_int8_qkv 8 + global_attention 8 + gemm_int8 8 + pre/post）,~30,11.30,~10.6,~2600,~3.3x,1271/1274/1275/1276/1277/1285/1286/1287,线性
+vit_stream_contract_frag_bstream_bout_compactw,8,0.97,同上,同上,同上,同上,同上,同上,同上,同上
+vit_stream_project_n64_bb_bout_compactw_w16,8,0.36,同上,同上,同上,同上,同上,同上,同上,同上
+vit_expand_blocked_fp8_frag_bytein_w16,8,0.75,同上（我们的 expand = ffn_stem 1.651 + ffn_merge 1.529）,2,3.180,3.19,192,~4.2x,1302/1303/1267,同上
+vit_attention_fused_640_bytein_bout,8,0.49,global_attention 8 只（每只 6 发：4 pack + 2 gemm + 1 softmax）,8,3.717,3.548,378.1,**7.6x**,1274/1275/1276/1277,**他们一核吃完注意力块（LDS 内）；我们 6 发全过 DRAM**
+split_ffn_one_w2f8_w16_bin,16,0.85,ffn 8 只（ffnc::launch_ffn_chip）,8,5.606,4.824,677.0,6.6x,1301/1302/1303/1267,我们 chip 138 GB/s vs 屋顶 560（§六.二十五）
+split_projection_frag_w16_bskip,16,0.38,gemm_int8_residual / gemm_window_int8_residual（投影+残差）,120,37.012,~33,9818,~97x,1267/1272/1301/1303,**归组不精确：我们的 residual 家族横跨所有层**
+decoder_project2x_h16w_byteout_w_bin_f8w16,2,0.09,decoder 段（post/unary2）,3,0.62,0.60,128,~7x,1301/1303,线性
+vit_gather_b8,2,0.02,gather（折在 WB/qres 的 blade-7 tile gather 里）,0,~0,~0,~0,已吸收,1267/1276,已驻留
+TOTAL,35,26.3（含 ~1.0 未列单发）,693 闭包,693,117.434（串行）/ 42.15（帧 wall 含复用）,121.9 / 36.71,30847.7,帧对靶 1.60x,,串行 vs wall 口径差 = 重叠吃掉 ~55%（§六.二十八）
