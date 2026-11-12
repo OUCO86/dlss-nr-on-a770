@@ -543,3 +543,6 @@ SM_LW | 分支=b1-wblock-resident（origin 已推）。
 ﻿207. ★ **`core.autocrlf=true` 的仓库里，往 CRLF 文件插入 LF 块会让刀在归一后 `git apply --check` 失败 —— 插块必须按目标文件自己的行尾写（python 用 `newline=''` 或显式 `\r\n`）。**
 **正案（2026-11-12 C61c）**：`gemm_s8_v8_kernel.hpp` / `pack_device.hpp` 是 CRLF；用 python 生成 LF 块插入后，**LF 版 diff `apply --check` 失败、原始 CRLF 版 exit=0**（同内容只差行尾）。
 **要求**：① 生成刀前先探目标文件行尾（`open(..., newline='')` 读原始字节判断）；② 刀里上下文行与新增行行尾一致；③ 交回时同时报 `git apply --check` 的 exit 与刀的字节大小（本轮 `C61c_engine_u8.diff` = 21,301 B、CRLF 上下文、exit=0 ✓）。与军规 181（刀文件编码/换行纪律）、153（一次一把）配套。
+﻿209. ★ **"面 EXACT"不是算术正确的证据 —— 判一把刀的算术必须先确认那张面的最后写手（`[cgraph] last3`）在被改的那条路上。**
+**正案（2026-11-12 C61e）**：BK=64 刀三件（C61b/c/d）在 **fused-1301 / features / result 三面全 EXACT**，我据此判"主路配对已对"；但两路的 `last3` 不同 —— **fused = `…ffn_merge, window_block, pre`；plain = `…window_block, ffn_merge, window_block`** ⇒ **fused 路 1301 的最后写手不是被改的那条腿** ⇒ 三面 EXACT 只说明 fused 不依赖它，**不能证明 `s8v8b` 的算术对**；真相靠**区域差分**钉出：plain-1301 **2,088,960 / 2,088,960 个 4 字节字全不同 = 100.00%**（按 64 行带 / 64 列带每带都 100%）⇒ **整面被另一个生产者换掉 ⇒ 错在读侧算术本身**。
+**要求**：① 任何"EXACT 所以没问题"的话必须先报**该面的 last writer 是否在被改路径上**；② 改 kernel 的算术一律先做**主机侧逐元素对拍**（现成仪器的 `diff != 0 kills the variant` 门），并打印**第一个错元素的 `(row,col,k)` + 所在 `kb`/`kc` + 按 `kc` 分段错率**；③ 与军规 192（判官哈希全部输入面）、196③（帧归因必须设备面自证）、199（环境限定基线）、203（先算上界）配套。

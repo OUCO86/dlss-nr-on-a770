@@ -4329,3 +4329,29 @@ GPU = 0；未改任何引擎源文件（porcelain 0、`libxmx_sycl.cpp` = `98F52
 **资产**：刀 `E:\DSH\tools\C61c_engine_u8.diff`（21,301 B、CRLF 上下文、`apply --check` exit=0、UTF-8 无 BOM、不含 `builds/`）；备份 `C61b_pre_engine.hpp`；脚本 `s6/c61c_edit.py`、`s6/c61c_dumpab.ps1`、`s6/c61b_build.ps1`；工具 `tools/wb_c61c_diffdump.py`；测试件 `E:\DSH\builds\libxmx_c61c.dll`（md5 `1721B121BBD386D0B80521A6E236AA2C`，未覆盖槽）。
 ### ⑥ 现场
 **GPU = 5 腿 ≈ 4 分钟**（预算 40）；改动已 revert ⇒ 主树 CLEAN（porcelain 0、HEAD `1837264`）；六份文件 md5 全原状（`libxmx_sycl.cpp` `98F521EF…`、`gemm_s8_v8_kernel.hpp` `E2991804…`、`pack_device.hpp` `64952F2F…`、守卫件 `s6_ffn_block_kernel.hpp` `490647A9…`、`quantize_row_kernel.hpp` `CAC3C50D…`、`publish_kernel.hpp` `69C9BA9E…`）✓；**两槽未写**（槽 `6C4D7AF7…`/3,454,976 B = `out/SHIPPED_MD5.txt`）；conf/`target.json`/`target_check.py`/门脚本/golden/受管缓存未写；未 commit；无进程；日志 `C61c_*`、`C27_s0f/s0p`；状态 `s6/layer1.md §150`。
+﻿## 209. ★★★★ **C61e（0 GPU）：消元定死 BK=64 那处的性质 —— packer 无罪、覆盖无罪、bmerge 无罪（死路），区域差分 100% 整面 ⇒ 错在 `s8v8b::gemm_b_res` 读侧算术本身；并纠正一条我先前用错的方法论**
+### ① gir 按 K 的覆盖表（谓词 `K%64==0 && K<=512`）
+| K | 闭包 | 串行 ms | 走新形？ | `Mp%128!=0` |
+|---|---|---|---|---|
+| 64 | 8 | 4.314 | YES | 0 |
+| 128 | 12 | 5.718 | YES | 0 |
+| 256 | 16 | 3.445 | YES | 0 |
+| 512 | 16 | 3.569 | YES | 0 |
+| 1024 | 8 | 1.972 | no（回落） | 0 |
+| 4096 | 8 | 3.452 | no（回落） | 0 |
+⇒ **68 只里 52 只被覆盖；`Mp` 全整除 128 ⇒ 无补齐不整除实例**；**K=1024/4096 那 16 只是 ViT 段 residual 腿、输出喂 `f1267vit/f1271vit` 不喂 head 1301** ⇒ **所以 C61b（68 只全切）与 C61c/d（52 只切）在 plain-1301 上逐字节相同 ⇒ 覆盖差不是原因** ✓
+### ② 三件刀的读数矩阵（消元）
+| 件 | packer | reader | fused-1301 | features | result | plain-1301 |
+|---|---|---|---|---|---|---|
+| 参照（现役/C18 同值） | 32 序 | `s8v8` | ✓ | ✓ | ✓ | ✓ `DD49827D…` |
+| C61b | 旧 | `s8v8b` + 核内 gather 重排 | ✓ | ✓ | ✓ | ✗ `249A46F3…` |
+| C61c | 新（64 序） | `s8v8b` 线性 256 B | ✓ | ✓ | ✓ | ✗ **与 C61b 逐字节相同** |
+| C61d | 新 | 新（谓词合一） | ✓ | ✓ | ✓ | ✗ 同上
+⇒ **两种"自洽配对"给出完全相同的错值 ⇒ 错与"用哪种 A 映射"无关**；**唯一未测格子"新 packer + 旧 reader"按构造必红 ⇒ 跑它没有信息量 ⇒ 本铲 GPU = 0**；
+**区域差分（两份 dump 都在盘上，零 GPU）**：plain-1301 **2,088,960 / 2,088,960 个 4 字节字全不同 = 100.00%**，按 64 行带 / 64 列带每一带都 100% ⇒ **不是某段错，是整面被另一个生产者换掉**；
+### ③ ★ 方法论更正（本铲最值钱的一条，已立军规 209）
+两路的 `[cgraph] last3` 不同（**fused = `…ffn_merge, window_block, pre`；plain = `…window_block, ffn_merge, window_block`**）⇒ **fused 路 1301 的最后写手与 plain 路不同** ⇒ **"fused 三面 EXACT"不能证明 `s8v8b` 的算术对**，它只说明 fused 路的 1301 不依赖被换掉的那条腿 ⇒ **这处错在 `s8v8b::gemm_b_res` 读侧算术本身**（K 分块 / dpas 配对 / SLM 条纹三者之一）。
+### ④ 下一铲（C61f 已下令，最迟 17:30）
+**换武器 = 主机侧逐元素对拍**：`bench_s8v8_tile`（自带 `diff != 0 kills the variant` 门）+ `bench_b6` 的 `gemm_b_res*` 路加一臂 **`s8v8::gemm_b_res` vs `s8v8b::gemm_b_res` 同输入同形状**；**扫 K=64（最小可判）/128/512 + 一档 `Mp` 非 128 整数倍**；**失败时打印第一个错元素的 `(row,col,k)` 与所在 `kb`/`kc` + 按 `kc` 分段错率**；逐个判三个嫌疑点：(a) B 侧 `load_grf` 的 `offB+2048/2304` 与 `load_block` 写的 `kc*B_KC+lid*64` 是否同序；(b) A 侧 `a2/a3 = offA+512/768` 与 `pack_a64` 的 `[wi][kc]` 是否同序；(c) `kc=1` 的 dpas 配对是否应为 `b2/b3 × a2/a3`；**bench 里 diff=0 后才回引擎跑四闸（环境限定基线 `254C02B7 / CACD2029 / 4D90CCA5 / DD49827D`）4/4 ⇒ 才交腿级 Δ 与帧 ms**；修不到 4/4 ⇒ 判死并交"哪一段 K 的序错"的定位证据。
+### ⑤ 现场
+GPU = 0；未改任何引擎文件（porcelain 0、HEAD `18a1519`）；六份 md5 原状（`libxmx_sycl.cpp` `98F521EF…`、`gemm_s8_v8_kernel.hpp` `E2991804…`、`pack_device.hpp` `64952F2F…`、守卫件 `490647A9…`、`quantize_row_kernel.hpp` `CAC3C50D…`、`publish_kernel.hpp` `69C9BA9E…`）✓；两槽未写；conf 只读未改；`fused_face_baseline.md`/`target.json`/`target_check.py` 未写；未 commit；无进程；工具新增 `tools/wb_c61e_table.py`、`tools/wb_c61e_regiondiff.py`；刀仍是 `tools/C61d_engine_u8.diff`（23,467 B，`apply --check` exit=0）；状态 `s6/layer1.md §152`；收工主树 CLEAN。
