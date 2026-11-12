@@ -564,3 +564,6 @@ SM_LW | 分支=b1-wblock-resident（origin 已推）。
 ② **bench 的操作数必须由引擎自己的打包器生成**（`packdev::gather_pack_a_b / gather_pack_b_b`、`pack_a*`、`pack_b`），**不许把 raw 数组手拷进 packed 缓冲**：核按 `kk32-block` 等打包布局索引，喂 raw 会得到"几乎全错但时间有效"的读数（C79 那次就是这么错的：raw `B96` 拷进 `Bp`）。
 **推论**：**时间读数与门读数是两回事** —— 未打包的输入仍会产生可用的时间数（工作量与访存相同），但**绝不能当逐位正确的证据**；任何"塌缩/换形"结论必须先 `bad=0 of tot=N` 再报 Δ。
 **配套**：军规 206（写侧三硬门）、190（探针 in_order + 自检）、192（判官哈希全部输入面）、211（面比对必须同构建宏与同腿 env）、209（面结论先查 last writer）。
+﻿213. ★ **换形刀的门梯必须同时满足两条：四闸逐字节 EXACT + 缓存普查 `ADDED ≥ 1`（证明新形真的被执行）。只有 EXACT 没有 ADDED ⇒ 那轮的 EXACT 只证明开关惰性，不证明该形在引擎里数值安全。**
+**正案（2026-11-13 C82）**：`NR_C512_BAND=1` 窄门（`N==512 && K==512 && M%128==0`）下四闸全 EXACT，但 ON/OFF 腿缓存对照 **A = 4 ELF/285 实例、B = 4 ELF/285 实例、ADDED=0、REMOVED=0、MOVED=0** ⇒ **新形一条都没跑** ⇒ "EXACT" 是开关惰性的假象；帧 ms 也在噪声内（槽 41.98/42.09/42.03 vs C82 42.23/42.12/42.30）⇒ 与普查一致。
+**配套要求**：① 换形前必须先在 **launcher 侧打印真实形状**（`NR_*_DBG=1` 打 `族/M/Mp/N/K/epi/narrow/band`）——bench 台账列不等于 launcher 实参（`rt_per_closure.csv` 的 M/N/K 是台账列；batched 族在 `:5169` 用 `Nw/Kw` 分开）；② **形状门必须钉到 bench 里 `diff=0` 的那一组完全一致**（N、K、M 整除、epi、narrow 全等），**不许用 `N%128 && K%64` 这类宽条件一刀切**（C82 宽门直接让 fused 1301/result/plain 三面红）；③ 与军规 209（面结论先查 last writer）、211（腿 env 与构建宏一致）、212（bench 操作数用引擎打包器、总结行打 correct/bad/tot）配套。
