@@ -4034,3 +4034,25 @@ A = 4 ELF / 271 实例，B = 4 ELF / **273**；**ADDED 4 / REMOVED 2**（= `xmx_
 **开工前必过坑名单**：`wa_res` 的 **WA_KT 2KB sizing OVERLAPPED QT 半行错**；§96 **plain 核里 SLM-fed dpas 静默归零 ⇒ 走 ESIMD `nd_range` + SLM 常驻（v4full/wa_res/lfw2 同族，不开 global scratch）**；`select<N,1>(k)` 先问偏移还是块号；诊断分支必须同二进制带/不带对照（§六.二十九）。
 ### ④ 现场
 **GPU = 0**；未改引擎源文件（porcelain 0、`.cpp` = `98F521EF…`、HEAD `4995e95`）、未编译、未 staged；两槽开工/收工对账 `6C4D7AF7…` / 3,454,976 B = `out/SHIPPED_MD5.txt` ✓；`nr_ship.conf` 只读未改（`AF12FFC8…`）；git 只读；旧 §132 已打"参照系作废"修正标记；状态 `s6/layer1.md §133`。
+﻿## 193. ★★★★ **C47（1 编译 + 3 冷进程）：链内 fused 但 plane 照写 = Δ≈0 判死；死因唯一 = 没消大面；同时零 GPU 修正闸门表 —— 三闸全绿的只有 C64（我上一条说 C128 全绿是错的，没查 WG）**
+### ① 实测（现成仪器 `bench_b6`，reference = `qres::gemm_qkv_res` → `wares::launch_wa_res`(1277) → `qr_kernel_rowthread<64>`(1277→pk/scales) → `pack_a_v` + `s8v8::gemm_b_res_window`(1270)；fused = `b6_res_kernel.hpp`）
+- **windows=510**：split min-of-9 = 0.6312 / 0.6285 / 0.6339 ⇒ **0.6285**；b6 = 0.6344 / 0.6340 / 0.6331 ⇒ **0.6331** ⇒ **ratio 0.99×、Δ = −0.7%**；
+- **windows=558**：split = 0.6821 / 0.6873 / 0.6815 ⇒ **0.6815**；b6 = 0.6796 / 0.6874 / 0.6847 ⇒ **0.6796** ⇒ **ratio 1.00×、Δ = +0.3%**；
+- **对拍 24/24 EXACT**（8 项 diff × 两形状 × 三进程：PKT / AS / ATT-head0 / ATT-head1 / Q / K / V / 1270-out）；
+- **ocloc**：bench 缓存 2 ELF / 65 实例，**`scratch≠0 = 0`、`grf>128 = 0`**；b6 **SLM = 57,344 B**（`b6_res_kernel.hpp:56`，布局 `:33` QT 8K + KT 8K + VT 8K）≤ 65,536（余 8 KB）；派发 `nd_range(windows*16, 16)`（`:72`）⇒ **LW=16、WG = 8,160 / 8,928**；
+- **ARM2（+A3）未建**：45 分钟改不动 23 KB ESIMD 核的供数布局 ⇒ **不做假探针、不外推**；
+- **仪器偏离（写明）**：`bench_b6` 用 `enable_profiling` 队列、**没有显式 in_order**（190）⇒ 只做仪器内相对比较，**不当帧账**；**C48 已下令补显式 in_order**。
+### ② 两个硬数（防重犯 B6-1）
+**消掉的大面 = 0 MB**：`bench_b6` 头注释自证对拍目标 = **1270 的 f16 image slice**，且 **Q/K/V plane 两边照写** ⇒ fused 消掉的只有 **1277 往返 + 1272(pk/scales) 往返 + `pack_a` 一发**（都是 ≤17.8 MB 中小面），**`1267`（66.85 MB、W122×R278 = 26.7 GB/帧）在两 arm 里原样进出 DRAM** ⇒ **B6-1 判词在代码层复现 ✓**；
+**算术**：C64 层 hop 3,858 MB/帧，链内可消 ≈ **0.35-0.55 ms/帧** vs **门槛 2.6 ms（= 25% of 10.416）** ⇒ **这一形数学上到不了线**，实测 Δ≈0 只是钉死它；
+**闸门表修正（§134.1，零 GPU 实算，按 `chain_map.csv` 的 M_att）**：
+`C64 windows 510-558 ⇒ WG 1020-1116 ✅｜C128 M_att 8640/9216 ⇒ windows 135-144 ⇒ WG 270-288 ❌（差 3.6×）｜C256 M_att 2560 ⇒ windows 40 ⇒ WG 80 ❌（差 12.8×）｜C512 M_att 768/960 ⇒ windows 12-15 ⇒ WG 24-30 ❌（差 34-42×）`；
+SLM（2×64×C×esz）：`C64 16,384 ✅｜C128 32,768 ✅｜C256 65,536 顶格（int8 32,768 ✅）｜C512 f16 131,072 ✗`
+**⇒ 三闸（SLM / grf+scratch / 并行度）全绿的只有 C64**；**C256/C512 只有 lmxx 的 `sp_run256` persistent 形能救，而那形被我们 `grf=128 / scratch=0` 挡死**。
+### ③ 判定与下一铲（C48 已下令）
+**判定**：链内 fused + plane 照写 = **判死**（并行度不是死因、SLM 不是死因、半宽不是死因 ⇒ **唯一死因 = 没消大面**）；
+**C48 = 真驻留探针（试验层 C64）**：**一个 WG 拥有该块全部 64 token，五阶段全在 SLM 两块 64×C plane 交替里完成，`1267` 每块只 1 读 1 写、中间阶段绝不落 global**；**A3（B 常驻）必须同铲做（ARM3a 无 A3 / ARM3b 带 A3）**，否则 5.3× SLM 读放大吃掉省下的 DRAM；
+**出口写死（不许我再换标准）**：**Δ ≥25% ⇒ 建引擎刀 S6-C64**；**Δ <25% 但 `1267` 消掉 ≥15 GB/帧 ⇒ 交"消了大面却不省时间"的归因**（SLM 读放大 / 派发 / 依赖链）；**`1267` 消不掉（<5 GB/帧）⇒ 整条驻留路线判死**，那时我拿这个负结果向用户申请转靶；
+**新坑入册**：**独立 bench TU 必须自带 `LC_TICK/LC_ADD` 宏定义**（引擎 TU 才有 ⇒ 直接编 bench 会 8 处 undeclared；解法 `s6/c47_shim.py`）。
+### ④ 现场
+**GPU = 1 编译 + 3 冷进程 ≈ 6-8 分钟**（standalone 仪器，不是引擎腿）；未改引擎源文件（porcelain 0、`.cpp` = `98F521EF…`）、未编译引擎件、未 staged；两槽开工/收工对账 `6C4D7AF7…` / 3,454,976 B = `out/SHIPPED_MD5.txt` ✓；`nr_ship.conf` 只读未改；骨架件只在 `E:\DSH\tmp\c47\`；日志 `C47_b6_p1/2/3.log`、`C47_zeinfo1.log`；无进程残留；状态 `s6/layer1.md §134`（含 §134.1 闸门修正、§134.6 坑名单打勾）。
