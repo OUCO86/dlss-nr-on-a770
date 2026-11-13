@@ -1,0 +1,38 @@
+diff --git a/src/bench/sycl/libxmx_sycl.cpp b/src/bench/sycl/libxmx_sycl.cpp
+--- a/src/bench/sycl/libxmx_sycl.cpp
++++ b/src/bench/sycl/libxmx_sycl.cpp
+@@ -1752,6 +1752,34 @@
+         ++skipped;
+         std::printf("[skip-chains] chain=%d SKIPPED closures %zu..%zu (%zu no-ops): %s .. %s\n",
+                     wk, c.a, c.b, c.b - c.a + 1, nm(c.a), nm(c.b));
++    }
++    // ---- C111 diagnostic only: NR_STOP_CHAIN=<ids> (tools/C111_chainstop_diag.diff).
++    // No-ops the closures of those chains WITHOUT removing them, so the pass count and the graph
++    // shape stay identical; the frame output is garbage by design -- time-only, like NR_*_STOP.
++    {
++        static const std::vector<int> stopset = [](){
++            std::vector<int> out; const char* s = getenv("NR_STOP_CHAIN");
++            if (s) { const char* p = s;
++                while (*p) { char* e = nullptr; long v = strtol(p, &e, 10);
++                             if (e != p) { out.push_back((int)v); p = e; } else ++p; } }
++            return out; }();
++        if (!stopset.empty()) {
++            size_t stnoop = 0;
++            for (int wk : stopset) {
++                if (wk < 0 || (size_t)wk >= ch.size()) {
++                    std::printf("[stop-chain] id=%d OUT OF RANGE (valid 0..%zu) -- ignored\n",
++                                wk, ch.size() - 1);
++                    continue;
++                }
++                const Ch& c = ch[wk];
++                for (size_t i = c.a; i <= c.b; ++i) { cmds[i] = [](){}; g_skipped_cmds.insert(i); ++stnoop; }
++                std::printf("[stop-chain] id=%d STOPPED closures %zu..%zu (n=%zu): %s .. %s\n",
++                            wk, c.a, c.b, c.b - c.a + 1, nm(c.a), nm(c.b));
++            }
++            std::printf("[stop-chain] graph=%d stopped=%zu noop=%zu passes=%zu (unchanged)\n",
++                        graphid, stopset.size(), stnoop, n);
++            std::fflush(stdout);
++        }
+     }
+     std::printf("[skip-chains] graph=%d chains_skipped=%zu refused=%zu closures_noop=%zu "
+                 "passes=%zu (unchanged)\n", graphid, skipped, refused, noops, n);
