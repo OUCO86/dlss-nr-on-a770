@@ -1,8 +1,7 @@
 diff --git a/src/bench/sycl/libxmx_sycl.cpp b/src/bench/sycl/libxmx_sycl.cpp
-index c3248c5..7fa3c2c 100644
 --- a/src/bench/sycl/libxmx_sycl.cpp
 +++ b/src/bench/sycl/libxmx_sycl.cpp
-@@ -191,7 +191,41 @@ static void pg_note_ids(const std::initializer_list<int>& ids) {
+@@ -191,7 +191,41 @@
          if (it != g_bufs.end() && it->second.p) g_pg_pending_ids.push_back(id);
      }
  }
@@ -44,7 +43,7 @@ index c3248c5..7fa3c2c 100644
      g_pg_pending.clear();
      g_pg_pending_ids.clear();
      pg_note_ids(ids);
-@@ -1421,6 +1455,9 @@ int xmx_buf_create_kind(unsigned long long bytes, int kind) {
+@@ -1421,6 +1455,9 @@
      if (!p) FAILMSG("out of device memory");
      int id = g_nextbuf++;
      g_bufs[id] = { p, (size_t)bytes, (size_t)(kind == 0 ? 2 : kind), false, g_gen };
@@ -54,10 +53,11 @@ index c3248c5..7fa3c2c 100644
      sp_note_created(id, bytes);   // B step 3: register versioning targets by role
      if (getenv("NR_BUFNEW")) {   // presence-gated, host print only (rules 4/9)
          // during_closure = how many closures have been pushed so far, i.e. which op was being
-@@ -1753,6 +1790,35 @@ static void skip_chains_apply(std::vector<std::function<void()>>& cmds,
+@@ -1752,6 +1789,35 @@
+         ++skipped;
          std::printf("[skip-chains] chain=%d SKIPPED closures %zu..%zu (%zu no-ops): %s .. %s\n",
                      wk, c.a, c.b, c.b - c.a + 1, nm(c.a), nm(c.b));
-     }
++    }
 +    // ---- C111 diagnostic only: NR_STOP_CHAIN=<ids> (tools/C111_chainstop_diag.diff).
 +    // No-ops the closures of those chains WITHOUT removing them, so the pass count and the graph
 +    // shape stay identical; the frame output is garbage by design -- time-only, like NR_*_STOP.
@@ -86,7 +86,17 @@ index c3248c5..7fa3c2c 100644
 +                        graphid, stopset.size(), stnoop, n);
 +            std::fflush(stdout);
 +        }
-+    }
+     }
      std::printf("[skip-chains] graph=%d chains_skipped=%zu refused=%zu closures_noop=%zu "
                  "passes=%zu (unchanged)\n", graphid, skipped, refused, noops, n);
-     std::fflush(stdout);
+@@ -6346,6 +6412,10 @@
+         vit_note_unary(g_cmds.size(), a, b, c, d, n);   // the producer of the entry GEMM's face
+     const unsigned flags = kind;                 // the plan's arg0 IS the flags word
+     const unsigned sub = flags & 0xFFu;
++    { static const int uk = getenv("NR_U_KIND") ? atoi(getenv("NR_U_KIND")) : -1;
++      if (uk >= 0 && (int)(flags & 0xFFu) == uk) { g_cmd_names.push_back(__func__); pg_push([](){});
++        std::printf("[u-kind] kind=%d sub=%u STOPPED (time-only diag)\n", (int)kind, (unsigned)(flags & 0xFFu));
++        std::fflush(stdout); return 0; } }
+     auto ia = g_bufs.find(a), ic = g_bufs.find(c);
+     if (ia == g_bufs.end() || ic == g_bufs.end()) FAILMSG("bad unary operand (a/c)");
+     const void* A = ia->second.p; void* C = ic->second.p;
