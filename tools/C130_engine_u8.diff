@@ -1,0 +1,230 @@
+diff --git a/src/bench/sycl/libxmx_sycl.cpp b/src/bench/sycl/libxmx_sycl.cpp
+index c3248c5..79482c6 100644
+--- a/src/bench/sycl/libxmx_sycl.cpp
++++ b/src/bench/sycl/libxmx_sycl.cpp
+@@ -5925,6 +5925,137 @@ int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale,
+     rb_push(c, (unsigned)Mp, N, "residual");               // NR_RES_BYTE grid probe
+     return 0;
+ }
++// ============================================================================================
++// C130 (2026-11-13): NR_C512_WRES_FUSE -- pull the GEMM_WINDOW_INT8_RESIDUAL leg INTO the
++// window_attention resident-block closure. DEFAULT 0: the shipped two-closure path is untouched
++// (junreg 217 -- the OFF arm must land the four gates byte-EXACT).
++// WHY THIS FORM: see s6/layer1.md §228. The one-kernel form the four-piece pins (one WG =
++// window x head also doing the wres gemm) is NOT expressible for the C512 chains: wres's K = 512
++// spans ALL 16 heads of a window while a WA WG holds exactly ONE head's 64x32, and the A row
++// scale (pack_a_fused: per-row max over the whole K) spans the same 512 columns. A fused
++// per-window WG would need the 64x512 half A tile = 65,536 B in SLM all by itself -- over the
++// 43,690 B 3-WG line and over the 65,536 B per-WG cap with the attention regions added.
++// What IS expressible, and what this knife does: the SAME launches, the SAME operands, the SAME
++// order, issued inside ONE closure -- launch_wa_res, then the wres pack, then the wres gemm --
++// so the 1277 face is read while it is still in L2 and the closure boundary between the two legs
++// disappears. No arithmetic changes => the four gates must stay byte-EXACT (bad=0 is a hard gate).
++// ============================================================================================
++struct C130Wa {                 // the window_attention resident leg, captured at record time
++    const sycl::half *Q, *Kk, *V; const float* Bp; sycl::half* Out;
++    unsigned batches, heads, merged;
++};
++struct C130Wres {               // the wres leg's arguments (ids + geometry), captured at record time
++    int a, b, c, a_scale, b_scale, skip, cosine;
++    unsigned M, N, K, flags, height, width, across, pad;
++    int Mp; size_t na, nb;
++    bool fused_w; int srcid_w;
++};
++static bool wres_fuse_on() {
++    static int v = getenv("NR_C512_WRES_FUSE") ? atoi(getenv("NR_C512_WRES_FUSE")) : 0;
++    return v != 0;
++}
++struct C130Stash { bool valid = false; size_t wacmd = 0; C130Wa W;
++                    int q = 0, k = 0, v = 0, bias = 0, out = 0; };
++static C130Stash g_c130;
++// The WA closure body, VERBATIM from xmx_rec_window_attention's resident branch (:6928-6976):
++// the same seven pool_gets in the same order (so the scratch addresses stay identical), the same
++// raw_v decision, the same launch_wa_res, the same pool_puts. Only the resident branch is
++// reachable: the record-side gate requires it, and a run-time disagreement THROWS (loud, never
++// a silent divergence).
++static void c130_wa_leg(const C130Wa& W) {
++    static int wastop = getenv("NR_WA_STOP") ? atoi(getenv("NR_WA_STOP")) : 0;
++    if (wastop == 9) return;
++    const sycl::half* Q = W.Q; const sycl::half* Kk = W.Kk; const sycl::half* V = W.V;
++    const float* Bp = W.Bp; sycl::half* Out = W.Out;
++    const unsigned batches = W.batches, heads = W.heads, merged = W.merged;
++    const size_t sc_elems  = (size_t)batches * 64u * 64u;    // scores & probs
++    const size_t ctx_elems = (size_t)batches * 64u * 32u;    // attnV context
++    float* dScores = (float*)pool_get(sc_elems * 4);
++    sycl::half* dProbs = (sycl::half*)pool_get(sc_elems * 2);
++    float* dCtx = (float*)pool_get(ctx_elems * 4);
++    sycl::half* dAq = (sycl::half*)pool_get((size_t)batches * 64u * 32u * 2);
++    sycl::half* dBk = (sycl::half*)pool_get((size_t)batches * 32u * 64u * 2);
++    sycl::half* dAp = (sycl::half*)pool_get((size_t)batches * 64u * 64u * 2);
++    sycl::half* dBv = (sycl::half*)pool_get((size_t)batches * 64u * 32u * 2);
++    static bool wares = !getenv("NR_WA_RES") || atoi(getenv("NR_WA_RES")) != 0;
++    const bool wa_raw = wares && merged && Bp;
++    if (!wa_raw) throw std::runtime_error("c130: WA leg left the resident branch at run");
++    static bool rawv2 = !getenv("NR_WA_RAWV") || atoi(getenv("NR_WA_RAWV")) != 0;
++    if (!rawv2) packdev::pack_b16_b(*GQ, V, dBv, 64, 32, (int)batches);
++    wares::launch_wa_res(*GQ, Q, Kk, V, dBv, Bp, Out, batches, heads, rawv2);
++    pool_put(dAq); pool_put(dBk); pool_put(dAp); pool_put(dBv);
++    pool_put(dScores); pool_put(dProbs); pool_put(dCtx);
++}
++// The wres closure body, VERBATIM from xmx_rec_gemm_window_int8_residual (:6069-6145): same
++// run-time sized() lookups, same p128/band_w gates, same pack choice, same cached weight pack,
++// same s8v8::gemm_b_res_window call with the same arguments. NR_WRES_DBG / NR_BAND_DBG /
++// NR_WRES_STOP keep working inside the merged leg, so the decomposition arms stay comparable.
++static void c130_wres_leg(const C130Wres& R) {
++    const unsigned M = R.M, N = R.N, K = R.K, flags = R.flags;
++    const unsigned height = R.height, width = R.width, across = R.across, pad = R.pad;
++    const int Mp = R.Mp; const size_t na = R.na, nb = R.nb;
++    const int a = R.a, b = R.b, c = R.c, a_scale = R.a_scale, b_scale = R.b_scale;
++    const int skip = R.skip, cosine = R.cosine;
++    const bool fused_w = R.fused_w; const int srcid_w = R.srcid_w;
++    const unsigned epi = (flags >> 8) & 0xFu;
++    const bool narrow = (flags & 0x1000u) != 0u;
++    const bool half_skip = (flags & 0x40000u) != 0u;
++    const size_t wsz = narrow ? 2u : 4u;
++    const size_t img_elems = (size_t)height * width * N;
++    const size_t c_need = img_elems * wsz, k_need = img_elems * (half_skip ? 2u : 4u);
++    auto sized = [&](int id, size_t bytes, const char* what) -> void* {
++        auto it = g_bufs.find(id);
++        if (it == g_bufs.end())
++            throw std::runtime_error(std::string("window residual: ") + what + " not live at run");
++        if (it->second.bytes < bytes)
++            throw std::runtime_error(std::string("window residual: ") + what + " smaller than the image at run");
++        return it->second.p;
++    };
++    int8_t*  Araw  = (int8_t*)sized(a,       (size_t)M * K, "A");
++    int8_t*  Braw  = (int8_t*)sized(b,       nb,          "B");
++    void*    Cout  = sized(c,        c_need,     "C");
++    const float* as = (const float*)sized(a_scale, (size_t)M * 4u, "a_scale");
++    const float* bs = (const float*)sized(b_scale, (size_t)N * 4u, "b_scale");
++    const void*  skp = sized(skip,   k_need,     "skip");
++    const float* cp  = (const float*)sized(cosine, (size_t)N * 4u, "cosine");
++    const unsigned top = pad >> 16, left = pad & 0xffffu;
++    int8_t* dAp = (int8_t*)pool_get(na);
++    const bool p128 = wres_pub128_on()
++                      && ((M == 768u  && N == 512u && K == 512u)
++                          || (M == 960u  && N == 512u && K == 512u)
++                          || (M == 2560u && N == 256u && K == 256u)
++                          || (M == 8640u && N == 128u && K == 128u)
++                          || (M == 9216u && N == 128u && K == 128u));
++    const bool band_w = band_scale_on() && fused_w && M == 768u && N == 512u && K == 512u;
++    if (getenv("NR_WRES_DBG"))
++        std::printf("[wres-pub128] p128=%d M=%u N=%u K=%u Mp=%d epi=%u narrow=%d half_skip=%d flags=%u\n",
++                    (int)p128, M, N, K, Mp, (unsigned)((flags >> 8) & 0xFu),
++                    (int)((flags & 0x1000u) != 0u), (int)((flags & 0x40000u) != 0u), flags);
++    static int wrstop = getenv("NR_WRES_STOP") ? atoi(getenv("NR_WRES_STOP")) : 0;
++    if (wrstop < 2) {
++        if (fused_w) {
++            sycl::half* a16w = (sycl::half*)sized(srcid_w, (size_t)M * K * 2u, "A(f16 fused)");
++            if (band_w) packdev::pack_a_fused_band128(*GQ, a16w, dAp, (float*)as, (int)M, Mp, (int)K);
++            else if (p128) packdev::pack_a_fused64(*GQ, a16w, dAp, (float*)as, (int)M, Mp, (int)K);
++            else      packdev::pack_a_fused(*GQ, a16w, dAp, (float*)as, (int)M, Mp, (int)K);
++        } else if (p128) { packdev::pack_a64(*GQ, Araw, dAp, (int)M, Mp, (int)K); }
++        else
++        {  packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K); }
++    }
++    int8_t* dBp = cached_pack_b_i8(b, Braw, (int)N, (int)K);
++    if (wrstop >= 1) { pool_put(dAp); return; }
++    if (getenv("NR_BAND_DBG"))
++        std::printf("[band-wres] band_w=%d fused_w=%d p128=%d M=%u N=%u K=%u nband=%u\n",
++                    (int)band_w, (int)fused_w, (int)p128, M, N, K, band_w ? 4u : 1u);
++    (void)wsz; (void)epi;
++    if (p128)
++         s8v8t::gemm_b_res_window_128(*GQ, dAp, dBp, Cout, as, bs, skp, cp, (int)M, Mp, (int)N, (int)K,
++                                narrow, half_skip, epi, across, top, left, height, width, band_w ? 4u : 1u);
++    else
++         s8v8::gemm_b_res_window(*GQ, dAp, dBp, Cout, as, bs, skp, cp, (int)M, Mp, (int)N, (int)K,
++                                narrow, half_skip, epi, across, top, left, height, width, band_w ? 4u : 1u);
++    pool_put(dAp);
++}
+ // int xmx_rec_gemm_window_int8_residual(a,b,c,a_scale,b_scale,skip,cosine,
+ //        M,N,K,flags, height,width,across,pad)
+ // swap-in #5 (section 76). = the plain int8 residual's math PLUS the unpadded-image
+@@ -6065,6 +6196,61 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
+     }
+     QuantFused qfw; const bool fused_w = qfuse_take(a, a_scale, M, K, qfw);
+     const int srcid_w = fused_w ? qfw.src : 0;
++    // ---- C130 (NR_C512_WRES_FUSE, default 0): merge the wres leg into the WA resident closure.
++    // Shape gate = the ENGINE's own live arguments (junreg 216), printed by [c130-wa]/[c130-fuse]
++    // under NR_C130_DBG=1 (launcher-side DBG = the execution evidence; junreg 213-216 correction:
++    // a cache census proves nothing for a single-module engine dll).
++    //   chain 25 (plan line 5897) / chain 33 (6235): window_attention(q=1275,k=1274,v=1276,
++    //   bias=571/747,out=1277,batches=192,heads=16,merged=1) then
++    //   gemm_window_int8_residual(a=1277,...,M=768,N=512,K=512).
++    if (wres_fuse_on() && g_c130.valid) {
++        const size_t wacmd = g_c130.wacmd;
++        const bool shape_ok = ((M == 768u && N == 512u && K == 512u) ||
++                               (M == 960u && N == 512u && K == 512u));
++        // The real link is NOT out==a: the plan's QUANT leg sits between them, and the shipped
++        // qfuse dissolves it so THIS leg packs straight from the QUANT's f16 source -- and that
++        // source is the WA output face. Proven by srcid_w == g_c130.out, printed by the DBG line
++        // below (junreg 216: read the pairing off the engine, never assume it).
++        const bool pair_ok  = fused_w && (srcid_w == g_c130.out) && g_c130.W.merged == 1u &&
++                              g_c130.W.heads == 16u &&
++                              M == (g_c130.W.batches / g_c130.W.heads) * 64u;
++        const bool gap_ok   = (wacmd < g_cmds.size()) && (g_cmds.size() - wacmd) <= 4u;
++        if (shape_ok && pair_ok && gap_ok) {
++            C130Wa W = g_c130.W;
++            C130Wres R; R.a=a; R.b=b; R.c=c; R.a_scale=a_scale; R.b_scale=b_scale;
++            R.skip=skip; R.cosine=cosine; R.M=M; R.N=N; R.K=K; R.flags=flags;
++            R.height=height; R.width=width; R.across=across; R.pad=pad;
++            R.Mp=Mp; R.na=na; R.nb=nb; R.fused_w=fused_w; R.srcid_w=srcid_w;
++            g_cmds[wacmd] = [W,R]() { c130_wa_leg(W); c130_wres_leg(R); };
++            // junreg 224-1: the merged closure must declare the UNION of both touch sets --
++            // the scheduler treats "same device pointer in two closures" as a conflict in ANY
++            // direction (gemm_s8_v8_kernel.hpp:118-143; the 82.6% scatter accident signature).
++            { auto& tv = g_cmds_touch[wacmd]; auto& iv = g_pg_ids_snap[wacmd];
++              const int more[7] = { a, b, c, a_scale, b_scale, skip, cosine };
++              for (int t = 0; t < 7; ++t) {
++                  auto it = g_bufs.find(more[t]);
++                  if (it != g_bufs.end() && it->second.p) { tv.push_back(it->second.p); iv.push_back(more[t]); }
++              } }
++            if (getenv("NR_C130_DBG"))
++                std::printf("[c130-fuse] FIRE wacmd=%zu a=%d b=%d c=%d as=%d bs=%d sk=%d co=%d "
++                            "M=%u N=%u K=%u Mp=%d epi=%u narrow=%d half=%d flags=%u "
++                            "h=%u w=%u across=%u pad=%u fused_w=%d src=%d\n",
++                            wacmd, a,b,c,a_scale,b_scale,skip,cosine, M,N,K,Mp,
++                            (unsigned)((flags >> 8) & 0xFu), (int)((flags & 0x1000u) != 0u),
++                            (int)((flags & 0x40000u) != 0u), flags,
++                            height, width, across, pad, (int)fused_w, srcid_w);
++            g_c130 = C130Stash{};
++            std::fflush(stdout);
++            pg_push([](){});          // the leg moved; the node keeps its name and its edges
++            rb_push(c, M, N, "wres");
++            return 0;
++        }
++        if (getenv("NR_C130_DBG"))
++            std::printf("[c130-fuse] REJECT shape=%d pair=%d gap=%d wacmd=%zu out=%d a=%d src=%d "
++                        "fused_w=%d batches=%u heads=%u merged=%u M=%u N=%u K=%u\n",
++                        (int)shape_ok, (int)pair_ok, (int)gap_ok, wacmd, g_c130.out, a, srcid_w,
++                        (int)fused_w, g_c130.W.batches, g_c130.W.heads, g_c130.W.merged, M, N, K);
++    }
+     pg_push([=]() {
+         // RUN-TIME fresh lookups shadowing the capture-time pointers (see the lesson
+         // above): sizes are checked HERE because the scratch recording's placeholder
+@@ -6924,6 +7110,25 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
+         });
+         return 0;
+     }
++    // C130: stash this WA closure (and its real arguments) so a later window_int8_residual leg
++    // can be pulled into it. The record-time predicate mirrors the closure's own resident test
++    // (wares && merged && Bp) -- junreg 221: read the branch ownership before wiring to it.
++    g_c130 = C130Stash{};
++    {
++        static bool wares_rec = !getenv("NR_WA_RES") || atoi(getenv("NR_WA_RES")) != 0;
++        g_c130.W.Q = Q; g_c130.W.Kk = Kk; g_c130.W.V = V; g_c130.W.Bp = Bp;
++        g_c130.W.Out = (sycl::half*)Out;
++        g_c130.W.batches = batches; g_c130.W.heads = heads; g_c130.W.merged = merged;
++        g_c130.q = q; g_c130.k = k; g_c130.v = v; g_c130.bias = bias; g_c130.out = out;
++        g_c130.wacmd = g_cmds.size();
++        g_c130.valid = wares_rec && merged == 1u && Bp != nullptr;
++        if (getenv("NR_C130_DBG"))
++            std::printf("[c130-wa] STASH wacmd=%zu q=%d k=%d v=%d bias=%d out=%d batches=%u "
++                        "heads=%u merged=%u resident=%d\n",
++                        g_c130.wacmd, q, k, v, bias, out, batches, heads, merged,
++                        (int)g_c130.valid);
++        std::fflush(stdout);
++    }
+     pg_push([=]() {
+         // NR_WA_STOP=9 (section 100 P7 game-path ledger, time-only DIAGNOSTIC: the
+         // frame output is garbage here by design -- same convention as NR_QKV_STOP

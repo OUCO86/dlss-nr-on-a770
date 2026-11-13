@@ -1,0 +1,132 @@
+diff --git a/src/bench/sycl/libxmx_sycl.cpp b/src/bench/sycl/libxmx_sycl.cpp
+index c3248c5..32df3cf 100644
+--- a/src/bench/sycl/libxmx_sycl.cpp
++++ b/src/bench/sycl/libxmx_sycl.cpp
+@@ -2666,6 +2666,19 @@ static bool band_scale_on() {
+     static int v = getenv("NR_BAND_SCALE") ? atoi(getenv("NR_BAND_SCALE")) : 0;
+     return v != 0;
+ }
++// C133 (junreg 221: read the branch ownership first -- this gates ONLY the resident WA branch
++// `wa_raw = wares && merged && Bp` at :6953, and only when P10c RAW-V is live).
++// NR_WA_VDIRECT=0 (default) => launch_wa_res == the shipped template instantiation VD=false,
++// SLM 45,056 => 2 WG/Xe-core, byte-identical code (junreg 217 strict-equality rule).
++// NR_WA_VDIRECT=1 => launch_wa_res_vd: the V dpas tile is gathered from global straight into the
++// attnV B slot instead of global -> WA_VT -> slot; the WA_VT region disappears => SLM 40,960 =>
++// 3 WG/Xe-core. The C133 bench proved the B tile byte-identical at batches=192 (the live C512
++// chains) and batches=1116 (the biggest C64-family shape): bad=0, nonfinite=0/0.
++static bool wa_vdirect_on() {
++    static int v = getenv("NR_WA_VDIRECT") ? atoi(getenv("NR_WA_VDIRECT")) : 0;
++    return v != 0;
++}
++
+ static bool wres_pub128_on() {
+     static int v = getenv("NR_WRES_PUB128") ? atoi(getenv("NR_WRES_PUB128")) : 0;
+     return v != 0;
+@@ -6969,7 +6982,18 @@ int xmx_rec_window_attention(int q, int k, int v, int bias, int out,
+             static bool rawv2 = !getenv("NR_WA_RAWV") || atoi(getenv("NR_WA_RAWV")) != 0;   // P10c PROMOTED: every A/B pair beats RAW-QK by 0.8-1.2ms (the V pack launch + dBv round-trip gone); escape NR_WA_RAWV=0.
+             if (!rawv2)packdev::pack_b16_b(*GQ, V, dBv, 64, 32, (int)batches);   // the span below is
+                                                                        // skipped -- pack V FIRST (unless P10c RAW-V)
+-             wares::launch_wa_res(*GQ, Q, Kk, V, dBv, Bp, (sycl::half*)Out, batches, heads, rawv2);
++             const bool vdir = wa_vdirect_on() && wa_raw && rawv2;   // the changed path only
++             if (getenv("NR_C133_DBG"))
++                 std::printf("[c133-vdirect] vdir=%d kernel=%s batches=%u heads=%u merged=%u "
++                             "rawv2=%d slm=%u\n",
++                             (int)vdir,
++                             vdir ? "wares::launch_wa_res_vd (WA_VT gone, SLM 40,960 => 3 WG)"
++                                  : "wares::launch_wa_res (shipped, SLM 45,056 => 2 WG)",
++                             batches, heads, merged, (int)rawv2, vdir ? 40960u : 45056u);
++             if (vdir)
++              wares::launch_wa_res_vd(*GQ, Q, Kk, V, dBv, Bp, (sycl::half*)Out, batches, heads, rawv2);
++             else
++              wares::launch_wa_res(*GQ, Q, Kk, V, dBv, Bp, (sycl::half*)Out, batches, heads, rawv2);
+             pool_put(dAq); pool_put(dBk); pool_put(dAp); pool_put(dBv);
+             pool_put(dScores); pool_put(dProbs); pool_put(dCtx);
+             return;
+diff --git a/src/bench/sycl/wa_res_kernel.hpp b/src/bench/sycl/wa_res_kernel.hpp
+index 41c1e25..45429d9 100644
+--- a/src/bench/sycl/wa_res_kernel.hpp
++++ b/src/bench/sycl/wa_res_kernel.hpp
+@@ -31,14 +31,16 @@ namespace esimd = sycl::ext::intel::esimd;
+ #define WA_VT 40960u
+ #define WA_SLM 45056u
+ 
+-static inline event launch_wa_res(queue& q, const half* dQ, const half* dK, const half* dV,
++template<bool VD>          // C133: VD = true -> the V dpas tile is gathered straight from
++                      // global into the attnV B slot (no WA_VT region, no SLM->SLM copy)
++static inline event launch_wa_res_impl(queue& q, const half* dQ, const half* dK, const half* dV,
+                                   const half* dBv, const float* dBias, half* Out,
+                                   unsigned batches, unsigned heads, bool raw_v) {
+     LC_TICK();   // #145 军规 132: launch counted at helper entry
+     return q.submit([&](handler& h) {
+         h.parallel_for(nd_range(range((size_t)batches * 16u), range(16u)),
+             [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+-            esimd::slm_init<WA_SLM>();
++            esimd::slm_init<(VD ? (WA_SLM - 4096u) : WA_SLM)>();   // C133: 45,056 -> 40,960 for VD
+             uint b  = (uint)it.get_group(0);
+             uint lid = (uint)it.get_local_id(0);
+             // ===== stage 1: scores gemm (the gemm_b2<64> loop VERBATIM; BM=64,BN=64,
+@@ -115,7 +117,8 @@ static inline event launch_wa_res(queue& q, const half* dQ, const half* dK, cons
+                 }
+                 esimd::barrier();
+                 
+-                if (raw_v) {   // P10c V gather (clean): tile blocks bidx =
++                if constexpr (VD) {   /* C133: no VT -- the V slice is gathered in stage 3 */ }
++                else if (raw_v) {   // P10c V gather (clean): tile blocks bidx =
+                     // (kc*2+tc)*2+js (0..15) -- thread lid = bidx; for kq 0..7 the
+                     // tile's CONTIGUOUS 16-half run at bidx*128 + kq*16 holds elems
+                     // j = jl*2+kpar (0..15): raw row kc*16 + kq*2 + (j%2), col
+@@ -276,7 +279,31 @@ static inline event launch_wa_res(queue& q, const half* dQ, const half* dK, cons
+                     for (int i = 0; i < BCH2 / 64; ++i) {
+                         int lb = t8 * BCH2 + i * 64;
+                         int tcl = lb / 256, within = lb % 256;
+-                        if (raw_v) {   // P10c: SLM->SLM copy from the V tile (the
++                        if constexpr (VD) {
++                            // C133 (ding'): the V dpas slice comes straight from GLOBAL into the
++                            // B slot -- the shipped path did global -> WA_VT (:123-137) and then
++                            // WA_VT -> this same slot (a pure SLM->SLM copy; the file's own comment
++                            // says "the gather's linear map == the gemm's block addressing").
++                            // Same run map as the shipped gather: q = t8/2 picks the 4 blocks
++                            // (tc2 = q/2, js = q%2), kq = 4*(t8%2)+u, and every 16-half run is the
++                            // INTERLEAVE of two contiguous 8-half raw rows (:131-135 VERBATIM).
++                            const half* Vb = dV + (size_t)b * 64u * 32u;
++                            uint qq = (uint)t8 / 2u, kq0 = ((uint)t8 % 2u) * 4u;
++                            uint tc2q = qq / 2u, jsq = qq % 2u;
++                            esimd::simd<half,64> v64;
++                            #pragma unroll
++                            for (int u = 0; u < 4; ++u) {
++                                uint kq = kq0 + (uint)u;
++                                esimd::simd<half,16> run;
++                                esimd::simd<half,8> va = esimd::block_load<half,8>(Vb + (size_t)(kc * 16u + kq * 2u) * 32u + tc2q * 16u + jsq * 8u, esimd::overaligned_tag<16>{});
++                                esimd::simd<half,8> vb = esimd::block_load<half,8>(Vb + (size_t)(kc * 16u + kq * 2u + 1u) * 32u + tc2q * 16u + jsq * 8u, esimd::overaligned_tag<16>{});
++                                run.template select<8,2>(0) = va;   // even lanes: row kq*2
++                                run.template select<8,2>(1) = vb;   // odd lanes:  row kq*2+1
++                                v64.template select<16,1>(u * 16) = run;
++                            }
++                            esimd::slm_block_store(WA_X + 4096u + buf * SLM_B2 + lb * 2, v64, esimd::overaligned_tag<16>{});
++                        }
++                        else if (raw_v) {   // P10c: SLM->SLM copy from the V tile (the
+                             // gather's linear map == the gemm's block addressing)
+                             esimd::simd<half,64> v2 = esimd::slm_block_load<half,64>(WA_VT + (uint)(kc * 512 + lb) * 2u, esimd::overaligned_tag<16>{});   // the kc-slice offset was MISSING (the block map is kc*512 + tcl*256 + within == kc*512 + lb)
+                             esimd::slm_block_store(WA_X + 4096u + buf * SLM_B2 + lb * 2, v2, esimd::overaligned_tag<16>{});
+@@ -329,4 +356,21 @@ static inline event launch_wa_res(queue& q, const half* dQ, const half* dK, cons
+         });
+     });
+ }
++
++// C133 wrappers. launch_wa_res keeps EXACTLY the shipped instantiation (VD=false), so every
++// existing call site -- and the shipped SLM size 45,056 (2 WG/Xe-core) -- is untouched;
++// launch_wa_res_vd is the same kernel with the V tile gathered directly into the attnV B slots
++// (SLM 40,960 => 3 WG/Xe-core). Values are identical by construction: same bytes, same maps.
++static inline event launch_wa_res(queue& q, const half* dQ, const half* dK, const half* dV,
++                                  const half* dBv, const float* dBias, half* Out,
++                                  unsigned batches, unsigned heads, bool raw_v) {
++    return launch_wa_res_impl<false>(q, dQ, dK, dV, dBv, dBias, Out, batches, heads, raw_v);
++}
++static inline event launch_wa_res_vd(queue& q, const half* dQ, const half* dK, const half* dV,
++                                  const half* dBv, const float* dBias, half* Out,
++                                  unsigned batches, unsigned heads, bool raw_v) {
++    LC_TICK();
++    return launch_wa_res_impl<true>(q, dQ, dK, dV, dBv, dBias, Out, batches, heads, raw_v);
++}
++
+ }

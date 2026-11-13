@@ -1,0 +1,219 @@
+diff --git a/src/bench/sycl/libxmx_sycl.cpp b/src/bench/sycl/libxmx_sycl.cpp
+index c3248c5..a1ee072 100644
+--- a/src/bench/sycl/libxmx_sycl.cpp
++++ b/src/bench/sycl/libxmx_sycl.cpp
+@@ -46,6 +46,7 @@ static long g_lc_tick0 = 0;           // the reading when the current closure st
+ #include "qkv_resident.hpp"
+ #include "ffn_chip_kernel.hpp"
+ #include "wa_res_kernel.hpp"
++#include "wres_bn32_kernel.hpp"   // C131: the BN=32 form of the window int8 residual gemm
+ #include "lfw_res_kernel.hpp"
+ #include "b6_res_kernel.hpp"
+ #include "lfw2_res_kernel.hpp"
+@@ -2670,6 +2671,14 @@ static bool wres_pub128_on() {
+     static int v = getenv("NR_WRES_PUB128") ? atoi(getenv("NR_WRES_PUB128")) : 0;
+     return v != 0;
+ }
++// C131: the BN=32 re-tile of the window int8 residual gemm. DEFAULT 0 -> the shipped
++// gemm_b_res_window (BM128/BN64/BK32/NT32) is selected by exactly the same expression as
++// before this knife existed (junreg 217). The band/accumulator chain is unchanged over K,
++// the A and B planes are NOT re-packed => bit-identical by construction (bench gate proves it).
++static bool wres_bn32_on() {
++    static int v = getenv("NR_WRES_BN32") ? atoi(getenv("NR_WRES_BN32")) : 0;
++    return v != 0;
++}
+ static bool c512_band_on() {
+     static int v = getenv("NR_C512_BAND") ? atoi(getenv("NR_C512_BAND")) : 0;
+     return v != 0;
+@@ -6135,9 +6144,26 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
+          if (getenv("NR_BAND_DBG"))
+              std::printf("[band-wres] band_w=%d fused_w=%d p128=%d M=%u N=%u K=%u nband=%u\n",
+                          (int)band_w, (int)fused_w, (int)p128, M, N, K, band_w ? 4u : 1u);
++         // C131 shape gate = the live C512 legs only (junreg 216: the same real args the
++         // [wres-pub128] line prints -- M=768/960, N=512, K=512, epi=1, narrow=1, half_skip=1,
++         // flags=266496). With NR_WRES_BN32=0 (the default) bn32 is false and the chain below is
++         // strictly the pre-knife expression (junreg 217).
++         const bool bn32 = wres_bn32_on() && !p128 &&
++                           ((M == 768u && N == 512u && K == 512u) ||
++                            (M == 960u && N == 512u && K == 512u));
++         if (getenv("NR_C131_DBG"))
++             std::printf("[c131-bn32] bn32=%d p128=%d kernel=%s M=%u N=%u K=%u Mp=%d epi=%u "
++                         "narrow=%d half_skip=%d flags=%u across=%u top=%u left=%u img=%ux%u\n",
++                         (int)bn32, (int)p128,
++                         bn32 ? "wres32::gemm_b_res_window_bn32" : "s8v8::gemm_b_res_window",
++                         M, N, K, Mp, epi, (int)narrow, (int)half_skip, flags,
++                         across, top, left, height, width);
+          if (p128)
+               s8v8t::gemm_b_res_window_128(*GQ, dAp, dBp, Cout, as, bs, skp, cp, (int)M, Mp, (int)N, (int)K,
+                                 narrow, half_skip, epi, across, top, left, height, width, band_w ? 4u : 1u);
++         else if (bn32)
++              wres32::gemm_b_res_window_bn32(*GQ, dAp, dBp, Cout, as, bs, skp, cp, (int)M, Mp, (int)N, (int)K,
++                                narrow, half_skip, epi, across, top, left, height, width, band_w ? 4u : 1u);
+          else
+               s8v8::gemm_b_res_window(*GQ, dAp, dBp, Cout, as, bs, skp, cp, (int)M, Mp, (int)N, (int)K,
+                                 narrow, half_skip, epi, across, top, left, height, width, band_w ? 4u : 1u);
+diff --git a/src/bench/sycl/wres_bn32_kernel.hpp b/src/bench/sycl/wres_bn32_kernel.hpp
+new file mode 100644
+index 0000000..a307131
+--- /dev/null
++++ b/src/bench/sycl/wres_bn32_kernel.hpp
+@@ -0,0 +1,159 @@
++// wres_bn32_kernel.hpp -- C131 (2026-11-13): the BN=32 form of the window int8 residual gemm.
++//
++// WHAT CHANGES: only WHICH columns a thread owns. BM stays 128, BK stays 32, the kb loop stays
++// 0..K/32-1, and the per-thread dpas chain stays c00/c01/c10/c11 = dpas<8,8,int32> over the SAME
++// operand bytes in the SAME order. NT drops 32 -> 16 (WI_ROWS = BM/16 = 8 bands x WI_COLS =
++// BN/16 = 2 bands = 16 threads, one band each => NO duplicated work, junreg 223-1).
++// Consequence: wg = (Mp/128) x (N/32): the live C512 shapes go 48 WG -> 96 WG, and SLM goes
++// 3*4096 + 3*2048 = 18,432 B -> 3*4096 + 3*1024 = 15,360 B (further from the 43,690 B 3-WG line).
++//
++// WHY THE PACKERS DO NOT MOVE (bench_s8v8_tile.cpp:32-36 states it: "the packers hardcode
++// BM=128/BK=32 for A (pack_b is kk32-block based => BK-INDEPENDENT)"):
++//   A plane: the kernel's per-WG base is Ap + (wg_row*(K/BK))*8*512 -- identical to the shipped
++//            BN=64 form (pack_a / pack_a_fused emit 8 row-bands x 512 B per (w,kb) block).
++//   B plane: per kk32 block the plane is [n0][n1]... contiguous with ntile = n/8 (pack_b:55), and
++//            a WG's slice is Bp + wg_col*(BN/8)*256 -- for BN=32 that is wg_col*1024, i.e. a
++//            CONTIGUOUS SUB-RANGE of the very same block. So BN=64 and BN=32 read the same bytes;
++//            nothing is re-packed, and the weight cache (cached_pack_b_i8) stays valid.
++// => int32 dpas accumulation over K is exact and the operand order per output element is
++//    unchanged => BIT-IDENTICAL by construction (same argument as C61b's BK=64 form,
++//    gemm_s8_v8_kernel.hpp:1401-1407). The bench gate (bad=0) and the four gates (EXACT) prove it.
++//
++// The window tail (image map, row scale, skip read, pub chain, narrow store) is copied VERBATIM
++// from s8v8::gemm_b_res_window (:1324-1389) -- not one character of arithmetic changed.
++// Gate: NR_WRES_BN32 (engine), default 0. Shape gate: the live C512 legs only.
++#pragma once
++#include "gemm_s8_v8_kernel.hpp"
++
++namespace wres32 {
++using namespace sycl;
++namespace esimd = sycl::ext::intel::esimd;
++
++static const int BM = 128, BN32 = 32, BK = 32, NT32 = 16;
++static const int SLM_A = BM * BK;              // 4,096
++static const int SLM_B = BK * BN32;            // 1,024
++
++static inline sycl::event gemm_b_res_window_bn32(sycl::queue& q, const int8_t* Ap, const int8_t* Bp,
++                                                 void* Cout, const float* as, const float* bs,
++                                                 const void* skip, const float* cos,
++                                                 int M, int Mp, int N, int K,
++                                                 bool narrow, bool half_skip, unsigned epi,
++                                                 unsigned across, unsigned top, unsigned left,
++                                                 unsigned image_h, unsigned image_w, unsigned nband = 1) {
++    LC_TICK();   // launch counted at helper entry (rule 132); the bench TU defines LC_TICK()
++    int wg = (Mp / BM) * (N / BN32);
++    return q.submit([&](handler& h) {
++        h.parallel_for(nd_range(range((size_t)wg * NT32), range(NT32)), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
++            esimd::slm_init<3 * SLM_A + 3 * SLM_B>();   // s8d2 three-buffer, 15,360 B
++            int loc = (int)it.get_group(0);
++            int lid = (int)it.get_local_id(0);
++            int NB = N / BN32;
++            int wg_row = loc / NB, wg_col = loc % NB;
++            int wi_row = lid / 2, wi_col = lid % 2;     // 8 row-bands x 2 col-bands = 16
++            const int8_t* apb = Ap + (size_t)(wg_row * (K / BK)) * 8 * 512;
++            const int8_t* bp  = Bp + (size_t)wg_col * (BN32 / 8) * 256;
++            const int SLM_B_BASE = 3 * SLM_A;           // s8d2: third buffer slot
++            auto load_block = [=](int buf, int kb) SYCL_ESIMD_FUNCTION {
++                esimd::simd<int8_t, 256> av = esimd::block_load<int8_t, 256>(
++                    apb + (size_t)kb * SLM_A + lid * 256, esimd::overaligned_tag<16>{});
++                esimd::slm_block_store(buf * SLM_A + lid * 256, av, esimd::overaligned_tag<16>{});
++                esimd::simd<int8_t, 64> bv = esimd::block_load<int8_t, 64>(
++                    bp + (size_t)kb * N * 32 + lid * 64, esimd::overaligned_tag<16>{});
++                esimd::slm_block_store(SLM_B_BASE + buf * SLM_B + lid * 64, bv, esimd::overaligned_tag<16>{});
++            };
++            auto load_grf = [=](int buf, esimd::simd<int8_t,256>& a0, esimd::simd<int8_t,256>& a1,
++                                esimd::simd<int8_t,256>& b0, esimd::simd<int8_t,256>& b1) SYCL_ESIMD_FUNCTION {
++                uint32_t offA = buf * SLM_A + wi_row * 512;
++                uint32_t offB = SLM_B_BASE + buf * SLM_B + wi_col * 512;
++                a0 = esimd::slm_block_load<int8_t, 256>(offA + 0, esimd::overaligned_tag<16>{});
++                a1 = esimd::slm_block_load<int8_t, 256>(offA + 256, esimd::overaligned_tag<16>{});
++                b0 = esimd::slm_block_load<int8_t, 256>(offB + 0, esimd::overaligned_tag<16>{});
++                b1 = esimd::slm_block_load<int8_t, 256>(offB + 256, esimd::overaligned_tag<16>{});
++            };
++            esimd::simd<int8_t, 256> a0, a1, b0, b1;
++            esimd::simd<int32_t, 64> c00(0), c01(0), c10(0), c11(0);
++            load_block(0, 0);
++            if (K / BK > 1) load_block(1, 1);   // s8d2 prologue
++            esimd::barrier();
++            int kb_n = K / BK;
++            for (int b = 0; b < kb_n; ++b) {
++                int cur = b % 3;
++                if (b + 2 < kb_n) load_block((b + 2) % 3, b + 2);   // s8d2 depth-2
++                load_grf(cur, a0, a1, b0, b1);
++                c00 = esimd::xmx::dpas<8, 8, int32_t>(c00, b0, a0);
++                c01 = esimd::xmx::dpas<8, 8, int32_t>(c01, b1, a0);
++                c10 = esimd::xmx::dpas<8, 8, int32_t>(c10, b0, a1);
++                c11 = esimd::xmx::dpas<8, 8, int32_t>(c11, b1, a1);
++                esimd::barrier();
++            }
++            // ---- the shipped window tail, VERBATIM (s8v8::gemm_b_res_window:1324-1389) ----
++            int gr = wg_row * BM + wi_row * 16, gc = wg_col * BN32 + wi_col * 16;
++            esimd::simd<float, 16> cs = esimd::block_load<float, 16>(bs + gc, esimd::overaligned_tag<16>{});
++            esimd::simd<float, 16> cc = esimd::block_load<float, 16>(cos + gc, esimd::overaligned_tag<16>{});
++            esimd::simd<float, 8> csl = cs.template select<8,1>(0), csh = cs.template select<8,1>(8);
++            esimd::simd<float, 8> ccl = cc.template select<8,1>(0), cch = cc.template select<8,1>(8);
++            for (int r = 0; r < 8; ++r) {
++                int rr0 = gr + r, rr1 = gr + 8 + r;
++                if (rr0 < M) {
++                    unsigned window=(unsigned)rr0/64u, token=(unsigned)rr0%64u;
++                    unsigned yy=(window/across)*8u+token/8u, xx=(window%across)*8u+token%8u;
++                    bool in=(yy>=top&&xx>=left&&yy-top<image_h&&xx-left<image_w);
++                    size_t out=in?(((size_t)(yy-top)*image_w+(xx-left))*N+gc):0;
++                    float rs = as[(size_t)rr0 * nband + (nband > 1u ? (unsigned)(gc / 128) : 0u)];
++                    esimd::simd<float, 8> f0 = esimd::convert<float>(c00.select<8,1>(r*8).read()) * rs * csl;
++                    esimd::simd<float, 8> f1 = esimd::convert<float>(c01.select<8,1>(r*8).read()) * rs * csh;
++                    esimd::simd<float, 8> sk0, sk1;
++                    if (half_skip) {
++                        esimd::simd<half,16> sh = esimd::block_load<half,16>((const half*)skip + out, esimd::overaligned_tag<16>{});
++                        sk0 = esimd::convert<float>(sh.template select<8,1>(0).read()); sk1 = esimd::convert<float>(sh.template select<8,1>(8).read());
++                    } else {
++                        esimd::simd<float,16> sf = esimd::block_load<float,16>((const float*)skip + out, esimd::overaligned_tag<16>{});
++                        sk0 = sf.template select<8,1>(0); sk1 = sf.template select<8,1>(8);
++                    }
++                    esimd::simd<float, 16> pub;
++                    if (epi != 2u) {
++                        esimd::simd<float,8> t0, t1;
++                        for (int e = 0; e < 8; ++e) { t0[e] = sk0[e]*ccl[e] + f0.read()[e]; t1[e] = sk1[e]*cch[e] + f1.read()[e]; }
++                        { esimd::simd<float,16> tt; tt.template select<8,1>(0) = t0; tt.template select<8,1>(8) = t1;
++                          pub = s8v8::pub_vec_v8<16>(epi, tt); }
++                    } else {
++                    for (int e = 0; e < 8; ++e) pub[e] = s8v8::pub_esimd(epi, sk0[e]*ccl[e] + f0.read()[e]);
++                    for (int e = 0; e < 8; ++e) pub[8+e] = s8v8::pub_esimd(epi, sk1[e]*cch[e] + f1.read()[e]);
++                    }
++                    if (in) { if (narrow) esimd::convert<half>(pub).copy_to((half*)Cout + out);
++                              else        pub.copy_to((float*)Cout + out); }
++                }
++                if (rr1 < M) {
++                    unsigned window=(unsigned)rr1/64u, token=(unsigned)rr1%64u;
++                    unsigned yy=(window/across)*8u+token/8u, xx=(window%across)*8u+token%8u;
++                    bool in=(yy>=top&&xx>=left&&yy-top<image_h&&xx-left<image_w);
++                    size_t out=in?(((size_t)(yy-top)*image_w+(xx-left))*N+gc):0;
++                    float rs = as[(size_t)rr1 * nband + (nband > 1u ? (unsigned)(gc / 128) : 0u)];
++                    esimd::simd<float, 8> g0 = esimd::convert<float>(c10.select<8,1>(r*8).read()) * rs * csl;
++                    esimd::simd<float, 8> g1 = esimd::convert<float>(c11.select<8,1>(r*8).read()) * rs * csh;
++                    esimd::simd<float, 8> sk0, sk1;
++                    if (half_skip) {
++                        esimd::simd<half,16> sh = esimd::block_load<half,16>((const half*)skip + out, esimd::overaligned_tag<16>{});
++                        sk0 = esimd::convert<float>(sh.template select<8,1>(0).read()); sk1 = esimd::convert<float>(sh.template select<8,1>(8).read());
++                    } else {
++                        esimd::simd<float,16> sf = esimd::block_load<float,16>((const float*)skip + out, esimd::overaligned_tag<16>{});
++                        sk0 = sf.template select<8,1>(0); sk1 = sf.template select<8,1>(8);
++                    }
++                    esimd::simd<float, 16> pub;
++                    if (epi != 2u) {
++                        esimd::simd<float,8> t0, t1;
++                        for (int e = 0; e < 8; ++e) { t0[e] = sk0[e]*ccl[e] + g0.read()[e]; t1[e] = sk1[e]*cch[e] + g1.read()[e]; }
++                        { esimd::simd<float,16> tt; tt.template select<8,1>(0) = t0; tt.template select<8,1>(8) = t1;
++                          pub = s8v8::pub_vec_v8<16>(epi, tt); }
++                    } else {
++                    for (int e = 0; e < 8; ++e) pub[e] = s8v8::pub_esimd(epi, sk0[e]*ccl[e] + g0.read()[e]);
++                    for (int e = 0; e < 8; ++e) pub[8+e] = s8v8::pub_esimd(epi, sk1[e]*cch[e] + g1.read()[e]);
++                    }
++                    if (in) { if (narrow) esimd::convert<half>(pub).copy_to((half*)Cout + out);
++                              else        pub.copy_to((float*)Cout + out); }
++                }
++            }
++        });
++    });
++}
++}   // namespace wres32
