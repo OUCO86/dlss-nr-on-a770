@@ -1,0 +1,119 @@
+diff --git a/src/bench/sycl/libxmx_sycl.cpp b/src/bench/sycl/libxmx_sycl.cpp
+index c3248c5..d5b0e32 100644
+--- a/src/bench/sycl/libxmx_sycl.cpp
++++ b/src/bench/sycl/libxmx_sycl.cpp
+@@ -191,7 +191,41 @@ static void pg_note_ids(const std::initializer_list<int>& ids) {
+         if (it != g_bufs.end() && it->second.p) g_pg_pending_ids.push_back(id);
+     }
+ }
++// C123 (merged diag): per-closure byte audit. Buf carries bytes + esz (struct Buf at :111), so one
++// hook at the pgraph_ids choke point gives, for every closure, which faces it touches and at what
++// element width. Env-gated by NR_BYTE_AUDIT=1. DIAG ONLY: never staged, never a revenue knife.
++static std::map<int, std::vector<std::pair<int, unsigned>>> g_audit;
++static void audit_note(int id) {
++    if (!getenv("NR_BYTE_AUDIT")) return;
++    int ci = (int)g_cmds.size();
++    auto& v = g_audit[ci];
++    for (auto& pr : v) if (pr.first == id) return;
++    auto it = g_bufs.find(id);
++    if (it == g_bufs.end()) return;
++    v.push_back({ id, (unsigned)it->second.esz });
++}
++static void audit_chain(int chain, size_t a, size_t b) {
++    if (!getenv("NR_BYTE_AUDIT")) return;
++    std::map<int, unsigned long long> per;
++    unsigned long long tot = 0;
++    for (size_t i = a; i <= b; ++i) {
++        auto it = g_audit.find((int)i);
++        if (it == g_audit.end()) continue;
++        for (auto& pr : it->second) {
++            auto bf = g_bufs.find(pr.first);
++            if (bf == g_bufs.end()) continue;
++            per[pr.first] += bf->second.bytes; tot += bf->second.bytes;
++        }
++    }
++    std::printf("[byte-audit] chain=%d totalMB=%.1f faces=", chain, tot / 1e6);
++    for (auto& f : per)
++        std::printf(" %d:%.1fMB(w%u)", f.first, f.second / 1e6,
++                    (unsigned)(g_bufs.count(f.first) ? g_bufs[f.first].esz : 0));
++    std::printf("\n");
++    std::fflush(stdout);
++}
+ static void pgraph_ids(std::initializer_list<int> ids) {
++    for (int id : ids) audit_note(id);
+     g_pg_pending.clear();
+     g_pg_pending_ids.clear();
+     pg_note_ids(ids);
+@@ -1421,6 +1455,9 @@ int xmx_buf_create_kind(unsigned long long bytes, int kind) {
+     if (!p) FAILMSG("out of device memory");
+     int id = g_nextbuf++;
+     g_bufs[id] = { p, (size_t)bytes, (size_t)(kind == 0 ? 2 : kind), false, g_gen };
++    if (getenv("NR_BYTE_AUDIT"))
++        std::printf("[buf-create] id=%d bytes=%zu esz=%zu kind=%d by=%s\n",
++                    id, (size_t)bytes, (size_t)(kind == 0 ? 2 : kind), kind, __func__);
+     sp_note_created(id, bytes);   // B step 3: register versioning targets by role
+     if (getenv("NR_BUFNEW")) {   // presence-gated, host print only (rules 4/9)
+         // during_closure = how many closures have been pushed so far, i.e. which op was being
+@@ -1753,6 +1790,51 @@ static void skip_chains_apply(std::vector<std::function<void()>>& cmds,
+         std::printf("[skip-chains] chain=%d SKIPPED closures %zu..%zu (%zu no-ops): %s .. %s\n",
+                     wk, c.a, c.b, c.b - c.a + 1, nm(c.a), nm(c.b));
+     }
++    // ---- C111 diagnostic only: NR_STOP_CHAIN=<ids> (tools/C111_chainstop_diag.diff).
++    // No-ops the closures of those chains WITHOUT removing them, so the pass count and the graph
++    // shape stay identical; the frame output is garbage by design -- time-only, like NR_*_STOP.
++    {
++        static const std::vector<int> stopset = [](){
++            std::vector<int> out; const char* s = getenv("NR_STOP_CHAIN");
++            if (s) { const char* p = s;
++                while (*p) { char* e = nullptr; long v = strtol(p, &e, 10);
++                             if (e != p) { out.push_back((int)v); p = e; } else ++p; } }
++            return out; }();
++        static const char *stopname = getenv("NR_STOP_NAME");
++        if (!stopset.empty()) {
++            if (stopname) {   // name-selective stop inside the selected chains
++                size_t nnoop = 0;
++                for (int wk : stopset) {
++                    if (wk < 0 || (size_t)wk >= ch.size()) continue;
++                    const Ch& cc = ch[wk];
++                    for (size_t i = cc.a; i <= cc.b; ++i) {
++                        const char* nmv = (i < names.size()) ? names[i] : "";
++                        if (!nmv || strstr(nmv, stopname) == nullptr) continue;
++                        if (cmds[i]) { cmds[i] = [](){}; ++nnoop; }
++                        std::printf("[stop-name] chain=%d closure=%zu name=%s NOOPED\n", wk, i, nmv);
++                    }
++                }
++                std::printf("[stop-name] pattern=%s closures_noop=%zu\n", stopname, nnoop);
++                std::fflush(stdout);
++            }
++            size_t stnoop = 0;
++            for (size_t k = 0; k < ch.size(); ++k) audit_chain((int)k, ch[k].a, ch[k].b);
++    for (int wk : stopset) {
++                if (wk < 0 || (size_t)wk >= ch.size()) {
++                    std::printf("[stop-chain] id=%d OUT OF RANGE (valid 0..%zu) -- ignored\n",
++                                wk, ch.size() - 1);
++                    continue;
++                }
++                const Ch& c = ch[wk];
++                for (size_t i = c.a; i <= c.b; ++i) { cmds[i] = [](){}; g_skipped_cmds.insert(i); ++stnoop; }
++                std::printf("[stop-chain] id=%d STOPPED closures %zu..%zu (n=%zu): %s .. %s\n",
++                            wk, c.a, c.b, c.b - c.a + 1, nm(c.a), nm(c.b));
++            }
++            std::printf("[stop-chain] graph=%d stopped=%zu noop=%zu passes=%zu (unchanged)\n",
++                        graphid, stopset.size(), stnoop, n);
++            std::fflush(stdout);
++        }
++    }
+     std::printf("[skip-chains] graph=%d chains_skipped=%zu refused=%zu closures_noop=%zu "
+                 "passes=%zu (unchanged)\n", graphid, skipped, refused, noops, n);
+     std::fflush(stdout);
+@@ -6346,6 +6428,10 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
+         vit_note_unary(g_cmds.size(), a, b, c, d, n);   // the producer of the entry GEMM's face
+     const unsigned flags = kind;                 // the plan's arg0 IS the flags word
+     const unsigned sub = flags & 0xFFu;
++    { static const int uk = getenv("NR_U_KIND") ? atoi(getenv("NR_U_KIND")) : -1;
++      if (uk >= 0 && (int)(flags & 0xFFu) == uk) { g_cmd_names.push_back(__func__); pg_push([](){});
++        std::printf("[u-kind] kind=%d sub=%u STOPPED (time-only diag)\n", (int)kind, (unsigned)(flags & 0xFFu));
++        std::fflush(stdout); return 0; } }
+     auto ia = g_bufs.find(a), ic = g_bufs.find(c);
+     if (ia == g_bufs.end() || ic == g_bufs.end()) FAILMSG("bad unary operand (a/c)");
+     const void* A = ia->second.p; void* C = ic->second.p;
