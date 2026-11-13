@@ -1,0 +1,82 @@
+diff --git a/src/bench/sycl/libxmx_sycl.cpp b/src/bench/sycl/libxmx_sycl.cpp
+--- a/src/bench/sycl/libxmx_sycl.cpp
++++ b/src/bench/sycl/libxmx_sycl.cpp
+@@ -191,7 +191,24 @@
+         if (it != g_bufs.end() && it->second.p) g_pg_pending_ids.push_back(id);
+     }
+ }
++// C119 (0) DIAGNOSTIC ONLY (tools/C118_diag.diff): a per-closure byte audit. Buf carries both the
++// face size and its element size (struct Buf { void* p; size_t bytes; size_t esz; ... } at :111), so
++// one hook at the pgraph_ids choke point (18 recorder call sites) gives, for every closure, which
++// faces it touches, how many bytes each, and at what element width -- exactly what the P8 decision
++// needs before ANY face is re-typed. Env-gated: NR_BYTE_AUDIT=1.
++static std::map<int, std::vector<std::pair<int, unsigned>>> g_audit;   // closure idx -> (bufid, esz)
++static void audit_note(int id) {
++    if (!getenv("NR_BYTE_AUDIT")) return;
++    int ci = (int)g_cmds.size();
++    auto& v = g_audit[ci];
++    for (auto& pr : v) if (pr.first == id) return;          // once per face per closure
++    auto it = g_bufs.find(id);
++    if (it == g_bufs.end()) return;
++    v.push_back({ id, (unsigned)it->second.esz });
++}
+ static void pgraph_ids(std::initializer_list<int> ids) {
++    for (int id : ids) audit_note(id);
++
+     g_pg_pending.clear();
+     g_pg_pending_ids.clear();
+     pg_note_ids(ids);
+@@ -1421,6 +1438,9 @@
+     if (!p) FAILMSG("out of device memory");
+     int id = g_nextbuf++;
+     g_bufs[id] = { p, (size_t)bytes, (size_t)(kind == 0 ? 2 : kind), false, g_gen };
++    if (getenv("NR_BYTE_AUDIT"))
++        std::printf("[buf-create] id=%d bytes=%zu esz=%zu kind=%d by=%s\n",
++                    id, (size_t)bytes, (size_t)(kind == 0 ? 2 : kind), kind, __func__);
+     sp_note_created(id, bytes);   // B step 3: register versioning targets by role
+     if (getenv("NR_BUFNEW")) {   // presence-gated, host print only (rules 4/9)
+         // during_closure = how many closures have been pushed so far, i.e. which op was being
+@@ -1538,6 +1558,9 @@
+                                               (unsigned)kind, (unsigned)r);
+     int id = g_nextbuf++;
+     g_bufs[id] = { p, (size_t)bytes, (size_t)esz, true, g_gen };
++    if (getenv("NR_BYTE_AUDIT"))
++        std::printf("[buf-import] id=%d bytes=%zu esz=%zu by=%s\n",
++                    id, (size_t)bytes, (size_t)esz, __func__);
+     if (getenv("NR_BUFNEW")) { std::printf("[bufnew] id=%d bytes=%zu esz=%zu IMPORTED during_closure=%zu\n",
+                             id, (size_t)bytes, (size_t)esz, g_cmds.size()); std::fflush(stdout); }
+     return id;
+@@ -1752,6 +1775,33 @@
+         ++skipped;
+         std::printf("[skip-chains] chain=%d SKIPPED closures %zu..%zu (%zu no-ops): %s .. %s\n",
+                     wk, c.a, c.b, c.b - c.a + 1, nm(c.a), nm(c.b));
++    }
++    if (getenv("NR_BYTE_AUDIT")) {
++        // per-chain face bytes: element width is reported so a re-typing decision can be made
++        // per face (f32=4, f16=2, int8=1). Bytes per face per closure = that face's full size,
++        // which is an UPPER bound on what the closure touches -- stated, not hidden.
++        std::map<int, std::map<int, unsigned long long>> per;   // chain -> bufid -> bytes
++        for (size_t k = 0; k < ch.size(); ++k) {
++            for (size_t i = ch[k].a; i <= ch[k].b; ++i) {
++                auto it = g_audit.find((int)i);
++                if (it == g_audit.end()) continue;
++                for (auto& pr : it->second) {
++                    auto b = g_bufs.find(pr.first);
++                    if (b == g_bufs.end()) continue;
++                    per[(int)k][pr.first] += b->second.bytes;
++                }
++            }
++        }
++        for (auto& kv : per) {
++            unsigned long long tot = 0;
++            for (auto& f : kv.second) tot += f.second;
++            std::printf("[byte-audit] chain=%d totalMB=%.1f faces=", kv.first, tot / 1e6);
++            for (auto& f : kv.second)
++                std::printf(" %d:%.1fMB(w%u)", f.first, f.second / 1e6,
++                            (unsigned)(g_bufs.count(f.first) ? g_bufs[f.first].esz : 0));
++            std::printf("\n");
++        }
++        std::fflush(stdout);
+     }
+     std::printf("[skip-chains] graph=%d chains_skipped=%zu refused=%zu closures_noop=%zu "
+                 "passes=%zu (unchanged)\n", graphid, skipped, refused, noops, n);
