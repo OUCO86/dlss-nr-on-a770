@@ -1,0 +1,57 @@
+diff --git a/src/bench/sycl/libxmx_sycl.cpp b/src/bench/sycl/libxmx_sycl.cpp
+index c3248c5..d039e1c 100644
+--- a/src/bench/sycl/libxmx_sycl.cpp
++++ b/src/bench/sycl/libxmx_sycl.cpp
+@@ -5059,7 +5059,11 @@ int xmx_rec_gemm_int8(int a, int b, int c, int a_scale, int b_scale,
+         // M a multiple of 128). The broader N%128/K%64 gate also caught other tiers' legs
+         // whose operands were never validated in this tile family -- that is what turned the
+         // four gates red with the switch ON (1301 fused 4D6D3667 / plain 17D0575C).
+-const bool band = c512_band_on() && N == 512u && K == 512u && (M % 128u) == 0u;
++// C116 (E): the [gir-band] print below is unconditional, so a leg that prints ZERO such lines
++        // never reaches this site. Measured: on the PLAIN caliber (NR_VIT_REUSE=0 + skip-ON) no
++        // leg prints it => this knife is inert for the C512 block measurement; it only engages on
++        // the fused+reseed path (32 legs/frame there, C95/C105 DBG). Block delta for it is void.
++const bool band = c512_band_on() && M == 640u && N == 512u && K == 512u;   // exact signature (the DBG saw only M=640 at N=K=512; 32 legs/frame)
+         if (getenv("NR_C512_BAND_DBG"))
+             std::printf("[gir-band] band=%d on=%d M=%u N=%u K=%u Mp=%d epi=%u narrow=%d flags=%u\n",
+                         (int)band, c512_band_on() ? 1 : 0, M, N, K, Mp, epi, (int)narrow, flags);
+@@ -6094,12 +6098,16 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
+         // The epi/narrow terms that were here came from the bench form, not from these legs --
+         // with them the gate matched nothing (90/90 wres lines printed p128=0). The copied
+         // window tail already handles epi=0/narrow=false and epi=1/narrow=true.
++        // C106: exact-signature allowlist, not a condition test. gate_window_block went RED on the
++        // WB-16x24-head-halfimage geometry (flags=0x1008000), which the previous shape test let
++        // through. Only the signatures the four shipping faces and the bench actually cover:
++        //   M=768/960, N=512, K=512, flags 262144 (chain 25) or 266496 (chain 33)
++        //   M=2560/8640/9216 with N=256/128/128, flags 266496   (bench bad=0, C93/C102)
++        // flags=0x1008000 and anything else keep the shipped tile.
+         const bool p128 = wres_pub128_on()
+-                          && ((M == 768u  && N == 512u && K == 512u)      // the live C512 chains (C90)
+-                              || (M == 960u  && N == 512u && K == 512u)    // same family, other chain
+-                              || (M == 2560u && N == 256u && K == 256u)    // bench-gated bad=0, -20.8%
+-                              || (M == 8640u && N == 128u && K == 128u)    // bench-gated bad=0,  -8.2%
+-                              || (M == 9216u && N == 128u && K == 128u));  // bench-gated bad=0,  -7.4%
++                          && ((M == 2560u  && N == 256u && K == 256u && flags == 266496u)
++                           || (M == 8640u  && N == 128u && K == 128u && flags == 266496u)
++                           || (M == 9216u  && N == 128u && K == 128u && flags == 266496u));
+         // N=64 (34560x64x64) is deliberately excluded above: BN=128 needs N >= BN.
+         // C92: the band pair -- producer (the fused packer's row max per 128 columns) and
+         // consumer (the publish tail's as[row*nband + band]) switch TOGETHER. Requires the
+@@ -6466,9 +6474,15 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
+         // 254C02B7/CACD2029/4D90CCA5 + plain DD49827D EXACT both sides, 8/8 legs on the new form).
+         static bool up2 = !getenv("NR_UP_2X2") || atoi(getenv("NR_UP_2X2")) != 0;
+         const unsigned u_rows = (SA && CH) ? (N / (SA * CH)) : 0u;
++        // Allowlist: ONLY the four signatures the bench gate proved bad=0 (tmp\c104\c104_up.cpp,
++        // 3 cold processes): n / CH / SA / SB all must match exactly. Everything else -- including
++        // N=130,560, which gate_unary showed is NOT equivalent -- keeps the shipped arm.
+         const bool up2_ok = up2 && !a_half && b_half && narrow && epi == 1u
+-                            && (CH % 16u) == 0u && (N % 16u) == 0u
+-                            && (SA % 2u) == 0u && (u_rows % 2u) == 0u && (SB * 2u >= SA);
++                            && ((N == 327680u  && CH == 512u && SA == 32u  && SB == 16u)
++                             || (N == 522240u  && CH == 256u && SA == 60u  && SB == 32u)
++                             || (N == 1044480u && CH == 128u && SA == 120u && SB == 60u)
++                             || (N == 2088960u && CH == 64u  && SA == 240u && SB == 120u)
++                             || (N == 6144u    && CH == 64u  && SA == 12u  && SB == 6u));  // gate geometry
+         if (getenv("NR_U_DBG"))
+             std::printf("[up2x2] sub=%u up2=%d up2_ok=%d n=%u CH=%u SA=%u SB=%u rows=%u\n",
+                         sub, (int)up2, (int)up2_ok, N, CH, SA, SB, u_rows);
