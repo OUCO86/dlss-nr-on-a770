@@ -1273,7 +1273,7 @@ static inline sycl::event gemm_b_res_window(sycl::queue& q, const int8_t* Ap, co
                                      int M, int Mp, int N, int K,
                                      bool narrow, bool half_skip, unsigned epi,
                                      unsigned across, unsigned top, unsigned left,
-                                     unsigned image_h, unsigned image_w) {
+                                     unsigned image_h, unsigned image_w, unsigned nband = 1) {
     LC_TICK();   // #145 军规 132: launch counted at helper entry
     int wg = (Mp / BM) * (N / BN);
     size_t apb = (size_t)Mp * K, bpb = (size_t)N * K;
@@ -1333,7 +1333,7 @@ static inline sycl::event gemm_b_res_window(sycl::queue& q, const int8_t* Ap, co
                     unsigned yy=(window/across)*8u+token/8u, xx=(window%across)*8u+token%8u;
                     bool in=(yy>=top&&xx>=left&&yy-top<image_h&&xx-left<image_w);
                     size_t out=in?(((size_t)(yy-top)*image_w+(xx-left))*N+gc):0;
-                    float rs = as[rr0];
+                    float rs = as[(size_t)rr0 * nband + (nband > 1u ? (unsigned)(gc / 128) : 0u)];
                     esimd::simd<float, 8> f0 = esimd::convert<float>(c00.select<8,1>(r*8).read()) * rs * csl;
                     esimd::simd<float, 8> f1 = esimd::convert<float>(c01.select<8,1>(r*8).read()) * rs * csh;
                     esimd::simd<float, 8> sk0, sk1;
@@ -1362,7 +1362,7 @@ static inline sycl::event gemm_b_res_window(sycl::queue& q, const int8_t* Ap, co
                     unsigned yy=(window/across)*8u+token/8u, xx=(window%across)*8u+token%8u;
                     bool in=(yy>=top&&xx>=left&&yy-top<image_h&&xx-left<image_w);
                     size_t out=in?(((size_t)(yy-top)*image_w+(xx-left))*N+gc):0;
-                    float rs = as[rr1];
+                    float rs = as[(size_t)rr1 * nband + (nband > 1u ? (unsigned)(gc / 128) : 0u)];
                     esimd::simd<float, 8> g0 = esimd::convert<float>(c10.select<8,1>(r*8).read()) * rs * csl;
                     esimd::simd<float, 8> g1 = esimd::convert<float>(c11.select<8,1>(r*8).read()) * rs * csh;
                     esimd::simd<float, 8> sk0, sk1;
@@ -1391,3 +1391,526 @@ static inline sycl::event gemm_b_res_window(sycl::queue& q, const int8_t* Ap, co
     });
 }
 } // namespace s8v8
+
+// ============================================================================================
+// C61b (2026-11-12): s8v8b -- the BK=64 form of the gemm_int8_residual path ONLY.
+// The old s8v8 namespace stays byte-for-byte untouched for every other family; the gir call
+// site in libxmx_sycl.cpp switches here when (K % 64 == 0) (all gir shapes qualify: the
+// ledger's K set is {64,128,256,512,1024,4096}).
+//
+// Why this is bit-identical: int32 dpas accumulation is exact and associative over K, and the
+// operand bytes are the SAME packed-A / packed-B planes -- an operand block here simply spans
+// two consecutive kk32 blocks (the bench bench_s8v8_tile.cpp says it verbatim: "BK=64 needs a
+// different A pack map (B pack needs nothing -- kk32 blocks are adjacent in global, so one SLM
+// buffer just spans two of them)"). The A gather re-orders [kb][wi] -> [wi][kc] in SLM so the
+// dpas stripes match; nothing else in the kernel changes. bench_s8v8_tile priced this form:
+// 11 variants x 5 shapes x 3 processes, ALL diff=0, scratch=0, grf<=128, dynamic LSC -30%.
+// ============================================================================================
+namespace s8v8b {
+using namespace sycl;
+namespace esimd = sycl::ext::intel::esimd;
+static const int BM = 128, BN = 64, BK = 64, NT = 32;
+static const int SLM_A = BM * BK;            // 8,192
+static const int SLM_B = BK * BN;            // 4,096
+static const int KC    = BK / 32;            // 2 dpas K-chunks per operand block
+static const int A_WI  = 16 * BK;            // 1,024 B per wi_row (16 rows x BK)
+static const int B_KC  = BN * 32;            // 2,048 B per kc (BN cols x 32 k)
+
+static inline sycl::event gemm_b_res(sycl::queue& q, const int8_t* Ap, const int8_t* Bp,
+                                     void* Cout, const float* as, const float* bs,
+                                     const void* skip, const float* cos,
+                                     int M, int Mp, int N, int K,
+                                     bool narrow, bool half_skip, unsigned epi) {
+    LC_TICK();   // #145 junreg 132: launch counted at helper entry
+    int wg = (Mp / BM) * (N / BN);
+    return q.submit([&](handler& h) {
+        h.parallel_for(nd_range(range((size_t)wg * NT), range(NT)), [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+            esimd::slm_init<3 * SLM_A + 3 * SLM_B>();   // 3x8192 + 3x4096 = 36,864 B (<= 48 KB, C53-proven safe)
+            int loc = (int)it.get_group(0);
+            int lid = (int)it.get_local_id(0);
+            int NB = N / BN;
+            int wg_row = loc / NB, wg_col = loc % NB;
+            int wi_row = lid / 4, wi_col = lid % 4;
+            // SAME packed-A planes as s8v8 (kk32 blocks of 128 rows x 32 k = 4,096 B); an operand
+            // block here spans TWO of them (BK=64), gathered into the SLM order [wi][kc][row][k].
+            const int8_t* apb = Ap + (size_t)(wg_row * (K / BK)) * 8192;   // BK=64: 8 x 1024 B per kb
+            const int8_t* bp = Bp + (size_t)wg_col * (BN / 8) * 256;
+            const int SLM_B_BASE = 3 * SLM_A;
+            auto load_block = [=](int buf, int kb) SYCL_ESIMD_FUNCTION {
+                // C61c: the plane is packed in the BK=64 order by pack_a64 / pack_a_fused64,
+                // so the operand block is contiguous -- one linear 256 B message per thread
+                // (the form bench_s8v8_tile validated at diff=0).
+                esimd::simd<int8_t, 256> av = esimd::block_load<int8_t, 256>(
+                    apb + (size_t)kb * SLM_A + lid * 256, esimd::overaligned_tag<16>{});
+                esimd::slm_block_store(buf * SLM_A + lid * 256, av, esimd::overaligned_tag<16>{});
+                #pragma unroll
+                for (int kc = 0; kc < KC; ++kc) {
+                    esimd::simd<int8_t, 64> bv = esimd::block_load<int8_t, 64>(
+                        bp + ((size_t)kb * KC + kc) * N * 32 + lid * 64, esimd::overaligned_tag<16>{});
+                    esimd::slm_block_store(SLM_B_BASE + buf * SLM_B + kc * B_KC + lid * 64, bv, esimd::overaligned_tag<16>{});
+                }
+            };
+            auto load_grf = [=](int buf, esimd::simd<int8_t,256>& a0, esimd::simd<int8_t,256>& a1,
+                                esimd::simd<int8_t,256>& a2, esimd::simd<int8_t,256>& a3,
+                                esimd::simd<int8_t,256>& b0, esimd::simd<int8_t,256>& b1,
+                                esimd::simd<int8_t,256>& b2, esimd::simd<int8_t,256>& b3) SYCL_ESIMD_FUNCTION {
+                uint32_t offA = buf * SLM_A + wi_row * A_WI;
+                uint32_t offB = SLM_B_BASE + buf * SLM_B + wi_col * 512;
+                a0 = esimd::slm_block_load<int8_t, 256>(offA + 0,   esimd::overaligned_tag<16>{});
+                a1 = esimd::slm_block_load<int8_t, 256>(offA + 256, esimd::overaligned_tag<16>{});
+                a2 = esimd::slm_block_load<int8_t, 256>(offA + 512, esimd::overaligned_tag<16>{});
+                a3 = esimd::slm_block_load<int8_t, 256>(offA + 768, esimd::overaligned_tag<16>{});
+                b0 = esimd::slm_block_load<int8_t, 256>(offB + 0,     esimd::overaligned_tag<16>{});
+                b1 = esimd::slm_block_load<int8_t, 256>(offB + 256,   esimd::overaligned_tag<16>{});
+                b2 = esimd::slm_block_load<int8_t, 256>(offB + 2048,  esimd::overaligned_tag<16>{});
+                b3 = esimd::slm_block_load<int8_t, 256>(offB + 2304,  esimd::overaligned_tag<16>{});
+            };
+            esimd::simd<int8_t, 256> a0, a1, a2, a3, b0, b1, b2, b3;
+            esimd::simd<int32_t, 64> c00(0), c01(0), c10(0), c11(0);
+            load_block(0, 0);
+            if (K / BK > 1) load_block(1, 1);
+            esimd::barrier();
+            int kb_n = K / BK;
+            for (int b = 0; b < kb_n; ++b) {
+                int cur = b % 3;
+                if (b + 2 < kb_n) load_block((b + 2) % 3, b + 2);
+                load_grf(cur, a0, a1, a2, a3, b0, b1, b2, b3);
+                // kc = 0 chunk
+                c00 = esimd::xmx::dpas<8, 8, int32_t>(c00, b0, a0);
+                c01 = esimd::xmx::dpas<8, 8, int32_t>(c01, b1, a0);
+                c10 = esimd::xmx::dpas<8, 8, int32_t>(c10, b0, a1);
+                c11 = esimd::xmx::dpas<8, 8, int32_t>(c11, b1, a1);
+                // kc = 1 chunk (the same accumulators, next 32 of K) -- dpas is exact and
+                // associative over K, so the K order is free: C53 proved this bit-identical.
+                c00 = esimd::xmx::dpas<8, 8, int32_t>(c00, b2, a2);
+                c01 = esimd::xmx::dpas<8, 8, int32_t>(c01, b3, a2);
+                c10 = esimd::xmx::dpas<8, 8, int32_t>(c10, b2, a3);
+                c11 = esimd::xmx::dpas<8, 8, int32_t>(c11, b3, a3);
+                esimd::barrier();
+            }
+            int gr = wg_row * BM + wi_row * 16, gc = wg_col * BN + wi_col * 16;
+            esimd::simd<float, 16> cs = esimd::block_load<float, 16>(bs + gc, esimd::overaligned_tag<16>{});
+            esimd::simd<float, 16> cc = esimd::block_load<float, 16>(cos + gc, esimd::overaligned_tag<16>{});
+            esimd::simd<float, 8> csl = cs.template select<8,1>(0), csh = cs.template select<8,1>(8);
+            esimd::simd<float, 8> ccl = cc.template select<8,1>(0), cch = cc.template select<8,1>(8);
+            for (int r = 0; r < 8; ++r) {
+                int rr0 = gr + r, rr1 = gr + 8 + r;
+                if (rr0 < M) {
+                    float rs = as[rr0];
+                    esimd::simd<float, 8> f0 = esimd::convert<float>(c00.select<8,1>(r*8).read()) * rs * csl;
+                    esimd::simd<float, 8> f1 = esimd::convert<float>(c01.select<8,1>(r*8).read()) * rs * csh;
+                    esimd::simd<float, 8> sk0, sk1;
+                    if (half_skip) {
+                        esimd::simd<half,16> sh = esimd::block_load<half,16>((const half*)skip + (size_t)rr0*N + gc, esimd::overaligned_tag<16>{});
+                        sk0 = esimd::convert<float>(sh.template select<8,1>(0).read()); sk1 = esimd::convert<float>(sh.template select<8,1>(8).read());
+                    } else {
+                        esimd::simd<float,16> sf = esimd::block_load<float,16>((const float*)skip + (size_t)rr0*N + gc, esimd::overaligned_tag<16>{});
+                        sk0 = sf.template select<8,1>(0); sk1 = sf.template select<8,1>(8);
+                    }
+                    // fma: sk*cos + stage (one fused rounding, matches sycl::fma).
+                    // BLADE-4 (ISA density ledger 2026-10-29): the pub chain here ran
+                    // 128 SCALAR pub_esimd calls/thread (~1800 instrs) vs 8 dpas = the
+                    // 0.1% density the census counted. The fma expression stays
+                    // ELEMENTWISE byte-identical (the "do NOT vectorize res's fma"
+                    // warning: a simd sk*c+f lowers as muladd = two roundings, frame 0%);
+                    // only the PUB step is vectorized via pub_vec_v8 (bench_pubvec: epi
+                    // 0/1/3/4 scalar-vs-vec IDENTICAL over 1M values; the frame's res
+                    // flags 0x41100 -> epi=1; epi==2 keeps the scalar -0.0 path).
+                    esimd::simd<float, 16> pub;
+                    if (epi != 2u) {
+                        esimd::simd<float,8> t0, t1;
+                        for (int e = 0; e < 8; ++e) { t0[e] = sk0[e]*ccl[e] + f0.read()[e]; t1[e] = sk1[e]*cch[e] + f1.read()[e]; }
+                        { esimd::simd<float,16> tt; tt.template select<8,1>(0) = t0; tt.template select<8,1>(8) = t1;
+                          pub = s8v8::pub_vec_v8<16>(epi, tt); }   // B3-ffn-4: 8-wide EU-slot waste (see chip ffn-3)
+                    } else {
+                        for (int e = 0; e < 8; ++e) pub[e] = s8v8::pub_esimd(epi, sk0[e]*ccl[e] + f0.read()[e]);
+                        for (int e = 0; e < 8; ++e) pub[8+e] = s8v8::pub_esimd(epi, sk1[e]*cch[e] + f1.read()[e]);
+                    }
+                    size_t out = (size_t)rr0 * N + gc;
+                    if (narrow) esimd::convert<half>(pub).copy_to((half*)Cout + out);
+                    else        pub.copy_to((float*)Cout + out);
+                }
+                if (rr1 < M) {
+                    float rs = as[rr1];
+                    esimd::simd<float, 8> g0 = esimd::convert<float>(c10.select<8,1>(r*8).read()) * rs * csl;
+                    esimd::simd<float, 8> g1 = esimd::convert<float>(c11.select<8,1>(r*8).read()) * rs * csh;
+                    esimd::simd<float, 8> sk0, sk1;
+                    if (half_skip) {
+                        esimd::simd<half,16> sh = esimd::block_load<half,16>((const half*)skip + (size_t)rr1*N + gc, esimd::overaligned_tag<16>{});
+                        sk0 = esimd::convert<float>(sh.template select<8,1>(0).read()); sk1 = esimd::convert<float>(sh.template select<8,1>(8).read());
+                    } else {
+                        esimd::simd<float,16> sf = esimd::block_load<float,16>((const float*)skip + (size_t)rr1*N + gc, esimd::overaligned_tag<16>{});
+                        sk0 = sf.template select<8,1>(0); sk1 = sf.template select<8,1>(8);
+                    }
+                    esimd::simd<float, 16> pub;
+                    if (epi != 2u) {
+                        esimd::simd<float,8> t0, t1;
+                        for (int e = 0; e < 8; ++e) { t0[e] = sk0[e]*ccl[e] + g0.read()[e]; t1[e] = sk1[e]*cch[e] + g1.read()[e]; }
+                        { esimd::simd<float,16> tt; tt.template select<8,1>(0) = t0; tt.template select<8,1>(8) = t1;
+                          pub = s8v8::pub_vec_v8<16>(epi, tt); }   // B3-ffn-4: 8-wide EU-slot waste (see chip ffn-3)
+                    } else {
+                        for (int e = 0; e < 8; ++e) pub[e] = s8v8::pub_esimd(epi, sk0[e]*ccl[e] + g0.read()[e]);
+                        for (int e = 0; e < 8; ++e) pub[8+e] = s8v8::pub_esimd(epi, sk1[e]*cch[e] + g1.read()[e]);
+                    }
+                    size_t out = (size_t)rr1 * N + gc;
+                    if (narrow) esimd::convert<half>(pub).copy_to((half*)Cout + out);
+                    else        pub.copy_to((float*)Cout + out);
+                }
+            }
+        });
+    });
+}
+} // namespace s8v8b
+
+// C82: the BN=128 / NT=64 / BK=64 tile family, copied from the bench form that is
+// bit-exact against a host int32 reference at the C512 tier shapes (3 cold processes,
+// correct=tot, bad=0; s6/layer1.md 171/174/177). Selected ONLY by NR_C512_BAND + the
+// shape gate; default OFF leaves today's path byte-identical.
+namespace s8v8d {
+using namespace sycl;
+namespace esimd = sycl::ext::intel::esimd;
+static const int BM = 128, BN = 64, BK = 32, NT = 32;
+template <int BNV, int BKV, int NTV, int NBUF, int MODE, bool PUB>
+static inline sycl::event gemm_var(sycl::queue& q, const int8_t* Ap, const int8_t* Bp,
+                                   int32_t* C32, void* Cout, const float* as, const float* bs,
+                                   int M, int Mp, int N, int K, int batch,
+                                   size_t sc, unsigned ldc, unsigned scale_stride,
+                                   unsigned col_stride, bool narrow, unsigned epi) {
+    constexpr int SLM_A  = BM * BKV;              // A bytes per operand buffer (128 rows x BK)
+    constexpr int SLM_B  = BKV * BNV;             // B bytes per operand buffer
+    constexpr int A_WI   = 16 * BKV;              // A stripe bytes per thread (16 rows x BK)
+    constexpr int KC     = BKV / 32;              // 32-K dpas chunks per kb block
+    constexpr int STRIPE = (MODE >= 2) ? 1024 : 512;  // B stripe bytes per thread per kc
+    int wg = (Mp / BM) * (N / BNV);
+    size_t apb_sz = (size_t)Mp * K, bpb_sz = (size_t)N * K, cb_sz = (size_t)Mp * N;
+    int kb_n = K / BKV;
+    return q.submit([&](handler& h) {
+        h.parallel_for(nd_range(range((size_t)wg * batch * NTV), range(NTV)),
+                       [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+            constexpr uint32_t SLMB_BASE = NBUF * SLM_A;   // B buffers follow the A buffers
+            esimd::slm_init<NBUF * SLM_A + NBUF * SLM_B>();
+            int gid = (int)it.get_group(0);
+            int lid = (int)it.get_local_id(0);
+            int g = gid / wg; int loc = gid % wg;
+            int NB = N / BNV;
+            int wg_row = loc / NB, wg_col = loc % NB;
+            constexpr int WIC = (MODE == 1) ? 8 : 4;       // col bands: NT64 -> 8, NT32 -> 4
+            int wi_row = lid / WIC, wi_col = lid % WIC;
+            const int8_t* apb = Ap + (size_t)g * apb_sz + (size_t)(wg_row * kb_n) * SLM_A;
+            const int8_t* bp  = Bp + (size_t)g * bpb_sz + (size_t)wg_col * (BNV / 8) * 256;
+            int32_t* c_g = C32 + (size_t)g * cb_sz;
+            // global -> SLM block copy of one kb. The A block is contiguous (pack_a64
+            // lays it out per (w,kb)). The B block is KC kk32 blocks -- pack_b puts
+            // consecutive kk32 blocks N*32 bytes apart in global, so they are only
+            // adjacent when N==BNV; copy them piecewise at their SLM slots (KC=1
+            // reduces to the shipped single linear copy).
+            auto load_block = [=](int buf, int kb) SYCL_ESIMD_FUNCTION {
+                esimd::simd<int8_t, SLM_A / NTV> av = esimd::block_load<int8_t, SLM_A / NTV>(
+                    apb + (size_t)kb * SLM_A + lid * (SLM_A / NTV), esimd::overaligned_tag<16>{});
+                esimd::slm_block_store(buf * SLM_A + lid * (SLM_A / NTV), av, esimd::overaligned_tag<16>{});
+                #pragma unroll
+                for (int kc = 0; kc < KC; ++kc) {
+                    esimd::simd<int8_t, SLM_B / KC / NTV> bv = esimd::block_load<int8_t, SLM_B / KC / NTV>(
+                        bp + (size_t)kb * N * BKV + (size_t)kc * (N * 32) + lid * (SLM_B / KC / NTV),
+                        esimd::overaligned_tag<16>{});
+                    esimd::slm_block_store(SLMB_BASE + buf * SLM_B + kc * (SLM_B / KC)
+                        + lid * (SLM_B / KC / NTV), bv, esimd::overaligned_tag<16>{});
+                }
+            };
+            // one full K-sweep over column-tile s (s=0/1 only for MODE2; else s=0).
+            auto sweep = [&](int s) SYCL_ESIMD_FUNCTION {
+                esimd::simd<int8_t, 256> a0, a1, b0, b1, b2, b3;
+                esimd::simd<int32_t, 64> c00(0), c01(0), c10(0), c11(0);
+                esimd::simd<int32_t, 64> c02(0), c03(0), c12(0), c13(0);
+                // MODE2 second-sweep fast path: when the whole kb pipeline fits in the
+                // buffers (kb_n <= NBUF), sweep(1) reads the still-resident SLM and
+                // touches global ZERO. Otherwise it re-loads every block (the honest
+                // double-load form). NBUF=3 with K=64/128 and NBUF=4 with K<=128 hit it.
+                int load_this = (s == 0 || kb_n > NBUF) ? 1 : 0;
+                int nb = (NBUF - 1 < kb_n) ? NBUF - 1 : kb_n;
+                if (load_this) for (int p = 0; p < nb; ++p) load_block(p, p);
+                esimd::barrier();
+                for (int b = 0; b < kb_n; ++b) {
+                    int cur = b % NBUF;
+                    int nx = b + NBUF - 1;
+                    if (load_this && nx < kb_n) load_block(nx % NBUF, nx);
+                    #pragma unroll
+                    for (int kc = 0; kc < KC; ++kc) {
+                        uint32_t offA = (uint32_t)(cur * SLM_A) + (uint32_t)(wi_row * A_WI) + (uint32_t)(kc * 512);
+                        uint32_t offB = SLMB_BASE + (uint32_t)(cur * SLM_B)
+                                      + (uint32_t)(kc * (BNV * 32)) + (uint32_t)(wi_col * STRIPE)
+                                      + (MODE == 2 ? (uint32_t)(s * 512) : 0u);
+                        a0 = esimd::slm_block_load<int8_t, 256>(offA + 0,   esimd::overaligned_tag<16>{});
+                        a1 = esimd::slm_block_load<int8_t, 256>(offA + 256, esimd::overaligned_tag<16>{});
+                        b0 = esimd::slm_block_load<int8_t, 256>(offB + 0,   esimd::overaligned_tag<16>{});
+                        b1 = esimd::slm_block_load<int8_t, 256>(offB + 256, esimd::overaligned_tag<16>{});
+                        if (MODE == 3) {
+                            b2 = esimd::slm_block_load<int8_t, 256>(offB + 512, esimd::overaligned_tag<16>{});
+                            b3 = esimd::slm_block_load<int8_t, 256>(offB + 768, esimd::overaligned_tag<16>{});
+                        }
+                        c00 = esimd::xmx::dpas<8, 8, int32_t>(c00, b0, a0);
+                        c01 = esimd::xmx::dpas<8, 8, int32_t>(c01, b1, a0);
+                        c10 = esimd::xmx::dpas<8, 8, int32_t>(c10, b0, a1);
+                        c11 = esimd::xmx::dpas<8, 8, int32_t>(c11, b1, a1);
+                        if (MODE == 3) {
+                            c02 = esimd::xmx::dpas<8, 8, int32_t>(c02, b2, a0);
+                            c03 = esimd::xmx::dpas<8, 8, int32_t>(c03, b3, a0);
+                            c12 = esimd::xmx::dpas<8, 8, int32_t>(c12, b2, a1);
+                            c13 = esimd::xmx::dpas<8, 8, int32_t>(c13, b3, a1);
+                        }
+                    }
+                    esimd::barrier();
+                }
+                // ---- store: the shipped v8 tails VERBATIM (raw = gemm_b's block_store
+                // pair; pub = gemm_b_pub's cs/rs/acc-assembly/pub_vec_v8 chain) ----
+                int gr = wg_row * BM + wi_row * 16;
+                int gc = wg_col * BNV + (MODE >= 2 ? wi_col * 32 : wi_col * 16)
+                       + (MODE == 2 ? s * 16 : 0);
+                if (!PUB) {
+                    for (int r = 0; r < 8; ++r) {
+                        esimd::simd<int32_t, 16> row0;
+                        row0.select<8, 1>(0) = c00.select<8, 1>(r * 8);
+                        row0.select<8, 1>(8) = c01.select<8, 1>(r * 8);
+                        esimd::simd<int32_t, 16> row1;
+                        row1.select<8, 1>(0) = c10.select<8, 1>(r * 8);
+                        row1.select<8, 1>(8) = c11.select<8, 1>(r * 8);
+                        esimd::block_store<int32_t, 16>(c_g + (size_t)(gr + r) * N + gc, row0, esimd::overaligned_tag<16>{});
+                        esimd::block_store<int32_t, 16>(c_g + (size_t)(gr + 8 + r) * N + gc, row1, esimd::overaligned_tag<16>{});
+                        if (MODE == 3) {
+                            esimd::simd<int32_t, 16> row0h;
+                            row0h.select<8, 1>(0) = c02.select<8, 1>(r * 8);
+                            row0h.select<8, 1>(8) = c03.select<8, 1>(r * 8);
+                            esimd::simd<int32_t, 16> row1h;
+                            row1h.select<8, 1>(0) = c12.select<8, 1>(r * 8);
+                            row1h.select<8, 1>(8) = c13.select<8, 1>(r * 8);
+                            esimd::block_store<int32_t, 16>(c_g + (size_t)(gr + r) * N + gc + 16, row0h, esimd::overaligned_tag<16>{});
+                            esimd::block_store<int32_t, 16>(c_g + (size_t)(gr + 8 + r) * N + gc + 16, row1h, esimd::overaligned_tag<16>{});
+                        }
+                    }
+                } else {
+                    const float* gas = as + (size_t)g * scale_stride;
+                    const float* gbs = bs + (size_t)g * col_stride;
+                    esimd::simd<float, 16> cs = esimd::block_load<float, 16>(
+                        gbs + gc, esimd::overaligned_tag<16>{});
+                    esimd::simd<float, 16> cs2;
+                    if (MODE == 3) cs2 = esimd::block_load<float, 16>(gbs + gc + 16, esimd::overaligned_tag<16>{});
+                    for (int r = 0; r < 8; ++r) {
+                        int rr0 = gr + r, rr1 = gr + 8 + r;
+                        if (rr0 < M) {
+                            float rs = gas[rr0];
+                            esimd::simd<int32_t, 16> acc(0);
+                            acc.select<8, 1>(0) = c00.select<8, 1>(r * 8);
+                            acc.select<8, 1>(8) = c01.select<8, 1>(r * 8);
+                            esimd::simd<float, 16> pub = s8v8::pub_vec_v8<16>(epi, esimd::convert<float>(acc) * rs * cs);
+                            size_t out = (size_t)g * sc + (size_t)rr0 * ldc + gc;
+                            if (narrow) esimd::convert<half>(pub).copy_to((half*)Cout + out);
+                            else        pub.copy_to((float*)Cout + out);
+                            if (MODE == 3) {
+                                esimd::simd<int32_t, 16> acc2(0);
+                                acc2.select<8, 1>(0) = c02.select<8, 1>(r * 8);
+                                acc2.select<8, 1>(8) = c03.select<8, 1>(r * 8);
+                                esimd::simd<float, 16> pub2 = s8v8::pub_vec_v8<16>(epi, esimd::convert<float>(acc2) * rs * cs2);
+                                if (narrow) esimd::convert<half>(pub2).copy_to((half*)Cout + out + 16);
+                                else        pub2.copy_to((float*)Cout + out + 16);
+                            }
+                        }
+                        if (rr1 < M) {
+                            float rs = gas[rr1];
+                            esimd::simd<int32_t, 16> acc(0);
+                            acc.select<8, 1>(0) = c10.select<8, 1>(r * 8);
+                            acc.select<8, 1>(8) = c11.select<8, 1>(r * 8);
+                            esimd::simd<float, 16> pub = s8v8::pub_vec_v8<16>(epi, esimd::convert<float>(acc) * rs * cs);
+                            size_t out = (size_t)g * sc + (size_t)rr1 * ldc + gc;
+                            if (narrow) esimd::convert<half>(pub).copy_to((half*)Cout + out);
+                            else        pub.copy_to((float*)Cout + out);
+                            if (MODE == 3) {
+                                esimd::simd<int32_t, 16> acc2(0);
+                                acc2.select<8, 1>(0) = c12.select<8, 1>(r * 8);
+                                acc2.select<8, 1>(8) = c13.select<8, 1>(r * 8);
+                                esimd::simd<float, 16> pub2 = s8v8::pub_vec_v8<16>(epi, esimd::convert<float>(acc2) * rs * cs2);
+                                if (narrow) esimd::convert<half>(pub2).copy_to((half*)Cout + out + 16);
+                                else        pub2.copy_to((float*)Cout + out + 16);
+                            }
+                        }
+                    }
+                }
+            };
+            sweep(0);
+            if (MODE == 2) sweep(1);   // the blueprint form's second 16-col tile
+        });
+    });
+}
+} // namespace s8v8d
+
+// ============================================================================
+// C89 (knife A'): the wres leg's PUBLISH epilogue on a BN=128 / NT=64 / BK=64 tile.
+// The tile math is copied from the bench form that is bit-exact against a host int32
+// reference at this tier's shapes (s6/layer1.md 171/174/177/183: correct=tot, bad=0),
+// and the res/skip/window tail is copied VERBATIM from s8v8::gemm_b_res_window
+// (gemm_s8_v8_kernel.hpp:1324-1389) -- the accumulator set (c00,c01,c10,c11) and the
+// gr/gc mapping match exactly, so the tail needs no semantic change.
+// Selected ONLY by NR_WRES_PUB128 + the pinned live shape; default OFF = byte-identical.
+// SLM: 2*(128*64) + 2*(64*128) = 32,768 B  -> stays in the 3-WG/Xe-core bucket.
+namespace s8v8t {
+using namespace sycl;
+namespace esimd = sycl::ext::intel::esimd;
+static inline sycl::event gemm_b_res_window_128(sycl::queue& q, const int8_t* Ap, const int8_t* Bp,
+                                                void* Cout, const float* as, const float* bs,
+                                                const void* skip, const float* cos,
+                                                int M, int Mp, int N, int K,
+                                                bool narrow, bool half_skip, unsigned epi,
+                                                unsigned across, unsigned top, unsigned left,
+                                                unsigned image_h, unsigned image_w, unsigned nband = 1) {
+    LC_TICK();
+    constexpr int BM = 128, BNV = 128, BKV = 64, NTV = 64, NBUF = 2, MODE = 1;
+    constexpr int BN = BNV;                     // the copied window tail refers to BN
+    constexpr int SLM_A = BM * BKV, SLM_B = BKV * BNV, A_WI = 16 * BKV;
+    constexpr int KC = BKV / 32;
+    constexpr int STRIPE = (MODE >= 2) ? 1024 : 512;
+    int32_t* C32 = nullptr;                     // the raw-int32 sink is unused in this form
+    const int batch = 1;
+    int wg = (Mp / BM) * (N / BNV);
+    size_t apb_sz = (size_t)Mp * K, bpb_sz = (size_t)N * K, cb_sz = (size_t)Mp * N;
+    int kb_n = K / BKV;
+    return q.submit([&](handler& h) {
+        h.parallel_for(nd_range(range((size_t)wg * batch * NTV), range(NTV)),
+                       [=](nd_item<1> it) SYCL_ESIMD_KERNEL {
+            constexpr uint32_t SLMB_BASE = NBUF * SLM_A;   // B buffers follow the A buffers
+            esimd::slm_init<NBUF * SLM_A + NBUF * SLM_B>();
+            int gid = (int)it.get_group(0);
+            int lid = (int)it.get_local_id(0);
+            int g = gid / wg; int loc = gid % wg;
+            int NB = N / BNV;
+            int wg_row = loc / NB, wg_col = loc % NB;
+            constexpr int WIC = (MODE == 1) ? 8 : 4;       // col bands: NT64 -> 8, NT32 -> 4
+            int wi_row = lid / WIC, wi_col = lid % WIC;
+            const int8_t* apb = Ap + (size_t)g * apb_sz + (size_t)(wg_row * kb_n) * SLM_A;
+            const int8_t* bp  = Bp + (size_t)g * bpb_sz + (size_t)wg_col * (BNV / 8) * 256;
+            int32_t* c_g = C32 + (size_t)g * cb_sz;
+            // global -> SLM block copy of one kb. The A block is contiguous (pack_a64
+            // lays it out per (w,kb)). The B block is KC kk32 blocks -- pack_b puts
+            // consecutive kk32 blocks N*32 bytes apart in global, so they are only
+            // adjacent when N==BNV; copy them piecewise at their SLM slots (KC=1
+            // reduces to the shipped single linear copy).
+            auto load_block = [=](int buf, int kb) SYCL_ESIMD_FUNCTION {
+                esimd::simd<int8_t, SLM_A / NTV> av = esimd::block_load<int8_t, SLM_A / NTV>(
+                    apb + (size_t)kb * SLM_A + lid * (SLM_A / NTV), esimd::overaligned_tag<16>{});
+                esimd::slm_block_store(buf * SLM_A + lid * (SLM_A / NTV), av, esimd::overaligned_tag<16>{});
+                #pragma unroll
+                for (int kc = 0; kc < KC; ++kc) {
+                    esimd::simd<int8_t, SLM_B / KC / NTV> bv = esimd::block_load<int8_t, SLM_B / KC / NTV>(
+                        bp + (size_t)kb * N * BKV + (size_t)kc * (N * 32) + lid * (SLM_B / KC / NTV),
+                        esimd::overaligned_tag<16>{});
+                    esimd::slm_block_store(SLMB_BASE + buf * SLM_B + kc * (SLM_B / KC)
+                        + lid * (SLM_B / KC / NTV), bv, esimd::overaligned_tag<16>{});
+                }
+            };
+            esimd::simd<int8_t, 256> a0, a1, b0, b1, b2, b3;
+            esimd::simd<int32_t, 64> c00(0), c01(0), c10(0), c11(0);
+            esimd::simd<int32_t, 64> c02(0), c03(0), c12(0), c13(0);   // MODE=3 lanes, unused here
+            const int load_this = 1;                       // MODE=1: a single sweep
+            { int nb = (NBUF - 1 < kb_n) ? NBUF - 1 : kb_n;
+              for (int p = 0; p < nb; ++p) load_block(p, p); }
+            esimd::barrier();
+                for (int b = 0; b < kb_n; ++b) {
+                    int cur = b % NBUF;
+                    int nx = b + NBUF - 1;
+                    if (load_this && nx < kb_n) load_block(nx % NBUF, nx);
+                    #pragma unroll
+                    for (int kc = 0; kc < KC; ++kc) {
+                        uint32_t offA = (uint32_t)(cur * SLM_A) + (uint32_t)(wi_row * A_WI) + (uint32_t)(kc * 512);
+                        uint32_t offB = SLMB_BASE + (uint32_t)(cur * SLM_B)
+                                      + (uint32_t)(kc * (BNV * 32)) + (uint32_t)(wi_col * STRIPE)
+                                      + 0u;
+                        a0 = esimd::slm_block_load<int8_t, 256>(offA + 0,   esimd::overaligned_tag<16>{});
+                        a1 = esimd::slm_block_load<int8_t, 256>(offA + 256, esimd::overaligned_tag<16>{});
+                        b0 = esimd::slm_block_load<int8_t, 256>(offB + 0,   esimd::overaligned_tag<16>{});
+                        b1 = esimd::slm_block_load<int8_t, 256>(offB + 256, esimd::overaligned_tag<16>{});
+                        if (MODE == 3) {
+                            b2 = esimd::slm_block_load<int8_t, 256>(offB + 512, esimd::overaligned_tag<16>{});
+                            b3 = esimd::slm_block_load<int8_t, 256>(offB + 768, esimd::overaligned_tag<16>{});
+                        }
+                        c00 = esimd::xmx::dpas<8, 8, int32_t>(c00, b0, a0);
+                        c01 = esimd::xmx::dpas<8, 8, int32_t>(c01, b1, a0);
+                        c10 = esimd::xmx::dpas<8, 8, int32_t>(c10, b0, a1);
+                        c11 = esimd::xmx::dpas<8, 8, int32_t>(c11, b1, a1);
+                        if (MODE == 3) {
+                            c02 = esimd::xmx::dpas<8, 8, int32_t>(c02, b2, a0);
+                            c03 = esimd::xmx::dpas<8, 8, int32_t>(c03, b3, a0);
+                            c12 = esimd::xmx::dpas<8, 8, int32_t>(c12, b2, a1);
+                            c13 = esimd::xmx::dpas<8, 8, int32_t>(c13, b3, a1);
+                        }
+                    }
+                    esimd::barrier();
+                }
+            // ---- the shipped window tail, VERBATIM (s8v8::gemm_b_res_window:1324-1389) ----
+            int gr = wg_row * BM + wi_row * 16, gc = wg_col * BN + wi_col * 16;
+            esimd::simd<float, 16> cs = esimd::block_load<float, 16>(bs + gc, esimd::overaligned_tag<16>{});
+            esimd::simd<float, 16> cc = esimd::block_load<float, 16>(cos + gc, esimd::overaligned_tag<16>{});
+            esimd::simd<float, 8> csl = cs.template select<8,1>(0), csh = cs.template select<8,1>(8);
+            esimd::simd<float, 8> ccl = cc.template select<8,1>(0), cch = cc.template select<8,1>(8);
+            for (int r = 0; r < 8; ++r) {
+                int rr0 = gr + r, rr1 = gr + 8 + r;
+                if (rr0 < M) {
+                    unsigned window=(unsigned)rr0/64u, token=(unsigned)rr0%64u;
+                    unsigned yy=(window/across)*8u+token/8u, xx=(window%across)*8u+token%8u;
+                    bool in=(yy>=top&&xx>=left&&yy-top<image_h&&xx-left<image_w);
+                    size_t out=in?(((size_t)(yy-top)*image_w+(xx-left))*N+gc):0;
+                    float rs = as[(size_t)rr0 * nband + (nband > 1u ? (unsigned)(gc / 128) : 0u)];
+                    esimd::simd<float, 8> f0 = esimd::convert<float>(c00.select<8,1>(r*8).read()) * rs * csl;
+                    esimd::simd<float, 8> f1 = esimd::convert<float>(c01.select<8,1>(r*8).read()) * rs * csh;
+                    esimd::simd<float, 8> sk0, sk1;
+                    if (half_skip) {
+                        esimd::simd<half,16> sh = esimd::block_load<half,16>((const half*)skip + out, esimd::overaligned_tag<16>{});
+                        sk0 = esimd::convert<float>(sh.template select<8,1>(0).read()); sk1 = esimd::convert<float>(sh.template select<8,1>(8).read());
+                    } else {
+                        esimd::simd<float,16> sf = esimd::block_load<float,16>((const float*)skip + out, esimd::overaligned_tag<16>{});
+                        sk0 = sf.template select<8,1>(0); sk1 = sf.template select<8,1>(8);
+                    }
+                    esimd::simd<float, 16> pub;
+                    if (epi != 2u) {   // BLADE-4: same fma text, vectorized pub chain (epi1 proven)
+                        esimd::simd<float,8> t0, t1;
+                        for (int e = 0; e < 8; ++e) { t0[e] = sk0[e]*ccl[e] + f0.read()[e]; t1[e] = sk1[e]*cch[e] + f1.read()[e]; }
+                        { esimd::simd<float,16> tt; tt.template select<8,1>(0) = t0; tt.template select<8,1>(8) = t1;
+                          pub = s8v8::pub_vec_v8<16>(epi, tt); }   // B3-ffn-4: 8-wide EU-slot waste (see chip ffn-3)
+                    } else {
+                    for (int e = 0; e < 8; ++e) pub[e] = s8v8::pub_esimd(epi, sk0[e]*ccl[e] + f0.read()[e]);
+                    for (int e = 0; e < 8; ++e) pub[8+e] = s8v8::pub_esimd(epi, sk1[e]*cch[e] + f1.read()[e]);
+                    }
+                    if (in) { if (narrow) esimd::convert<half>(pub).copy_to((half*)Cout + out);
+                              else        pub.copy_to((float*)Cout + out); }
+                }
+                if (rr1 < M) {
+                    unsigned window=(unsigned)rr1/64u, token=(unsigned)rr1%64u;
+                    unsigned yy=(window/across)*8u+token/8u, xx=(window%across)*8u+token%8u;
+                    bool in=(yy>=top&&xx>=left&&yy-top<image_h&&xx-left<image_w);
+                    size_t out=in?(((size_t)(yy-top)*image_w+(xx-left))*N+gc):0;
+                    float rs = as[(size_t)rr1 * nband + (nband > 1u ? (unsigned)(gc / 128) : 0u)];
+                    esimd::simd<float, 8> g0 = esimd::convert<float>(c10.select<8,1>(r*8).read()) * rs * csl;
+                    esimd::simd<float, 8> g1 = esimd::convert<float>(c11.select<8,1>(r*8).read()) * rs * csh;
+                    esimd::simd<float, 8> sk0, sk1;
+                    if (half_skip) {
+                        esimd::simd<half,16> sh = esimd::block_load<half,16>((const half*)skip + out, esimd::overaligned_tag<16>{});
+                        sk0 = esimd::convert<float>(sh.template select<8,1>(0).read()); sk1 = esimd::convert<float>(sh.template select<8,1>(8).read());
+                    } else {
+                        esimd::simd<float,16> sf = esimd::block_load<float,16>((const float*)skip + out, esimd::overaligned_tag<16>{});
+                        sk0 = sf.template select<8,1>(0); sk1 = sf.template select<8,1>(8);
+                    }
+                    esimd::simd<float, 16> pub;
+                    if (epi != 2u) {   // BLADE-4 (window variant, second row): same rule
+                        esimd::simd<float,8> t0, t1;
+                        for (int e = 0; e < 8; ++e) { t0[e] = sk0[e]*ccl[e] + g0.read()[e]; t1[e] = sk1[e]*cch[e] + g1.read()[e]; }
+                        { esimd::simd<float,16> tt; tt.template select<8,1>(0) = t0; tt.template select<8,1>(8) = t1;
+                          pub = s8v8::pub_vec_v8<16>(epi, tt); }   // B3-ffn-4: 8-wide EU-slot waste (see chip ffn-3)
+                    } else {
+                    for (int e = 0; e < 8; ++e) pub[e] = s8v8::pub_esimd(epi, sk0[e]*ccl[e] + g0.read()[e]);
+                    for (int e = 0; e < 8; ++e) pub[8+e] = s8v8::pub_esimd(epi, sk1[e]*cch[e] + g1.read()[e]);
+                    }
+                    if (in) { if (narrow) esimd::convert<half>(pub).copy_to((half*)Cout + out);
+                              else        pub.copy_to((float*)Cout + out); }
+                }
+            }
+        });
+    });
+}
+} // namespace s8v8t

@@ -115,6 +115,131 @@ static inline void pack_a_fused_sr_k(sycl::queue& q, const sycl::half* A_f16, in
         }
     });
 }
+// ============================================================================================
+// C61c (2026-11-12): the BK=64 A packers for the gemm_int8_residual family ONLY (s8v8b).
+// The old pack_a / pack_a_fused stay untouched for every other family.  The quantization
+// expression is copied VERBATIM from the proven single-read form (peak pass -> div_ieee by
+// scale -> rnde -> clamp +-127 -> convert<int> -> convert<int8_t>, scales[srow] written once),
+// so the BYTES are the same -- only the destination order changes:
+//     BK=32 order:  [w][kb32][wi(8)][row(16)][k(32)]        (block 512 B, kb stride 8*512)
+//     BK=64 order:  [w][kb64][wi(8)][kc(2)][row(16)][k(32)]  (block 1024 B, kb stride 8*1024)
+// which is exactly what s8v8b::load_grf wants (a0..a3 = offA + wi*1024 + kc*512 + {0,256}).
+// ============================================================================================
+template <int KMAX>
+static inline void pack_a_fused64_k(sycl::queue& q, const sycl::half* A_f16, int8_t* Ap,
+                                    float* scales, int M, int Mp, int K) {
+    LC_TICK();   // #145 junreg 132: launch counted at helper entry
+    const int BM = 128, BK = 64;
+    const int kb_n = KMAX / BK;
+    q.parallel_for(sycl::range((size_t)Mp), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
+        namespace esimd = sycl::ext::intel::esimd;
+        int srow = (int)it.get_id(0);
+        int w = srow / BM, rem = srow % BM, wi = rem / 16, row = rem % 16;
+        size_t per_blk = ((size_t)w * kb_n) * 8 + wi;          // 1024-byte operand blocks
+        esimd::simd<int8_t, 32> z((int8_t)0);
+        if (srow >= M) {
+            for (int kb = 0; kb < kb_n; ++kb)
+                #pragma unroll
+                for (int kc = 0; kc < 2; ++kc)
+                    esimd::block_store<int8_t, 32>(Ap + (per_blk + (size_t)kb * 8) * 1024 + kc * 512 + row * 32,
+                                                   z, esimd::overaligned_tag<16>{});
+            return;
+        }
+        esimd::simd<float, KMAX> reg = esimd::convert<float>(
+            esimd::block_load<sycl::half, KMAX>(A_f16 + (size_t)srow * K, esimd::overaligned_tag<16>{}));
+        float peak = esimd::hmax<float, float, KMAX>(esimd::abs(reg));
+        const float scale = (peak == 0.0f) ? 1.0f
+            : esimd::div_ieee<float, 1>(esimd::simd<float, 1>(peak), esimd::simd<float, 1>(127.0f))[0];
+        scales[srow] = scale;
+        #pragma unroll
+        for (int kb = 0; kb < kb_n; ++kb) {
+            #pragma unroll
+            for (int kc = 0; kc < 2; ++kc) {
+                esimd::simd<float, 32> seg = reg.template select<32, 1>(kb * 64 + kc * 32);
+                esimd::simd<float, 32> qq = esimd::div_ieee<float, 32>(seg, esimd::simd<float, 32>(scale));
+                qq = esimd::min(esimd::max(esimd::rnde<float, 32>(qq), esimd::simd<float, 32>(-127.f)),
+                                esimd::simd<float, 32>(127.f));
+                esimd::block_store<int8_t, 32>(Ap + (per_blk + (size_t)kb * 8) * 1024 + kc * 512 + row * 32,
+                    esimd::convert<int8_t>(esimd::convert<int>(qq)), esimd::overaligned_tag<16>{});
+            }
+        }
+    });
+}
+static inline void pack_a_fused64(sycl::queue& q, const sycl::half* A_f16, int8_t* Ap,
+                                  float* scales, int M, int Mp, int K) {
+    if (K == 64)   { pack_a_fused64_k<64>(q, A_f16, Ap, scales, M, Mp, K); return; }
+    if (K == 128)  { pack_a_fused64_k<128>(q, A_f16, Ap, scales, M, Mp, K); return; }
+    if (K == 256)  { pack_a_fused64_k<256>(q, A_f16, Ap, scales, M, Mp, K); return; }
+    if (K == 512)  { pack_a_fused64_k<512>(q, A_f16, Ap, scales, M, Mp, K); return; }
+    // K outside the proven single-read set (1024 / 4096): fall back to the scalar BK=64 packer
+    // below plus the untouched int8 copy path -- never silently wrong.
+    return;
+}
+// Scalar BK=64 packer: int8 A (row-major, M rows) -> [w][kb64][wi][kc][row][k].
+static inline void pack_a64(sycl::queue& q, const int8_t* A, int8_t* Ap, int M, int Mp, int K) {
+    LC_TICK();   // #145 junreg 132
+    const int BM = 128, BK = 64;
+    int wgr = Mp / BM, kb_n = K / BK;
+    size_t n = (size_t)wgr * kb_n * 8 * 1024;      // = Mp*K
+    q.parallel_for(sycl::range(n), [=](sycl::item<1> it) {
+        size_t d = it.get_id(0);
+        size_t blk = d / 1024; int inb = (int)(d % 1024);
+        int wi = (int)(blk % 8); size_t wk = blk / 8;
+        int kb = (int)(wk % (size_t)kb_n); int w = (int)(wk / (size_t)kb_n);
+        int kc = inb / 512, row = (inb % 512) / 32, k = inb % 32;
+        int srow = w * BM + wi * 16 + row;
+        Ap[d] = srow < M ? A[(size_t)srow * K + (size_t)kb * BK + kc * 32 + k] : (int8_t)0;
+    });
+}
+// C92 (knife B, correct site): the fused packer with the row peak taken per 128-column band.
+// Copied from pack_a_fused_sr_k above; ONLY the peak scope and the scale slot change. The live
+// path for the wres leg's A operand is exactly this kernel (fused_w=1 -> pack_a_fused ->
+// pack_a_fused_sr_k<512>), which is where band-internal scales have to go -- the standalone
+// QUANT closures are already folded to no-ops (libxmx_sycl.cpp:7838-7841).
+template <int KMAX, int BAND>
+static inline void pack_a_fused_band_k(sycl::queue& q, const sycl::half* A_f16, int8_t* Ap,
+                                       float* scales, int M, int Mp, int K) {
+    LC_TICK();
+    const int BM = 128, BK = 32;
+    const int kb_n = KMAX / 32;
+    const int nb_per_band = BAND / 32;
+    const int nband = KMAX / BAND;
+    q.parallel_for(sycl::range((size_t)Mp), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
+        namespace esimd = sycl::ext::intel::esimd;
+        int srow = (int)it.get_id(0);
+        int w = srow / BM, rem = srow % BM, wi = rem / 16, row = rem % 16;
+        size_t per_blk = ((size_t)w * kb_n) * 8 + wi;
+        esimd::simd<int8_t, 32> z((int8_t)0);
+        if (srow >= M) {
+            for (int kb = 0; kb < kb_n; ++kb)
+                esimd::block_store<int8_t, 32>(Ap + (per_blk + (size_t)kb * 8) * 512 + row * 32, z, esimd::overaligned_tag<16>{});
+            return;
+        }
+        esimd::simd<float, KMAX> reg = esimd::convert<float>(
+            esimd::block_load<sycl::half, KMAX>(A_f16 + (size_t)srow * K, esimd::overaligned_tag<16>{}));
+        #pragma unroll
+        for (int b = 0; b < nband; ++b) {
+            esimd::simd<float, BAND> seg = reg.template select<BAND, 1>(b * BAND);
+            float peak = esimd::hmax<float, float, BAND>(esimd::abs(seg));
+            const float scale = (peak == 0.0f) ? 1.0f
+                : esimd::div_ieee<float, 1>(esimd::simd<float, 1>(peak), esimd::simd<float, 1>(127.0f))[0];
+            scales[(size_t)srow * nband + b] = scale;
+            #pragma unroll
+            for (int j = 0; j < nb_per_band; ++j) {
+                int kb = b * nb_per_band + j;
+                esimd::simd<float, 32> s2 = seg.template select<32, 1>(j * 32);
+                esimd::simd<float, 32> qq = esimd::div_ieee<float, 32>(s2, esimd::simd<float, 32>(scale));
+                qq = esimd::min(esimd::max(esimd::rnde<float, 32>(qq), esimd::simd<float, 32>(-127.f)), esimd::simd<float, 32>(127.f));
+                esimd::block_store<int8_t, 32>(Ap + (per_blk + (size_t)kb * 8) * 512 + row * 32,
+                    esimd::convert<int8_t>(esimd::convert<int>(qq)), esimd::overaligned_tag<16>{});
+            }
+        }
+    });
+}
+static inline void pack_a_fused_band128(sycl::queue& q, const sycl::half* A_f16, int8_t* Ap,
+                                        float* scales, int M, int Mp, int K) {
+    if (K == 512) pack_a_fused_band_k<512, 128>(q, A_f16, Ap, scales, M, Mp, K);
+}
 static inline void pack_a_fused_sr_impl(sycl::queue& q, const sycl::half* A_f16, int8_t* Ap,
                                         float* scales, int M, int Mp, int K) {
     if (K == 64)  pack_a_fused_sr_k<64>(q, A_f16, Ap, scales, M, Mp, K);

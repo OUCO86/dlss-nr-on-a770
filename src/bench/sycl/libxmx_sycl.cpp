@@ -2645,6 +2645,36 @@ struct BmResGroup {
     int n;
 };
 static std::vector<BmResGroup*> g_bm_groups;      // alive for the life of the process (cgraph-safe)
+// C61d: ONE predicate decides the BK=64 gir path, and EVERY A producer plus the gemm entry
+// call it -- a plane can never be packed in one order and read in another (that mixed-layout
+// signature is exactly what the plain-1301 82.6% whole-face diff showed in C61c).
+// Kept deliberately identical to the C61c condition (K % 64 == 0 && K <= 512) so coverage does
+// not silently change between the two shovels.
+static bool gir_bk64_ok(unsigned K) { return (K % 64u) == 0u && K <= 512u; }
+// C82: the BN=128/NT=64/BK=64 tile gate for the int8 gemm legs of the C512 tier.
+// NR_C512_BAND defaults to 0 -> the shipped path stays byte-identical. The shape gate
+// (N%128==0, K%64==0) makes legs that fail it (e.g. gemm_int8_batched at N=64) fall back
+// to the shipped BN=64 form -- per-leg judgement, not a blanket switch.
+// C89: the BN=128/NT=64/BK=64 publish tile for the LIVE wres leg. Default OFF -> the
+// shipped path stays byte-identical. The gate is pinned to the live shape measured in
+// 184.5b/185.3 (M=768, N=512, K=512, epi=3, narrow=true) -- never a broad N%128 test,
+// which C82 proved can change the numbers.
+// C91: band-internal quantization scales (the numeric knife). Default OFF -> the shipped
+// path is byte-identical. Rule 216: the shape gate below comes from the engine's own live
+// arguments (plan chains 25/33), not from a bench form.
+static bool band_scale_on() {
+    static int v = getenv("NR_BAND_SCALE") ? atoi(getenv("NR_BAND_SCALE")) : 0;
+    return v != 0;
+}
+static bool wres_pub128_on() {
+    static int v = getenv("NR_WRES_PUB128") ? atoi(getenv("NR_WRES_PUB128")) : 0;
+    return v != 0;
+}
+static bool c512_band_on() {
+    static int v = getenv("NR_C512_BAND") ? atoi(getenv("NR_C512_BAND")) : 0;
+    return v != 0;
+}
+
 static void bmerge_apply(std::vector<std::function<void()>>& cmds) {
     if (bmerge_level() < 1 || g_bm_res_sites.size() < 2) { g_bm_res_sites.clear(); return; }
     // group by (M,N,K,flags) with a linear scan (no map/tuple/array: keep the include set untouched)
@@ -2759,6 +2789,12 @@ static void bmerge_apply(std::vector<std::function<void()>>& cmds) {
                     int8_t* dAp = nullptr;
                     if (poolfaces) { dAp = (int8_t*)pool_get(s.na); put_back_now = true; }
                     else dAp = gr->face[k];          // allocated at rewrite time, NOT here
+                    // C61d NOTE: deliberately NOT switched to the BK=64 order -- the merged
+                    // launch consumes this plane with s8v8::gemm_b_res_batch, which is still a
+                    // BK=32 kernel (not ported in this shovel).  Switching the packer here while
+                    // the batch reader stayed BK=32 is exactly the mixed-layout bug that made
+                    // plain-1301 diverge by 82.6% of its bytes.  If bmerge is ever ported, both
+                    // sides must switch together via gir_bk64_ok().
                     if (s.fused_r) packdev::pack_a_fused(*GQ, s.a16r, dAp, (float*)s.as, s.M, s.Mp, s.K);
                     else           packdev::pack_a(*GQ, s.Araw, dAp, s.M, s.Mp, s.K);
                     int8_t* dBp = cached_pack_b_i8(s.b_id, s.Braw, s.N, s.K);
@@ -5019,13 +5055,31 @@ int xmx_rec_gemm_int8(int a, int b, int c, int a_scale, int b_scale,
         // round-trip (download -> CPU pack -> upload) was the whole 89s/frame, and the
         // gather is bit-exact vs the host pack (PACK_DEVICE gate).
         int8_t* dAp = (int8_t*)pool_get(na);
-        if (fused) packdev::pack_a_fused(*GQ, a16, dAp, (float*)as, (int)M, Mp, (int)K);
-        else packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K);
+        // C82b: narrow the gate to the EXACT shape the bench form was validated on (N=512, K=512,
+        // M a multiple of 128). The broader N%128/K%64 gate also caught other tiers' legs
+        // whose operands were never validated in this tile family -- that is what turned the
+        // four gates red with the switch ON (1301 fused 4D6D3667 / plain 17D0575C).
+const bool band = c512_band_on() && N == 512u && K == 512u && (M % 128u) == 0u;
+        if (getenv("NR_C512_BAND_DBG"))
+            std::printf("[gir-band] band=%d on=%d M=%u N=%u K=%u Mp=%d epi=%u narrow=%d flags=%u\n",
+                        (int)band, c512_band_on() ? 1 : 0, M, N, K, Mp, epi, (int)narrow, flags);
+        // pack_b is BK-independent (kk32 blocks), so dBp is shared by both tile families.
         int8_t* dBp = cached_pack_b_i8(b, Braw, (int)N, (int)K);   // weight: pack once, reuse
+        if (band) {
+            // the A pack switches TOGETHER with the kernel (BK=64 order) -- the pairing rule
+            // the C70/BK64 knife pinned with gir_bk64_ok().
+            if (fused) packdev::pack_a_fused64(*GQ, a16, dAp, (float*)as, (int)M, Mp, (int)K);
+            else       packdev::pack_a64(*GQ, Araw, dAp, (int)M, Mp, (int)K);
+        } else if (fused) packdev::pack_a_fused(*GQ, a16, dAp, (float*)as, (int)M, Mp, (int)K);
+        else packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K);
         // DERIVED (section 92): pure publish (dequant + qr_publish, no residual fma) and
         // N%64==0 is a hard requirement -- exactly gemm_b_pub's shape (batch=1, dense ldc=N,
         // scale_stride/col_stride 0). Kills the int32 dC scratch + the separate publish pass.
-         s8v8::gemm_b_pub(*GQ, dAp, dBp, Cout, as, bs, (int)M, Mp, (int)N, (int)K,
+        if (band)
+             s8v8d::gemm_var<128, 64, 64, 2, 1, true>(*GQ, dAp, dBp, nullptr, Cout, as, bs,
+                     (int)M, Mp, (int)N, (int)K, 1, (size_t)Mp * N, (unsigned)N, 0u, 0u, narrow, epi);
+        else
+             s8v8::gemm_b_pub(*GQ, dAp, dBp, Cout, as, bs, (int)M, Mp, (int)N, (int)K,
                          1, (size_t)M * N, N, 0u, 0u, narrow, epi);
         pool_put(dAp);   // dBp is cache-owned (cached_pack_b_i8), not pooled
     });
@@ -5827,8 +5881,23 @@ int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale,
         // no download/upload round-trip (same conversion as gemm_int8, packdev gate).
         int8_t* dAp = (int8_t*)pool_get(na);
         static int rstop = getenv("NR_RES_STOP") ? atoi(getenv("NR_RES_STOP")) : 0;   // section 100 ledger (time-only): 1 = pack only, 2 = no pack either
+        // C61g: SINGLE DECISION POINT. The predicate is evaluated ONCE per leg and cached in
+        // gkb64 (declared OUTSIDE the rstop block so both the packer and the reader see it);
+        // the packer below and the reader further below both branch on that one boolean, so a
+        // plane can never be packed in one order and read in another.  NR_GKB64_DBG=1 dumps the
+        // decision tuple per gir leg -- construction-level evidence the four gates cannot give.
+        const bool gkb64 = gir_bk64_ok((unsigned)K);
+        static int gkdbg = getenv("NR_GKB64_DBG") ? atoi(getenv("NR_GKB64_DBG")) : 0;
+        if (gkdbg) fprintf(stderr, "[gkb64] M=%d Mp=%d N=%d K=%u fused_r=%d -> %s\n",
+                           (int)M, (int)Mp, (int)N, (unsigned)K, (int)fused_r,
+                           gkb64 ? "BK64 (pack_a64/fused64 + s8v8b)" : "BK32 (shipped pair)");
         if (rstop < 2) {
-        if (fused_r) packdev::pack_a_fused(*GQ, a16r, dAp, (float*)as, (int)M, Mp, (int)K);
+        if (gkb64) {
+            // C61d: the same predicate the gemm entry below uses -- packer and reader switch
+            // together by construction.
+            if (fused_r) packdev::pack_a_fused64(*GQ, a16r, dAp, (float*)as, (int)M, Mp, (int)K);
+            else         packdev::pack_a64(*GQ, Araw, dAp, (int)M, Mp, (int)K);
+        } else if (fused_r) packdev::pack_a_fused(*GQ, a16r, dAp, (float*)as, (int)M, Mp, (int)K);
         else packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K);
         }
         int8_t* dBp = cached_pack_b_i8(b, Braw, (int)N, (int)K);   // weight: pack once
@@ -5838,8 +5907,19 @@ int xmx_rec_gemm_int8_residual(int a, int b, int c, int a_scale, int b_scale,
         // epilogue's sycl::fma(skip,cos,stage) maps to ESIMD's auto-contracted sk*cp+stage
         // (one fused rounding, the gate_esimd lesson used correctly). N%64==0 is already a
         // hard requirement of this op, so every call qualifies. GEMM_INT8_RESIDUAL judges.
-         s8v8::gemm_b_res(*GQ, dAp, dBp, Cout, as, bs, skp, cp, (int)M, Mp, (int)N, (int)K,
-                         narrow, half_skip, epi);
+        // C61b (2026-11-12): BK=64 operand form for the gemm_int8_residual family ONLY.
+        // Every gir shape in the ledger has K % 64 == 0 ({64,128,256,512,1024,4096}), and the
+        // guard keeps the old entry reachable (198④: the new file must not leave two live paths
+        // by accident -- here the fallback is deliberate and single, for shapes BK=64 cannot
+        // divide). Bit-exactness argument: int32 dpas accumulation is exact + associative over
+        // K and the operand bytes are the same packed planes; bench_s8v8_tile priced this form
+        // at 11 variants x 5 shapes x 3 processes with ALL diff=0.
+        if (gkb64)
+             s8v8b::gemm_b_res(*GQ, dAp, dBp, Cout, as, bs, skp, cp, (int)M, Mp, (int)N, (int)K,
+                             narrow, half_skip, epi);
+        else
+             s8v8::gemm_b_res(*GQ, dAp, dBp, Cout, as, bs, skp, cp, (int)M, Mp, (int)N, (int)K,
+                             narrow, half_skip, epi);
         pool_put(dAp);   // dBp is cache-owned (the weight)
     });
     rb_push(c, (unsigned)Mp, N, "residual");               // NR_RES_BYTE grid probe
@@ -6010,12 +6090,36 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
         const float* cp  = (const float*)sized(cosine, (size_t)N * 4u, "cosine");
         // device pack (section 92): Araw/Braw already on device -- pack in place.
         int8_t* dAp = (int8_t*)pool_get(na);
+        // C90: pinned to the LIVE shapes only (plan chains 25 and 33: M=768, N=512, K=512).
+        // The epi/narrow terms that were here came from the bench form, not from these legs --
+        // with them the gate matched nothing (90/90 wres lines printed p128=0). The copied
+        // window tail already handles epi=0/narrow=false and epi=1/narrow=true.
+        const bool p128 = wres_pub128_on()
+                          && ((M == 768u  && N == 512u && K == 512u)      // the live C512 chains (C90)
+                              || (M == 960u  && N == 512u && K == 512u)    // same family, other chain
+                              || (M == 2560u && N == 256u && K == 256u)    // bench-gated bad=0, -20.8%
+                              || (M == 8640u && N == 128u && K == 128u)    // bench-gated bad=0,  -8.2%
+                              || (M == 9216u && N == 128u && K == 128u));  // bench-gated bad=0,  -7.4%
+        // N=64 (34560x64x64) is deliberately excluded above: BN=128 needs N >= BN.
+        // C92: the band pair -- producer (the fused packer's row max per 128 columns) and
+        // consumer (the publish tail's as[row*nband + band]) switch TOGETHER. Requires the
+        // fused path, because on the split path the standalone QUANT writes the scales.
+        const bool band_w = band_scale_on() && fused_w && M == 768u && N == 512u && K == 512u;
+        if (getenv("NR_WRES_DBG"))
+            std::printf("[wres-pub128] p128=%d M=%u N=%u K=%u Mp=%d epi=%u narrow=%d half_skip=%d flags=%u\n",
+                        (int)p128, M, N, K, Mp, (unsigned)((flags >> 8) & 0xFu),
+                        (int)((flags & 0x1000u) != 0u), (int)((flags & 0x40000u) != 0u), flags);
         static int wrstop = getenv("NR_WRES_STOP") ? atoi(getenv("NR_WRES_STOP")) : 0;   // section 100 ledger (time-only)
         if (wrstop < 2) {
         if (fused_w) {   // P2: the closure captured (fused_w, srcid_w) by value at
             sycl::half* a16w = (sycl::half*)sized(srcid_w, (size_t)M * K * 2u, "A(f16 fused)");
-             packdev::pack_a_fused(*GQ, a16w, dAp, (float*)as, (int)M, Mp, (int)K);
-        } else
+            // the A pack switches TOGETHER with the kernel (BK=64 order) -- the pairing rule
+            // pinned by the C70/C82 knife (gir_bk64_ok).
+            if (band_w) packdev::pack_a_fused_band128(*GQ, a16w, dAp, (float*)as, (int)M, Mp, (int)K);
+            else if (p128) packdev::pack_a_fused64(*GQ, a16w, dAp, (float*)as, (int)M, Mp, (int)K);
+            else      packdev::pack_a_fused(*GQ, a16w, dAp, (float*)as, (int)M, Mp, (int)K);
+        } else if (p128) { packdev::pack_a64(*GQ, Araw, dAp, (int)M, Mp, (int)K); }
+        else
         {  packdev::pack_a(*GQ, Araw, dAp, (int)M, Mp, (int)K); }
         }
         int8_t* dBp = cached_pack_b_i8(b, Braw, (int)N, (int)K);   // weight: pack once
@@ -6024,8 +6128,19 @@ int xmx_rec_gemm_window_int8_residual(int a, int b, int c, int a_scale, int b_sc
         // window variant maps the gemm row (window*64+token) to the image slot with the
         // same bounds cull the split pass did, and reads skip at that slot. N%64==0 is a
         // hard requirement of this op. WINDOW_INT8_RESIDUAL gate is the judge.
-         s8v8::gemm_b_res_window(*GQ, dAp, dBp, Cout, as, bs, skp, cp, (int)M, Mp, (int)N, (int)K,
-                                narrow, half_skip, epi, across, top, left, height, width);
+         // C91: this leg reads the (pk,sc) pair the mid-chain QUANT produced. When that quant
+         // was band-scaled (band_w), the row scale becomes per-band -- and the fused-pack path
+         // (fused_w) is excluded, because there the quant closure is a no-op and the row max is
+         // taken inside the packer (whole-row) -- that path keeps the shipped scales.
+         if (getenv("NR_BAND_DBG"))
+             std::printf("[band-wres] band_w=%d fused_w=%d p128=%d M=%u N=%u K=%u nband=%u\n",
+                         (int)band_w, (int)fused_w, (int)p128, M, N, K, band_w ? 4u : 1u);
+         if (p128)
+              s8v8t::gemm_b_res_window_128(*GQ, dAp, dBp, Cout, as, bs, skp, cp, (int)M, Mp, (int)N, (int)K,
+                                narrow, half_skip, epi, across, top, left, height, width, band_w ? 4u : 1u);
+         else
+              s8v8::gemm_b_res_window(*GQ, dAp, dBp, Cout, as, bs, skp, cp, (int)M, Mp, (int)N, (int)K,
+                                narrow, half_skip, epi, across, top, left, height, width, band_w ? 4u : 1u);
         pool_put(dAp);   // dBp is cache-owned (the weight)
     });
     rb_push(c, M, N, "wres");                             // NR_RES_BYTE grid probe (1270 plane)
@@ -6180,6 +6295,44 @@ namespace unaryloc {
 static inline float cr_mul(float x, float y) { return x * y; }
 static inline float cr_add(float x, float y) { return x + y; }
 }   // #148 com2: plain-operator shadows for xmx_rec_unary (no pragma, no division)
+// C104 (knife: unary kind 21 UPSAMPLE_ADD): one item handles a 2x2 block of TARGET pixels, so
+// the source-pixel value (A) and the per-channel D vector are loaded ONCE for four outputs.
+// The per-output arithmetic is unchanged (same order, same s8v8::e4m3_vec_v8), so the output is
+// byte-identical to the live arm -- PROVEN in the bench: bad=0 on all three real shapes, 3 cold
+// processes, at -84.5% / -87.9% / -89.4% per launch (tmp\c104\c104_up.cpp).
+static inline sycl::event up_2x2(sycl::queue& q, const void* A, const void* B, void* C, const float* D,
+                           unsigned N, unsigned CH, unsigned target, unsigned source,
+                           const int* vgate) {
+    unsigned rows = N / (target * CH);
+    size_t blocks = (size_t)(target / 2u) * (rows / 2u);
+    return q.parallel_for(sycl::range(blocks * (CH / 16u)), [=](sycl::item<1> it) SYCL_ESIMD_KERNEL {
+        // the C32 reuse gate, verbatim as the live arm has it -- without this the REUSE=1 path
+        // would recompute planes the shipped path deliberately skips.
+        if (vgate && vgate[-1] && *vgate) { ((int*)vgate)[4199] = 2; return; }
+        namespace esimd = sycl::ext::intel::esimd;
+        size_t id = it.get_id(0);
+        unsigned cc = (unsigned)((id % (CH / 16u)) * 16u);
+        unsigned rest = (unsigned)(id / (CH / 16u));
+        unsigned bx = rest % (target / 2u), by = rest / (target / 2u);
+        unsigned x0 = 2u * bx, y0 = 2u * by;
+        size_t srcbase = ((size_t)(y0 / 2u) * source + (x0 / 2u)) * CH + cc;
+        esimd::simd<float,16> av = esimd::block_load<float,16>((const float*)A + srcbase, esimd::overaligned_tag<16>{});
+        esimd::simd<float,16> dv = esimd::block_load<float,16>(D + cc, esimd::overaligned_tag<16>{});
+        #pragma unroll
+        for (int dy = 0; dy < 2; ++dy) {
+            #pragma unroll
+            for (int dx = 0; dx < 2; ++dx) {
+                size_t index = ((size_t)(y0 + dy) * target + (x0 + dx)) * CH + cc;
+                esimd::simd<sycl::half,16> bv = esimd::block_load<sycl::half,16>(
+                    (const sycl::half*)B + index, esimd::overaligned_tag<16>{});
+                esimd::simd<float,16> merged = av + esimd::convert<float>(bv) * dv;
+                esimd::simd<sycl::half,16> o = esimd::convert<sycl::half>(s8v8::e4m3_vec_v8<16>(merged));
+                esimd::block_store<sycl::half,16>((sycl::half*)C + index, o, esimd::overaligned_tag<16>{});
+            }
+        }
+    });
+}
+
 int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
                   unsigned channels, float p0, unsigned batch, unsigned sa,
                   unsigned sb, unsigned sc, unsigned k) {
@@ -6303,6 +6456,29 @@ int xmx_rec_unary(unsigned kind, int a, int b, int c, int d, unsigned n,
         // Guards: !a_half && b_half && narrow && CH%16==0 && N%16==0 && epi==1.
         // Escape NR_UNARY_VEC=0 (shared with U-1). UNARY_KINDS gate judges.
         static bool uvec2 = !getenv("NR_UNARY_VEC") || atoi(getenv("NR_UNARY_VEC")) != 0;
+        // C104: the 2x2 form. Default OFF (NR_UP_2X2 unset) -> the shipped arm below is untouched
+        // (rule 217: the default path must be the original expression, and here it literally is:
+        // the new arm is an additional branch in front of it, never a modified common path).
+        // Shape gate pinned to the engine's own DBG arguments (rule 216): rows and target must
+        // both be even so a 2x2 block never crosses the image edge.
+        // STAGED (C105 promotion, 2026-11-13): default ON; escape hatch NR_UP_2X2=0 restores the
+        // old arm verbatim. Faces are byte-identical ON vs OFF (C104 four-gate ladder: fused
+        // 254C02B7/CACD2029/4D90CCA5 + plain DD49827D EXACT both sides, 8/8 legs on the new form).
+        static bool up2 = !getenv("NR_UP_2X2") || atoi(getenv("NR_UP_2X2")) != 0;
+        const unsigned u_rows = (SA && CH) ? (N / (SA * CH)) : 0u;
+        const bool up2_ok = up2 && !a_half && b_half && narrow && epi == 1u
+                            && (CH % 16u) == 0u && (N % 16u) == 0u
+                            && (SA % 2u) == 0u && (u_rows % 2u) == 0u && (SB * 2u >= SA);
+        if (getenv("NR_U_DBG"))
+            std::printf("[up2x2] sub=%u up2=%d up2_ok=%d n=%u CH=%u SA=%u SB=%u rows=%u\n",
+                        sub, (int)up2, (int)up2_ok, N, CH, SA, SB, u_rows);
+        if (up2_ok) {
+            pg_push([=]() {
+                 const int* vit_g_up2 = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
+                 up_2x2(*GQ, A, B, C, D, N, CH, SA, SB, vit_g_up2);
+            });
+            return 0;
+        }
         if (uvec2 && !a_half && b_half && narrow && epi == 1u && (CH % 16u) == 0u && (N % 16u) == 0u) {
             pg_push([=]() {
                  const int* vit_g_6101 = vit_gate(g_vit_run_cmd);   // C32 gate for THIS closure
@@ -7994,7 +8170,18 @@ int xmx_rec_quant(int source, int packed, int scale, unsigned M, unsigned K) {
     s6_note_quant(g_cmds.size(), source, packed, scale, M, K);   // S6-1a (see above)
     a5_note_quant(g_cmds.size(), source, packed, scale, M, K);   // A5
     pg_push([=]() {
-         qr_launch(*GQ, *GD, qr_kernel(), a, pk, sc, M, K, 0u, 0u, 0u, 0u, 0u, nullptr, nullptr);
+         {
+        // C91 (knife B step 1): band-internal scales. Default OFF -> byte-identical shipped
+        // path. The gate is pinned to the LIVE shape of the mid-chain QUANT in plan chains
+        // 25/33 (src 1277 -> pk 1272, sc 1273, M=768, K=512) -- rule 216: the gate must come
+        // from the engine's real arguments, never from a bench form. nband = K/128.
+        const bool band = band_scale_on() && M == 768u && K == 512u;
+        if (getenv("NR_BAND_DBG"))
+            std::printf("[band-quant] band=%d M=%u K=%u nband=%u src=%d pk=%d sc=%d\n",
+                        (int)band, M, K, K / 128u, source, packed, scale);
+        if (band) qr_launch(*GQ, *GD, qr_kernel(), a, pk, sc, M * 4u, 128u, 0u, 0u, 0u, 0u, 0u, nullptr, nullptr);
+        else      qr_launch(*GQ, *GD, qr_kernel(), a, pk, sc, M, K, 0u, 0u, 0u, 0u, 0u, nullptr, nullptr);
+    }
         if (getenv("NR_PK_DUMP")) { static int pdSP=0; if(pdSP<1){pdSP++;
             GQ->wait();
             std::vector<int8_t> hp(512); GQ->memcpy(hp.data(), pk, 512).wait();
